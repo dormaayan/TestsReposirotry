@@ -44,16 +44,14 @@
 
 package org.jfree.data.statistics;
 
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertTrue;
-import static org.junit.Assert.assertFalse;
-import static org.junit.Assert.assertNotNull;
+import static org.junit.jupiter.api.Assertions.*;
 
 import org.jfree.chart.TestUtils;
 
 import org.jfree.data.general.DatasetChangeEvent;
 import org.jfree.data.general.DatasetChangeListener;
-import org.junit.Test;
+import org.junit.jupiter.api.Test;
+
 
 /**
  * Tests for the {@link HistogramDataset} class.
@@ -70,11 +68,12 @@ public class HistogramDatasetTest implements DatasetChangeListener {
         double[] values = {1.0, 2.0, 3.0, 4.0, 6.0, 12.0, 5.0, 6.3, 4.5};
         HistogramDataset hd = new HistogramDataset();
         hd.addSeries("Series 1", values, 5);
-        assertEquals(hd.getYValue(0, 0), 3.0, EPSILON);
-        assertEquals(hd.getYValue(0, 1), 3.0, EPSILON);
-        assertEquals(hd.getYValue(0, 2), 2.0, EPSILON);
-        assertEquals(hd.getYValue(0, 3), 0.0, EPSILON);
-        assertEquals(hd.getYValue(0, 4), 1.0, EPSILON);
+        assertAll("Wrong values in bins",
+        			() -> assertEquals(hd.getYValue(0, 0), 3.0, EPSILON),
+        			() -> assertEquals(hd.getYValue(0, 1), 3.0, EPSILON),
+        			() -> assertEquals(hd.getYValue(0, 2), 2.0, EPSILON),
+        			() -> assertEquals(hd.getYValue(0, 3), 0.0, EPSILON),
+        			() -> assertEquals(hd.getYValue(0, 4), 1.0, EPSILON));
     }
 
     /**
@@ -108,13 +107,9 @@ public class HistogramDatasetTest implements DatasetChangeListener {
         HistogramDataset d2 = (HistogramDataset) d1.clone();
         assertTrue(d1 != d2);
         assertTrue(d1.getClass() == d2.getClass());
-        assertTrue(d1.equals(d2));
+        assertEquals(d1,d2);
 
-        // simple check for independence
-        d1.addSeries("Series 2", new double[] {1.0, 2.0, 3.0}, 2);
-        assertFalse(d1.equals(d2));
-        d2.addSeries("Series 2", new double[] {1.0, 2.0, 3.0}, 2);
-        assertTrue(d1.equals(d2));
+        inependenceSimpleCheck(d1,d2);
     }
 
     /**
@@ -127,12 +122,17 @@ public class HistogramDatasetTest implements DatasetChangeListener {
         d1.addSeries("Series 1", values, 5);
         HistogramDataset d2 = (HistogramDataset) TestUtils.serialised(d1);
         assertEquals(d1, d2);
+        
+        inependenceSimpleCheck(d1,d2);
 
+    }
+    
+    public void inependenceSimpleCheck(HistogramDataset d1, HistogramDataset d2){
         // simple check for independence
         d1.addSeries("Series 2", new double[] {1.0, 2.0, 3.0}, 2);
-        assertFalse(d1.equals(d2));
+        assertNotEquals(d1,d2);
         d2.addSeries("Series 2", new double[] {1.0, 2.0, 3.0}, 2);
-        assertTrue(d1.equals(d2));
+        assertEquals(d1,d2);
     }
 
     /**
@@ -155,13 +155,13 @@ public class HistogramDatasetTest implements DatasetChangeListener {
         double[] values = {-1.0, 0.0, 0.1, 0.9, 1.0, 1.1, 1.9, 2.0, 3.0};
         HistogramDataset d = new HistogramDataset();
         d.addSeries("S1", values, 2, 0.0, 2.0);
-        assertEquals(0.0, d.getStartXValue(0, 0), EPSILON);
-        assertEquals(1.0, d.getEndXValue(0, 0), EPSILON);
-        assertEquals(4.0, d.getYValue(0, 0), EPSILON);
-
-        assertEquals(1.0, d.getStartXValue(0, 1), EPSILON);
-        assertEquals(2.0, d.getEndXValue(0, 1), EPSILON);
-        assertEquals(5.0, d.getYValue(0, 1), EPSILON);
+        assertAll("Incorrect list addition",
+        		() -> assertEquals(0.0, d.getStartXValue(0, 0), EPSILON),
+        		() -> assertEquals(1.0, d.getEndXValue(0, 0), EPSILON),
+        		() -> assertEquals(4.0, d.getYValue(0, 0), EPSILON),
+        		() -> assertEquals(1.0, d.getStartXValue(0, 1), EPSILON),
+        		() -> assertEquals(2.0, d.getEndXValue(0, 1), EPSILON),
+        		() -> assertEquals(5.0, d.getYValue(0, 1), EPSILON));
     }
 
     /**
@@ -172,21 +172,22 @@ public class HistogramDatasetTest implements DatasetChangeListener {
         double[] values = {0.0, 1.0, 2.0, 3.0, 4.0, 5.0};
         HistogramDataset hd = new HistogramDataset();
         hd.addSeries("S1", values, 5);
-        assertEquals(0.0, hd.getStartXValue(0, 0), EPSILON);
-        assertEquals(1.0, hd.getEndXValue(0, 0), EPSILON);
-        assertEquals(1.0, hd.getYValue(0, 0), EPSILON);
-        assertEquals(1.0, hd.getStartXValue(0, 1), EPSILON);
-        assertEquals(2.0, hd.getEndXValue(0, 1), EPSILON);
-        assertEquals(1.0, hd.getYValue(0, 1), EPSILON);
-        assertEquals(2.0, hd.getStartXValue(0, 2), EPSILON);
-        assertEquals(3.0, hd.getEndXValue(0, 2), EPSILON);
-        assertEquals(1.0, hd.getYValue(0, 2), EPSILON);
-        assertEquals(3.0, hd.getStartXValue(0, 3), EPSILON);
-        assertEquals(4.0, hd.getEndXValue(0, 3), EPSILON);
-        assertEquals(1.0, hd.getYValue(0, 3), EPSILON);
-        assertEquals(4.0, hd.getStartXValue(0, 4), EPSILON);
-        assertEquals(5.0, hd.getEndXValue(0, 4), EPSILON);
-        assertEquals(2.0, hd.getYValue(0, 4), EPSILON);
+        assertAll("Incorrect list addition",
+        		() -> assertEquals(0.0, hd.getStartXValue(0, 0), EPSILON),
+        		() -> assertEquals(1.0, hd.getEndXValue(0, 0), EPSILON),
+        		() -> assertEquals(1.0, hd.getYValue(0, 0), EPSILON),
+        		() -> assertEquals(1.0, hd.getStartXValue(0, 1), EPSILON),
+        		() -> assertEquals(2.0, hd.getEndXValue(0, 1), EPSILON),
+        		() -> assertEquals(1.0, hd.getYValue(0, 1), EPSILON),
+        		() -> assertEquals(2.0, hd.getStartXValue(0, 2), EPSILON),
+        		() -> assertEquals(3.0, hd.getEndXValue(0, 2), EPSILON),
+        		() -> assertEquals(1.0, hd.getYValue(0, 2), EPSILON),
+        		() -> assertEquals(3.0, hd.getStartXValue(0, 3), EPSILON),
+        		() -> assertEquals(4.0, hd.getEndXValue(0, 3), EPSILON),
+        		() -> assertEquals(1.0, hd.getYValue(0, 3), EPSILON),
+        		() -> assertEquals(4.0, hd.getStartXValue(0, 4), EPSILON),
+        		() -> assertEquals(5.0, hd.getEndXValue(0, 4), EPSILON),
+        		() -> assertEquals(2.0, hd.getYValue(0, 4), EPSILON));
     }
 
     /**
