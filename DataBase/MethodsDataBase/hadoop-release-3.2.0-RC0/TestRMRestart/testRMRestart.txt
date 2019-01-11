@@ -1,0 +1,143 @@
+@Test(timeout=180000) public void testRMRestart() throws Exception {
+  conf.setInt(YarnConfiguration.RM_AM_MAX_ATTEMPTS,YarnConfiguration.DEFAULT_RM_AM_MAX_ATTEMPTS);
+  MockRM rm1=createMockRM(conf);
+  MockMemoryRMStateStore memStore=(MockMemoryRMStateStore)rm1.getRMStateStore();
+  Map<ApplicationId,ApplicationStateData> rmAppState=memStore.getState().getApplicationState();
+  rm1.start();
+  MockNM nm1=new MockNM("127.0.0.1:1234",15120,rm1.getResourceTrackerService());
+  MockNM nm2=new MockNM("127.0.0.2:5678",15120,rm1.getResourceTrackerService());
+  nm1.registerNode();
+  nm2.registerNode();
+  RMApp app0=rm1.submitApp(200);
+  RMAppAttempt attempt0=app0.getCurrentAppAttempt();
+  Assert.assertEquals(1,rmAppState.size());
+  nm1.nodeHeartbeat(true);
+  MockAM am0=rm1.sendAMLaunched(attempt0.getAppAttemptId());
+  am0.registerAppAttempt();
+  finishApplicationMaster(app0,rm1,nm1,am0);
+  RMApp app1=rm1.submitApp(200);
+  ApplicationStateData appState=rmAppState.get(app1.getApplicationId());
+  Assert.assertNotNull(appState);
+  Assert.assertEquals(0,appState.getAttemptCount());
+  Assert.assertEquals(appState.getApplicationSubmissionContext().getApplicationId(),app1.getApplicationSubmissionContext().getApplicationId());
+  nm1.nodeHeartbeat(true);
+  RMAppAttempt attempt1=app1.getCurrentAppAttempt();
+  ApplicationAttemptId attemptId1=attempt1.getAppAttemptId();
+  rm1.waitForState(attemptId1,RMAppAttemptState.ALLOCATED);
+  Assert.assertEquals(1,appState.getAttemptCount());
+  ApplicationAttemptStateData attemptState=appState.getAttempt(attemptId1);
+  Assert.assertNotNull(attemptState);
+  Assert.assertEquals(BuilderUtils.newContainerId(attemptId1,1),attemptState.getMasterContainer().getId());
+  MockAM am1=rm1.sendAMLaunched(attempt1.getAppAttemptId());
+  am1.registerAppAttempt();
+  am1.allocate("127.0.0.1",1000,1,new ArrayList<ContainerId>());
+  nm1.nodeHeartbeat(true);
+  List<Container> conts=am1.allocate(new ArrayList<ResourceRequest>(),new ArrayList<ContainerId>()).getAllocatedContainers();
+  while (conts.size() == 0) {
+    nm1.nodeHeartbeat(true);
+    conts.addAll(am1.allocate(new ArrayList<ResourceRequest>(),new ArrayList<ContainerId>()).getAllocatedContainers());
+    Thread.sleep(500);
+  }
+  RMApp app2=rm1.submitApp(200);
+  appState=rmAppState.get(app2.getApplicationId());
+  Assert.assertNotNull(appState);
+  Assert.assertEquals(0,appState.getAttemptCount());
+  Assert.assertEquals(appState.getApplicationSubmissionContext().getApplicationId(),app2.getApplicationSubmissionContext().getApplicationId());
+  RMApp appUnmanaged=rm1.submitApp(200,"someApp","someUser",null,true,null,conf.getInt(YarnConfiguration.RM_AM_MAX_ATTEMPTS,YarnConfiguration.DEFAULT_RM_AM_MAX_ATTEMPTS),null);
+  ApplicationAttemptId unmanagedAttemptId=appUnmanaged.getCurrentAppAttempt().getAppAttemptId();
+  ApplicationId unmanagedAppId=appUnmanaged.getApplicationId();
+  appState=rmAppState.get(unmanagedAppId);
+  Assert.assertNotNull(appState);
+  rm1.waitForState(unmanagedAttemptId,RMAppAttemptState.LAUNCHED);
+  rm1.waitForState(unmanagedAppId,RMAppState.ACCEPTED);
+  Assert.assertEquals(1,appState.getAttemptCount());
+  Assert.assertEquals(appState.getApplicationSubmissionContext().getApplicationId(),appUnmanaged.getApplicationSubmissionContext().getApplicationId());
+  MockRM rm2=createMockRM(conf,memStore);
+  rm2.start();
+  nm1.setResourceTrackerService(rm2.getResourceTrackerService());
+  nm2.setResourceTrackerService(rm2.getResourceTrackerService());
+  Assert.assertEquals(4,rm2.getRMContext().getRMApps().size());
+  rm2.waitForState(app0.getApplicationId(),RMAppState.FINISHED);
+  rm2.waitForState(am0.getApplicationAttemptId(),RMAppAttemptState.FINISHED);
+  RMApp loadedApp1=rm2.getRMContext().getRMApps().get(app1.getApplicationId());
+  Assert.assertNotNull(loadedApp1);
+  Assert.assertEquals(1,loadedApp1.getAppAttempts().size());
+  Assert.assertEquals(app1.getApplicationSubmissionContext().getApplicationId(),loadedApp1.getApplicationSubmissionContext().getApplicationId());
+  RMApp loadedApp2=rm2.getRMContext().getRMApps().get(app2.getApplicationId());
+  Assert.assertNotNull(loadedApp2);
+  Assert.assertEquals(app2.getApplicationSubmissionContext().getApplicationId(),loadedApp2.getApplicationSubmissionContext().getApplicationId());
+  rm2.waitForState(loadedApp1.getApplicationId(),RMAppState.ACCEPTED);
+  rm2.waitForState(loadedApp2.getApplicationId(),RMAppState.ACCEPTED);
+  Assert.assertEquals(1,loadedApp1.getAppAttempts().size());
+  Assert.assertEquals(1,loadedApp2.getAppAttempts().size());
+  am1.setAMRMProtocol(rm2.getApplicationMasterService(),rm2.getRMContext());
+  try {
+    am1.allocate(new ArrayList<ResourceRequest>(),new ArrayList<ContainerId>());
+    Assert.fail();
+  }
+ catch (  ApplicationAttemptNotFoundException e) {
+    Assert.assertTrue(e instanceof ApplicationAttemptNotFoundException);
+  }
+  NodeHeartbeatResponse hbResponse=nm1.nodeHeartbeat(true);
+  Assert.assertEquals(NodeAction.RESYNC,hbResponse.getNodeAction());
+  hbResponse=nm2.nodeHeartbeat(true);
+  Assert.assertEquals(NodeAction.RESYNC,hbResponse.getNodeAction());
+  nm1=new MockNM("127.0.0.1:1234",15120,rm2.getResourceTrackerService());
+  nm2=new MockNM("127.0.0.2:5678",15120,rm2.getResourceTrackerService());
+  NMContainerStatus status=TestRMRestart.createNMContainerStatus(loadedApp1.getCurrentAppAttempt().getAppAttemptId(),1,ContainerState.COMPLETE);
+  nm1.registerNode(Arrays.asList(status),null);
+  nm2.registerNode();
+  rm2.waitForState(loadedApp1.getApplicationId(),RMAppState.ACCEPTED);
+  int timeoutSecs=0;
+  while (loadedApp1.getAppAttempts().size() != 2 && timeoutSecs++ < 40) {
+    ;
+    Thread.sleep(200);
+  }
+  hbResponse=nm1.nodeHeartbeat(true);
+  Assert.assertTrue(NodeAction.RESYNC != hbResponse.getNodeAction());
+  hbResponse=nm2.nodeHeartbeat(true);
+  Assert.assertTrue(NodeAction.RESYNC != hbResponse.getNodeAction());
+  attempt1=loadedApp1.getCurrentAppAttempt();
+  attemptId1=attempt1.getAppAttemptId();
+  ((AbstractYarnScheduler)rm2.getResourceScheduler()).update();
+  rm2.waitForState(attemptId1,RMAppAttemptState.ALLOCATED);
+  appState=rmAppState.get(loadedApp1.getApplicationId());
+  attemptState=appState.getAttempt(attemptId1);
+  Assert.assertNotNull(attemptState);
+  Assert.assertEquals(BuilderUtils.newContainerId(attemptId1,1),attemptState.getMasterContainer().getId());
+  MockNM am1Node=nm1;
+  if (attemptState.getMasterContainer().getNodeId().toString().contains("127.0.0.2")) {
+    am1Node=nm2;
+  }
+  RMAppAttempt attempt2=loadedApp2.getCurrentAppAttempt();
+  ApplicationAttemptId attemptId2=attempt2.getAppAttemptId();
+  rm2.waitForState(attemptId2,RMAppAttemptState.ALLOCATED);
+  appState=rmAppState.get(loadedApp2.getApplicationId());
+  attemptState=appState.getAttempt(attemptId2);
+  Assert.assertNotNull(attemptState);
+  Assert.assertEquals(BuilderUtils.newContainerId(attemptId2,1),attemptState.getMasterContainer().getId());
+  MockNM am2Node=nm1;
+  if (attemptState.getMasterContainer().getNodeId().toString().contains("127.0.0.2")) {
+    am2Node=nm2;
+  }
+  am1=rm2.sendAMLaunched(attempt1.getAppAttemptId());
+  am1.registerAppAttempt();
+  MockAM am2=rm2.sendAMLaunched(attempt2.getAppAttemptId());
+  am2.registerAppAttempt();
+  am1.allocate("127.0.0.1",1000,3,new ArrayList<ContainerId>());
+  am2.allocate("127.0.0.2",1000,1,new ArrayList<ContainerId>());
+  nm1.nodeHeartbeat(true);
+  nm2.nodeHeartbeat(true);
+  conts=am1.allocate(new ArrayList<ResourceRequest>(),new ArrayList<ContainerId>()).getAllocatedContainers();
+  while (conts.size() == 0) {
+    nm1.nodeHeartbeat(true);
+    nm2.nodeHeartbeat(true);
+    conts.addAll(am1.allocate(new ArrayList<ResourceRequest>(),new ArrayList<ContainerId>()).getAllocatedContainers());
+    Thread.sleep(500);
+  }
+  finishApplicationMaster(loadedApp1,rm2,am1Node,am1);
+  finishApplicationMaster(loadedApp2,rm2,am2Node,am2);
+  rm2.stop();
+  rm1.stop();
+  Assert.assertEquals(4,rmAppState.size());
+}

@@ -1,0 +1,48 @@
+@Test public void testECFsck() throws Exception {
+  DistributedFileSystem fs=null;
+  final long precision=1L;
+  conf.setLong(DFSConfigKeys.DFS_NAMENODE_ACCESSTIME_PRECISION_KEY,precision);
+  conf.setLong(DFSConfigKeys.DFS_BLOCKREPORT_INTERVAL_MSEC_KEY,10000L);
+  int dataBlocks=StripedFileTestUtil.getDefaultECPolicy().getNumDataUnits();
+  int parityBlocks=StripedFileTestUtil.getDefaultECPolicy().getNumParityUnits();
+  int totalSize=dataBlocks + parityBlocks;
+  File builderBaseDir=new File(GenericTestUtils.getRandomizedTempPath());
+  cluster=new MiniDFSCluster.Builder(conf,builderBaseDir).numDataNodes(totalSize).build();
+  fs=cluster.getFileSystem();
+  fs.enableErasureCodingPolicy(StripedFileTestUtil.getDefaultECPolicy().getName());
+  Path replDirPath=new Path("/replicated");
+  Path replFilePath=new Path(replDirPath,"replfile");
+  final short factor=3;
+  DFSTestUtil.createFile(fs,replFilePath,1024,factor,0);
+  DFSTestUtil.waitReplication(fs,replFilePath,factor);
+  Path ecDirPath=new Path("/striped");
+  Path largeFilePath=new Path(ecDirPath,"largeFile");
+  DFSTestUtil.createStripedFile(cluster,largeFilePath,ecDirPath,1,2,true);
+  Path smallFilePath=new Path(ecDirPath,"smallFile");
+  DFSTestUtil.writeFile(fs,smallFilePath,"hello world!");
+  long replTime=fs.getFileStatus(replFilePath).getAccessTime();
+  long ecTime=fs.getFileStatus(largeFilePath).getAccessTime();
+  Thread.sleep(precision);
+  setupAuditLogs();
+  String outStr=runFsck(conf,0,true,"/");
+  verifyAuditLogs();
+  assertEquals(replTime,fs.getFileStatus(replFilePath).getAccessTime());
+  assertEquals(ecTime,fs.getFileStatus(largeFilePath).getAccessTime());
+  System.out.println(outStr);
+  assertTrue(outStr.contains(NamenodeFsck.HEALTHY_STATUS));
+  shutdownCluster();
+  cluster=new MiniDFSCluster.Builder(conf).numDataNodes(0).format(false).build();
+  outStr=runFsck(conf,1,true,"/","-files","-blocks");
+  assertTrue(outStr.contains(NamenodeFsck.CORRUPT_STATUS));
+  String[] outLines=outStr.split("\\r?\\n");
+  for (  String line : outLines) {
+    if (line.contains(largeFilePath.toString())) {
+      final HdfsFileStatus file=cluster.getNameNode().getRpcServer().getFileInfo(largeFilePath.toString());
+      assertTrue(line.contains("policy=" + file.getErasureCodingPolicy().getName()));
+    }
+ else     if (line.contains(replFilePath.toString())) {
+      assertTrue(line.contains("replication=" + cluster.getFileSystem().getFileStatus(replFilePath).getReplication()));
+    }
+  }
+  System.out.println(outStr);
+}

@@ -1,0 +1,55 @@
+@Test public void testCorruptBlock() throws Exception {
+  conf.setLong(DFSConfigKeys.DFS_BLOCKREPORT_INTERVAL_MSEC_KEY,1000);
+  conf.setInt(HdfsClientConfigKeys.Retry.WINDOW_BASE_KEY,10);
+  FileSystem fs=null;
+  DFSClient dfsClient=null;
+  LocatedBlocks blocks=null;
+  int replicaCount=0;
+  Random random=new Random();
+  String outStr=null;
+  short factor=1;
+  File builderBaseDir=new File(GenericTestUtils.getRandomizedTempPath());
+  cluster=new MiniDFSCluster.Builder(conf,builderBaseDir).numDataNodes(1).build();
+  cluster.waitActive();
+  fs=cluster.getFileSystem();
+  Path file1=new Path("/testCorruptBlock");
+  DFSTestUtil.createFile(fs,file1,1024,factor,0);
+  DFSTestUtil.waitReplication(fs,file1,factor);
+  ExtendedBlock block=DFSTestUtil.getFirstBlock(fs,file1);
+  outStr=runFsck(conf,0,true,"/");
+  System.out.println(outStr);
+  assertTrue(outStr.contains(NamenodeFsck.HEALTHY_STATUS));
+  File blockFile=cluster.getBlockFile(0,block);
+  if (blockFile != null && blockFile.exists()) {
+    RandomAccessFile raFile=new RandomAccessFile(blockFile,"rw");
+    FileChannel channel=raFile.getChannel();
+    String badString="BADBAD";
+    int rand=random.nextInt((int)channel.size() / 2);
+    raFile.seek(rand);
+    raFile.write(badString.getBytes());
+    raFile.close();
+  }
+  try {
+    IOUtils.copyBytes(fs.open(file1),new IOUtils.NullOutputStream(),conf,true);
+  }
+ catch (  IOException ie) {
+    assertTrue(ie instanceof ChecksumException);
+  }
+  dfsClient=new DFSClient(new InetSocketAddress("localhost",cluster.getNameNodePort()),conf);
+  blocks=dfsClient.getNamenode().getBlockLocations(file1.toString(),0,Long.MAX_VALUE);
+  replicaCount=blocks.get(0).getLocations().length;
+  while (replicaCount != factor) {
+    try {
+      Thread.sleep(100);
+    }
+ catch (    InterruptedException ignore) {
+    }
+    blocks=dfsClient.getNamenode().getBlockLocations(file1.toString(),0,Long.MAX_VALUE);
+    replicaCount=blocks.get(0).getLocations().length;
+  }
+  assertTrue(blocks.get(0).isCorrupt());
+  outStr=runFsck(conf,1,true,"/");
+  System.out.println(outStr);
+  assertTrue(outStr.contains(NamenodeFsck.CORRUPT_STATUS));
+  assertTrue(outStr.contains("testCorruptBlock"));
+}

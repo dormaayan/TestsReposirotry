@@ -1,0 +1,43 @@
+@Test public void testProcessOverReplicatedAndCorruptStripedBlock() throws Exception {
+  long fileLen=dataBlocks * blockSize;
+  DFSTestUtil.createStripedFile(cluster,filePath,null,1,stripesPerBlock,false);
+  LocatedBlocks lbs=cluster.getNameNodeRpc().getBlockLocations(filePath.toString(),0,fileLen);
+  LocatedStripedBlock bg=(LocatedStripedBlock)(lbs.get(0));
+  long gs=bg.getBlock().getGenerationStamp();
+  String bpid=bg.getBlock().getBlockPoolId();
+  long groupId=bg.getBlock().getBlockId();
+  Block blk=new Block(groupId,blockSize,gs);
+  BlockInfoStriped blockInfo=new BlockInfoStriped(blk,StripedFileTestUtil.getDefaultECPolicy());
+  for (int i=0; i < groupSize; i++) {
+    blk.setBlockId(groupId + i);
+    cluster.injectBlocks(i,Arrays.asList(blk),bpid);
+  }
+  cluster.triggerBlockReports();
+  BlockManager bm=cluster.getNamesystem().getBlockManager();
+  List<DatanodeInfo> infos=Arrays.asList(bg.getLocations());
+  List<String> storages=Arrays.asList(bg.getStorageIDs());
+  cluster.getNamesystem().writeLock();
+  try {
+    bm.findAndMarkBlockAsCorrupt(lbs.getLastLocatedBlock().getBlock(),infos.get(0),storages.get(0),"TEST");
+  }
+  finally {
+    cluster.getNamesystem().writeUnlock();
+  }
+  assertEquals(1,bm.countNodes(bm.getStoredBlock(blockInfo)).corruptReplicas());
+  blk.setBlockId(groupId + 2);
+  cluster.injectBlocks(numDNs - 3,Arrays.asList(blk),bpid);
+  cluster.injectBlocks(numDNs - 2,Arrays.asList(blk),bpid);
+  cluster.triggerBlockReports();
+  lbs=cluster.getNameNodeRpc().getBlockLocations(filePath.toString(),0,fileLen);
+  bg=(LocatedStripedBlock)(lbs.get(0));
+  assertEquals(groupSize + 1,bg.getBlockIndices().length);
+  assertEquals(groupSize + 1,bg.getLocations().length);
+  BitSet set=new BitSet(groupSize);
+  for (  byte index : bg.getBlockIndices()) {
+    set.set(index);
+  }
+  Assert.assertFalse(set.get(0));
+  for (int i=1; i < groupSize; i++) {
+    assertTrue(set.get(i));
+  }
+}

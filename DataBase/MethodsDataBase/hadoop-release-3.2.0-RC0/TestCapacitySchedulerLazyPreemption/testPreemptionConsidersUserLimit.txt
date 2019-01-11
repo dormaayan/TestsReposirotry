@@ -1,0 +1,39 @@
+@Test(timeout=60000) public void testPreemptionConsidersUserLimit() throws Exception {
+  CapacitySchedulerConfiguration csConf=new CapacitySchedulerConfiguration(conf);
+  csConf.setUserLimitFactor(CapacitySchedulerConfiguration.ROOT + ".c",0.1f);
+  MockRM rm1=new MockRM(csConf);
+  rm1.getRMContext().setNodeLabelManager(mgr);
+  rm1.start();
+  MockNM nm1=rm1.registerNode("h1:1234",4 * GB);
+  MockNM nm2=rm1.registerNode("h2:1234",4 * GB);
+  CapacityScheduler cs=(CapacityScheduler)rm1.getResourceScheduler();
+  RMNode rmNode1=rm1.getRMContext().getRMNodes().get(nm1.getNodeId());
+  RMNode rmNode2=rm1.getRMContext().getRMNodes().get(nm2.getNodeId());
+  RMApp app1=rm1.submitApp(1 * GB,"app","user",null,"a");
+  MockAM am1=MockRM.launchAndRegisterAM(app1,rm1,nm1);
+  am1.allocate("*",1 * GB,6,new ArrayList<ContainerId>());
+  for (int i=0; i < 3; i++) {
+    cs.handle(new NodeUpdateSchedulerEvent(rmNode1));
+    cs.handle(new NodeUpdateSchedulerEvent(rmNode2));
+  }
+  FiCaSchedulerApp schedulerApp1=cs.getApplicationAttempt(am1.getApplicationAttemptId());
+  Assert.assertEquals(7,schedulerApp1.getLiveContainers().size());
+  RMApp app2=rm1.submitApp(1 * GB,"app","user",null,"c");
+  MockAM am2=MockRM.launchAndRegisterAM(app2,rm1,nm2);
+  Assert.assertEquals(0 * GB,cs.getNode(nm1.getNodeId()).getUnallocatedResource().getMemorySize());
+  Assert.assertEquals(0 * GB,cs.getNode(nm2.getNodeId()).getUnallocatedResource().getMemorySize());
+  am2.allocate(Arrays.asList(ResourceRequest.newInstance(Priority.newInstance(1),ResourceRequest.ANY,Resources.createResource(1 * GB),1)),null);
+  SchedulingMonitorManager smm=((CapacityScheduler)rm1.getResourceScheduler()).getSchedulingMonitorManager();
+  SchedulingMonitor smon=smm.getAvailableSchedulingMonitor();
+  ProportionalCapacityPreemptionPolicy editPolicy=(ProportionalCapacityPreemptionPolicy)smon.getSchedulingEditPolicy();
+  editPolicy.editSchedule();
+  editPolicy.editSchedule();
+  PreemptionManager pm=cs.getPreemptionManager();
+  Map<ContainerId,RMContainer> killableContainers=waitKillableContainersSize(pm,"a",RMNodeLabelsManager.NO_LABEL,0);
+  Assert.assertEquals(0,killableContainers.size());
+  cs.handle(new NodeUpdateSchedulerEvent(rmNode2));
+  FiCaSchedulerApp schedulerApp2=cs.getApplicationAttempt(am2.getApplicationAttemptId());
+  Assert.assertEquals(7,schedulerApp1.getLiveContainers().size());
+  Assert.assertEquals(1,schedulerApp2.getLiveContainers().size());
+  rm1.close();
+}

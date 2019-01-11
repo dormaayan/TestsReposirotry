@@ -1,0 +1,56 @@
+/** 
+ * Standby namenode doesn't queue Delete block request when the add block request is in the edit log which are yet to be read.
+ * @throws Exception
+ */
+@Test public void testDeletedBlockWhenAddBlockIsInEdit() throws Exception {
+  Configuration conf=new HdfsConfiguration();
+  cluster=new MiniDFSCluster.Builder(conf).nnTopology(MiniDFSNNTopology.simpleHATopology()).numDataNodes(1).build();
+  DFSClient client=null;
+  try {
+    cluster.waitActive();
+    assertEquals("Number of namenodes is not 2",2,cluster.getNumNameNodes());
+    cluster.transitionToActive(0);
+    assertTrue("Namenode 0 should be in active state",cluster.getNameNode(0).isActiveState());
+    assertTrue("Namenode 1 should be in standby state",cluster.getNameNode(1).isStandbyState());
+    DataNodeTestUtils.triggerHeartbeat(cluster.getDataNodes().get(0));
+    FileSystem fs=cluster.getFileSystem(0);
+    cluster.getDataNodes().get(0).triggerBlockReport(new BlockReportOptions.Factory().setIncremental(false).build());
+    Path fileName=new Path("/tmp.txt");
+    DFSTestUtil.createFile(fs,fileName,10L,(short)1,1234L);
+    DFSTestUtil.waitReplication(fs,fileName,(short)1);
+    client=new DFSClient(cluster.getFileSystem(0).getUri(),conf);
+    List<LocatedBlock> locatedBlocks=client.getNamenode().getBlockLocations("/tmp.txt",0,10L).getLocatedBlocks();
+    assertTrue(locatedBlocks.size() == 1);
+    assertTrue(locatedBlocks.get(0).getLocations().length == 1);
+    cluster.startDataNodes(conf,1,true,null,null,null,null);
+    assertEquals("Number of datanodes should be 2",2,cluster.getDataNodes().size());
+    DataNode dn0=cluster.getDataNodes().get(0);
+    DataNode dn1=cluster.getDataNodes().get(1);
+    String activeNNBPId=cluster.getNamesystem(0).getBlockPoolId();
+    DatanodeDescriptor sourceDnDesc=NameNodeAdapter.getDatanode(cluster.getNamesystem(0),dn0.getDNRegistrationForBP(activeNNBPId));
+    DatanodeDescriptor destDnDesc=NameNodeAdapter.getDatanode(cluster.getNamesystem(0),dn1.getDNRegistrationForBP(activeNNBPId));
+    ExtendedBlock block=DFSTestUtil.getFirstBlock(fs,fileName);
+    LOG.info("replaceBlock:  " + replaceBlock(block,(DatanodeInfo)sourceDnDesc,(DatanodeInfo)sourceDnDesc,(DatanodeInfo)destDnDesc));
+    for (int tries=0; tries < 20; tries++) {
+      Thread.sleep(1000);
+      DataNodeTestUtils.triggerDeletionReport(cluster.getDataNodes().get(0));
+      locatedBlocks=client.getNamenode().getBlockLocations("/tmp.txt",0,10L).getLocatedBlocks();
+      if (locatedBlocks.get(0).getLocations().length == 1) {
+        break;
+      }
+    }
+    cluster.transitionToStandby(0);
+    cluster.transitionToActive(1);
+    assertTrue("Namenode 1 should be in active state",cluster.getNameNode(1).isActiveState());
+    assertTrue("Namenode 0 should be in standby state",cluster.getNameNode(0).isStandbyState());
+    client.close();
+    client=new DFSClient(cluster.getFileSystem(1).getUri(),conf);
+    List<LocatedBlock> locatedBlocks1=client.getNamenode().getBlockLocations("/tmp.txt",0,10L).getLocatedBlocks();
+    assertEquals(1,locatedBlocks1.size());
+    assertEquals("The block should be only on 1 datanode ",1,locatedBlocks1.get(0).getLocations().length);
+  }
+  finally {
+    IOUtils.cleanup(null,client);
+    cluster.shutdown();
+  }
+}

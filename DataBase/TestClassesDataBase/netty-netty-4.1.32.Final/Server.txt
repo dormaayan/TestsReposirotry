@@ -1,0 +1,86 @@
+static class Server implements Runnable {
+  static final Logger log=LoggerFactory.getLogger(Server.class);
+  final ChannelGroup group=new DefaultChannelGroup("server group",GlobalEventExecutor.INSTANCE);
+  private final InetSocketAddress address;
+  volatile Channel channel;
+  volatile boolean isRunning;
+  volatile boolean isShutdown;
+  Server(  InetSocketAddress address){
+    this.address=address;
+  }
+  @Override public void run(){
+    final ServerBootstrap boot=new ServerBootstrap();
+    final ThreadFactory acceptFactory=new DefaultThreadFactory("accept");
+    final ThreadFactory serverFactory=new DefaultThreadFactory("server");
+    final NioEventLoopGroup acceptGroup=new NioEventLoopGroup(1,acceptFactory,NioUdtProvider.BYTE_PROVIDER);
+    final NioEventLoopGroup connectGroup=new NioEventLoopGroup(1,serverFactory,NioUdtProvider.BYTE_PROVIDER);
+    try {
+      boot.group(acceptGroup,connectGroup).channelFactory(NioUdtProvider.BYTE_ACCEPTOR).childHandler(new ChannelInitializer<UdtChannel>(){
+        @Override protected void initChannel(        final UdtChannel ch) throws Exception {
+          final ChannelPipeline pipeline=ch.pipeline();
+          pipeline.addLast("framer",new DelimiterBasedFrameDecoder(8192,Delimiters.lineDelimiter()));
+          pipeline.addLast("decoder",new StringDecoder(CharsetUtil.UTF_8));
+          pipeline.addLast("encoder",new StringEncoder(CharsetUtil.UTF_8));
+          pipeline.addLast("handler",new ServerHandler(group));
+        }
+      }
+);
+      channel=boot.bind(address).sync().channel();
+      isRunning=true;
+      log.info("Server ready.");
+      waitForRunning(false);
+      log.info("Server closing acceptor...");
+      channel.close().sync();
+      log.info("Server closing connectors...");
+      group.close().sync();
+      isShutdown=true;
+      log.info("Server is done.");
+    }
+ catch (    final Throwable e) {
+      log.error("Server failure.",e);
+    }
+ finally {
+      acceptGroup.shutdownGracefully();
+      connectGroup.shutdownGracefully();
+      acceptGroup.terminationFuture().syncUninterruptibly();
+      connectGroup.terminationFuture().syncUninterruptibly();
+    }
+  }
+  void shutdown(){
+    isRunning=false;
+  }
+  void waitForActive(  final boolean isActive) throws Exception {
+    for (int k=0; k < WAIT_COUNT; k++) {
+      Thread.sleep(WAIT_SLEEP);
+      if (isActive) {
+        for (        final Channel channel : group) {
+          final ServerHandler handler=channel.pipeline().get(ServerHandler.class);
+          if (handler != null && handler.isActive) {
+            return;
+          }
+        }
+      }
+ else {
+        if (group.isEmpty()) {
+          return;
+        }
+      }
+    }
+  }
+  void waitForRunning(  final boolean isRunning) throws Exception {
+    for (int k=0; k < WAIT_COUNT; k++) {
+      if (isRunning == this.isRunning) {
+        return;
+      }
+      Thread.sleep(WAIT_SLEEP);
+    }
+  }
+  void waitForShutdown() throws Exception {
+    for (int k=0; k < WAIT_COUNT; k++) {
+      if (isShutdown) {
+        return;
+      }
+      Thread.sleep(WAIT_SLEEP);
+    }
+  }
+}

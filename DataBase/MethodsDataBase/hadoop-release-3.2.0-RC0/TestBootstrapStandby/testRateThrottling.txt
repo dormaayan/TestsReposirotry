@@ -1,0 +1,76 @@
+/** 
+ * Test that bootstrapping standby NN is not limited by {@link DFSConfigKeys#DFS_IMAGE_TRANSFER_RATE_KEY}, but is limited by {@link DFSConfigKeys#DFS_IMAGE_TRANSFER_BOOTSTRAP_STANDBY_RATE_KEY}created by HDFS-8808.
+ */
+@Test(timeout=30000) public void testRateThrottling() throws Exception {
+  cluster.getConfiguration(0).setLong(DFSConfigKeys.DFS_IMAGE_TRANSFER_RATE_KEY,1);
+  cluster.restartNameNode(0);
+  cluster.waitActive();
+  nn0=cluster.getNameNode(0);
+  cluster.transitionToActive(0);
+  final int minXferRatePerMS=1;
+  int imageXferBufferSize=DFSUtilClient.getIoFileBufferSize(new Configuration());
+  File imageFile=null;
+  int dirIdx=0;
+  while (imageFile == null || imageFile.length() < imageXferBufferSize) {
+    for (int i=0; i < 5; i++) {
+      cluster.getFileSystem(0).mkdirs(new Path("/foo" + dirIdx++));
+    }
+    nn0.getRpcServer().rollEditLog();
+    NameNodeAdapter.enterSafeMode(nn0,false);
+    NameNodeAdapter.saveNamespace(nn0);
+    NameNodeAdapter.leaveSafeMode(nn0);
+    imageFile=FSImageTestUtil.findLatestImageFile(FSImageTestUtil.getFSImage(nn0).getStorage().getStorageDir(0));
+  }
+  final int timeOut=(int)(imageFile.length() / minXferRatePerMS) + 1;
+  final AtomicBoolean bootStrapped=new AtomicBoolean(false);
+  new Thread(new Runnable(){
+    @Override public void run(){
+      try {
+        testSuccessfulBaseCase();
+        bootStrapped.set(true);
+      }
+ catch (      Exception e) {
+        fail(e.getMessage());
+      }
+    }
+  }
+).start();
+  GenericTestUtils.waitFor(new Supplier<Boolean>(){
+    public Boolean get(){
+      return bootStrapped.get();
+    }
+  }
+,50,timeOut);
+  shutdownCluster();
+  setupCluster();
+  cluster.getConfiguration(0).setLong(DFSConfigKeys.DFS_IMAGE_TRANSFER_BOOTSTRAP_STANDBY_RATE_KEY,1);
+  cluster.restartNameNode(0);
+  cluster.waitActive();
+  nn0=cluster.getNameNode(0);
+  cluster.transitionToActive(0);
+  bootStrapped.set(false);
+  new Thread(new Runnable(){
+    @Override public void run(){
+      try {
+        testSuccessfulBaseCase();
+        bootStrapped.set(true);
+      }
+ catch (      Exception e) {
+        LOG.info(e.getMessage());
+      }
+    }
+  }
+).start();
+  try {
+    GenericTestUtils.waitFor(new Supplier<Boolean>(){
+      public Boolean get(){
+        return bootStrapped.get();
+      }
+    }
+,50,timeOut);
+    fail("Did not timeout");
+  }
+ catch (  TimeoutException e) {
+    LOG.info("Encountered expected timeout.");
+  }
+}

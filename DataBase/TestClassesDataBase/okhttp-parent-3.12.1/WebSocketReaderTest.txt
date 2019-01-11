@@ -1,0 +1,274 @@
+public final class WebSocketReaderTest {
+  private final Buffer data=new Buffer();
+  private final WebSocketRecorder callback=new WebSocketRecorder("client");
+  private final Random random=new Random(0);
+  final WebSocketReader serverReader=new WebSocketReader(false,data,callback.asFrameCallback());
+  final WebSocketReader clientReader=new WebSocketReader(true,data,callback.asFrameCallback());
+  @After public void tearDown(){
+    callback.assertExhausted();
+  }
+  @Test public void controlFramesMustBeFinal() throws IOException {
+    data.write(ByteString.decodeHex("0a00"));
+    try {
+      clientReader.processNextFrame();
+      fail();
+    }
+ catch (    ProtocolException e) {
+      assertEquals("Control frames must be final.",e.getMessage());
+    }
+  }
+  @Test public void reservedFlagsAreUnsupported() throws IOException {
+    data.write(ByteString.decodeHex("9a00"));
+    try {
+      clientReader.processNextFrame();
+      fail();
+    }
+ catch (    ProtocolException e) {
+      assertEquals("Reserved flags are unsupported.",e.getMessage());
+    }
+    data.clear();
+    data.write(ByteString.decodeHex("aa00"));
+    try {
+      clientReader.processNextFrame();
+      fail();
+    }
+ catch (    ProtocolException e) {
+      assertEquals("Reserved flags are unsupported.",e.getMessage());
+    }
+    data.clear();
+    data.write(ByteString.decodeHex("ca00"));
+    try {
+      clientReader.processNextFrame();
+      fail();
+    }
+ catch (    ProtocolException e) {
+      assertEquals("Reserved flags are unsupported.",e.getMessage());
+    }
+  }
+  @Test public void clientSentFramesMustBeMasked() throws IOException {
+    data.write(ByteString.decodeHex("8100"));
+    try {
+      serverReader.processNextFrame();
+      fail();
+    }
+ catch (    ProtocolException e) {
+      assertEquals("Client-sent frames must be masked.",e.getMessage());
+    }
+  }
+  @Test public void serverSentFramesMustNotBeMasked() throws IOException {
+    data.write(ByteString.decodeHex("8180"));
+    try {
+      clientReader.processNextFrame();
+      fail();
+    }
+ catch (    ProtocolException e) {
+      assertEquals("Server-sent frames must not be masked.",e.getMessage());
+    }
+  }
+  @Test public void controlFramePayloadMax() throws IOException {
+    data.write(ByteString.decodeHex("8a7e007e"));
+    try {
+      clientReader.processNextFrame();
+      fail();
+    }
+ catch (    ProtocolException e) {
+      assertEquals("Control frame must be less than 125B.",e.getMessage());
+    }
+  }
+  @Test public void clientSimpleHello() throws IOException {
+    data.write(ByteString.decodeHex("810548656c6c6f"));
+    clientReader.processNextFrame();
+    callback.assertTextMessage("Hello");
+  }
+  @Test public void serverSimpleHello() throws IOException {
+    data.write(ByteString.decodeHex("818537fa213d7f9f4d5158"));
+    serverReader.processNextFrame();
+    callback.assertTextMessage("Hello");
+  }
+  @Test public void clientFramePayloadShort() throws IOException {
+    data.write(ByteString.decodeHex("817E000548656c6c6f"));
+    clientReader.processNextFrame();
+    callback.assertTextMessage("Hello");
+  }
+  @Test public void clientFramePayloadLong() throws IOException {
+    data.write(ByteString.decodeHex("817f000000000000000548656c6c6f"));
+    clientReader.processNextFrame();
+    callback.assertTextMessage("Hello");
+  }
+  @Test public void clientFramePayloadTooLongThrows() throws IOException {
+    data.write(ByteString.decodeHex("817f8000000000000000"));
+    try {
+      clientReader.processNextFrame();
+      fail();
+    }
+ catch (    ProtocolException e) {
+      assertEquals("Frame length 0x8000000000000000 > 0x7FFFFFFFFFFFFFFF",e.getMessage());
+    }
+  }
+  @Test public void serverHelloTwoChunks() throws IOException {
+    data.write(ByteString.decodeHex("818537fa213d7f9f4d"));
+    data.write(ByteString.decodeHex("5158"));
+    serverReader.processNextFrame();
+    callback.assertTextMessage("Hello");
+  }
+  @Test public void clientTwoFrameHello() throws IOException {
+    data.write(ByteString.decodeHex("010348656c"));
+    data.write(ByteString.decodeHex("80026c6f"));
+    clientReader.processNextFrame();
+    callback.assertTextMessage("Hello");
+  }
+  @Test public void clientTwoFrameHelloWithPongs() throws IOException {
+    data.write(ByteString.decodeHex("010348656c"));
+    data.write(ByteString.decodeHex("8a00"));
+    data.write(ByteString.decodeHex("8a00"));
+    data.write(ByteString.decodeHex("8a00"));
+    data.write(ByteString.decodeHex("8a00"));
+    data.write(ByteString.decodeHex("80026c6f"));
+    clientReader.processNextFrame();
+    callback.assertPong(ByteString.EMPTY);
+    callback.assertPong(ByteString.EMPTY);
+    callback.assertPong(ByteString.EMPTY);
+    callback.assertPong(ByteString.EMPTY);
+    callback.assertTextMessage("Hello");
+  }
+  @Test public void clientIncompleteMessageBodyThrows() throws IOException {
+    data.write(ByteString.decodeHex("810548656c"));
+    try {
+      clientReader.processNextFrame();
+      fail();
+    }
+ catch (    EOFException ignored) {
+    }
+  }
+  @Test public void clientIncompleteControlFrameBodyThrows() throws IOException {
+    data.write(ByteString.decodeHex("8a0548656c"));
+    try {
+      clientReader.processNextFrame();
+      fail();
+    }
+ catch (    EOFException ignored) {
+    }
+  }
+  @Test public void serverIncompleteMessageBodyThrows() throws IOException {
+    data.write(ByteString.decodeHex("818537fa213d7f9f4d"));
+    try {
+      serverReader.processNextFrame();
+      fail();
+    }
+ catch (    EOFException ignored) {
+    }
+  }
+  @Test public void serverIncompleteControlFrameBodyThrows() throws IOException {
+    data.write(ByteString.decodeHex("8a8537fa213d7f9f4d"));
+    try {
+      serverReader.processNextFrame();
+      fail();
+    }
+ catch (    EOFException ignored) {
+    }
+  }
+  @Test public void clientSimpleBinary() throws IOException {
+    byte[] bytes=binaryData(256);
+    data.write(ByteString.decodeHex("827E0100")).write(bytes);
+    clientReader.processNextFrame();
+    callback.assertBinaryMessage(ByteString.of(bytes));
+  }
+  @Test public void clientTwoFrameBinary() throws IOException {
+    byte[] bytes=binaryData(200);
+    data.write(ByteString.decodeHex("0264")).write(bytes,0,100);
+    data.write(ByteString.decodeHex("8064")).write(bytes,100,100);
+    clientReader.processNextFrame();
+    callback.assertBinaryMessage(ByteString.of(bytes));
+  }
+  @Test public void twoFrameNotContinuation() throws IOException {
+    byte[] bytes=binaryData(200);
+    data.write(ByteString.decodeHex("0264")).write(bytes,0,100);
+    data.write(ByteString.decodeHex("8264")).write(bytes,100,100);
+    try {
+      clientReader.processNextFrame();
+      fail();
+    }
+ catch (    ProtocolException e) {
+      assertEquals("Expected continuation opcode. Got: 2",e.getMessage());
+    }
+  }
+  @Test public void emptyPingCallsCallback() throws IOException {
+    data.write(ByteString.decodeHex("8900"));
+    clientReader.processNextFrame();
+    callback.assertPing(ByteString.EMPTY);
+  }
+  @Test public void pingCallsCallback() throws IOException {
+    data.write(ByteString.decodeHex("890548656c6c6f"));
+    clientReader.processNextFrame();
+    callback.assertPing(ByteString.encodeUtf8("Hello"));
+  }
+  @Test public void emptyCloseCallsCallback() throws IOException {
+    data.write(ByteString.decodeHex("8800"));
+    clientReader.processNextFrame();
+    callback.assertClosing(1005,"");
+  }
+  @Test public void closeLengthOfOneThrows() throws IOException {
+    data.write(ByteString.decodeHex("880100"));
+    try {
+      clientReader.processNextFrame();
+      fail();
+    }
+ catch (    ProtocolException e) {
+      assertEquals("Malformed close payload length of 1.",e.getMessage());
+    }
+  }
+  @Test public void closeCallsCallback() throws IOException {
+    data.write(ByteString.decodeHex("880703e848656c6c6f"));
+    clientReader.processNextFrame();
+    callback.assertClosing(1000,"Hello");
+  }
+  @Test public void closeIncompleteCallsCallback() throws IOException {
+    data.write(ByteString.decodeHex("880703e948656c6c6f"));
+    data.close();
+    clientReader.processNextFrame();
+    callback.assertClosing(1001,"Hello");
+  }
+  @Test public void closeOutOfRangeThrows() throws IOException {
+    data.write(ByteString.decodeHex("88020001"));
+    try {
+      clientReader.processNextFrame();
+      fail();
+    }
+ catch (    ProtocolException e) {
+      assertEquals("Code must be in range [1000,5000): 1",e.getMessage());
+    }
+    data.write(ByteString.decodeHex("88021388"));
+    try {
+      clientReader.processNextFrame();
+      fail();
+    }
+ catch (    ProtocolException e) {
+      assertEquals("Code must be in range [1000,5000): 5000",e.getMessage());
+    }
+  }
+  @Test public void closeReservedSetThrows() throws IOException {
+    data.write(ByteString.decodeHex("880203ec"));
+    data.write(ByteString.decodeHex("880203ed"));
+    data.write(ByteString.decodeHex("880203ee"));
+    for (int i=1012; i <= 2999; i++) {
+      data.write(ByteString.decodeHex("8802" + Util.format("%04X",i)));
+    }
+    int count=0;
+    for (; !data.exhausted(); count++) {
+      try {
+        clientReader.processNextFrame();
+        fail();
+      }
+ catch (      ProtocolException e) {
+        String message=e.getMessage();
+        assertTrue(message,Pattern.matches("Code \\d+ is reserved and may not be used.",message));
+      }
+    }
+    assertEquals(1991,count);
+  }
+  private byte[] binaryData(  int length){
+    byte[] junk=new byte[length];
+    random.nextBytes(junk);
+    return junk;
+  }
+}

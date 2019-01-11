@@ -1,0 +1,52 @@
+@Test public void testDynamoDBInitDestroyCycle() throws Throwable {
+  String testTableName="testDynamoDBInitDestroy" + new Random().nextInt();
+  String testS3Url=path(testTableName).toString();
+  S3AFileSystem fs=getFileSystem();
+  DynamoDB db=null;
+  try {
+    Init initCmd=new Init(fs.getConf());
+    expectSuccess("Init command did not exit successfully - see output",initCmd,"init","-meta","dynamodb://" + testTableName,testS3Url);
+    MetadataStore ms=getMetadataStore();
+    assertTrue("metadata store should be DynamoDBMetadataStore",ms instanceof DynamoDBMetadataStore);
+    DynamoDBMetadataStore dynamoMs=(DynamoDBMetadataStore)ms;
+    db=dynamoMs.getDynamoDB();
+    assertTrue(String.format("%s does not exist",testTableName),exist(db,testTableName));
+    Configuration conf=fs.getConf();
+    String bucket=fs.getBucket();
+    S3AUtils.setBucketOption(conf,bucket,Constants.S3_METADATA_STORE_IMPL,Constants.S3GUARD_METASTORE_DYNAMO);
+    initCmd=new Init(conf);
+    String initOutput=exec(initCmd,"init","-meta","dynamodb://" + testTableName,testS3Url);
+    assertTrue("No Dynamo diagnostics in output " + initOutput,initOutput.contains(DESCRIPTION));
+    S3GuardTool.BucketInfo infocmd=new S3GuardTool.BucketInfo(conf);
+    String info=exec(infocmd,S3GuardTool.BucketInfo.NAME,"-" + S3GuardTool.BucketInfo.GUARDED_FLAG,testS3Url);
+    assertTrue("No Dynamo diagnostics in output " + info,info.contains(DESCRIPTION));
+    Capacities original=getCapacities();
+    String fsURI=getFileSystem().getUri().toString();
+    String capacityOut=exec(newSetCapacity(),S3GuardTool.SetCapacity.NAME,fsURI);
+    LOG.info("Set Capacity output=\n{}",capacityOut);
+    capacityOut=exec(newSetCapacity(),S3GuardTool.SetCapacity.NAME,"-" + READ_FLAG,original.getReadStr(),"-" + WRITE_FLAG,original.getWriteStr(),fsURI);
+    LOG.info("Set Capacity output=\n{}",capacityOut);
+    original.checkEquals("unchanged",getCapacities());
+    Destroy destroyCmd=new Destroy(fs.getConf());
+    String destroyed=exec(destroyCmd,"destroy","-meta","dynamodb://" + testTableName,testS3Url);
+    assertFalse(String.format("%s still exists",testTableName),exist(db,testTableName));
+    expectSuccess("Destroy command did not exit successfully - see output",destroyCmd,"destroy","-meta","dynamodb://" + testTableName,testS3Url);
+  }
+ catch (  ResourceNotFoundException e) {
+    throw new AssertionError(String.format("DynamoDB table %s does not exist",testTableName),e);
+  }
+ finally {
+    LOG.warn("Table may have not been cleaned up: " + testTableName);
+    if (db != null) {
+      Table table=db.getTable(testTableName);
+      if (table != null) {
+        try {
+          table.delete();
+          table.waitForDelete();
+        }
+ catch (        ResourceNotFoundException e) {
+        }
+      }
+    }
+  }
+}

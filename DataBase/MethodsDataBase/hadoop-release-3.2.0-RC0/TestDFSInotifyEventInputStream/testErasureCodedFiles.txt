@@ -1,0 +1,53 @@
+@Test(timeout=120000) public void testErasureCodedFiles() throws Exception {
+  ErasureCodingPolicy ecPolicy=StripedFileTestUtil.getDefaultECPolicy();
+  final int dataUnits=ecPolicy.getNumDataUnits();
+  final int parityUnits=ecPolicy.getNumParityUnits();
+  Configuration conf=new HdfsConfiguration();
+  conf.setLong(DFSConfigKeys.DFS_BLOCK_SIZE_KEY,ecPolicy.getCellSize());
+  conf.setBoolean(DFSConfigKeys.DFS_NAMENODE_ACLS_ENABLED_KEY,true);
+  conf.setLong(DFSConfigKeys.DFS_NAMENODE_ACCESSTIME_PRECISION_KEY,1);
+  MiniQJMHACluster.Builder builder=new MiniQJMHACluster.Builder(conf);
+  builder.getDfsBuilder().numDataNodes(dataUnits + parityUnits);
+  MiniQJMHACluster cluster=builder.build();
+  try {
+    cluster.getDfsCluster().waitActive();
+    cluster.getDfsCluster().transitionToActive(0);
+    DFSClient client=new DFSClient(cluster.getDfsCluster().getNameNode(0).getNameNodeAddress(),conf);
+    DistributedFileSystem fs=(DistributedFileSystem)cluster.getDfsCluster().getFileSystem(0);
+    Path ecDir=new Path("/ecdir");
+    fs.mkdirs(ecDir);
+    fs.setErasureCodingPolicy(ecDir,ecPolicy.getName());
+    DFSInotifyEventInputStream eis=client.getInotifyEventStream();
+    int sz=ecPolicy.getNumDataUnits() * ecPolicy.getCellSize();
+    byte[] contents=new byte[sz];
+    DFSTestUtil.writeFile(fs,new Path("/ecdir/file_ec_test2"),contents);
+    EventBatch batch=null;
+    batch=waitForNextEvents(eis);
+    Assert.assertEquals(1,batch.getEvents().length);
+    long txid=batch.getTxid();
+    long eventsBehind=eis.getTxidsBehindEstimate();
+    Assert.assertTrue(batch.getEvents()[0].getEventType() == Event.EventType.CREATE);
+    Event.CreateEvent ce=(Event.CreateEvent)batch.getEvents()[0];
+    Assert.assertTrue(ce.getiNodeType() == Event.CreateEvent.INodeType.FILE);
+    Assert.assertTrue(ce.getPath().equals("/ecdir/file_ec_test2"));
+    Assert.assertTrue(ce.getCtime() > 0);
+    Assert.assertEquals(1,ce.getReplication());
+    Assert.assertTrue(ce.getSymlinkTarget() == null);
+    Assert.assertTrue(ce.getOverwrite());
+    Assert.assertEquals(ecPolicy.getCellSize(),ce.getDefaultBlockSize());
+    Assert.assertTrue(ce.isErasureCoded().isPresent());
+    Assert.assertTrue(ce.isErasureCoded().get());
+    LOG.info(ce.toString());
+    Assert.assertTrue(ce.toString().startsWith("CreateEvent [INodeType="));
+    batch=waitForNextEvents(eis);
+    Assert.assertEquals(1,batch.getEvents().length);
+    txid=checkTxid(batch,txid);
+    Assert.assertTrue(batch.getEvents()[0].getEventType() == Event.EventType.CLOSE);
+    Assert.assertTrue(((Event.CloseEvent)batch.getEvents()[0]).getPath().equals("/ecdir/file_ec_test2"));
+    Assert.assertTrue(eis.poll() == null);
+    Assert.assertTrue(eis.getTxidsBehindEstimate() == eventsBehind);
+  }
+  finally {
+    cluster.shutdown();
+  }
+}

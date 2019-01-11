@@ -1,0 +1,133 @@
+/** 
+ * Test class for FileSystemNodeAttributeStore.
+ */
+public class TestFileSystemNodeAttributeStore {
+  private MockNodeAttrbuteManager mgr=null;
+  private Configuration conf=null;
+private static class MockNodeAttrbuteManager extends NodeAttributesManagerImpl {
+    @Override protected void initDispatcher(    Configuration conf){
+      super.dispatcher=new InlineDispatcher();
+    }
+    @Override protected void startDispatcher(){
+    }
+    @Override protected void stopDispatcher(){
+    }
+  }
+  @Before public void before() throws IOException {
+    mgr=new MockNodeAttrbuteManager();
+    conf=new Configuration();
+    conf.setClass(YarnConfiguration.FS_NODE_ATTRIBUTE_STORE_IMPL_CLASS,FileSystemNodeAttributeStore.class,NodeAttributeStore.class);
+    conf=NodeAttributeTestUtils.getRandomDirConf(conf);
+    mgr.init(conf);
+    mgr.start();
+  }
+  @After public void after() throws IOException {
+    FileSystemNodeAttributeStore fsStore=((FileSystemNodeAttributeStore)mgr.store);
+    fsStore.getFs().delete(fsStore.getFsWorkingPath(),true);
+    mgr.stop();
+  }
+  @Test(timeout=10000) public void testEmptyRecoverSkipInternalUdpate() throws Exception {
+    mgr.stop();
+    mgr=spy(new MockNodeAttrbuteManager());
+    mgr.init(conf);
+    mgr.start();
+    verify(mgr,times(0)).internalUpdateAttributesOnNodes(any(),any(),any(),any());
+  }
+  @Test(timeout=10000) public void testRecoverWithMirror() throws Exception {
+    NodeAttribute docker=NodeAttribute.newInstance(NodeAttribute.PREFIX_CENTRALIZED,"DOCKER",NodeAttributeType.STRING,"docker-0");
+    NodeAttribute gpu=NodeAttribute.newInstance(NodeAttribute.PREFIX_CENTRALIZED,"GPU",NodeAttributeType.STRING,"nvidia");
+    NodeAttribute fpga=NodeAttribute.newInstance(NodeAttribute.PREFIX_CENTRALIZED,"FPGA",NodeAttributeType.STRING,"asus");
+    Map<String,Set<NodeAttribute>> toAddAttributes=new HashMap<>();
+    toAddAttributes.put("host0",ImmutableSet.of(gpu,fpga));
+    toAddAttributes.put("host1",ImmutableSet.of(gpu));
+    mgr.addNodeAttributes(toAddAttributes);
+    Assert.assertEquals("host0 size",2,mgr.getAttributesForNode("host0").size());
+    toAddAttributes.clear();
+    toAddAttributes.put("host0",ImmutableSet.of(gpu));
+    mgr.removeNodeAttributes(toAddAttributes);
+    toAddAttributes.clear();
+    toAddAttributes.put("host0",ImmutableSet.of(docker));
+    mgr.replaceNodeAttributes(NodeAttribute.PREFIX_CENTRALIZED,toAddAttributes);
+    Map<NodeAttribute,AttributeValue> attrs=mgr.getAttributesForNode("host0");
+    Assert.assertEquals(attrs.size(),1);
+    Assert.assertEquals(attrs.keySet().toArray()[0],docker);
+    mgr.stop();
+    mgr=new MockNodeAttrbuteManager();
+    mgr.init(conf);
+    mgr.start();
+    mgr.getAttributesForNode("host0");
+    Assert.assertEquals("host0 size",1,mgr.getAttributesForNode("host0").size());
+    Assert.assertEquals("host1 size",1,mgr.getAttributesForNode("host1").size());
+    attrs=mgr.getAttributesForNode("host0");
+    Assert.assertEquals(attrs.size(),1);
+    Assert.assertEquals(attrs.keySet().toArray()[0],docker);
+    toAddAttributes.clear();
+    toAddAttributes.put("host0",ImmutableSet.of(gpu));
+    mgr.replaceNodeAttributes(NodeAttribute.PREFIX_CENTRALIZED,toAddAttributes);
+    toAddAttributes.clear();
+    toAddAttributes.put("host1",ImmutableSet.of(docker));
+    mgr.addNodeAttributes(toAddAttributes);
+    mgr.stop();
+    mgr=new MockNodeAttrbuteManager();
+    mgr.init(conf);
+    mgr.start();
+    Assert.assertEquals("host0 size",1,mgr.getAttributesForNode("host0").size());
+    Assert.assertEquals("host1 size",2,mgr.getAttributesForNode("host1").size());
+    attrs=mgr.getAttributesForNode("host0");
+    Assert.assertEquals(attrs.size(),1);
+    Assert.assertEquals(attrs.keySet().toArray()[0],gpu);
+    attrs=mgr.getAttributesForNode("host1");
+    Assert.assertTrue(attrs.keySet().contains(docker));
+    Assert.assertTrue(attrs.keySet().contains(gpu));
+  }
+  @Test(timeout=10000) public void testRecoverFromEditLog() throws Exception {
+    NodeAttribute docker=NodeAttribute.newInstance(NodeAttribute.PREFIX_CENTRALIZED,"DOCKER",NodeAttributeType.STRING,"docker-0");
+    NodeAttribute gpu=NodeAttribute.newInstance(NodeAttribute.PREFIX_CENTRALIZED,"GPU",NodeAttributeType.STRING,"nvidia");
+    NodeAttribute fpga=NodeAttribute.newInstance(NodeAttribute.PREFIX_CENTRALIZED,"FPGA",NodeAttributeType.STRING,"asus");
+    Map<String,Set<NodeAttribute>> toAddAttributes=new HashMap<>();
+    toAddAttributes.put("host0",ImmutableSet.of(gpu,fpga));
+    toAddAttributes.put("host1",ImmutableSet.of(docker));
+    mgr.addNodeAttributes(toAddAttributes);
+    Assert.assertEquals("host0 size",2,mgr.getAttributesForNode("host0").size());
+    for (int i=0; i < 5; i++) {
+      toAddAttributes.clear();
+      toAddAttributes.put("host0",ImmutableSet.of(gpu));
+      mgr.removeNodeAttributes(toAddAttributes);
+      toAddAttributes.clear();
+      toAddAttributes.put("host1",ImmutableSet.of(docker));
+      mgr.addNodeAttributes(toAddAttributes);
+      toAddAttributes.clear();
+      toAddAttributes.put("host0",ImmutableSet.of(gpu));
+      mgr.replaceNodeAttributes(NodeAttribute.PREFIX_CENTRALIZED,toAddAttributes);
+      toAddAttributes.clear();
+      toAddAttributes.put("host1",ImmutableSet.of(gpu));
+      mgr.addNodeAttributes(toAddAttributes);
+    }
+    mgr.stop();
+    mgr=new MockNodeAttrbuteManager();
+    mgr.init(conf);
+    mgr.start();
+    Assert.assertEquals("host0 size",1,mgr.getAttributesForNode("host0").size());
+    Assert.assertEquals("host1 size",2,mgr.getAttributesForNode("host1").size());
+    toAddAttributes.clear();
+    NodeAttribute replaced=NodeAttribute.newInstance("GPU2",NodeAttributeType.STRING,"nvidia2");
+    toAddAttributes.put("host0",ImmutableSet.of(replaced));
+    mgr.replaceNodeAttributes(NodeAttribute.PREFIX_CENTRALIZED,toAddAttributes);
+    mgr.stop();
+    mgr=new MockNodeAttrbuteManager();
+    mgr.init(conf);
+    mgr.start();
+    Map<NodeAttribute,AttributeValue> valueMap=mgr.getAttributesForNode("host0");
+    Map.Entry<NodeAttribute,AttributeValue> entry=valueMap.entrySet().iterator().next();
+    NodeAttribute attribute=entry.getKey();
+    Assert.assertEquals("host0 size",1,mgr.getAttributesForNode("host0").size());
+    Assert.assertEquals("host1 size",2,mgr.getAttributesForNode("host1").size());
+    checkNodeAttributeEqual(replaced,attribute);
+  }
+  public void checkNodeAttributeEqual(  NodeAttribute atr1,  NodeAttribute atr2){
+    Assert.assertEquals(atr1.getAttributeType(),atr2.getAttributeType());
+    Assert.assertEquals(atr1.getAttributeKey().getAttributeName(),atr2.getAttributeKey().getAttributeName());
+    Assert.assertEquals(atr1.getAttributeKey().getAttributePrefix(),atr2.getAttributeKey().getAttributePrefix());
+    Assert.assertEquals(atr1.getAttributeValue(),atr2.getAttributeValue());
+  }
+}

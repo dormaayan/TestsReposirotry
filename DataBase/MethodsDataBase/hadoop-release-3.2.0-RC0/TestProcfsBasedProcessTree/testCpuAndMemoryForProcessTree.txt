@@ -1,0 +1,53 @@
+/** 
+ * A basic test that creates a few process directories and writes stat files. Verifies that the cpu time and memory is correctly computed.
+ * @throws IOException if there was a problem setting up the fake procfs directories or files.
+ */
+@Test(timeout=30000) public void testCpuAndMemoryForProcessTree() throws IOException {
+  String[] pids={"100","200","300","400"};
+  ControlledClock testClock=new ControlledClock();
+  testClock.setTime(0);
+  File procfsRootDir=new File(TEST_ROOT_DIR,"proc");
+  try {
+    setupProcfsRootDir(procfsRootDir);
+    setupPidDirs(procfsRootDir,pids);
+    ProcessStatInfo[] procInfos=new ProcessStatInfo[4];
+    procInfos[0]=new ProcessStatInfo(new String[]{"100","proc1","1","100","100","100000","100","1000","200"});
+    procInfos[1]=new ProcessStatInfo(new String[]{"200","process two","100","100","100","200000","200","2000","400"});
+    procInfos[2]=new ProcessStatInfo(new String[]{"300","proc(3)","200","100","100","300000","300","3000","600"});
+    procInfos[3]=new ProcessStatInfo(new String[]{"400","proc4","1","400","400","400000","400","4000","800"});
+    ProcessTreeSmapMemInfo[] memInfo=new ProcessTreeSmapMemInfo[4];
+    memInfo[0]=new ProcessTreeSmapMemInfo("100");
+    memInfo[1]=new ProcessTreeSmapMemInfo("200");
+    memInfo[2]=new ProcessTreeSmapMemInfo("300");
+    memInfo[3]=new ProcessTreeSmapMemInfo("400");
+    createMemoryMappingInfo(memInfo);
+    writeStatFiles(procfsRootDir,pids,procInfos,memInfo);
+    Configuration conf=new Configuration();
+    ProcfsBasedProcessTree processTree=createProcessTree("100",procfsRootDir.getAbsolutePath(),testClock);
+    processTree.setConf(conf);
+    processTree.updateProcessTree();
+    Assert.assertEquals("Virtual memory does not match",600000L,processTree.getVirtualMemorySize());
+    long cumuRssMem=ProcfsBasedProcessTree.PAGE_SIZE > 0 ? 600L * ProcfsBasedProcessTree.PAGE_SIZE : ResourceCalculatorProcessTree.UNAVAILABLE;
+    Assert.assertEquals("rss memory does not match",cumuRssMem,processTree.getRssMemorySize());
+    long cumuCpuTime=ProcfsBasedProcessTree.JIFFY_LENGTH_IN_MILLIS > 0 ? 7200L * ProcfsBasedProcessTree.JIFFY_LENGTH_IN_MILLIS : 0L;
+    Assert.assertEquals("Cumulative cpu time does not match",cumuCpuTime,processTree.getCumulativeCpuTime());
+    Assert.assertEquals("Percent CPU time should be set to -1 initially",-1.0,processTree.getCpuUsagePercent(),0.01);
+    setSmapsInProceTree(processTree,true);
+    Assert.assertEquals("rss memory does not match",(20 * KB_TO_BYTES * 3),processTree.getRssMemorySize());
+    procInfos[0]=new ProcessStatInfo(new String[]{"100","proc1","1","100","100","100000","100","2000","300"});
+    procInfos[1]=new ProcessStatInfo(new String[]{"200","process two","100","100","100","200000","200","3000","500"});
+    writeStatFiles(procfsRootDir,pids,procInfos,memInfo);
+    long elapsedTimeBetweenUpdatesMsec=200000;
+    testClock.setTime(elapsedTimeBetweenUpdatesMsec);
+    processTree.updateProcessTree();
+    long prevCumuCpuTime=cumuCpuTime;
+    cumuCpuTime=ProcfsBasedProcessTree.JIFFY_LENGTH_IN_MILLIS > 0 ? 9400L * ProcfsBasedProcessTree.JIFFY_LENGTH_IN_MILLIS : 0L;
+    Assert.assertEquals("Cumulative cpu time does not match",cumuCpuTime,processTree.getCumulativeCpuTime());
+    double expectedCpuUsagePercent=(ProcfsBasedProcessTree.JIFFY_LENGTH_IN_MILLIS > 0) ? (cumuCpuTime - prevCumuCpuTime) * 100.0 / elapsedTimeBetweenUpdatesMsec : 0;
+    Assert.assertEquals(11,expectedCpuUsagePercent,0.001);
+    Assert.assertEquals("Percent CPU time is not correct expected " + expectedCpuUsagePercent,expectedCpuUsagePercent,processTree.getCpuUsagePercent(),0.01);
+  }
+  finally {
+    FileUtil.fullyDelete(procfsRootDir);
+  }
+}

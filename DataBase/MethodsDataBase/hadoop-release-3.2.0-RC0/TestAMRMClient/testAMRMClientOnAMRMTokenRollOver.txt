@@ -1,0 +1,72 @@
+@Test(timeout=60000) public void testAMRMClientOnAMRMTokenRollOver() throws YarnException, IOException {
+  AMRMClient<ContainerRequest> amClient=null;
+  try {
+    AMRMTokenSecretManager amrmTokenSecretManager=yarnCluster.getResourceManager().getRMContext().getAMRMTokenSecretManager();
+    amClient=AMRMClient.<ContainerRequest>createAMRMClient();
+    amClient.init(conf);
+    amClient.start();
+    Long startTime=System.currentTimeMillis();
+    amClient.registerApplicationMaster("Host",10000,"");
+    org.apache.hadoop.security.token.Token<AMRMTokenIdentifier> amrmToken_1=getAMRMToken();
+    Assert.assertNotNull(amrmToken_1);
+    assertEquals(amrmToken_1.decodeIdentifier().getKeyId(),amrmTokenSecretManager.getMasterKey().getMasterKey().getKeyId());
+    while (System.currentTimeMillis() - startTime < rollingIntervalSec * 1000) {
+      amClient.allocate(0.1f);
+      sleep(1000);
+    }
+    amClient.allocate(0.1f);
+    org.apache.hadoop.security.token.Token<AMRMTokenIdentifier> amrmToken_2=getAMRMToken();
+    Assert.assertNotNull(amrmToken_2);
+    assertEquals(amrmToken_2.decodeIdentifier().getKeyId(),amrmTokenSecretManager.getMasterKey().getMasterKey().getKeyId());
+    Assert.assertNotEquals(amrmToken_1,amrmToken_2);
+    AllocateResponse response=amClient.allocate(0.1f);
+    UserGroupInformation testUser1=UserGroupInformation.createRemoteUser("testUser1");
+    AMRMTokenIdentifierForTest newVersionTokenIdentifier=new AMRMTokenIdentifierForTest(amrmToken_2.decodeIdentifier(),"message");
+    assertEquals("Message is changed after set to newVersionTokenIdentifier","message",newVersionTokenIdentifier.getMessage());
+    org.apache.hadoop.security.token.Token<AMRMTokenIdentifier> newVersionToken=new org.apache.hadoop.security.token.Token<AMRMTokenIdentifier>(newVersionTokenIdentifier.getBytes(),amrmTokenSecretManager.retrievePassword(newVersionTokenIdentifier),newVersionTokenIdentifier.getKind(),new Text());
+    SecurityUtil.setTokenService(newVersionToken,yarnCluster.getResourceManager().getApplicationMasterService().getBindAddress());
+    testUser1.addToken(newVersionToken);
+    AllocateRequest request=Records.newRecord(AllocateRequest.class);
+    request.setResponseId(response.getResponseId());
+    testUser1.doAs(new PrivilegedAction<ApplicationMasterProtocol>(){
+      @Override public ApplicationMasterProtocol run(){
+        return (ApplicationMasterProtocol)YarnRPC.create(conf).getProxy(ApplicationMasterProtocol.class,yarnCluster.getResourceManager().getApplicationMasterService().getBindAddress(),conf);
+      }
+    }
+).allocate(request);
+    while (true) {
+      if (amrmToken_2.decodeIdentifier().getKeyId() != amrmTokenSecretManager.getCurrnetMasterKeyData().getMasterKey().getKeyId()) {
+        if (amrmTokenSecretManager.getNextMasterKeyData() == null) {
+          break;
+        }
+ else         if (amrmToken_2.decodeIdentifier().getKeyId() != amrmTokenSecretManager.getNextMasterKeyData().getMasterKey().getKeyId()) {
+          break;
+        }
+      }
+      amClient.allocate(0.1f);
+      sleep(1000);
+    }
+    try {
+      UserGroupInformation testUser2=UserGroupInformation.createRemoteUser("testUser2");
+      SecurityUtil.setTokenService(amrmToken_2,yarnCluster.getResourceManager().getApplicationMasterService().getBindAddress());
+      testUser2.addToken(amrmToken_2);
+      testUser2.doAs(new PrivilegedAction<ApplicationMasterProtocol>(){
+        @Override public ApplicationMasterProtocol run(){
+          return (ApplicationMasterProtocol)YarnRPC.create(conf).getProxy(ApplicationMasterProtocol.class,yarnCluster.getResourceManager().getApplicationMasterService().getBindAddress(),conf);
+        }
+      }
+).allocate(Records.newRecord(AllocateRequest.class));
+      fail("The old Token should not work");
+    }
+ catch (    Exception ex) {
+      assertTrue(ex instanceof InvalidToken);
+      assertTrue(ex.getMessage().contains("Invalid AMRMToken from " + amrmToken_2.decodeIdentifier().getApplicationAttemptId()));
+    }
+    amClient.unregisterApplicationMaster(FinalApplicationStatus.SUCCEEDED,null,null);
+  }
+  finally {
+    if (amClient != null && amClient.getServiceState() == STATE.STARTED) {
+      amClient.stop();
+    }
+  }
+}

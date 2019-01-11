@@ -1,0 +1,99 @@
+/** 
+ * Test an async Observable that emits more async Observables.
+ * @throws InterruptedException if the test is interrupted
+ */
+@Test public void testNestedAsyncConcat() throws InterruptedException {
+  Observer<String> observer=TestHelper.mockObserver();
+  final TestObservable<String> o1=new TestObservable<String>("one","two","three");
+  final TestObservable<String> o2=new TestObservable<String>("four","five","six");
+  final TestObservable<String> o3=new TestObservable<String>("seven","eight","nine");
+  final CountDownLatch allowThird=new CountDownLatch(1);
+  final AtomicReference<Thread> parent=new AtomicReference<Thread>();
+  final CountDownLatch parentHasStarted=new CountDownLatch(1);
+  final CountDownLatch parentHasFinished=new CountDownLatch(1);
+  Observable<Observable<String>> observableOfObservables=Observable.unsafeCreate(new ObservableSource<Observable<String>>(){
+    @Override public void subscribe(    final Observer<? super Observable<String>> observer){
+      final Disposable d=Disposables.empty();
+      observer.onSubscribe(d);
+      parent.set(new Thread(new Runnable(){
+        @Override public void run(){
+          try {
+            if (!d.isDisposed()) {
+              System.out.println("Emit o1");
+              observer.onNext(Observable.unsafeCreate(o1));
+            }
+            if (!d.isDisposed()) {
+              System.out.println("Emit o2");
+              observer.onNext(Observable.unsafeCreate(o2));
+            }
+            try {
+              allowThird.await();
+            }
+ catch (            InterruptedException e) {
+              observer.onError(e);
+            }
+            if (!d.isDisposed()) {
+              System.out.println("Emit o3");
+              observer.onNext(Observable.unsafeCreate(o3));
+            }
+          }
+ catch (          Throwable e) {
+            observer.onError(e);
+          }
+ finally {
+            System.out.println("Done parent Observable");
+            observer.onComplete();
+            parentHasFinished.countDown();
+          }
+        }
+      }
+));
+      parent.get().start();
+      parentHasStarted.countDown();
+    }
+  }
+);
+  Observable.concat(observableOfObservables).subscribe(observer);
+  parentHasStarted.await();
+  try {
+    System.out.println("Thread1 is starting ... waiting for it to complete ...");
+    o1.waitForThreadDone();
+    System.out.println("Thread2 is starting ... waiting for it to complete ...");
+    o2.waitForThreadDone();
+  }
+ catch (  Throwable e) {
+    throw new RuntimeException("failed waiting on threads",e);
+  }
+  InOrder inOrder=inOrder(observer);
+  inOrder.verify(observer,times(1)).onNext("one");
+  inOrder.verify(observer,times(1)).onNext("two");
+  inOrder.verify(observer,times(1)).onNext("three");
+  inOrder.verify(observer,times(1)).onNext("four");
+  inOrder.verify(observer,times(1)).onNext("five");
+  inOrder.verify(observer,times(1)).onNext("six");
+  inOrder.verify(observer,never()).onNext("seven");
+  inOrder.verify(observer,never()).onNext("eight");
+  inOrder.verify(observer,never()).onNext("nine");
+  verify(observer,never()).onComplete();
+  verify(observer,never()).onError(any(Throwable.class));
+  allowThird.countDown();
+  try {
+    o3.waitForThreadDone();
+  }
+ catch (  Throwable e) {
+    throw new RuntimeException("failed waiting on threads",e);
+  }
+  try {
+    if (!parentHasFinished.await(5,TimeUnit.SECONDS)) {
+      fail("Parent didn't finish within the time limit");
+    }
+  }
+ catch (  Throwable e) {
+    throw new RuntimeException("failed waiting on threads",e);
+  }
+  inOrder.verify(observer,times(1)).onNext("seven");
+  inOrder.verify(observer,times(1)).onNext("eight");
+  inOrder.verify(observer,times(1)).onNext("nine");
+  verify(observer,never()).onError(any(Throwable.class));
+  inOrder.verify(observer,times(1)).onComplete();
+}

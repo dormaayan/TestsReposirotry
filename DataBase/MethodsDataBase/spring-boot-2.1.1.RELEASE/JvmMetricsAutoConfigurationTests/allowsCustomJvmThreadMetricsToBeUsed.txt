@@ -1,0 +1,3 @@
+@Test public void allowsCustomJvmThreadMetricsToBeUsed(){
+  this.contextRunner.withUserConfiguration(CustomJvmThreadMetricsConfiguration.class).run((context) -> assertThat(context).hasSingleBean(JvmGcMetrics.class).hasSingleBean(JvmMemoryMetrics.class).hasSingleBean(JvmThreadMetrics.class).hasSingleBean(ClassLoaderMetrics.class).hasBean("customJvmThreadMetrics"));
+}

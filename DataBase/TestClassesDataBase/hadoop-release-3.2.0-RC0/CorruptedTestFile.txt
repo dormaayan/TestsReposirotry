@@ -1,0 +1,97 @@
+static private class CorruptedTestFile {
+  final private String name;
+  final private Set<Integer> blocksToCorrupt;
+  final private DFSClient dfsClient;
+  final private int numDataNodes;
+  final private int blockSize;
+  final private byte[] initialContents;
+  CorruptedTestFile(  String name,  Set<Integer> blocksToCorrupt,  DFSClient dfsClient,  int numDataNodes,  int blockSize) throws IOException {
+    this.name=name;
+    this.blocksToCorrupt=blocksToCorrupt;
+    this.dfsClient=dfsClient;
+    this.numDataNodes=numDataNodes;
+    this.blockSize=blockSize;
+    this.initialContents=cacheInitialContents();
+  }
+  public int getTotalMissingBlocks(){
+    return blocksToCorrupt.size();
+  }
+  private byte[] cacheInitialContents() throws IOException {
+    HdfsFileStatus status=dfsClient.getFileInfo(name);
+    byte[] content=new byte[(int)status.getLen()];
+    DFSInputStream in=null;
+    try {
+      in=dfsClient.open(name);
+      IOUtils.readFully(in,content,0,content.length);
+    }
+  finally {
+      in.close();
+    }
+    return content;
+  }
+  public void removeBlocks(  MiniDFSCluster cluster) throws AccessControlException, FileNotFoundException, UnresolvedLinkException, IOException {
+    for (    int corruptIdx : blocksToCorrupt) {
+      ExtendedBlock block=dfsClient.getNamenode().getBlockLocations(name,blockSize * corruptIdx,Long.MAX_VALUE).get(0).getBlock();
+      for (int i=0; i < numDataNodes; i++) {
+        File blockFile=cluster.getBlockFile(i,block);
+        if (blockFile != null && blockFile.exists()) {
+          assertTrue(blockFile.delete());
+        }
+      }
+    }
+  }
+  public void corruptBlocks(  MiniDFSCluster cluster) throws IOException {
+    for (    int corruptIdx : blocksToCorrupt) {
+      ExtendedBlock block=dfsClient.getNamenode().getBlockLocations(name,blockSize * corruptIdx,Long.MAX_VALUE).get(0).getBlock();
+      for (int i=0; i < numDataNodes; i++) {
+        File blockFile=cluster.getBlockFile(i,block);
+        if (blockFile != null && blockFile.exists()) {
+          FileOutputStream blockFileStream=new FileOutputStream(blockFile,false);
+          blockFileStream.write("corrupt".getBytes());
+          blockFileStream.close();
+          LOG.info("Corrupted block file " + blockFile);
+        }
+      }
+    }
+  }
+  public void checkSalvagedRemains() throws IOException {
+    int chainIdx=0;
+    HdfsFileStatus status=dfsClient.getFileInfo(name);
+    long length=status.getLen();
+    int numBlocks=(int)((length + blockSize - 1) / blockSize);
+    DFSInputStream in=null;
+    byte[] blockBuffer=new byte[blockSize];
+    try {
+      for (int blockIdx=0; blockIdx < numBlocks; blockIdx++) {
+        if (blocksToCorrupt.contains(blockIdx)) {
+          if (in != null) {
+            in.close();
+            in=null;
+          }
+          continue;
+        }
+        if (in == null) {
+          in=dfsClient.open("/lost+found" + name + "/"+ chainIdx);
+          chainIdx++;
+        }
+        int len=blockBuffer.length;
+        if (blockIdx == (numBlocks - 1)) {
+          len=(int)(in.getFileLength() % blockSize);
+          if (len == 0) {
+            len=blockBuffer.length;
+          }
+        }
+        IOUtils.readFully(in,blockBuffer,0,len);
+        int startIdx=blockIdx * blockSize;
+        for (int i=0; i < len; i++) {
+          if (initialContents[startIdx + i] != blockBuffer[i]) {
+            throw new IOException("salvaged file " + name + " differed "+ "from what we expected on block "+ blockIdx);
+          }
+        }
+      }
+    }
+  finally {
+      IOUtils.cleanup(null,in);
+    }
+  }
+}

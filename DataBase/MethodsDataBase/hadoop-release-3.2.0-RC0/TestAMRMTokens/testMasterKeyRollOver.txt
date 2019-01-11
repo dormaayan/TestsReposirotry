@@ -1,0 +1,91 @@
+/** 
+ * Validate master-key-roll-over and that tokens are usable even after master-key-roll-over.
+ * @throws Exception
+ */
+@Test public void testMasterKeyRollOver() throws Exception {
+  conf.setLong(YarnConfiguration.RM_AMRM_TOKEN_MASTER_KEY_ROLLING_INTERVAL_SECS,rolling_interval_sec);
+  conf.setLong(YarnConfiguration.RM_AM_EXPIRY_INTERVAL_MS,am_expire_ms);
+  conf.set(YarnConfiguration.RM_SCHEDULER_ADDRESS,"0.0.0.0:0");
+  MyContainerManager containerManager=new MyContainerManager();
+  final MockRMWithAMS rm=new MockRMWithAMS(conf,containerManager);
+  rm.start();
+  Long startTime=System.currentTimeMillis();
+  final Configuration conf=rm.getConfig();
+  final YarnRPC rpc=YarnRPC.create(conf);
+  ApplicationMasterProtocol rmClient=null;
+  AMRMTokenSecretManager appTokenSecretManager=rm.getRMContext().getAMRMTokenSecretManager();
+  MasterKeyData oldKey=appTokenSecretManager.getMasterKey();
+  Assert.assertNotNull(oldKey);
+  try {
+    MockNM nm1=rm.registerNode("localhost:1234",5120);
+    RMApp app=rm.submitApp(1024);
+    nm1.nodeHeartbeat(true);
+    int waitCount=0;
+    while (containerManager.containerTokens == null && waitCount++ < maxWaitAttempts) {
+      LOG.info("Waiting for AM Launch to happen..");
+      Thread.sleep(1000);
+    }
+    Assert.assertNotNull(containerManager.containerTokens);
+    RMAppAttempt attempt=app.getCurrentAppAttempt();
+    ApplicationAttemptId applicationAttemptId=attempt.getAppAttemptId();
+    UserGroupInformation currentUser=UserGroupInformation.createRemoteUser(applicationAttemptId.toString());
+    Credentials credentials=containerManager.getContainerCredentials();
+    final InetSocketAddress rmBindAddress=rm.getApplicationMasterService().getBindAddress();
+    Token<? extends TokenIdentifier> amRMToken=MockRMWithAMS.setupAndReturnAMRMToken(rmBindAddress,credentials.getAllTokens());
+    currentUser.addToken(amRMToken);
+    rmClient=createRMClient(rm,conf,rpc,currentUser);
+    RegisterApplicationMasterRequest request=Records.newRecord(RegisterApplicationMasterRequest.class);
+    rmClient.registerApplicationMaster(request);
+    AllocateRequest allocateRequest=Records.newRecord(AllocateRequest.class);
+    Assert.assertTrue(rmClient.allocate(allocateRequest).getAMCommand() == null);
+    while (System.currentTimeMillis() - startTime < rolling_interval_sec * 1000) {
+      rmClient.allocate(allocateRequest);
+      Thread.sleep(500);
+    }
+    MasterKeyData newKey=appTokenSecretManager.getMasterKey();
+    Assert.assertNotNull(newKey);
+    Assert.assertFalse("Master key should have changed!",oldKey.equals(newKey));
+    rpc.stopProxy(rmClient,conf);
+    rmClient=createRMClient(rm,conf,rpc,currentUser);
+    Assert.assertTrue(rmClient.allocate(allocateRequest).getAMCommand() == null);
+    waitCount=0;
+    while (waitCount++ <= maxWaitAttempts) {
+      if (appTokenSecretManager.getCurrnetMasterKeyData() != oldKey) {
+        break;
+      }
+      try {
+        rmClient.allocate(allocateRequest);
+      }
+ catch (      Exception ex) {
+        break;
+      }
+      Thread.sleep(200);
+    }
+    Assert.assertTrue(appTokenSecretManager.getCurrnetMasterKeyData().equals(newKey));
+    Assert.assertTrue(appTokenSecretManager.getMasterKey().equals(newKey));
+    Assert.assertTrue(appTokenSecretManager.getNextMasterKeyData() == null);
+    Token<AMRMTokenIdentifier> newToken=appTokenSecretManager.createAndGetAMRMToken(applicationAttemptId);
+    SecurityUtil.setTokenService(newToken,rmBindAddress);
+    currentUser.addToken(newToken);
+    rpc.stopProxy(rmClient,conf);
+    rmClient=createRMClient(rm,conf,rpc,currentUser);
+    allocateRequest=Records.newRecord(AllocateRequest.class);
+    Assert.assertTrue(rmClient.allocate(allocateRequest).getAMCommand() == null);
+    rpc.stopProxy(rmClient,conf);
+    try {
+      currentUser.addToken(amRMToken);
+      rmClient=createRMClient(rm,conf,rpc,currentUser);
+      allocateRequest=Records.newRecord(AllocateRequest.class);
+      Assert.assertTrue(rmClient.allocate(allocateRequest).getAMCommand() == null);
+      Assert.fail("The old Token should not work");
+    }
+ catch (    Exception ex) {
+    }
+  }
+  finally {
+    rm.stop();
+    if (rmClient != null) {
+      rpc.stopProxy(rmClient,conf);
+    }
+  }
+}

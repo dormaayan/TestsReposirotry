@@ -1,0 +1,56 @@
+@Test(timeout=60000) public void testPreemptionForFragmentatedCluster() throws Exception {
+  conf.setBoolean(CapacitySchedulerConfiguration.ADDITIONAL_RESOURCE_BALANCE_BASED_ON_RESERVED_CONTAINERS,true);
+  CapacitySchedulerConfiguration conf=new CapacitySchedulerConfiguration(this.conf);
+  conf.setLong(YarnConfiguration.RM_SCHEDULER_MAXIMUM_ALLOCATION_MB,1024 * 21);
+  conf.setQueues("root",new String[]{"a","b"});
+  conf.setCapacity("root.a",50);
+  conf.setUserLimitFactor("root.a",100);
+  conf.setCapacity("root.b",50);
+  conf.setUserLimitFactor("root.b",100);
+  MockRM rm1=new MockRM(conf);
+  rm1.getRMContext().setNodeLabelManager(mgr);
+  rm1.start();
+  List<MockNM> nms=new ArrayList<>();
+  for (int i=0; i < 5; i++) {
+    nms.add(rm1.registerNode("h" + i + ":1234",30 * GB));
+  }
+  CapacityScheduler cs=(CapacityScheduler)rm1.getResourceScheduler();
+  RMApp app1=rm1.submitApp(3 * GB,"app","user",null,"a");
+  MockAM am1=MockRM.launchAndRegisterAM(app1,rm1,nms.get(0));
+  am1.allocate("*",21 * GB,4,new ArrayList<ContainerId>());
+  for (int i=0; i < 10; i++) {
+    MockNM mockNM=nms.get(i % nms.size());
+    RMNode rmNode=cs.getRMContext().getRMNodes().get(mockNM.getNodeId());
+    cs.handle(new NodeUpdateSchedulerEvent(rmNode));
+  }
+  FiCaSchedulerApp schedulerApp1=cs.getApplicationAttempt(am1.getApplicationAttemptId());
+  Assert.assertEquals(5,schedulerApp1.getLiveContainers().size());
+  RMApp app2=rm1.submitApp(3 * GB,"app","user",null,"b");
+  MockAM am2=MockRM.launchAndRegisterAM(app2,rm1,nms.get(2));
+  am2.allocate("*",21 * GB,4,new ArrayList<ContainerId>());
+  for (int i=0; i < 10; i++) {
+    MockNM mockNM=nms.get(i % nms.size());
+    RMNode rmNode=cs.getRMContext().getRMNodes().get(mockNM.getNodeId());
+    cs.handle(new NodeUpdateSchedulerEvent(rmNode));
+  }
+  FiCaSchedulerApp schedulerApp2=cs.getApplicationAttempt(am2.getApplicationAttemptId());
+  Assert.assertEquals(2,schedulerApp2.getLiveContainers().size());
+  waitNumberOfReservedContainersFromApp(schedulerApp2,1);
+  SchedulingMonitorManager smm=((CapacityScheduler)rm1.getResourceScheduler()).getSchedulingMonitorManager();
+  SchedulingMonitor smon=smm.getAvailableSchedulingMonitor();
+  ProportionalCapacityPreemptionPolicy editPolicy=(ProportionalCapacityPreemptionPolicy)smon.getSchedulingEditPolicy();
+  editPolicy.editSchedule();
+  editPolicy.editSchedule();
+  int tick=0;
+  while (schedulerApp2.getLiveContainers().size() != 4 && tick < 10) {
+    for (int i=0; i < 10; i++) {
+      MockNM mockNM=nms.get(i % nms.size());
+      RMNode rmNode=cs.getRMContext().getRMNodes().get(mockNM.getNodeId());
+      cs.handle(new NodeUpdateSchedulerEvent(rmNode));
+    }
+    tick++;
+    Thread.sleep(100);
+  }
+  Assert.assertEquals(3,schedulerApp2.getLiveContainers().size());
+  rm1.close();
+}

@@ -1,0 +1,86 @@
+/** 
+ * Test NetworkPacketTagging Handler.
+ */
+public class TestNetworkPacketTaggingHandlerImpl {
+  private static final Logger LOG=LoggerFactory.getLogger(TestNetworkPacketTaggingHandlerImpl.class);
+  private static final String TEST_CLASSID="0x100001";
+  private static final String TEST_CONTAINER_ID_STR="container_01";
+  private static final String TEST_TASKS_FILE="testTasksFile";
+  private NetworkTagMappingManager mockManager;
+  private PrivilegedOperationExecutor privilegedOperationExecutorMock;
+  private CGroupsHandler cGroupsHandlerMock;
+  private Configuration conf;
+  private String tmpPath;
+  private ContainerId containerIdMock;
+  private Container containerMock;
+  @Before public void setup(){
+    privilegedOperationExecutorMock=mock(PrivilegedOperationExecutor.class);
+    cGroupsHandlerMock=mock(CGroupsHandler.class);
+    conf=new YarnConfiguration();
+    tmpPath=new StringBuffer(System.getProperty("test.build.data")).append('/').append("hadoop.tmp.dir").toString();
+    containerIdMock=mock(ContainerId.class);
+    containerMock=mock(Container.class);
+    when(containerIdMock.toString()).thenReturn(TEST_CONTAINER_ID_STR);
+    when(containerMock.getContainerId()).thenReturn(containerIdMock);
+    conf.set("hadoop.tmp.dir",tmpPath);
+    conf.setBoolean(YarnConfiguration.NM_RECOVERY_ENABLED,false);
+    mockManager=mock(NetworkTagMappingManager.class);
+    doNothing().when(mockManager).initialize(any(Configuration.class));
+    when(mockManager.getNetworkTagHexID(any(Container.class))).thenReturn(TEST_CLASSID);
+  }
+  @Test public void testBootstrap(){
+    NetworkPacketTaggingHandlerImpl handlerImpl=createNetworkPacketTaggingHandlerImpl();
+    try {
+      handlerImpl.bootstrap(conf);
+      verify(cGroupsHandlerMock).initializeCGroupController(eq(CGroupsHandler.CGroupController.NET_CLS));
+      verifyNoMoreInteractions(cGroupsHandlerMock);
+    }
+ catch (    ResourceHandlerException e) {
+      LOG.error("Unexpected exception: " + e);
+      Assert.fail("Caught unexpected ResourceHandlerException!");
+    }
+  }
+  @Test public void testLifeCycle(){
+    NetworkPacketTaggingHandlerImpl handlerImpl=createNetworkPacketTaggingHandlerImpl();
+    try {
+      handlerImpl.bootstrap(conf);
+      testPreStart(handlerImpl);
+      testPostComplete(handlerImpl);
+    }
+ catch (    ResourceHandlerException e) {
+      LOG.error("Unexpected exception: " + e);
+      Assert.fail("Caught unexpected ResourceHandlerException!");
+    }
+  }
+  private void testPreStart(  NetworkPacketTaggingHandlerImpl handlerImpl) throws ResourceHandlerException {
+    reset(privilegedOperationExecutorMock);
+    when(cGroupsHandlerMock.getPathForCGroupTasks(CGroupsHandler.CGroupController.NET_CLS,TEST_CONTAINER_ID_STR)).thenReturn(TEST_TASKS_FILE);
+    List<PrivilegedOperation> ops=handlerImpl.preStart(containerMock);
+    verify(cGroupsHandlerMock).createCGroup(eq(CGroupsHandler.CGroupController.NET_CLS),eq(TEST_CONTAINER_ID_STR));
+    verify(cGroupsHandlerMock).updateCGroupParam(eq(CGroupsHandler.CGroupController.NET_CLS),eq(TEST_CONTAINER_ID_STR),eq(CGroupsHandler.CGROUP_PARAM_CLASSID),eq(TEST_CLASSID));
+    Assert.assertEquals(1,ops.size());
+    PrivilegedOperation addPidOp=ops.get(0);
+    String expectedAddPidOpArg=PrivilegedOperation.CGROUP_ARG_PREFIX + TEST_TASKS_FILE;
+    List<String> addPidOpArgs=addPidOp.getArguments();
+    Assert.assertEquals(PrivilegedOperation.OperationType.ADD_PID_TO_CGROUP,addPidOp.getOperationType());
+    Assert.assertEquals(1,addPidOpArgs.size());
+    Assert.assertEquals(expectedAddPidOpArg,addPidOpArgs.get(0));
+  }
+  private void testPostComplete(  NetworkPacketTaggingHandlerImpl handlerImpl) throws ResourceHandlerException {
+    reset(privilegedOperationExecutorMock);
+    List<PrivilegedOperation> ops=handlerImpl.postComplete(containerIdMock);
+    verify(cGroupsHandlerMock).deleteCGroup(eq(CGroupsHandler.CGroupController.NET_CLS),eq(TEST_CONTAINER_ID_STR));
+    Assert.assertNull(ops);
+  }
+  private NetworkPacketTaggingHandlerImpl createNetworkPacketTaggingHandlerImpl(){
+    return new NetworkPacketTaggingHandlerImpl(privilegedOperationExecutorMock,cGroupsHandlerMock){
+      @Override public NetworkTagMappingManager createNetworkTagMappingManager(      Configuration conf){
+        return mockManager;
+      }
+    }
+;
+  }
+  @After public void teardown(){
+    FileUtil.fullyDelete(new File(tmpPath));
+  }
+}

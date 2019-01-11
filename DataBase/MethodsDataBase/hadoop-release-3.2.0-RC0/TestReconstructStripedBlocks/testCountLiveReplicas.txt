@@ -1,0 +1,72 @@
+/** 
+ * make sure the NN can detect the scenario where there are enough number of internal blocks (>=9 by default) but there is still missing data/parity block.
+ */
+@Test public void testCountLiveReplicas() throws Exception {
+  final HdfsConfiguration conf=new HdfsConfiguration();
+  conf.setInt(DFSConfigKeys.DFS_NAMENODE_REDUNDANCY_INTERVAL_SECONDS_KEY,1);
+  conf.setBoolean(DFSConfigKeys.DFS_NAMENODE_REDUNDANCY_CONSIDERLOAD_KEY,false);
+  cluster=new MiniDFSCluster.Builder(conf).numDataNodes(groupSize + 2).build();
+  cluster.waitActive();
+  DistributedFileSystem fs=cluster.getFileSystem();
+  fs.enableErasureCodingPolicy(StripedFileTestUtil.getDefaultECPolicy().getName());
+  try {
+    fs.mkdirs(dirPath);
+    fs.setErasureCodingPolicy(dirPath,StripedFileTestUtil.getDefaultECPolicy().getName());
+    DFSTestUtil.createFile(fs,filePath,cellSize * dataBlocks * 2,(short)1,0L);
+    LocatedBlocks blks=fs.getClient().getLocatedBlocks(filePath.toString(),0);
+    LocatedStripedBlock block=(LocatedStripedBlock)blks.getLastLocatedBlock();
+    DatanodeInfo dnToStop=block.getLocations()[0];
+    MiniDFSCluster.DataNodeProperties dnProp=cluster.stopDataNode(dnToStop.getXferAddr());
+    cluster.setDataNodeDead(dnToStop);
+    DFSTestUtil.waitForReplication(fs,filePath,groupSize,15 * 1000);
+    cluster.restartDataNode(dnProp);
+    cluster.waitActive();
+    DFSTestUtil.verifyClientStats(conf,cluster);
+    dnToStop=block.getLocations()[1];
+    cluster.stopDataNode(dnToStop.getXferAddr());
+    cluster.setDataNodeDead(dnToStop);
+    cluster.restartNameNode(true);
+    for (    DataNode dn : cluster.getDataNodes()) {
+      DataNodeTestUtils.triggerBlockReport(dn);
+    }
+    FSNamesystem fsn=cluster.getNamesystem();
+    BlockManager bm=fsn.getBlockManager();
+    Thread.sleep(3000);
+    for (    DataNode dn : cluster.getDataNodes()) {
+      DataNodeTestUtils.triggerHeartbeat(dn);
+    }
+    StripedFileTestUtil.waitForReconstructionFinished(filePath,fs,groupSize);
+    boolean reconstructed=false;
+    for (int i=0; i < 5; i++) {
+      NumberReplicas num=null;
+      fsn.readLock();
+      try {
+        BlockInfo blockInfo=cluster.getNamesystem().getFSDirectory().getINode4Write(filePath.toString()).asFile().getLastBlock();
+        num=bm.countNodes(blockInfo);
+      }
+  finally {
+        fsn.readUnlock();
+      }
+      if (num.liveReplicas() >= groupSize) {
+        reconstructed=true;
+        break;
+      }
+ else {
+        Thread.sleep(1000);
+      }
+    }
+    Assert.assertTrue(reconstructed);
+    blks=fs.getClient().getLocatedBlocks(filePath.toString(),0);
+    block=(LocatedStripedBlock)blks.getLastLocatedBlock();
+    BitSet bitSet=new BitSet(groupSize);
+    for (    byte index : block.getBlockIndices()) {
+      bitSet.set(index);
+    }
+    for (int i=0; i < groupSize; i++) {
+      Assert.assertTrue(bitSet.get(i));
+    }
+  }
+  finally {
+    cluster.shutdown();
+  }
+}

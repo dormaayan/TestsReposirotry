@@ -1,0 +1,68 @@
+@Test(timeout=120000) public void testUsageWithMultipleContainersAndRMRestart() throws Exception {
+  conf.setInt(YarnConfiguration.RM_AM_MAX_ATTEMPTS,1);
+  conf.setBoolean(YarnConfiguration.RECOVERY_ENABLED,true);
+  conf.setBoolean(YarnConfiguration.RM_WORK_PRESERVING_RECOVERY_ENABLED,false);
+  conf.set(YarnConfiguration.RM_STORE,MemoryRMStateStore.class.getName());
+  MockRM rm0=new MockRM(conf);
+  rm0.start();
+  MockMemoryRMStateStore memStore=(MockMemoryRMStateStore)rm0.getRMStateStore();
+  MockNM nm=new MockNM("127.0.0.1:1234",65536,rm0.getResourceTrackerService());
+  nm.registerNode();
+  RMApp app0=rm0.submitApp(200);
+  rm0.waitForState(app0.getApplicationId(),RMAppState.ACCEPTED);
+  RMAppAttempt attempt0=app0.getCurrentAppAttempt();
+  ApplicationAttemptId attemptId0=attempt0.getAppAttemptId();
+  rm0.waitForState(attemptId0,RMAppAttemptState.SCHEDULED);
+  nm.nodeHeartbeat(true);
+  rm0.waitForState(attemptId0,RMAppAttemptState.ALLOCATED);
+  MockAM am0=rm0.sendAMLaunched(attempt0.getAppAttemptId());
+  am0.registerAppAttempt();
+  int NUM_CONTAINERS=2;
+  am0.allocate("127.0.0.1",1000,NUM_CONTAINERS,new ArrayList<ContainerId>());
+  nm.nodeHeartbeat(true);
+  List<Container> conts=am0.allocate(new ArrayList<ResourceRequest>(),new ArrayList<ContainerId>()).getAllocatedContainers();
+  while (conts.size() != NUM_CONTAINERS) {
+    nm.nodeHeartbeat(true);
+    conts.addAll(am0.allocate(new ArrayList<ResourceRequest>(),new ArrayList<ContainerId>()).getAllocatedContainers());
+    Thread.sleep(500);
+  }
+  for (  Container c : conts) {
+    nm.nodeHeartbeat(attempt0.getAppAttemptId(),c.getId().getContainerId(),ContainerState.RUNNING);
+    rm0.waitForState(nm,c.getId(),RMContainerState.RUNNING);
+  }
+  Collection<RMContainer> rmContainers=rm0.scheduler.getSchedulerAppInfo(attempt0.getAppAttemptId()).getLiveContainers();
+  int sleepInterval=1000;
+  int cumulativeSleepTime=0;
+  while (app0.getRMAppMetrics().getMemorySeconds() <= 0 && cumulativeSleepTime < 5000) {
+    Thread.sleep(sleepInterval);
+    cumulativeSleepTime+=sleepInterval;
+  }
+  for (  Container c : conts) {
+    if (c.getId().getContainerId() == 1)     continue;
+    nm.nodeHeartbeat(attempt0.getAppAttemptId(),c.getId().getContainerId(),ContainerState.COMPLETE);
+    rm0.waitForState(nm,c.getId(),RMContainerState.COMPLETED);
+  }
+  ContainerId cId=ContainerId.newContainerId(attempt0.getAppAttemptId(),1);
+  nm.nodeHeartbeat(attempt0.getAppAttemptId(),cId.getContainerId(),ContainerState.COMPLETE);
+  rm0.waitForState(nm,cId,RMContainerState.COMPLETED);
+  long memorySeconds=0;
+  long vcoreSeconds=0;
+  for (  RMContainer c : rmContainers) {
+    AggregateAppResourceUsage ru=calculateContainerResourceMetrics(c);
+    memorySeconds+=ru.getMemorySeconds();
+    vcoreSeconds+=ru.getVcoreSeconds();
+  }
+  RMAppMetrics metricsBefore=app0.getRMAppMetrics();
+  Assert.assertEquals("Unexpected MemorySeconds value",memorySeconds,metricsBefore.getMemorySeconds());
+  Assert.assertEquals("Unexpected VcoreSeconds value",vcoreSeconds,metricsBefore.getVcoreSeconds());
+  MockRM rm1=new MockRM(conf,memStore);
+  rm1.start();
+  RMApp app0After=rm1.getRMContext().getRMApps().get(app0.getApplicationId());
+  RMAppMetrics metricsAfter=app0After.getRMAppMetrics();
+  Assert.assertEquals("Vcore seconds were not the same after RM Restart",metricsBefore.getVcoreSeconds(),metricsAfter.getVcoreSeconds());
+  Assert.assertEquals("Memory seconds were not the same after RM Restart",metricsBefore.getMemorySeconds(),metricsAfter.getMemorySeconds());
+  rm0.stop();
+  rm0.close();
+  rm1.stop();
+  rm1.close();
+}

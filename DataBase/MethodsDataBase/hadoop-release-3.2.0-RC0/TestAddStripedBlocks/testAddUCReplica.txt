@@ -1,0 +1,63 @@
+/** 
+ * Test BlockInfoStripedUnderConstruction#addReplicaIfNotPresent in different scenarios.
+ */
+@Test public void testAddUCReplica() throws Exception {
+  final Path file=new Path("/file1");
+  final List<String> storageIDs=new ArrayList<>();
+  FSDataOutputStream out=null;
+  try {
+    out=dfs.create(file,(short)1);
+    FSDirectory fsdir=cluster.getNamesystem().getFSDirectory();
+    INodeFile fileNode=fsdir.getINode4Write(file.toString()).asFile();
+    cluster.getNamesystem().getAdditionalBlock(file.toString(),fileNode.getId(),dfs.getClient().getClientName(),null,null,null,null);
+    BlockInfo lastBlock=fileNode.getLastBlock();
+    DatanodeStorageInfo[] locs=lastBlock.getUnderConstructionFeature().getExpectedStorageLocations();
+    byte[] indices=lastBlock.getUnderConstructionFeature().getBlockIndices();
+    Assert.assertEquals(groupSize,locs.length);
+    Assert.assertEquals(groupSize,indices.length);
+    int i=0;
+    for (    DataNode dn : cluster.getDataNodes()) {
+      final Block block=new Block(lastBlock.getBlockId() + i++,0,lastBlock.getGenerationStamp());
+      DatanodeStorage storage=new DatanodeStorage(UUID.randomUUID().toString());
+      storageIDs.add(storage.getStorageID());
+      StorageReceivedDeletedBlocks[] reports=DFSTestUtil.makeReportForReceivedBlock(block,BlockStatus.RECEIVING_BLOCK,storage);
+      for (      StorageReceivedDeletedBlocks report : reports) {
+        cluster.getNamesystem().processIncrementalBlockReport(dn.getDatanodeId(),report);
+      }
+    }
+    locs=lastBlock.getUnderConstructionFeature().getExpectedStorageLocations();
+    indices=lastBlock.getUnderConstructionFeature().getBlockIndices();
+    Assert.assertEquals(groupSize,locs.length);
+    Assert.assertEquals(groupSize,indices.length);
+    for (    DatanodeStorageInfo newstorage : locs) {
+      Assert.assertTrue(storageIDs.contains(newstorage.getStorageID()));
+    }
+  }
+  finally {
+    IOUtils.cleanup(null,out);
+  }
+  cluster.restartNameNode(true);
+  final String bpId=cluster.getNamesystem().getBlockPoolId();
+  INodeFile fileNode=cluster.getNamesystem().getFSDirectory().getINode4Write(file.toString()).asFile();
+  BlockInfo lastBlock=fileNode.getLastBlock();
+  int i=groupSize - 1;
+  for (  DataNode dn : cluster.getDataNodes()) {
+    String storageID=storageIDs.get(i);
+    final Block block=new Block(lastBlock.getBlockId() + i--,0,lastBlock.getGenerationStamp());
+    DatanodeStorage storage=new DatanodeStorage(storageID);
+    List<ReplicaBeingWritten> blocks=new ArrayList<>();
+    ReplicaBeingWritten replica=new ReplicaBeingWritten(block,null,null,null);
+    blocks.add(replica);
+    BlockListAsLongs bll=BlockListAsLongs.encode(blocks);
+    StorageBlockReport[] reports={new StorageBlockReport(storage,bll)};
+    cluster.getNameNodeRpc().blockReport(dn.getDNRegistrationForBP(bpId),bpId,reports,new BlockReportContext(1,0,System.nanoTime(),0,true));
+  }
+  DatanodeStorageInfo[] locs=lastBlock.getUnderConstructionFeature().getExpectedStorageLocations();
+  byte[] indices=lastBlock.getUnderConstructionFeature().getBlockIndices();
+  Assert.assertEquals(groupSize,locs.length);
+  Assert.assertEquals(groupSize,indices.length);
+  for (i=0; i < groupSize; i++) {
+    Assert.assertEquals(storageIDs.get(i),locs[groupSize - 1 - i].getStorageID());
+    Assert.assertEquals(groupSize - i - 1,indices[i]);
+  }
+}

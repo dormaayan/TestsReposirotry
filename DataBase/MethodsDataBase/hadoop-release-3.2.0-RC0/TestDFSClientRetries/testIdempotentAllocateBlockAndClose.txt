@@ -1,0 +1,79 @@
+/** 
+ * Test that getAdditionalBlock() and close() are idempotent. This allows a client to safely retry a call and still produce a correct file. See HDFS-3031.
+ */
+@Test public void testIdempotentAllocateBlockAndClose() throws Exception {
+  final String src="/testIdempotentAllocateBlock";
+  Path file=new Path(src);
+  conf.setInt(DFSConfigKeys.DFS_BLOCK_SIZE_KEY,4096);
+  final MiniDFSCluster cluster=new MiniDFSCluster.Builder(conf).build();
+  try {
+    cluster.waitActive();
+    FileSystem fs=cluster.getFileSystem();
+    NamenodeProtocols preSpyNN=cluster.getNameNodeRpc();
+    NamenodeProtocols spyNN=spy(preSpyNN);
+    DFSClient client=new DFSClient(null,spyNN,conf,null);
+    doAnswer(new Answer<LocatedBlock>(){
+      private int getBlockCount(      LocatedBlock ret) throws IOException {
+        LocatedBlocks lb=cluster.getNameNodeRpc().getBlockLocations(src,0,Long.MAX_VALUE);
+        assertEquals(lb.getLastLocatedBlock().getBlock(),ret.getBlock());
+        return lb.getLocatedBlocks().size();
+      }
+      @Override public LocatedBlock answer(      InvocationOnMock invocation) throws Throwable {
+        LOG.info("Called addBlock: " + Arrays.toString(invocation.getArguments()));
+        final LocatedBlock ret;
+        try {
+          ret=(LocatedBlock)invocation.callRealMethod();
+        }
+ catch (        NotReplicatedYetException e) {
+          throw new RemoteException(e.getClass().getName(),e.getMessage());
+        }
+        final int blockCount=getBlockCount(ret);
+        final LocatedBlock ret2;
+        try {
+          ret2=(LocatedBlock)invocation.callRealMethod();
+        }
+ catch (        NotReplicatedYetException e) {
+          throw new AssertionError("Unexpected exception",e);
+        }
+        final int blockCount2=getBlockCount(ret2);
+        assertEquals(blockCount,blockCount2);
+        return ret2;
+      }
+    }
+).when(spyNN).addBlock(Mockito.anyString(),Mockito.anyString(),Mockito.<ExtendedBlock>any(),Mockito.<DatanodeInfo[]>any(),Mockito.anyLong(),Mockito.<String[]>any(),Mockito.<EnumSet<AddBlockFlag>>any());
+    doAnswer(new Answer<Boolean>(){
+      @Override public Boolean answer(      InvocationOnMock invocation) throws Throwable {
+        LOG.info("Called complete:");
+        if (!(Boolean)invocation.callRealMethod()) {
+          LOG.info("Complete call returned false, not faking a retry RPC");
+          return false;
+        }
+        try {
+          boolean ret=(Boolean)invocation.callRealMethod();
+          LOG.info("Complete call returned true, faked second RPC. " + "Returned: " + ret);
+          return ret;
+        }
+ catch (        Throwable t) {
+          LOG.error("Idempotent retry threw exception",t);
+          throw t;
+        }
+      }
+    }
+).when(spyNN).complete(Mockito.anyString(),Mockito.anyString(),Mockito.<ExtendedBlock>any(),anyLong());
+    OutputStream stm=client.create(file.toString(),true);
+    try {
+      AppendTestUtil.write(stm,0,10000);
+      stm.close();
+      stm=null;
+    }
+  finally {
+      IOUtils.cleanupWithLogger(LOG,stm);
+    }
+    Mockito.verify(spyNN,Mockito.atLeastOnce()).addBlock(Mockito.anyString(),Mockito.anyString(),Mockito.<ExtendedBlock>any(),Mockito.<DatanodeInfo[]>any(),Mockito.anyLong(),Mockito.<String[]>any(),Mockito.<EnumSet<AddBlockFlag>>any());
+    Mockito.verify(spyNN,Mockito.atLeastOnce()).complete(Mockito.anyString(),Mockito.anyString(),Mockito.<ExtendedBlock>any(),anyLong());
+    AppendTestUtil.check(fs,file,10000);
+  }
+  finally {
+    cluster.shutdown();
+  }
+}

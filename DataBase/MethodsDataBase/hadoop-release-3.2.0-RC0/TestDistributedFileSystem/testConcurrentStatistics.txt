@@ -1,0 +1,52 @@
+@SuppressWarnings("ThrowableResultOfMethodCallIgnored") @Test(timeout=180000) public void testConcurrentStatistics() throws IOException, InterruptedException {
+  FileSystem.getStatistics(HdfsConstants.HDFS_URI_SCHEME,DistributedFileSystem.class).reset();
+  final MiniDFSCluster cluster=new MiniDFSCluster.Builder(new Configuration()).build();
+  cluster.waitActive();
+  final FileSystem fs=cluster.getFileSystem();
+  final int numThreads=5;
+  final ExecutorService threadPool=HadoopExecutors.newFixedThreadPool(numThreads);
+  try {
+    final CountDownLatch allExecutorThreadsReady=new CountDownLatch(numThreads);
+    final CountDownLatch startBlocker=new CountDownLatch(1);
+    final CountDownLatch allDone=new CountDownLatch(numThreads);
+    final AtomicReference<Throwable> childError=new AtomicReference<>();
+    for (int i=0; i < numThreads; i++) {
+      threadPool.submit(new Runnable(){
+        @Override public void run(){
+          allExecutorThreadsReady.countDown();
+          try {
+            startBlocker.await();
+            final FileSystem fs=cluster.getFileSystem();
+            fs.mkdirs(new Path("/testStatisticsParallelChild"));
+          }
+ catch (          Throwable t) {
+            LOG.error("Child failed when calling mkdir",t);
+            childError.compareAndSet(null,t);
+          }
+ finally {
+            allDone.countDown();
+          }
+        }
+      }
+);
+    }
+    final long oldMkdirOpCount=getOpStatistics(OpType.MKDIRS);
+    allExecutorThreadsReady.await();
+    startBlocker.countDown();
+    allDone.await();
+    assertNull("Child failed with exception " + childError.get(),childError.get());
+    checkStatistics(fs,0,numThreads,0);
+    checkOpStatistics(OpType.MKDIRS,numThreads + oldMkdirOpCount);
+    for (Iterator<LongStatistic> opCountIter=FileSystem.getGlobalStorageStatistics().get(DFSOpsCountStatistics.NAME).getLongStatistics(); opCountIter.hasNext(); ) {
+      final LongStatistic opCount=opCountIter.next();
+      if (OpType.MKDIRS.getSymbol().equals(opCount.getName())) {
+        assertEquals("Unexpected op count from iterator!",numThreads + oldMkdirOpCount,opCount.getValue());
+      }
+      LOG.info(opCount.getName() + "\t" + opCount.getValue());
+    }
+  }
+  finally {
+    threadPool.shutdownNow();
+    cluster.shutdown();
+  }
+}

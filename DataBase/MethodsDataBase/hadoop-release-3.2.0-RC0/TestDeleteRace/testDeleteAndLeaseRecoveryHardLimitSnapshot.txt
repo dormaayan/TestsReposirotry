@@ -1,0 +1,51 @@
+/** 
+ * Test the sequence of deleting a file that has snapshot, and lease manager's hard limit recovery.
+ */
+@Test public void testDeleteAndLeaseRecoveryHardLimitSnapshot() throws Exception {
+  final Path rootPath=new Path("/");
+  final Configuration config=new Configuration();
+  config.setBoolean(DFSConfigKeys.DFS_PERMISSIONS_ENABLED_KEY,false);
+  config.setInt(DFSConfigKeys.DFS_BLOCK_SIZE_KEY,BLOCK_SIZE);
+  FSDataOutputStream stm=null;
+  try {
+    cluster=new MiniDFSCluster.Builder(config).numDataNodes(3).build();
+    cluster.waitActive();
+    final DistributedFileSystem fs=cluster.getFileSystem();
+    final Path testPath=new Path("/testfile");
+    stm=fs.create(testPath);
+    LOG.info("test on " + testPath);
+    AppendTestUtil.write(stm,0,BLOCK_SIZE / 2);
+    stm.hflush();
+    SnapshotTestHelper.createSnapshot(fs,rootPath,"snap");
+    fs.delete(testPath,false);
+    AppendTestUtil.write(stm,0,BLOCK_SIZE);
+    final LeaseManager lm=(LeaseManager)Whitebox.getInternalState(cluster.getNameNode().getNamesystem(),"leaseManager");
+    final TreeSet<Lease> leases=(TreeSet<Lease>)Whitebox.getInternalState(lm,"sortedLeases");
+    final TreeSet<Lease> spyLeases=new TreeSet<>(new Comparator<Lease>(){
+      @Override public int compare(      Lease o1,      Lease o2){
+        return Long.signum(o1.getLastUpdate() - o2.getLastUpdate());
+      }
+    }
+);
+    while (!leases.isEmpty()) {
+      final Lease lease=leases.first();
+      final Lease spyLease=Mockito.spy(lease);
+      Mockito.doReturn(true).when(spyLease).expiredHardLimit();
+      spyLeases.add(spyLease);
+      leases.remove(lease);
+    }
+    Whitebox.setInternalState(lm,"sortedLeases",spyLeases);
+    Thread.sleep(2 * conf.getLong(DFS_NAMENODE_LEASE_RECHECK_INTERVAL_MS_KEY,DFS_NAMENODE_LEASE_RECHECK_INTERVAL_MS_DEFAULT));
+    LOG.info("Now check we can restart");
+    cluster.restartNameNodes();
+    LOG.info("Restart finished");
+  }
+  finally {
+    if (stm != null) {
+      IOUtils.closeStream(stm);
+    }
+    if (cluster != null) {
+      cluster.shutdown();
+    }
+  }
+}

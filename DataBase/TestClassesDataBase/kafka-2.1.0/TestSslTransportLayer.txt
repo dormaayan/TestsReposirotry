@@ -1,0 +1,48 @@
+/** 
+ * SSLTransportLayer with overrides for testing including: <ul> <li>Overrides for packet and application buffer size to test buffer resize code path. The overridden buffer size starts with a small value and increases in size when the buffer size is retrieved to handle overflow/underflow, until the actual session buffer size is reached.</li> <li>IOException injection for reads and writes for testing exception handling during handshakes.</li> <li>Delayed writes to test handshake failure notifications to peer</li> </ul>
+ */
+class TestSslTransportLayer extends SslTransportLayer {
+  private final ResizeableBufferSize netReadBufSize;
+  private final ResizeableBufferSize netWriteBufSize;
+  private final ResizeableBufferSize appBufSize;
+  private final AtomicLong numReadsRemaining;
+  private final AtomicLong numFlushesRemaining;
+  private final AtomicInteger numDelayedFlushesRemaining;
+  public TestSslTransportLayer(  String channelId,  SelectionKey key,  SSLEngine sslEngine) throws IOException {
+    super(channelId,key,sslEngine);
+    this.netReadBufSize=new ResizeableBufferSize(netReadBufSizeOverride);
+    this.netWriteBufSize=new ResizeableBufferSize(netWriteBufSizeOverride);
+    this.appBufSize=new ResizeableBufferSize(appBufSizeOverride);
+    numReadsRemaining=new AtomicLong(failureIndex);
+    numFlushesRemaining=new AtomicLong(failureIndex);
+    numDelayedFlushesRemaining=new AtomicInteger(flushDelayCount);
+  }
+  @Override protected int netReadBufferSize(){
+    ByteBuffer netReadBuffer=netReadBuffer();
+    boolean updateBufSize=netReadBuffer != null && !netReadBuffer().hasRemaining();
+    return netReadBufSize.updateAndGet(super.netReadBufferSize(),updateBufSize);
+  }
+  @Override protected int netWriteBufferSize(){
+    return netWriteBufSize.updateAndGet(super.netWriteBufferSize(),true);
+  }
+  @Override protected int applicationBufferSize(){
+    return appBufSize.updateAndGet(super.applicationBufferSize(),true);
+  }
+  @Override protected int readFromSocketChannel() throws IOException {
+    if (numReadsRemaining.decrementAndGet() == 0 && !ready())     readFailureAction.run();
+    return super.readFromSocketChannel();
+  }
+  @Override protected boolean flush(  ByteBuffer buf) throws IOException {
+    if (numFlushesRemaining.decrementAndGet() == 0 && !ready())     flushFailureAction.run();
+ else     if (numDelayedFlushesRemaining.getAndDecrement() != 0)     return false;
+    resetDelayedFlush();
+    return super.flush(buf);
+  }
+  @Override protected void startHandshake() throws IOException {
+    assertTrue("SSL handshake initialized too early",socketChannel().isConnected());
+    super.startHandshake();
+  }
+  private void resetDelayedFlush(){
+    numDelayedFlushesRemaining.set(flushDelayCount);
+  }
+}

@@ -1,0 +1,55 @@
+@Test public void testCheckInterval() throws Exception {
+  long RETENTION_SECS=10 * 24 * 3600;
+  long now=System.currentTimeMillis();
+  long toDeleteTime=now - RETENTION_SECS * 1000;
+  String root="mockfs://foo/";
+  String remoteRootLogDir=root + "tmp/logs";
+  String suffix="logs";
+  Configuration conf=new Configuration();
+  conf.setClass("fs.mockfs.impl",MockFileSystem.class,FileSystem.class);
+  conf.set(YarnConfiguration.LOG_AGGREGATION_ENABLED,"true");
+  conf.set(YarnConfiguration.LOG_AGGREGATION_RETAIN_SECONDS,"864000");
+  conf.set(YarnConfiguration.LOG_AGGREGATION_RETAIN_CHECK_INTERVAL_SECONDS,"1");
+  conf.set(YarnConfiguration.NM_REMOTE_APP_LOG_DIR,remoteRootLogDir);
+  conf.set(YarnConfiguration.NM_REMOTE_APP_LOG_DIR_SUFFIX,suffix);
+  FileSystem.closeAll();
+  Path rootPath=new Path(root);
+  FileSystem rootFs=rootPath.getFileSystem(conf);
+  FileSystem mockFs=((FilterFileSystem)rootFs).getRawFileSystem();
+  Path remoteRootLogPath=new Path(remoteRootLogDir);
+  Path userDir=new Path(remoteRootLogPath,"me");
+  FileStatus userDirStatus=new FileStatus(0,true,0,0,now,userDir);
+  when(mockFs.listStatus(remoteRootLogPath)).thenReturn(new FileStatus[]{userDirStatus});
+  ApplicationId appId1=ApplicationId.newInstance(System.currentTimeMillis(),1);
+  Path userLogDir=new Path(userDir,suffix);
+  Path app1Dir=new Path(userLogDir,appId1.toString());
+  FileStatus app1DirStatus=new FileStatus(0,true,0,0,now,app1Dir);
+  when(mockFs.listStatus(userLogDir)).thenReturn(new FileStatus[]{app1DirStatus});
+  Path app1Log1=new Path(app1Dir,"host1");
+  FileStatus app1Log1Status=new FileStatus(10,false,1,1,now,app1Log1);
+  when(mockFs.listStatus(app1Dir)).thenReturn(new FileStatus[]{app1Log1Status});
+  final List<ApplicationId> finishedApplications=Collections.unmodifiableList(Arrays.asList(appId1));
+  AggregatedLogDeletionService deletionSvc=new AggregatedLogDeletionService(){
+    @Override protected ApplicationClientProtocol createRMClient() throws IOException {
+      try {
+        return createMockRMClient(finishedApplications,null);
+      }
+ catch (      Exception e) {
+        throw new IOException(e);
+      }
+    }
+    @Override protected void stopRMClient(){
+    }
+  }
+;
+  deletionSvc.init(conf);
+  deletionSvc.start();
+  verify(mockFs,timeout(10000).atLeast(4)).listStatus(any(Path.class));
+  verify(mockFs,never()).delete(app1Dir,true);
+  app1DirStatus=new FileStatus(0,true,0,0,toDeleteTime,app1Dir);
+  app1Log1Status=new FileStatus(10,false,1,1,toDeleteTime,app1Log1);
+  when(mockFs.listStatus(userLogDir)).thenReturn(new FileStatus[]{app1DirStatus});
+  when(mockFs.listStatus(app1Dir)).thenReturn(new FileStatus[]{app1Log1Status});
+  verify(mockFs,timeout(10000)).delete(app1Dir,true);
+  deletionSvc.stop();
+}

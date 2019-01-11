@@ -1,0 +1,424 @@
+public class SingleThreadEventLoopTest {
+  private static final Runnable NOOP=new Runnable(){
+    @Override public void run(){
+    }
+  }
+;
+  private SingleThreadEventLoopA loopA;
+  private SingleThreadEventLoopB loopB;
+  private SingleThreadEventLoopC loopC;
+  @Before public void newEventLoop(){
+    loopA=new SingleThreadEventLoopA();
+    loopB=new SingleThreadEventLoopB();
+    loopC=new SingleThreadEventLoopC();
+  }
+  @After public void stopEventLoop(){
+    if (!loopA.isShuttingDown()) {
+      loopA.shutdownGracefully(0,0,TimeUnit.MILLISECONDS);
+    }
+    if (!loopB.isShuttingDown()) {
+      loopB.shutdownGracefully(0,0,TimeUnit.MILLISECONDS);
+    }
+    if (!loopC.isShuttingDown()) {
+      loopC.shutdownGracefully(0,0,TimeUnit.MILLISECONDS);
+    }
+    while (!loopA.isTerminated()) {
+      try {
+        loopA.awaitTermination(1,TimeUnit.DAYS);
+      }
+ catch (      InterruptedException e) {
+      }
+    }
+    assertEquals(1,loopA.cleanedUp.get());
+    while (!loopB.isTerminated()) {
+      try {
+        loopB.awaitTermination(1,TimeUnit.DAYS);
+      }
+ catch (      InterruptedException e) {
+      }
+    }
+    while (!loopC.isTerminated()) {
+      try {
+        loopC.awaitTermination(1,TimeUnit.DAYS);
+      }
+ catch (      InterruptedException e) {
+      }
+    }
+  }
+  @Test @SuppressWarnings("deprecation") public void shutdownBeforeStart() throws Exception {
+    loopA.shutdown();
+    assertRejection(loopA);
+  }
+  @Test @SuppressWarnings("deprecation") public void shutdownAfterStart() throws Exception {
+    final CountDownLatch latch=new CountDownLatch(1);
+    loopA.execute(new Runnable(){
+      @Override public void run(){
+        latch.countDown();
+      }
+    }
+);
+    latch.await();
+    loopA.shutdown();
+    assertRejection(loopA);
+    assertTrue(loopA.isShutdown());
+    while (!loopA.isTerminated()) {
+      loopA.awaitTermination(1,TimeUnit.DAYS);
+    }
+  }
+  private static void assertRejection(  EventExecutor loop){
+    try {
+      loop.execute(NOOP);
+      fail("A task must be rejected after shutdown() is called.");
+    }
+ catch (    RejectedExecutionException e) {
+    }
+  }
+  @Test public void scheduleTaskA() throws Exception {
+    testScheduleTask(loopA);
+  }
+  @Test public void scheduleTaskB() throws Exception {
+    testScheduleTask(loopB);
+  }
+  @Test public void scheduleTaskC() throws Exception {
+    testScheduleTask(loopC);
+  }
+  private static void testScheduleTask(  EventLoop loopA) throws InterruptedException, ExecutionException {
+    long startTime=System.nanoTime();
+    final AtomicLong endTime=new AtomicLong();
+    loopA.schedule(new Runnable(){
+      @Override public void run(){
+        endTime.set(System.nanoTime());
+      }
+    }
+,500,TimeUnit.MILLISECONDS).get();
+    assertThat(endTime.get() - startTime,is(greaterThanOrEqualTo(TimeUnit.MILLISECONDS.toNanos(500))));
+  }
+  @Test(timeout=5000) public void scheduleTaskAtFixedRateA() throws Exception {
+    testScheduleTaskAtFixedRate(loopA);
+  }
+  @Test(timeout=5000) public void scheduleTaskAtFixedRateB() throws Exception {
+    testScheduleTaskAtFixedRate(loopB);
+  }
+  private static void testScheduleTaskAtFixedRate(  EventLoop loopA) throws InterruptedException {
+    final Queue<Long> timestamps=new LinkedBlockingQueue<Long>();
+    final int expectedTimeStamps=5;
+    final CountDownLatch allTimeStampsLatch=new CountDownLatch(expectedTimeStamps);
+    ScheduledFuture<?> f=loopA.scheduleAtFixedRate(new Runnable(){
+      @Override public void run(){
+        timestamps.add(System.nanoTime());
+        try {
+          Thread.sleep(50);
+        }
+ catch (        InterruptedException e) {
+        }
+        allTimeStampsLatch.countDown();
+      }
+    }
+,100,100,TimeUnit.MILLISECONDS);
+    allTimeStampsLatch.await();
+    assertTrue(f.cancel(true));
+    Thread.sleep(300);
+    assertEquals(expectedTimeStamps,timestamps.size());
+    Long firstTimestamp=null;
+    int cnt=0;
+    for (    Long t : timestamps) {
+      if (firstTimestamp == null) {
+        firstTimestamp=t;
+        continue;
+      }
+      long timepoint=t - firstTimestamp;
+      assertThat(timepoint,is(greaterThanOrEqualTo(TimeUnit.MILLISECONDS.toNanos(100 * cnt + 80))));
+      assertThat(timepoint,is(lessThan(TimeUnit.MILLISECONDS.toNanos(100 * (cnt + 1) + 20))));
+      cnt++;
+    }
+  }
+  @Test(timeout=5000) public void scheduleLaggyTaskAtFixedRateA() throws Exception {
+    testScheduleLaggyTaskAtFixedRate(loopA);
+  }
+  @Test(timeout=5000) public void scheduleLaggyTaskAtFixedRateB() throws Exception {
+    testScheduleLaggyTaskAtFixedRate(loopB);
+  }
+  private static void testScheduleLaggyTaskAtFixedRate(  EventLoop loopA) throws InterruptedException {
+    final Queue<Long> timestamps=new LinkedBlockingQueue<Long>();
+    final int expectedTimeStamps=5;
+    final CountDownLatch allTimeStampsLatch=new CountDownLatch(expectedTimeStamps);
+    ScheduledFuture<?> f=loopA.scheduleAtFixedRate(new Runnable(){
+      @Override public void run(){
+        boolean empty=timestamps.isEmpty();
+        timestamps.add(System.nanoTime());
+        if (empty) {
+          try {
+            Thread.sleep(401);
+          }
+ catch (          InterruptedException e) {
+          }
+        }
+        allTimeStampsLatch.countDown();
+      }
+    }
+,100,100,TimeUnit.MILLISECONDS);
+    allTimeStampsLatch.await();
+    assertTrue(f.cancel(true));
+    Thread.sleep(300);
+    assertEquals(expectedTimeStamps,timestamps.size());
+    int i=0;
+    Long previousTimestamp=null;
+    for (    Long t : timestamps) {
+      if (previousTimestamp == null) {
+        previousTimestamp=t;
+        continue;
+      }
+      long diff=t.longValue() - previousTimestamp.longValue();
+      if (i == 0) {
+        assertThat(diff,is(greaterThanOrEqualTo(TimeUnit.MILLISECONDS.toNanos(400))));
+      }
+ else {
+        assertThat(diff,is(lessThanOrEqualTo(TimeUnit.MILLISECONDS.toNanos(10))));
+      }
+      previousTimestamp=t;
+      i++;
+    }
+  }
+  @Test(timeout=5000) public void scheduleTaskWithFixedDelayA() throws Exception {
+    testScheduleTaskWithFixedDelay(loopA);
+  }
+  @Test(timeout=5000) public void scheduleTaskWithFixedDelayB() throws Exception {
+    testScheduleTaskWithFixedDelay(loopB);
+  }
+  private static void testScheduleTaskWithFixedDelay(  EventLoop loopA) throws InterruptedException {
+    final Queue<Long> timestamps=new LinkedBlockingQueue<Long>();
+    final int expectedTimeStamps=3;
+    final CountDownLatch allTimeStampsLatch=new CountDownLatch(expectedTimeStamps);
+    ScheduledFuture<?> f=loopA.scheduleWithFixedDelay(new Runnable(){
+      @Override public void run(){
+        timestamps.add(System.nanoTime());
+        try {
+          Thread.sleep(51);
+        }
+ catch (        InterruptedException e) {
+        }
+        allTimeStampsLatch.countDown();
+      }
+    }
+,100,100,TimeUnit.MILLISECONDS);
+    allTimeStampsLatch.await();
+    assertTrue(f.cancel(true));
+    Thread.sleep(300);
+    assertEquals(expectedTimeStamps,timestamps.size());
+    Long previousTimestamp=null;
+    for (    Long t : timestamps) {
+      if (previousTimestamp == null) {
+        previousTimestamp=t;
+        continue;
+      }
+      assertThat(t.longValue() - previousTimestamp.longValue(),is(greaterThanOrEqualTo(TimeUnit.MILLISECONDS.toNanos(150))));
+      previousTimestamp=t;
+    }
+  }
+  @Test @SuppressWarnings("deprecation") public void shutdownWithPendingTasks() throws Exception {
+    final int NUM_TASKS=3;
+    final AtomicInteger ranTasks=new AtomicInteger();
+    final CountDownLatch latch=new CountDownLatch(1);
+    final Runnable task=new Runnable(){
+      @Override public void run(){
+        ranTasks.incrementAndGet();
+        while (latch.getCount() > 0) {
+          try {
+            latch.await();
+          }
+ catch (          InterruptedException e) {
+          }
+        }
+      }
+    }
+;
+    for (int i=0; i < NUM_TASKS; i++) {
+      loopA.execute(task);
+    }
+    while (ranTasks.get() == 0) {
+      Thread.yield();
+    }
+    assertEquals(1,ranTasks.get());
+    loopA.shutdown();
+    latch.countDown();
+    while (!loopA.isTerminated()) {
+      loopA.awaitTermination(1,TimeUnit.DAYS);
+    }
+    assertEquals(NUM_TASKS,ranTasks.get());
+  }
+  @Test(timeout=10000) @SuppressWarnings("deprecation") public void testRegistrationAfterShutdown() throws Exception {
+    loopA.shutdown();
+    Logger root=(Logger)LoggerFactory.getLogger(org.slf4j.Logger.ROOT_LOGGER_NAME);
+    List<Appender<ILoggingEvent>> appenders=new ArrayList<Appender<ILoggingEvent>>();
+    for (Iterator<Appender<ILoggingEvent>> i=root.iteratorForAppenders(); i.hasNext(); ) {
+      Appender<ILoggingEvent> a=i.next();
+      appenders.add(a);
+      root.detachAppender(a);
+    }
+    try {
+      ChannelFuture f=loopA.register(new LocalChannel());
+      f.awaitUninterruptibly();
+      assertFalse(f.isSuccess());
+      assertThat(f.cause(),is(instanceOf(RejectedExecutionException.class)));
+      assertFalse(f.channel().isOpen());
+    }
+  finally {
+      for (      Appender<ILoggingEvent> a : appenders) {
+        root.addAppender(a);
+      }
+    }
+  }
+  @Test(timeout=10000) @SuppressWarnings("deprecation") public void testRegistrationAfterShutdown2() throws Exception {
+    loopA.shutdown();
+    final CountDownLatch latch=new CountDownLatch(1);
+    Channel ch=new LocalChannel();
+    ChannelPromise promise=ch.newPromise();
+    promise.addListener(new ChannelFutureListener(){
+      @Override public void operationComplete(      ChannelFuture future) throws Exception {
+        latch.countDown();
+      }
+    }
+);
+    Logger root=(Logger)LoggerFactory.getLogger(org.slf4j.Logger.ROOT_LOGGER_NAME);
+    List<Appender<ILoggingEvent>> appenders=new ArrayList<Appender<ILoggingEvent>>();
+    for (Iterator<Appender<ILoggingEvent>> i=root.iteratorForAppenders(); i.hasNext(); ) {
+      Appender<ILoggingEvent> a=i.next();
+      appenders.add(a);
+      root.detachAppender(a);
+    }
+    try {
+      ChannelFuture f=loopA.register(promise);
+      f.awaitUninterruptibly();
+      assertFalse(f.isSuccess());
+      assertThat(f.cause(),is(instanceOf(RejectedExecutionException.class)));
+      assertFalse(latch.await(1,TimeUnit.SECONDS));
+      assertFalse(ch.isOpen());
+    }
+  finally {
+      for (      Appender<ILoggingEvent> a : appenders) {
+        root.addAppender(a);
+      }
+    }
+  }
+  @Test(timeout=5000) public void testGracefulShutdownQuietPeriod() throws Exception {
+    loopA.shutdownGracefully(1,Integer.MAX_VALUE,TimeUnit.SECONDS);
+    for (int i=0; i < 20; i++) {
+      Thread.sleep(100);
+      loopA.execute(NOOP);
+    }
+    long startTime=System.nanoTime();
+    assertThat(loopA.isShuttingDown(),is(true));
+    assertThat(loopA.isShutdown(),is(false));
+    while (!loopA.isTerminated()) {
+      loopA.awaitTermination(Integer.MAX_VALUE,TimeUnit.SECONDS);
+    }
+    assertThat(System.nanoTime() - startTime,is(greaterThanOrEqualTo(TimeUnit.SECONDS.toNanos(1))));
+  }
+  @Test(timeout=5000) public void testGracefulShutdownTimeout() throws Exception {
+    loopA.shutdownGracefully(2,2,TimeUnit.SECONDS);
+    for (int i=0; i < 10; i++) {
+      Thread.sleep(100);
+      loopA.execute(NOOP);
+    }
+    try {
+      for (int i=0; i < 20; i++) {
+        Thread.sleep(100);
+        loopA.execute(NOOP);
+      }
+      fail("shutdownGracefully() must reject a task after timeout.");
+    }
+ catch (    RejectedExecutionException e) {
+    }
+    assertThat(loopA.isShuttingDown(),is(true));
+    assertThat(loopA.isShutdown(),is(true));
+  }
+  @Test(timeout=10000) public void testOnEventLoopIteration() throws Exception {
+    CountingRunnable onIteration=new CountingRunnable();
+    loopC.executeAfterEventLoopIteration(onIteration);
+    CountingRunnable noopTask=new CountingRunnable();
+    loopC.submit(noopTask).sync();
+    loopC.iterationEndSignal.take();
+    MatcherAssert.assertThat("Unexpected invocation count for regular task.",noopTask.getInvocationCount(),is(1));
+    MatcherAssert.assertThat("Unexpected invocation count for on every eventloop iteration task.",onIteration.getInvocationCount(),is(1));
+  }
+  @Test(timeout=10000) public void testRemoveOnEventLoopIteration() throws Exception {
+    CountingRunnable onIteration1=new CountingRunnable();
+    loopC.executeAfterEventLoopIteration(onIteration1);
+    CountingRunnable onIteration2=new CountingRunnable();
+    loopC.executeAfterEventLoopIteration(onIteration2);
+    loopC.removeAfterEventLoopIterationTask(onIteration1);
+    CountingRunnable noopTask=new CountingRunnable();
+    loopC.submit(noopTask).sync();
+    loopC.iterationEndSignal.take();
+    MatcherAssert.assertThat("Unexpected invocation count for regular task.",noopTask.getInvocationCount(),is(1));
+    MatcherAssert.assertThat("Unexpected invocation count for on every eventloop iteration task.",onIteration2.getInvocationCount(),is(1));
+    MatcherAssert.assertThat("Unexpected invocation count for on every eventloop iteration task.",onIteration1.getInvocationCount(),is(0));
+  }
+private static final class SingleThreadEventLoopA extends SingleThreadEventLoop {
+    final AtomicInteger cleanedUp=new AtomicInteger();
+    SingleThreadEventLoopA(){
+      super(null,Executors.defaultThreadFactory(),true);
+    }
+    @Override protected void run(){
+      for (; ; ) {
+        Runnable task=takeTask();
+        if (task != null) {
+          task.run();
+          updateLastExecutionTime();
+        }
+        if (confirmShutdown()) {
+          break;
+        }
+      }
+    }
+    @Override protected void cleanup(){
+      cleanedUp.incrementAndGet();
+    }
+  }
+private static class SingleThreadEventLoopB extends SingleThreadEventLoop {
+    SingleThreadEventLoopB(){
+      super(null,Executors.defaultThreadFactory(),false);
+    }
+    @Override protected void run(){
+      for (; ; ) {
+        try {
+          Thread.sleep(TimeUnit.NANOSECONDS.toMillis(delayNanos(System.nanoTime())));
+        }
+ catch (        InterruptedException e) {
+        }
+        runTasks0();
+        if (confirmShutdown()) {
+          break;
+        }
+      }
+    }
+    protected void runTasks0(){
+      runAllTasks();
+    }
+    @Override protected void wakeup(    boolean inEventLoop){
+      interruptThread();
+    }
+  }
+private static final class SingleThreadEventLoopC extends SingleThreadEventLoopB {
+    final LinkedBlockingQueue<Boolean> iterationEndSignal=new LinkedBlockingQueue<Boolean>(1);
+    @Override protected void afterRunningAllTasks(){
+      super.afterRunningAllTasks();
+      iterationEndSignal.offer(true);
+    }
+    @Override protected void runTasks0(){
+      runAllTasks(TimeUnit.MINUTES.toNanos(1));
+    }
+  }
+private static class CountingRunnable implements Runnable {
+    private final AtomicInteger invocationCount=new AtomicInteger();
+    @Override public void run(){
+      invocationCount.incrementAndGet();
+    }
+    public int getInvocationCount(){
+      return invocationCount.get();
+    }
+    public void resetInvocationCount(){
+      invocationCount.set(0);
+    }
+  }
+}

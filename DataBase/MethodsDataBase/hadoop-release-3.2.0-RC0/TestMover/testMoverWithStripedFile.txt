@@ -1,0 +1,72 @@
+@Test(timeout=300000) public void testMoverWithStripedFile() throws Exception {
+  final Configuration conf=new HdfsConfiguration();
+  initConfWithStripe(conf);
+  int numOfDatanodes=10;
+  int storagesPerDatanode=2;
+  long capacity=10 * defaultBlockSize;
+  long[][] capacities=new long[numOfDatanodes][storagesPerDatanode];
+  for (int i=0; i < numOfDatanodes; i++) {
+    for (int j=0; j < storagesPerDatanode; j++) {
+      capacities[i][j]=capacity;
+    }
+  }
+  final MiniDFSCluster cluster=new MiniDFSCluster.Builder(conf).numDataNodes(numOfDatanodes).storagesPerDatanode(storagesPerDatanode).storageTypes(new StorageType[][]{{StorageType.DISK,StorageType.DISK},{StorageType.DISK,StorageType.DISK},{StorageType.DISK,StorageType.DISK},{StorageType.DISK,StorageType.DISK},{StorageType.DISK,StorageType.DISK},{StorageType.DISK,StorageType.ARCHIVE},{StorageType.DISK,StorageType.ARCHIVE},{StorageType.DISK,StorageType.ARCHIVE},{StorageType.DISK,StorageType.ARCHIVE},{StorageType.DISK,StorageType.ARCHIVE}}).storageCapacities(capacities).build();
+  try {
+    cluster.waitActive();
+    cluster.getFileSystem().enableErasureCodingPolicy(StripedFileTestUtil.getDefaultECPolicy().getName());
+    ClientProtocol client=NameNodeProxies.createProxy(conf,cluster.getFileSystem(0).getUri(),ClientProtocol.class).getProxy();
+    String barDir="/bar";
+    client.mkdirs(barDir,new FsPermission((short)777),true);
+    client.setStoragePolicy(barDir,HdfsConstants.HOT_STORAGE_POLICY_NAME);
+    client.setErasureCodingPolicy(barDir,StripedFileTestUtil.getDefaultECPolicy().getName());
+    final String fooFile="/bar/foo";
+    long fileLen=20 * defaultBlockSize;
+    DFSTestUtil.createFile(cluster.getFileSystem(),new Path(fooFile),fileLen,(short)3,0);
+    LocatedBlocks locatedBlocks=client.getBlockLocations(fooFile,0,fileLen);
+    for (    LocatedBlock lb : locatedBlocks.getLocatedBlocks()) {
+      for (      StorageType type : lb.getStorageTypes()) {
+        Assert.assertEquals(StorageType.DISK,type);
+      }
+    }
+    StripedFileTestUtil.verifyLocatedStripedBlocks(locatedBlocks,dataBlocks + parityBlocks);
+    numOfDatanodes+=5;
+    capacities=new long[5][storagesPerDatanode];
+    for (int i=0; i < 5; i++) {
+      for (int j=0; j < storagesPerDatanode; j++) {
+        capacities[i][j]=capacity;
+      }
+    }
+    cluster.startDataNodes(conf,5,new StorageType[][]{{StorageType.ARCHIVE,StorageType.ARCHIVE},{StorageType.ARCHIVE,StorageType.ARCHIVE},{StorageType.ARCHIVE,StorageType.ARCHIVE},{StorageType.ARCHIVE,StorageType.ARCHIVE},{StorageType.ARCHIVE,StorageType.ARCHIVE}},true,null,null,null,capacities,null,false,false,false,null);
+    cluster.triggerHeartbeats();
+    client.setStoragePolicy(barDir,"COLD");
+    int rc=ToolRunner.run(conf,new Mover.Cli(),new String[]{"-p",barDir});
+    Assert.assertEquals("Movement to ARCHIVE should be successful",0,rc);
+    locatedBlocks=client.getBlockLocations(fooFile,0,fileLen);
+    for (    LocatedBlock lb : locatedBlocks.getLocatedBlocks()) {
+      for (      StorageType type : lb.getStorageTypes()) {
+        Assert.assertEquals(StorageType.ARCHIVE,type);
+      }
+    }
+    StripedFileTestUtil.verifyLocatedStripedBlocks(locatedBlocks,dataBlocks + parityBlocks);
+    numOfDatanodes+=5;
+    capacities=new long[5][storagesPerDatanode];
+    for (int i=0; i < 5; i++) {
+      for (int j=0; j < storagesPerDatanode; j++) {
+        capacities[i][j]=capacity;
+      }
+    }
+    cluster.startDataNodes(conf,5,new StorageType[][]{{StorageType.SSD,StorageType.DISK},{StorageType.SSD,StorageType.DISK},{StorageType.SSD,StorageType.DISK},{StorageType.SSD,StorageType.DISK},{StorageType.SSD,StorageType.DISK}},true,null,null,null,capacities,null,false,false,false,null);
+    cluster.triggerHeartbeats();
+    client.setStoragePolicy(barDir,"ONE_SSD");
+    rc=ToolRunner.run(conf,new Mover.Cli(),new String[]{"-p",barDir});
+    locatedBlocks=client.getBlockLocations(fooFile,0,fileLen);
+    for (    LocatedBlock lb : locatedBlocks.getLocatedBlocks()) {
+      for (      StorageType type : lb.getStorageTypes()) {
+        Assert.assertEquals(StorageType.ARCHIVE,type);
+      }
+    }
+  }
+  finally {
+    cluster.shutdown();
+  }
+}

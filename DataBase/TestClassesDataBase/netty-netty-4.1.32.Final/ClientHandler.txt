@@ -1,0 +1,58 @@
+private static class ClientHandler extends SimpleChannelInboundHandler<ByteBuf> {
+  volatile Channel channel;
+  final AtomicReference<Throwable> exception=new AtomicReference<Throwable>();
+  volatile int step;
+  private long currentLastTime=TrafficCounter.milliSecondFromNano();
+  private final long[] minimalWaitBetween;
+  private final int[] multipleMessage;
+  private final int[] autoRead;
+  final Promise<Boolean> promise;
+  ClientHandler(  Promise<Boolean> promise,  long[] minimalWaitBetween,  int[] multipleMessage,  int[] autoRead){
+    this.minimalWaitBetween=minimalWaitBetween;
+    this.multipleMessage=Arrays.copyOf(multipleMessage,multipleMessage.length);
+    this.promise=promise;
+    this.autoRead=autoRead;
+  }
+  @Override public void channelActive(  ChannelHandlerContext ctx) throws Exception {
+    channel=ctx.channel();
+  }
+  @Override public void channelRead0(  ChannelHandlerContext ctx,  ByteBuf in) throws Exception {
+    long lastTimestamp=0;
+    loggerClient.debug("Step: " + step + " Read: "+ in.readableBytes() / 8 + " blocks");
+    while (in.isReadable()) {
+      lastTimestamp=in.readLong();
+      multipleMessage[step]--;
+    }
+    if (multipleMessage[step] > 0) {
+      return;
+    }
+    long minimalWait=minimalWaitBetween != null ? minimalWaitBetween[step] : 0;
+    int ar=0;
+    if (autoRead != null) {
+      if (step > 0 && autoRead[step - 1] != 0) {
+        ar=autoRead[step - 1];
+      }
+    }
+    loggerClient.info("Step: " + step + " Interval: "+ (lastTimestamp - currentLastTime)+ " compareTo "+ minimalWait+ " ("+ ar+ ')');
+    assertTrue("The interval of time is incorrect:" + (lastTimestamp - currentLastTime) + " not> "+ minimalWait,lastTimestamp - currentLastTime >= minimalWait);
+    currentLastTime=lastTimestamp;
+    step++;
+    if (multipleMessage.length > step) {
+      int nb=multipleMessage[step];
+      for (int i=0; i < nb; i++) {
+        channel.write(channel.alloc().buffer().writeBytes(data));
+      }
+      channel.flush();
+    }
+ else {
+      promise.setSuccess(true);
+    }
+  }
+  @Override public void exceptionCaught(  ChannelHandlerContext ctx,  Throwable cause) throws Exception {
+    if (exception.compareAndSet(null,cause)) {
+      cause.printStackTrace();
+      promise.setFailure(cause);
+      ctx.close();
+    }
+  }
+}

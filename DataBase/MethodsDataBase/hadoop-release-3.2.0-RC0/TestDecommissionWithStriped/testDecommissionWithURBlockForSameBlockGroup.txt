@@ -1,0 +1,69 @@
+@Test(timeout=120000) public void testDecommissionWithURBlockForSameBlockGroup() throws Exception {
+  LOG.info("Starting test testDecommissionWithURBlocksForSameBlockGroup");
+  final Path ecFile=new Path(ecDir,"testDecommissionWithCorruptBlocks");
+  int writeBytes=cellSize * dataBlocks * 2;
+  writeStripedFile(dfs,ecFile,writeBytes);
+  Assert.assertEquals(0,bm.numOfUnderReplicatedBlocks());
+  final List<DatanodeInfo> decommisionNodes=new ArrayList<DatanodeInfo>();
+  LocatedBlock lb=dfs.getClient().getLocatedBlocks(ecFile.toString(),0).get(0);
+  DatanodeInfo[] dnLocs=lb.getLocations();
+  assertEquals(dataBlocks + parityBlocks,dnLocs.length);
+  int decommNodeIndex=dataBlocks - 1;
+  int stopNodeIndex=1;
+  decommisionNodes.add(dnLocs[decommNodeIndex]);
+  DatanodeInfo[] info=client.datanodeReport(DatanodeReportType.LIVE);
+  List<DataNodeProperties> stoppedDns=new ArrayList<>();
+  for (  DatanodeInfo liveDn : info) {
+    boolean usedNode=false;
+    for (    DatanodeInfo datanodeInfo : dnLocs) {
+      if (liveDn.getXferAddr().equals(datanodeInfo.getXferAddr())) {
+        usedNode=true;
+        break;
+      }
+    }
+    if (!usedNode) {
+      DataNode dn=cluster.getDataNode(liveDn.getIpcPort());
+      stoppedDns.add(cluster.stopDataNode(liveDn.getXferAddr()));
+      cluster.setDataNodeDead(dn.getDatanodeId());
+      LOG.info("stop datanode " + dn.getDatanodeId().getHostName());
+    }
+  }
+  DataNode dn=cluster.getDataNode(dnLocs[stopNodeIndex].getIpcPort());
+  cluster.stopDataNode(dnLocs[stopNodeIndex].getXferAddr());
+  cluster.setDataNodeDead(dn.getDatanodeId());
+  numDNs=numDNs - 1;
+  final CountDownLatch decomStarted=new CountDownLatch(0);
+  Thread decomTh=new Thread(){
+    public void run(){
+      try {
+        decomStarted.countDown();
+        decommissionNode(0,decommisionNodes,AdminStates.DECOMMISSIONED);
+      }
+ catch (      Exception e) {
+        LOG.error("Exception while decommissioning",e);
+        Assert.fail("Shouldn't throw exception!");
+      }
+    }
+  }
+;
+  int deadDecomissioned=fsn.getNumDecomDeadDataNodes();
+  int liveDecomissioned=fsn.getNumDecomLiveDataNodes();
+  decomTh.start();
+  decomStarted.await(5,TimeUnit.SECONDS);
+  Thread.sleep(3000);
+  for (  DataNodeProperties dnp : stoppedDns) {
+    cluster.restartDataNode(dnp);
+    LOG.info("Restarts stopped datanode:{} to trigger block reconstruction",dnp.datanode);
+  }
+  cluster.waitActive();
+  LOG.info("Waiting to finish decommissioning node:{}",decommisionNodes);
+  decomTh.join(20000);
+  LOG.info("Finished decommissioning node:{}",decommisionNodes);
+  assertEquals(deadDecomissioned,fsn.getNumDecomDeadDataNodes());
+  assertEquals(liveDecomissioned + decommisionNodes.size(),fsn.getNumDecomLiveDataNodes());
+  DFSClient client=getDfsClient(cluster.getNameNode(0),conf);
+  assertEquals("All datanodes must be alive",numDNs,client.datanodeReport(DatanodeReportType.LIVE).length);
+  assertNull(checkFile(dfs,ecFile,9,decommisionNodes,numDNs));
+  StripedFileTestUtil.checkData(dfs,ecFile,writeBytes,decommisionNodes,null,blockGroupSize);
+  cleanupFile(dfs,ecFile);
+}

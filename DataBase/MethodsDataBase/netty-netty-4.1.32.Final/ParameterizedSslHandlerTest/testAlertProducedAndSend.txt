@@ -1,0 +1,68 @@
+@Test(timeout=30000) public void testAlertProducedAndSend() throws Exception {
+  SelfSignedCertificate ssc=new SelfSignedCertificate();
+  final SslContext sslServerCtx=SslContextBuilder.forServer(ssc.certificate(),ssc.privateKey()).sslProvider(serverProvider).trustManager(new SimpleTrustManagerFactory(){
+    @Override protected void engineInit(    KeyStore keyStore){
+    }
+    @Override protected void engineInit(    ManagerFactoryParameters managerFactoryParameters){
+    }
+    @Override protected TrustManager[] engineGetTrustManagers(){
+      return new TrustManager[]{new X509TrustManager(){
+        @Override public void checkClientTrusted(        X509Certificate[] x509Certificates,        String s) throws CertificateException {
+          throw new CertificateException();
+        }
+        @Override public void checkServerTrusted(        X509Certificate[] x509Certificates,        String s){
+        }
+        @Override public X509Certificate[] getAcceptedIssuers(){
+          return EmptyArrays.EMPTY_X509_CERTIFICATES;
+        }
+      }
+};
+    }
+  }
+).clientAuth(ClientAuth.REQUIRE).build();
+  final SslContext sslClientCtx=SslContextBuilder.forClient().trustManager(InsecureTrustManagerFactory.INSTANCE).keyManager(new File(getClass().getResource("test.crt").getFile()),new File(getClass().getResource("test_unencrypted.pem").getFile())).sslProvider(clientProvider).build();
+  NioEventLoopGroup group=new NioEventLoopGroup();
+  Channel sc=null;
+  Channel cc=null;
+  try {
+    final Promise<Void> promise=group.next().newPromise();
+    sc=new ServerBootstrap().group(group).channel(NioServerSocketChannel.class).childHandler(new ChannelInitializer<Channel>(){
+      @Override protected void initChannel(      Channel ch) throws Exception {
+        ch.pipeline().addLast(sslServerCtx.newHandler(ch.alloc()));
+        ch.pipeline().addLast(new ChannelInboundHandlerAdapter(){
+          @Override public void exceptionCaught(          ChannelHandlerContext ctx,          Throwable cause){
+            ctx.close();
+          }
+        }
+);
+      }
+    }
+).bind(new InetSocketAddress(0)).syncUninterruptibly().channel();
+    cc=new Bootstrap().group(group).channel(NioSocketChannel.class).handler(new ChannelInitializer<Channel>(){
+      @Override protected void initChannel(      Channel ch) throws Exception {
+        ch.pipeline().addLast(sslClientCtx.newHandler(ch.alloc()));
+        ch.pipeline().addLast(new ChannelInboundHandlerAdapter(){
+          @Override public void exceptionCaught(          ChannelHandlerContext ctx,          Throwable cause){
+            if (cause.getCause() instanceof SSLException) {
+              promise.trySuccess(null);
+            }
+          }
+        }
+);
+      }
+    }
+).connect(sc.localAddress()).syncUninterruptibly().channel();
+    promise.syncUninterruptibly();
+  }
+  finally {
+    if (cc != null) {
+      cc.close().syncUninterruptibly();
+    }
+    if (sc != null) {
+      sc.close().syncUninterruptibly();
+    }
+    group.shutdownGracefully();
+    ReferenceCountUtil.release(sslServerCtx);
+    ReferenceCountUtil.release(sslClientCtx);
+  }
+}

@@ -1,0 +1,51 @@
+/** 
+ * Tests stopping all the active DataXceiver thread on volume failure event.
+ * @throws Exception
+ */
+@Test public void testCleanShutdownOfVolume() throws Exception {
+  MiniDFSCluster cluster=null;
+  try {
+    Configuration config=new HdfsConfiguration();
+    config.setLong(DFSConfigKeys.DFS_DATANODE_XCEIVER_STOP_TIMEOUT_MILLIS_KEY,1000);
+    config.setTimeDuration(DFSConfigKeys.DFS_DATANODE_DISK_CHECK_MIN_GAP_KEY,0,TimeUnit.MILLISECONDS);
+    config.setInt(DFSConfigKeys.DFS_DATANODE_FAILED_VOLUMES_TOLERATED_KEY,1);
+    cluster=new MiniDFSCluster.Builder(config,GenericTestUtils.getRandomizedTestDir()).numDataNodes(1).build();
+    cluster.waitActive();
+    FileSystem fs=cluster.getFileSystem();
+    DataNode dataNode=cluster.getDataNodes().get(0);
+    Path filePath=new Path("test.dat");
+    FSDataOutputStream out=fs.create(filePath,(short)1);
+    out.write(1);
+    out.hflush();
+    ExtendedBlock block=DFSTestUtil.getFirstBlock(fs,filePath);
+    final FsVolumeImpl volume=(FsVolumeImpl)dataNode.getFSDataset().getVolume(block);
+    File finalizedDir=volume.getFinalizedDir(cluster.getNamesystem().getBlockPoolId());
+    LocatedBlock lb=DFSTestUtil.getAllBlocks(fs,filePath).get(0);
+    DatanodeInfo info=lb.getLocations()[0];
+    if (finalizedDir.exists()) {
+      finalizedDir.setExecutable(false);
+      assertTrue(FileUtil.setWritable(finalizedDir,false));
+    }
+    Assert.assertTrue("Reference count for the volume should be greater " + "than 0",volume.getReferenceCount() > 0);
+    dataNode.checkDiskError();
+    GenericTestUtils.waitFor(new Supplier<Boolean>(){
+      @Override public Boolean get(){
+        return volume.getReferenceCount() == 0;
+      }
+    }
+,100,1000);
+    assertThat(dataNode.getFSDataset().getNumFailedVolumes(),is(1));
+    try {
+      out.close();
+      Assert.fail("This is not a valid code path. " + "out.close should have thrown an exception.");
+    }
+ catch (    IOException ioe) {
+      GenericTestUtils.assertExceptionContains(info.getXferAddr(),ioe);
+    }
+    assertTrue(FileUtil.setWritable(finalizedDir,true));
+    finalizedDir.setExecutable(true);
+  }
+  finally {
+    cluster.shutdown();
+  }
+}

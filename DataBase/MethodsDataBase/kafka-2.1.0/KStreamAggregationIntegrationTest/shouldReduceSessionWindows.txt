@@ -1,0 +1,34 @@
+@Test public void shouldReduceSessionWindows() throws Exception {
+  final long sessionGap=1000L;
+  final long t1=mockTime.milliseconds();
+  final List<KeyValue<String,String>> t1Messages=Arrays.asList(new KeyValue<>("bob","start"),new KeyValue<>("penny","start"),new KeyValue<>("jo","pause"),new KeyValue<>("emily","pause"));
+  IntegrationTestUtils.produceKeyValuesSynchronouslyWithTimestamp(userSessionsStream,t1Messages,TestUtils.producerConfig(CLUSTER.bootstrapServers(),StringSerializer.class,StringSerializer.class,new Properties()),t1);
+  final long t2=t1 + (sessionGap / 2);
+  IntegrationTestUtils.produceKeyValuesSynchronouslyWithTimestamp(userSessionsStream,Collections.singletonList(new KeyValue<>("emily","resume")),TestUtils.producerConfig(CLUSTER.bootstrapServers(),StringSerializer.class,StringSerializer.class,new Properties()),t2);
+  final long t3=t1 + sessionGap + 1;
+  IntegrationTestUtils.produceKeyValuesSynchronouslyWithTimestamp(userSessionsStream,Arrays.asList(new KeyValue<>("bob","pause"),new KeyValue<>("penny","stop")),TestUtils.producerConfig(CLUSTER.bootstrapServers(),StringSerializer.class,StringSerializer.class,new Properties()),t3);
+  final long t4=t3 + (sessionGap / 2);
+  IntegrationTestUtils.produceKeyValuesSynchronouslyWithTimestamp(userSessionsStream,Arrays.asList(new KeyValue<>("bob","resume"),new KeyValue<>("jo","resume")),TestUtils.producerConfig(CLUSTER.bootstrapServers(),StringSerializer.class,StringSerializer.class,new Properties()),t4);
+  final Map<Windowed<String>,String> results=new HashMap<>();
+  final CountDownLatch latch=new CountDownLatch(11);
+  final String userSessionsStore="UserSessionsStore";
+  builder.stream(userSessionsStream,Consumed.with(Serdes.String(),Serdes.String())).groupByKey(Serialized.with(Serdes.String(),Serdes.String())).windowedBy(SessionWindows.with(ofMillis(sessionGap))).reduce((value1,value2) -> value1 + ":" + value2,Materialized.as(userSessionsStore)).toStream().foreach((key,value) -> {
+    results.put(key,value);
+    latch.countDown();
+  }
+);
+  startStreams();
+  latch.await(30,TimeUnit.SECONDS);
+  final ReadOnlySessionStore<String,String> sessionStore=kafkaStreams.store(userSessionsStore,QueryableStoreTypes.sessionStore());
+  assertThat(results.get(new Windowed<>("bob",new SessionWindow(t1,t1))),equalTo("start"));
+  assertThat(results.get(new Windowed<>("penny",new SessionWindow(t1,t1))),equalTo("start"));
+  assertThat(results.get(new Windowed<>("jo",new SessionWindow(t1,t1))),equalTo("pause"));
+  assertThat(results.get(new Windowed<>("jo",new SessionWindow(t4,t4))),equalTo("resume"));
+  assertThat(results.get(new Windowed<>("emily",new SessionWindow(t1,t2))),equalTo("pause:resume"));
+  assertThat(results.get(new Windowed<>("bob",new SessionWindow(t3,t4))),equalTo("pause:resume"));
+  assertThat(results.get(new Windowed<>("penny",new SessionWindow(t3,t3))),equalTo("stop"));
+  final KeyValueIterator<Windowed<String>,String> bob=sessionStore.fetch("bob");
+  assertThat(bob.next(),equalTo(KeyValue.pair(new Windowed<>("bob",new SessionWindow(t1,t1)),"start")));
+  assertThat(bob.next(),equalTo(KeyValue.pair(new Windowed<>("bob",new SessionWindow(t3,t4)),"pause:resume")));
+  assertFalse(bob.hasNext());
+}

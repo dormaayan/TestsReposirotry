@@ -1,0 +1,72 @@
+/** 
+ * The logSync() method in FSEditLog is unsynchronized whiel syncing so that other threads can concurrently enqueue edits while the prior sync is ongoing. This test checks that the log is saved correctly if the saveImage occurs while the syncing thread is in the unsynchronized middle section. This replicates the following manual test proposed by Konstantin: I start the name-node in debugger. I do -mkdir and stop the debugger in logSync() just before it does flush. Then I enter safe mode with another client I start saveNamepsace and stop the debugger in FSImage.saveFSImage() -> FSEditLog.createEditLogFile() -> EditLogFileOutputStream.create() -> after truncating the file but before writing LAYOUT_VERSION into it. Then I let logSync() run. Then I terminate the name-node. After that the name-node wont start, since the edits file is broken.
+ */
+@Test public void testSaveImageWhileSyncInProgress() throws Exception {
+  Configuration conf=getConf();
+  NameNode.initMetrics(conf,NamenodeRole.NAMENODE);
+  DFSTestUtil.formatNameNode(conf);
+  final FSNamesystem namesystem=FSNamesystem.loadFromDisk(conf);
+  try {
+    FSImage fsimage=namesystem.getFSImage();
+    FSEditLog editLog=fsimage.getEditLog();
+    JournalAndStream jas=editLog.getJournals().get(0);
+    EditLogFileOutputStream spyElos=spy((EditLogFileOutputStream)jas.getCurrentStream());
+    jas.setCurrentStreamForTests(spyElos);
+    final AtomicReference<Throwable> deferredException=new AtomicReference<Throwable>();
+    final CountDownLatch waitToEnterFlush=new CountDownLatch(1);
+    final Thread doAnEditThread=new Thread(){
+      @Override public void run(){
+        try {
+          LOG.info("Starting mkdirs");
+          namesystem.mkdirs("/test",new PermissionStatus("test","test",new FsPermission((short)00755)),true);
+          LOG.info("mkdirs complete");
+        }
+ catch (        Throwable ioe) {
+          LOG.error("Got exception",ioe);
+          deferredException.set(ioe);
+          waitToEnterFlush.countDown();
+        }
+      }
+    }
+;
+    Answer<Void> blockingFlush=new Answer<Void>(){
+      @Override public Void answer(      InvocationOnMock invocation) throws Throwable {
+        LOG.info("Flush called");
+        if (useAsyncEditLog || Thread.currentThread() == doAnEditThread) {
+          LOG.info("edit thread: Telling main thread we made it to flush section...");
+          waitToEnterFlush.countDown();
+          LOG.info("edit thread: sleeping for " + BLOCK_TIME + "secs");
+          Thread.sleep(BLOCK_TIME * 1000);
+          LOG.info("Going through to flush. This will allow the main thread to continue.");
+        }
+        invocation.callRealMethod();
+        LOG.info("Flush complete");
+        return null;
+      }
+    }
+;
+    doAnswer(blockingFlush).when(spyElos).flush();
+    doAnEditThread.start();
+    LOG.info("Main thread: waiting to enter flush...");
+    waitToEnterFlush.await();
+    assertNull(deferredException.get());
+    LOG.info("Main thread: detected that logSync is in unsynchronized section.");
+    LOG.info("Trying to enter safe mode.");
+    LOG.info("This should block for " + BLOCK_TIME + "sec, since flush will sleep that long");
+    long st=Time.now();
+    namesystem.setSafeMode(SafeModeAction.SAFEMODE_ENTER);
+    long et=Time.now();
+    LOG.info("Entered safe mode");
+    assertTrue(et - st > (BLOCK_TIME - 1) * 1000);
+    namesystem.saveNamespace(0,0);
+    LOG.info("Joining on edit thread...");
+    doAnEditThread.join();
+    assertNull(deferredException.get());
+    assertEquals(3,verifyEditLogs(namesystem,fsimage,NNStorage.getFinalizedEditsFileName(1,3),1));
+    assertEquals(1,verifyEditLogs(namesystem,fsimage,NNStorage.getInProgressEditsFileName(4),4));
+  }
+  finally {
+    LOG.info("Closing nn");
+    if (namesystem != null)     namesystem.close();
+  }
+}

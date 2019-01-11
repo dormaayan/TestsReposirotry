@@ -1,0 +1,47 @@
+@Test public void recoverFromConnectionNoNewStreamsOnFollowUp() throws Exception {
+  server.enqueue(new MockResponse().setResponseCode(401));
+  server.enqueue(new MockResponse().setSocketPolicy(SocketPolicy.RESET_STREAM_AT_START).setHttp2ErrorCode(ErrorCode.INTERNAL_ERROR.httpCode));
+  server.enqueue(new MockResponse().setBody("DEF"));
+  server.enqueue(new MockResponse().setResponseCode(301).addHeader("Location","/foo"));
+  server.enqueue(new MockResponse().setBody("ABC"));
+  final CountDownLatch latch=new CountDownLatch(1);
+  final BlockingQueue<String> responses=new SynchronousQueue<>();
+  okhttp3.Authenticator authenticator=new okhttp3.Authenticator(){
+    @Override public Request authenticate(    Route route,    Response response) throws IOException {
+      responses.offer(response.body().string());
+      try {
+        latch.await();
+      }
+ catch (      InterruptedException e) {
+        throw new AssertionError();
+      }
+      return response.request();
+    }
+  }
+;
+  OkHttpClient blockingAuthClient=client.newBuilder().authenticator(authenticator).build();
+  Callback callback=new Callback(){
+    @Override public void onFailure(    Call call,    IOException e){
+      fail();
+    }
+    @Override public void onResponse(    Call call,    Response response) throws IOException {
+      responses.offer(response.body().string());
+    }
+  }
+;
+  Request request=new Request.Builder().url(server.url("/")).build();
+  blockingAuthClient.newCall(request).enqueue(callback);
+  String response1=responses.take();
+  assertEquals("",response1);
+  assertEquals(0,server.takeRequest().getSequenceNumber());
+  client.newCall(request).enqueue(callback);
+  String response2=responses.take();
+  assertEquals("DEF",response2);
+  assertEquals(1,server.takeRequest().getSequenceNumber());
+  assertEquals(0,server.takeRequest().getSequenceNumber());
+  latch.countDown();
+  String response3=responses.take();
+  assertEquals("ABC",response3);
+  assertEquals(1,server.takeRequest().getSequenceNumber());
+  assertEquals(2,server.takeRequest().getSequenceNumber());
+}

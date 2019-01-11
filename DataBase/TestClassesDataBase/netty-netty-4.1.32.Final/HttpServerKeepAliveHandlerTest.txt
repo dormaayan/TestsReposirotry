@@ -1,0 +1,140 @@
+@RunWith(Parameterized.class) public class HttpServerKeepAliveHandlerTest {
+  private static final String REQUEST_KEEP_ALIVE="REQUEST_KEEP_ALIVE";
+  private static final int NOT_SELF_DEFINED_MSG_LENGTH=0;
+  private static final int SET_RESPONSE_LENGTH=1;
+  private static final int SET_MULTIPART=2;
+  private static final int SET_CHUNKED=4;
+  private final boolean isKeepAliveResponseExpected;
+  private final HttpVersion httpVersion;
+  private final HttpResponseStatus responseStatus;
+  private final String sendKeepAlive;
+  private final int setSelfDefinedMessageLength;
+  private final String setResponseConnection;
+  private EmbeddedChannel channel;
+  @Parameters public static Collection<Object[]> keepAliveProvider(){
+    return Arrays.asList(new Object[][]{{true,HttpVersion.HTTP_1_0,OK,REQUEST_KEEP_ALIVE,SET_RESPONSE_LENGTH,KEEP_ALIVE},{true,HttpVersion.HTTP_1_0,OK,REQUEST_KEEP_ALIVE,SET_MULTIPART,KEEP_ALIVE},{false,HttpVersion.HTTP_1_0,OK,null,SET_RESPONSE_LENGTH,null},{true,HttpVersion.HTTP_1_1,OK,REQUEST_KEEP_ALIVE,SET_RESPONSE_LENGTH,null},{false,HttpVersion.HTTP_1_1,OK,REQUEST_KEEP_ALIVE,SET_RESPONSE_LENGTH,CLOSE},{true,HttpVersion.HTTP_1_1,OK,REQUEST_KEEP_ALIVE,SET_MULTIPART,null},{true,HttpVersion.HTTP_1_1,OK,REQUEST_KEEP_ALIVE,SET_CHUNKED,null},{false,HttpVersion.HTTP_1_1,OK,null,SET_RESPONSE_LENGTH,null},{false,HttpVersion.HTTP_1_0,OK,REQUEST_KEEP_ALIVE,NOT_SELF_DEFINED_MSG_LENGTH,null},{false,HttpVersion.HTTP_1_0,OK,null,NOT_SELF_DEFINED_MSG_LENGTH,null},{false,HttpVersion.HTTP_1_1,OK,REQUEST_KEEP_ALIVE,NOT_SELF_DEFINED_MSG_LENGTH,null},{false,HttpVersion.HTTP_1_1,OK,null,NOT_SELF_DEFINED_MSG_LENGTH,null},{false,HttpVersion.HTTP_1_0,OK,REQUEST_KEEP_ALIVE,SET_RESPONSE_LENGTH,null},{true,HttpVersion.HTTP_1_1,NO_CONTENT,REQUEST_KEEP_ALIVE,NOT_SELF_DEFINED_MSG_LENGTH,null},{false,HttpVersion.HTTP_1_0,NO_CONTENT,null,NOT_SELF_DEFINED_MSG_LENGTH,null}});
+  }
+  public HttpServerKeepAliveHandlerTest(  boolean isKeepAliveResponseExpected,  HttpVersion httpVersion,  HttpResponseStatus responseStatus,  String sendKeepAlive,  int setSelfDefinedMessageLength,  CharSequence setResponseConnection){
+    this.isKeepAliveResponseExpected=isKeepAliveResponseExpected;
+    this.httpVersion=httpVersion;
+    this.responseStatus=responseStatus;
+    this.sendKeepAlive=sendKeepAlive;
+    this.setSelfDefinedMessageLength=setSelfDefinedMessageLength;
+    this.setResponseConnection=setResponseConnection == null ? null : setResponseConnection.toString();
+  }
+  @Before public void setUp(){
+    channel=new EmbeddedChannel(new HttpServerKeepAliveHandler());
+  }
+  @Test public void test_KeepAlive() throws Exception {
+    FullHttpRequest request=new DefaultFullHttpRequest(httpVersion,HttpMethod.GET,"/v1/foo/bar");
+    setKeepAlive(request,REQUEST_KEEP_ALIVE.equals(sendKeepAlive));
+    HttpResponse response=new DefaultFullHttpResponse(httpVersion,responseStatus);
+    if (!StringUtil.isNullOrEmpty(setResponseConnection)) {
+      response.headers().set(HttpHeaderNames.CONNECTION,setResponseConnection);
+    }
+    setupMessageLength(response);
+    assertTrue(channel.writeInbound(request));
+    Object requestForwarded=channel.readInbound();
+    assertEquals(request,requestForwarded);
+    ReferenceCountUtil.release(requestForwarded);
+    channel.writeAndFlush(response);
+    HttpResponse writtenResponse=channel.readOutbound();
+    assertEquals("channel.isOpen",isKeepAliveResponseExpected,channel.isOpen());
+    assertEquals("response keep-alive",isKeepAliveResponseExpected,isKeepAlive(writtenResponse));
+    ReferenceCountUtil.release(writtenResponse);
+    assertFalse(channel.finishAndReleaseAll());
+  }
+  @Test public void testConnectionCloseHeaderHandledCorrectly() throws Exception {
+    HttpResponse response=new DefaultFullHttpResponse(httpVersion,responseStatus);
+    response.headers().set(HttpHeaderNames.CONNECTION,HttpHeaderValues.CLOSE);
+    setupMessageLength(response);
+    channel.writeAndFlush(response);
+    HttpResponse writtenResponse=channel.readOutbound();
+    assertFalse(channel.isOpen());
+    ReferenceCountUtil.release(writtenResponse);
+    assertFalse(channel.finishAndReleaseAll());
+  }
+  @Test public void testConnectionCloseHeaderHandledCorrectlyForVoidPromise() throws Exception {
+    HttpResponse response=new DefaultFullHttpResponse(httpVersion,responseStatus);
+    response.headers().set(HttpHeaderNames.CONNECTION,HttpHeaderValues.CLOSE);
+    setupMessageLength(response);
+    channel.writeAndFlush(response,channel.voidPromise());
+    HttpResponse writtenResponse=channel.readOutbound();
+    assertFalse(channel.isOpen());
+    ReferenceCountUtil.release(writtenResponse);
+    assertFalse(channel.finishAndReleaseAll());
+  }
+  @Test public void test_PipelineKeepAlive(){
+    FullHttpRequest firstRequest=new DefaultFullHttpRequest(httpVersion,HttpMethod.GET,"/v1/foo/bar");
+    setKeepAlive(firstRequest,true);
+    FullHttpRequest secondRequest=new DefaultFullHttpRequest(httpVersion,HttpMethod.GET,"/v1/foo/bar");
+    setKeepAlive(secondRequest,REQUEST_KEEP_ALIVE.equals(sendKeepAlive));
+    FullHttpRequest finalRequest=new DefaultFullHttpRequest(httpVersion,HttpMethod.GET,"/v1/foo/bar");
+    setKeepAlive(finalRequest,false);
+    FullHttpResponse response=new DefaultFullHttpResponse(httpVersion,responseStatus);
+    FullHttpResponse informationalResp=new DefaultFullHttpResponse(httpVersion,HttpResponseStatus.PROCESSING);
+    setKeepAlive(response,true);
+    setContentLength(response,0);
+    setKeepAlive(informationalResp,true);
+    assertTrue(channel.writeInbound(firstRequest,secondRequest,finalRequest));
+    Object requestForwarded=channel.readInbound();
+    assertEquals(firstRequest,requestForwarded);
+    ReferenceCountUtil.release(requestForwarded);
+    channel.writeAndFlush(response.retainedDuplicate());
+    HttpResponse firstResponse=channel.readOutbound();
+    assertTrue("channel.isOpen",channel.isOpen());
+    assertTrue("response keep-alive",isKeepAlive(firstResponse));
+    ReferenceCountUtil.release(firstResponse);
+    requestForwarded=channel.readInbound();
+    assertEquals(secondRequest,requestForwarded);
+    ReferenceCountUtil.release(requestForwarded);
+    channel.writeAndFlush(informationalResp);
+    HttpResponse writtenInfoResp=channel.readOutbound();
+    assertTrue("channel.isOpen",channel.isOpen());
+    assertTrue("response keep-alive",isKeepAlive(writtenInfoResp));
+    ReferenceCountUtil.release(writtenInfoResp);
+    if (!StringUtil.isNullOrEmpty(setResponseConnection)) {
+      response.headers().set(HttpHeaderNames.CONNECTION,setResponseConnection);
+    }
+ else {
+      response.headers().remove(HttpHeaderNames.CONNECTION);
+    }
+    setupMessageLength(response);
+    channel.writeAndFlush(response.retainedDuplicate());
+    HttpResponse secondResponse=channel.readOutbound();
+    assertEquals("channel.isOpen",isKeepAliveResponseExpected,channel.isOpen());
+    assertEquals("response keep-alive",isKeepAliveResponseExpected,isKeepAlive(secondResponse));
+    ReferenceCountUtil.release(secondResponse);
+    requestForwarded=channel.readInbound();
+    assertEquals(finalRequest,requestForwarded);
+    ReferenceCountUtil.release(requestForwarded);
+    if (isKeepAliveResponseExpected) {
+      channel.writeAndFlush(response);
+      HttpResponse finalResponse=channel.readOutbound();
+      assertFalse("channel.isOpen",channel.isOpen());
+      assertFalse("response keep-alive",isKeepAlive(finalResponse));
+    }
+    ReferenceCountUtil.release(response);
+    assertFalse(channel.finishAndReleaseAll());
+  }
+  private void setupMessageLength(  HttpResponse response){
+switch (setSelfDefinedMessageLength) {
+case NOT_SELF_DEFINED_MSG_LENGTH:
+      if (isContentLengthSet(response)) {
+        response.headers().remove(HttpHeaderNames.CONTENT_LENGTH);
+      }
+    break;
+case SET_RESPONSE_LENGTH:
+  setContentLength(response,0);
+break;
+case SET_CHUNKED:
+setTransferEncodingChunked(response,true);
+break;
+case SET_MULTIPART:
+response.headers().set(HttpHeaderNames.CONTENT_TYPE,MULTIPART_MIXED.toUpperCase());
+break;
+default :
+throw new IllegalArgumentException("selfDefinedMessageLength: " + setSelfDefinedMessageLength);
+}
+}
+}

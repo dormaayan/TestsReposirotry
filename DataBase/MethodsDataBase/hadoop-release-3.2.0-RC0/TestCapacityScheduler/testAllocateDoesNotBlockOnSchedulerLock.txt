@@ -1,0 +1,70 @@
+@Test(timeout=30000) public void testAllocateDoesNotBlockOnSchedulerLock() throws Exception {
+  final YarnConfiguration conf=new YarnConfiguration();
+  conf.setClass(YarnConfiguration.RM_SCHEDULER,CapacityScheduler.class,ResourceScheduler.class);
+  MyContainerManager containerManager=new MyContainerManager();
+  final MockRMWithAMS rm=new MockRMWithAMS(conf,containerManager);
+  rm.start();
+  MockNM nm1=rm.registerNode("localhost:1234",5120);
+  Map<ApplicationAccessType,String> acls=new HashMap<ApplicationAccessType,String>(2);
+  acls.put(ApplicationAccessType.VIEW_APP,"*");
+  RMApp app=rm.submitApp(1024,"appname","appuser",acls);
+  nm1.nodeHeartbeat(true);
+  RMAppAttempt attempt=app.getCurrentAppAttempt();
+  ApplicationAttemptId applicationAttemptId=attempt.getAppAttemptId();
+  int msecToWait=10000;
+  int msecToSleep=100;
+  while (attempt.getAppAttemptState() != RMAppAttemptState.LAUNCHED && msecToWait > 0) {
+    LOG.info("Waiting for AppAttempt to reach LAUNCHED state. " + "Current state is " + attempt.getAppAttemptState());
+    Thread.sleep(msecToSleep);
+    msecToWait-=msecToSleep;
+  }
+  Assert.assertEquals(attempt.getAppAttemptState(),RMAppAttemptState.LAUNCHED);
+  final YarnRPC rpc=YarnRPC.create(conf);
+  UserGroupInformation currentUser=UserGroupInformation.createRemoteUser(applicationAttemptId.toString());
+  Credentials credentials=containerManager.getContainerCredentials();
+  final InetSocketAddress rmBindAddress=rm.getApplicationMasterService().getBindAddress();
+  Token<? extends TokenIdentifier> amRMToken=MockRMWithAMS.setupAndReturnAMRMToken(rmBindAddress,credentials.getAllTokens());
+  currentUser.addToken(amRMToken);
+  ApplicationMasterProtocol client=currentUser.doAs(new PrivilegedAction<ApplicationMasterProtocol>(){
+    @Override public ApplicationMasterProtocol run(){
+      return (ApplicationMasterProtocol)rpc.getProxy(ApplicationMasterProtocol.class,rmBindAddress,conf);
+    }
+  }
+);
+  RegisterApplicationMasterRequest request=RegisterApplicationMasterRequest.newInstance("localhost",12345,"");
+  client.registerApplicationMaster(request);
+  List<ResourceRequest> asks=Collections.singletonList(ResourceRequest.newInstance(Priority.newInstance(1),"*",Resources.createResource(2 * GB),1));
+  AllocateRequest allocateRequest=AllocateRequest.newInstance(0,0.0f,asks,null,null);
+  client.allocate(allocateRequest);
+  nm1.nodeHeartbeat(true);
+  ContainerId containerId2=ContainerId.newContainerId(applicationAttemptId,2);
+  Assert.assertTrue(rm.waitForState(nm1,containerId2,RMContainerState.ALLOCATED));
+  allocateRequest=AllocateRequest.newInstance(1,0.0f,null,null,null);
+  client.allocate(allocateRequest);
+  final CapacityScheduler cs=(CapacityScheduler)rm.getResourceScheduler();
+  RMContainer rmContainer=cs.getRMContainer(containerId2);
+  rmContainer.handle(new RMContainerEvent(containerId2,RMContainerEventType.LAUNCHED));
+  final CyclicBarrier barrier=new CyclicBarrier(2);
+  Thread otherThread=new Thread(new Runnable(){
+    @Override public void run(){
+synchronized (cs) {
+        try {
+          barrier.await();
+          barrier.await();
+        }
+ catch (        InterruptedException|BrokenBarrierException e) {
+          e.printStackTrace();
+        }
+      }
+    }
+  }
+);
+  otherThread.start();
+  barrier.await();
+  List<ContainerId> release=Collections.singletonList(containerId2);
+  allocateRequest=AllocateRequest.newInstance(2,0.0f,null,release,null);
+  client.allocate(allocateRequest);
+  barrier.await();
+  otherThread.join();
+  rm.stop();
+}

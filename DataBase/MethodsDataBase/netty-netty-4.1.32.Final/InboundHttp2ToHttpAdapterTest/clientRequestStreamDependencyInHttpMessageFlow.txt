@@ -1,0 +1,43 @@
+@Test public void clientRequestStreamDependencyInHttpMessageFlow() throws Exception {
+  boostrapEnv(1,2,1);
+  final String text="hello world big time data!";
+  final ByteBuf content=Unpooled.copiedBuffer(text.getBytes());
+  final String text2="hello world big time data...number 2!!";
+  final ByteBuf content2=Unpooled.copiedBuffer(text2.getBytes());
+  final FullHttpRequest request=new DefaultFullHttpRequest(HttpVersion.HTTP_1_1,HttpMethod.PUT,"/some/path/resource",content,true);
+  final FullHttpMessage request2=new DefaultFullHttpRequest(HttpVersion.HTTP_1_1,HttpMethod.PUT,"/some/path/resource2",content2,true);
+  try {
+    HttpHeaders httpHeaders=request.headers();
+    httpHeaders.setInt(HttpConversionUtil.ExtensionHeaderNames.STREAM_ID.text(),3);
+    httpHeaders.setInt(HttpHeaderNames.CONTENT_LENGTH,text.length());
+    httpHeaders.setShort(HttpConversionUtil.ExtensionHeaderNames.STREAM_WEIGHT.text(),(short)16);
+    HttpHeaders httpHeaders2=request2.headers();
+    httpHeaders2.setInt(HttpConversionUtil.ExtensionHeaderNames.STREAM_ID.text(),5);
+    httpHeaders2.setInt(HttpConversionUtil.ExtensionHeaderNames.STREAM_DEPENDENCY_ID.text(),3);
+    httpHeaders2.setShort(HttpConversionUtil.ExtensionHeaderNames.STREAM_WEIGHT.text(),(short)123);
+    httpHeaders2.setInt(HttpHeaderNames.CONTENT_LENGTH,text2.length());
+    final Http2Headers http2Headers=new DefaultHttp2Headers().method(new AsciiString("PUT")).path(new AsciiString("/some/path/resource"));
+    final Http2Headers http2Headers2=new DefaultHttp2Headers().method(new AsciiString("PUT")).path(new AsciiString("/some/path/resource2"));
+    runInChannel(clientChannel,new Http2Runnable(){
+      @Override public void run() throws Http2Exception {
+        clientHandler.encoder().writeHeaders(ctxClient(),3,http2Headers,0,false,newPromiseClient());
+        clientHandler.encoder().writeHeaders(ctxClient(),5,http2Headers2,3,(short)123,true,0,false,newPromiseClient());
+        clientChannel.flush();
+        clientHandler.encoder().writeData(ctxClient(),3,content.retainedDuplicate(),0,true,newPromiseClient());
+        clientHandler.encoder().writeData(ctxClient(),5,content2.retainedDuplicate(),0,true,newPromiseClient());
+        clientChannel.flush();
+      }
+    }
+);
+    awaitRequests();
+    ArgumentCaptor<FullHttpMessage> httpObjectCaptor=ArgumentCaptor.forClass(FullHttpMessage.class);
+    verify(serverListener,times(2)).messageReceived(httpObjectCaptor.capture());
+    capturedRequests=httpObjectCaptor.getAllValues();
+    assertEquals(request,capturedRequests.get(0));
+    assertEquals(request2,capturedRequests.get(1));
+  }
+  finally {
+    request.release();
+    request2.release();
+  }
+}

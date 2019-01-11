@@ -1,0 +1,565 @@
+public class TestContainerAllocation {
+  private static final Log LOG=LogFactory.getLog(TestContainerAllocation.class);
+  private final int GB=1024;
+  private YarnConfiguration conf;
+  RMNodeLabelsManager mgr;
+  @Before public void setUp() throws Exception {
+    conf=new YarnConfiguration();
+    conf.setClass(YarnConfiguration.RM_SCHEDULER,CapacityScheduler.class,ResourceScheduler.class);
+    mgr=new NullRMNodeLabelsManager();
+    mgr.init(conf);
+  }
+  @Test(timeout=60000) public void testExcessReservationThanNodeManagerCapacity() throws Exception {
+    @SuppressWarnings("resource") MockRM rm=new MockRM(conf);
+    rm.start();
+    MockNM nm1=rm.registerNode("127.0.0.1:1234",2 * GB,4);
+    MockNM nm2=rm.registerNode("127.0.0.1:2234",3 * GB,4);
+    nm1.nodeHeartbeat(true);
+    nm2.nodeHeartbeat(true);
+    int waitCount=20;
+    int size=rm.getRMContext().getRMNodes().size();
+    while ((size=rm.getRMContext().getRMNodes().size()) != 2 && waitCount-- > 0) {
+      LOG.info("Waiting for node managers to register : " + size);
+      Thread.sleep(100);
+    }
+    Assert.assertEquals(2,rm.getRMContext().getRMNodes().size());
+    RMApp app1=rm.submitApp(128);
+    nm1.nodeHeartbeat(true);
+    RMAppAttempt attempt1=app1.getCurrentAppAttempt();
+    MockAM am1=rm.sendAMLaunched(attempt1.getAppAttemptId());
+    am1.registerAppAttempt();
+    LOG.info("sending container requests ");
+    am1.addRequests(new String[]{"*"},2 * GB,1,1);
+    AllocateResponse alloc1Response=am1.schedule();
+    nm1.nodeHeartbeat(true);
+    int waitCounter=20;
+    LOG.info("heartbeating nm1");
+    while (alloc1Response.getAllocatedContainers().size() < 1 && waitCounter-- > 0) {
+      LOG.info("Waiting for containers to be created for app 1...");
+      Thread.sleep(500);
+      alloc1Response=am1.schedule();
+    }
+    LOG.info("received container : " + alloc1Response.getAllocatedContainers().size());
+    Assert.assertTrue(alloc1Response.getAllocatedContainers().size() == 0);
+    LOG.info("heartbeating nm2");
+    waitCounter=20;
+    nm2.nodeHeartbeat(true);
+    while (alloc1Response.getAllocatedContainers().size() < 1 && waitCounter-- > 0) {
+      LOG.info("Waiting for containers to be created for app 1...");
+      Thread.sleep(500);
+      alloc1Response=am1.schedule();
+    }
+    LOG.info("received container : " + alloc1Response.getAllocatedContainers().size());
+    Assert.assertTrue(alloc1Response.getAllocatedContainers().size() == 1);
+    rm.stop();
+  }
+  @Test public void testContainerTokenGeneratedOnPullRequest() throws Exception {
+    MockRM rm1=new MockRM(conf);
+    rm1.start();
+    MockNM nm1=rm1.registerNode("127.0.0.1:1234",8000);
+    RMApp app1=rm1.submitApp(200);
+    MockAM am1=MockRM.launchAndRegisterAM(app1,rm1,nm1);
+    am1.allocate("127.0.0.1",1024,1,new ArrayList<ContainerId>());
+    ContainerId containerId2=ContainerId.newContainerId(am1.getApplicationAttemptId(),2);
+    rm1.waitForState(nm1,containerId2,RMContainerState.ALLOCATED);
+    RMContainer container=rm1.getResourceScheduler().getRMContainer(containerId2);
+    Assert.assertEquals(containerId2,container.getContainerId());
+    Assert.assertNull(container.getContainer().getContainerToken());
+    List<Container> containers=am1.allocate(new ArrayList<ResourceRequest>(),new ArrayList<ContainerId>()).getAllocatedContainers();
+    Assert.assertEquals(containerId2,containers.get(0).getId());
+    Assert.assertNotNull(containers.get(0).getContainerToken());
+    rm1.stop();
+  }
+  @Test public void testNormalContainerAllocationWhenDNSUnavailable() throws Exception {
+    MockRM rm1=new MockRM(conf);
+    rm1.start();
+    MockNM nm1=rm1.registerNode("unknownhost:1234",8000);
+    RMApp app1=rm1.submitApp(200);
+    MockAM am1=MockRM.launchAndRegisterAM(app1,rm1,nm1);
+    am1.allocate("127.0.0.1",1024,1,new ArrayList<ContainerId>());
+    ContainerId containerId2=ContainerId.newContainerId(am1.getApplicationAttemptId(),2);
+    rm1.waitForState(nm1,containerId2,RMContainerState.ALLOCATED);
+    SecurityUtilTestHelper.setTokenServiceUseIp(true);
+    List<Container> containers;
+    try {
+      containers=am1.allocate(new ArrayList<ResourceRequest>(),new ArrayList<ContainerId>()).getAllocatedContainers();
+      Assert.assertEquals(0,containers.size());
+    }
+  finally {
+      SecurityUtilTestHelper.setTokenServiceUseIp(false);
+    }
+    containers=am1.allocate(new ArrayList<ResourceRequest>(),new ArrayList<ContainerId>()).getAllocatedContainers();
+    Assert.assertEquals(1,containers.size());
+  }
+  @Test public void testLogAggregationContextPassedIntoContainerToken() throws Exception {
+    MockRM rm1=new MockRM(conf);
+    rm1.start();
+    MockNM nm1=rm1.registerNode("127.0.0.1:1234",8000);
+    MockNM nm2=rm1.registerNode("127.0.0.1:2345",8000);
+    Assert.assertNull(getLogAggregationContextFromContainerToken(rm1,nm1,null));
+    LogAggregationContext logAggregationContext=LogAggregationContext.newInstance("includePattern","excludePattern","rolledLogsIncludePattern","rolledLogsExcludePattern","policyClass","policyParameters");
+    LogAggregationContext returned=getLogAggregationContextFromContainerToken(rm1,nm2,logAggregationContext);
+    Assert.assertEquals("includePattern",returned.getIncludePattern());
+    Assert.assertEquals("excludePattern",returned.getExcludePattern());
+    Assert.assertEquals("rolledLogsIncludePattern",returned.getRolledLogsIncludePattern());
+    Assert.assertEquals("rolledLogsExcludePattern",returned.getRolledLogsExcludePattern());
+    Assert.assertEquals("policyClass",returned.getLogAggregationPolicyClassName());
+    Assert.assertEquals("policyParameters",returned.getLogAggregationPolicyParameters());
+    rm1.stop();
+  }
+  private LogAggregationContext getLogAggregationContextFromContainerToken(  MockRM rm1,  MockNM nm1,  LogAggregationContext logAggregationContext) throws Exception {
+    RMApp app2=rm1.submitApp(200,logAggregationContext);
+    MockAM am2=MockRM.launchAndRegisterAM(app2,rm1,nm1);
+    nm1.nodeHeartbeat(true);
+    am2.allocate("127.0.0.1",512,1,new ArrayList<ContainerId>());
+    ContainerId containerId=ContainerId.newContainerId(am2.getApplicationAttemptId(),2);
+    rm1.waitForState(nm1,containerId,RMContainerState.ALLOCATED);
+    List<Container> containers=am2.allocate(new ArrayList<ResourceRequest>(),new ArrayList<ContainerId>()).getAllocatedContainers();
+    Assert.assertEquals(containerId,containers.get(0).getId());
+    Assert.assertNotNull(containers.get(0).getContainerToken());
+    ContainerTokenIdentifier token=BuilderUtils.newContainerTokenIdentifier(containers.get(0).getContainerToken());
+    return token.getLogAggregationContext();
+  }
+  private volatile int numRetries=0;
+private class TestRMSecretManagerService extends RMSecretManagerService {
+    public TestRMSecretManagerService(    Configuration conf,    RMContextImpl rmContext){
+      super(conf,rmContext);
+    }
+    @Override protected RMContainerTokenSecretManager createContainerTokenSecretManager(    Configuration conf){
+      return new RMContainerTokenSecretManager(conf){
+        @Override public Token createContainerToken(        ContainerId containerId,        int containerVersion,        NodeId nodeId,        String appSubmitter,        Resource capability,        Priority priority,        long createTime,        LogAggregationContext logAggregationContext,        String nodeLabelExp,        ContainerType containerType,        ExecutionType executionType,        long allocationRequestId,        Set<String> allocationTags){
+          numRetries++;
+          return super.createContainerToken(containerId,containerVersion,nodeId,appSubmitter,capability,priority,createTime,logAggregationContext,nodeLabelExp,containerType,executionType,allocationRequestId,allocationTags);
+        }
+      }
+;
+    }
+  }
+  @Test(timeout=30000) public void testAMContainerAllocationWhenDNSUnavailable() throws Exception {
+    MockRM rm1=new MockRM(conf){
+      @Override protected RMSecretManagerService createRMSecretManagerService(){
+        return new TestRMSecretManagerService(conf,rmContext);
+      }
+    }
+;
+    rm1.start();
+    MockNM nm1=rm1.registerNode("unknownhost:1234",8000);
+    RMApp app1;
+    try {
+      SecurityUtilTestHelper.setTokenServiceUseIp(true);
+      app1=rm1.submitApp(200);
+      RMAppAttempt attempt=app1.getCurrentAppAttempt();
+      nm1.nodeHeartbeat(true);
+      while (numRetries <= 5) {
+        nm1.nodeHeartbeat(true);
+        Thread.sleep(1000);
+        Assert.assertEquals(RMAppAttemptState.SCHEDULED,attempt.getAppAttemptState());
+        System.out.println("Waiting for am container to be allocated.");
+      }
+    }
+  finally {
+      SecurityUtilTestHelper.setTokenServiceUseIp(false);
+    }
+    MockRM.launchAndRegisterAM(app1,rm1,nm1);
+  }
+  @Test(timeout=60000) public void testExcessReservationWillBeUnreserved() throws Exception {
+    MockRM rm1=new MockRM();
+    rm1.getRMContext().setNodeLabelManager(mgr);
+    rm1.start();
+    MockNM nm1=rm1.registerNode("h1:1234",8 * GB);
+    MockNM nm2=rm1.registerNode("h2:1234",8 * GB);
+    RMApp app1=rm1.submitApp(1 * GB,"app","user",null,"default");
+    MockAM am1=MockRM.launchAndRegisterAM(app1,rm1,nm1);
+    RMApp app2=rm1.submitApp(1 * GB,"app","user",null,"default");
+    MockAM am2=MockRM.launchAndRegisterAM(app2,rm1,nm1);
+    am1.allocate("*",4 * GB,1,new ArrayList<ContainerId>());
+    am2.allocate("*",4 * GB,1,new ArrayList<ContainerId>());
+    CapacityScheduler cs=(CapacityScheduler)rm1.getResourceScheduler();
+    RMNode rmNode1=rm1.getRMContext().getRMNodes().get(nm1.getNodeId());
+    LeafQueue leafQueue=(LeafQueue)cs.getQueue("default");
+    cs.handle(new NodeUpdateSchedulerEvent(rmNode1));
+    cs.handle(new NodeUpdateSchedulerEvent(rmNode1));
+    FiCaSchedulerApp schedulerApp1=cs.getApplicationAttempt(am1.getApplicationAttemptId());
+    FiCaSchedulerApp schedulerApp2=cs.getApplicationAttempt(am2.getApplicationAttemptId());
+    Assert.assertEquals(2,schedulerApp1.getLiveContainers().size());
+    Assert.assertEquals(1,schedulerApp2.getLiveContainers().size());
+    Assert.assertTrue(schedulerApp2.getReservedContainers().size() > 0);
+    Assert.assertEquals(2 * GB,cs.getNode(nm1.getNodeId()).getUnallocatedResource().getMemorySize());
+    Assert.assertNotNull(cs.getNode(nm1.getNodeId()).getReservedContainer());
+    Assert.assertEquals(10 * GB,cs.getRootQueue().getQueueResourceUsage().getUsed().getMemorySize());
+    Assert.assertEquals(4 * GB,cs.getRootQueue().getQueueResourceUsage().getReserved().getMemorySize());
+    Assert.assertEquals(4 * GB,leafQueue.getQueueResourceUsage().getReserved().getMemorySize());
+    am2.allocate("*",4 * GB,0,new ArrayList<ContainerId>());
+    cs.handle(new NodeUpdateSchedulerEvent(rmNode1));
+    Assert.assertTrue(schedulerApp2.getReservedContainers().size() == 0);
+    Assert.assertEquals(2 * GB,cs.getNode(nm1.getNodeId()).getUnallocatedResource().getMemorySize());
+    Assert.assertNull(cs.getNode(nm1.getNodeId()).getReservedContainer());
+    Assert.assertEquals(6 * GB,cs.getRootQueue().getQueueResourceUsage().getUsed().getMemorySize());
+    Assert.assertEquals(0,cs.getRootQueue().getQueueResourceUsage().getReserved().getMemorySize());
+    Assert.assertEquals(0,leafQueue.getQueueResourceUsage().getReserved().getMemorySize());
+    rm1.close();
+  }
+  @Test(timeout=60000) public void testAllocationForReservedContainer() throws Exception {
+    MockRM rm1=new MockRM();
+    rm1.getRMContext().setNodeLabelManager(mgr);
+    rm1.start();
+    MockNM nm1=rm1.registerNode("h1:1234",8 * GB);
+    MockNM nm2=rm1.registerNode("h2:1234",8 * GB);
+    RMApp app1=rm1.submitApp(1 * GB,"app","user",null,"default");
+    MockAM am1=MockRM.launchAndRegisterAM(app1,rm1,nm1);
+    RMApp app2=rm1.submitApp(1 * GB,"app","user",null,"default");
+    MockAM am2=MockRM.launchAndRegisterAM(app2,rm1,nm1);
+    am1.allocate("*",4 * GB,1,new ArrayList<ContainerId>());
+    am2.allocate("*",4 * GB,1,new ArrayList<ContainerId>());
+    CapacityScheduler cs=(CapacityScheduler)rm1.getResourceScheduler();
+    RMNode rmNode1=rm1.getRMContext().getRMNodes().get(nm1.getNodeId());
+    LeafQueue leafQueue=(LeafQueue)cs.getQueue("default");
+    cs.handle(new NodeUpdateSchedulerEvent(rmNode1));
+    cs.handle(new NodeUpdateSchedulerEvent(rmNode1));
+    FiCaSchedulerApp schedulerApp1=cs.getApplicationAttempt(am1.getApplicationAttemptId());
+    FiCaSchedulerApp schedulerApp2=cs.getApplicationAttempt(am2.getApplicationAttemptId());
+    Assert.assertEquals(2,schedulerApp1.getLiveContainers().size());
+    Assert.assertEquals(1,schedulerApp2.getLiveContainers().size());
+    Assert.assertTrue(schedulerApp2.getReservedContainers().size() > 0);
+    Assert.assertEquals(2 * GB,cs.getNode(nm1.getNodeId()).getUnallocatedResource().getMemorySize());
+    Assert.assertNotNull(cs.getNode(nm1.getNodeId()).getReservedContainer());
+    Assert.assertEquals(10 * GB,cs.getRootQueue().getQueueResourceUsage().getUsed().getMemorySize());
+    Assert.assertEquals(4 * GB,cs.getRootQueue().getQueueResourceUsage().getReserved().getMemorySize());
+    Assert.assertEquals(4 * GB,leafQueue.getQueueResourceUsage().getReserved().getMemorySize());
+    for (    RMContainer container : schedulerApp1.getLiveContainers()) {
+      if (container.isAMContainer()) {
+        continue;
+      }
+      cs.markContainerForKillable(container);
+    }
+    am1.allocate("*",4 * GB,0,new ArrayList<ContainerId>());
+    cs.handle(new NodeUpdateSchedulerEvent(rmNode1));
+    Assert.assertEquals(1,schedulerApp1.getLiveContainers().size());
+    Assert.assertEquals(2,schedulerApp2.getLiveContainers().size());
+    Assert.assertFalse(schedulerApp2.getReservedContainers().size() > 0);
+    Assert.assertEquals(2 * GB,cs.getNode(nm1.getNodeId()).getUnallocatedResource().getMemorySize());
+    Assert.assertNull(cs.getNode(nm1.getNodeId()).getReservedContainer());
+    Assert.assertEquals(6 * GB,cs.getRootQueue().getQueueResourceUsage().getUsed().getMemorySize());
+    Assert.assertEquals(0 * GB,cs.getRootQueue().getQueueResourceUsage().getReserved().getMemorySize());
+    Assert.assertEquals(0 * GB,leafQueue.getQueueResourceUsage().getReserved().getMemorySize());
+    rm1.close();
+  }
+  @Test(timeout=60000) public void testReservedContainerMetricsOnDecommisionedNode() throws Exception {
+    MockRM rm1=new MockRM();
+    rm1.getRMContext().setNodeLabelManager(mgr);
+    rm1.start();
+    MockNM nm1=rm1.registerNode("h1:1234",8 * GB);
+    MockNM nm2=rm1.registerNode("h2:1234",8 * GB);
+    RMApp app1=rm1.submitApp(1 * GB,"app","user",null,"default");
+    MockAM am1=MockRM.launchAndRegisterAM(app1,rm1,nm1);
+    RMApp app2=rm1.submitApp(1 * GB,"app","user",null,"default");
+    MockAM am2=MockRM.launchAndRegisterAM(app2,rm1,nm1);
+    am1.allocate("*",4 * GB,1,new ArrayList<ContainerId>());
+    am2.allocate("*",4 * GB,1,new ArrayList<ContainerId>());
+    CapacityScheduler cs=(CapacityScheduler)rm1.getResourceScheduler();
+    RMNode rmNode1=rm1.getRMContext().getRMNodes().get(nm1.getNodeId());
+    LeafQueue leafQueue=(LeafQueue)cs.getQueue("default");
+    cs.handle(new NodeUpdateSchedulerEvent(rmNode1));
+    cs.handle(new NodeUpdateSchedulerEvent(rmNode1));
+    FiCaSchedulerApp schedulerApp1=cs.getApplicationAttempt(am1.getApplicationAttemptId());
+    FiCaSchedulerApp schedulerApp2=cs.getApplicationAttempt(am2.getApplicationAttemptId());
+    Assert.assertEquals(2,schedulerApp1.getLiveContainers().size());
+    Assert.assertEquals(1,schedulerApp2.getLiveContainers().size());
+    Assert.assertTrue(schedulerApp2.getReservedContainers().size() > 0);
+    Assert.assertEquals(2 * GB,cs.getNode(nm1.getNodeId()).getUnallocatedResource().getMemorySize());
+    Assert.assertNotNull(cs.getNode(nm1.getNodeId()).getReservedContainer());
+    Assert.assertEquals(10 * GB,cs.getRootQueue().getQueueResourceUsage().getUsed().getMemorySize());
+    Assert.assertEquals(4 * GB,cs.getRootQueue().getQueueResourceUsage().getReserved().getMemorySize());
+    Assert.assertEquals(4 * GB,leafQueue.getQueueResourceUsage().getReserved().getMemorySize());
+    cs.handle(new NodeRemovedSchedulerEvent(rmNode1));
+    Assert.assertEquals(0,schedulerApp1.getLiveContainers().size());
+    Assert.assertEquals(0,schedulerApp2.getLiveContainers().size());
+    Assert.assertFalse(schedulerApp2.getReservedContainers().size() > 0);
+    Assert.assertEquals(0 * GB,cs.getRootQueue().getQueueResourceUsage().getUsed().getMemorySize());
+    Assert.assertEquals(0 * GB,cs.getRootQueue().getQueueResourceUsage().getReserved().getMemorySize());
+    Assert.assertEquals(0 * GB,leafQueue.getQueueResourceUsage().getReserved().getMemorySize());
+    rm1.close();
+  }
+  @Test(timeout=60000) public void testAssignMultipleOffswitchContainers() throws Exception {
+    MockRM rm1=new MockRM();
+    rm1.getRMContext().setNodeLabelManager(mgr);
+    rm1.start();
+    MockNM nm1=rm1.registerNode("h1:1234",80 * GB);
+    RMApp app1=rm1.submitApp(1 * GB,"app","user",null,"default");
+    MockAM am1=MockRM.launchAndRegisterAM(app1,rm1,nm1);
+    am1.allocate("*",1 * GB,5,new ArrayList<ContainerId>());
+    CapacityScheduler cs=(CapacityScheduler)rm1.getResourceScheduler();
+    RMNode rmNode1=rm1.getRMContext().getRMNodes().get(nm1.getNodeId());
+    cs.handle(new NodeUpdateSchedulerEvent(rmNode1));
+    FiCaSchedulerApp schedulerApp1=cs.getApplicationAttempt(am1.getApplicationAttemptId());
+    Assert.assertEquals(2,schedulerApp1.getLiveContainers().size());
+    CapacitySchedulerConfiguration newCSConf=new CapacitySchedulerConfiguration();
+    newCSConf.setInt(CapacitySchedulerConfiguration.OFFSWITCH_PER_HEARTBEAT_LIMIT,3);
+    cs.reinitialize(newCSConf,rm1.getRMContext());
+    cs.handle(new NodeUpdateSchedulerEvent(rmNode1));
+    Assert.assertEquals(5,schedulerApp1.getLiveContainers().size());
+    rm1.close();
+  }
+  @Test(timeout=60000) public void testContinuousReservationLookingWhenUsedEqualsMax() throws Exception {
+    CapacitySchedulerConfiguration newConf=(CapacitySchedulerConfiguration)TestUtils.getConfigurationWithMultipleQueues(conf);
+    newConf.setMaximumCapacity(CapacitySchedulerConfiguration.ROOT + ".a",10);
+    MockRM rm1=new MockRM(newConf);
+    rm1.getRMContext().setNodeLabelManager(mgr);
+    rm1.start();
+    MockNM nm1=rm1.registerNode("h1:1234",10 * GB);
+    MockNM nm2=rm1.registerNode("h2:1234",90 * GB);
+    RMApp app1=rm1.submitApp(2 * GB,"app","user",null,"a");
+    MockAM am1=MockRM.launchAndRegisterAM(app1,rm1,nm1);
+    RMApp app2=rm1.submitApp(1 * GB,"app","user",null,"b");
+    MockAM am2=MockRM.launchAndRegisterAM(app2,rm1,nm1);
+    am1.allocate("*",4 * GB,2,null);
+    CapacityScheduler cs=(CapacityScheduler)rm1.getResourceScheduler();
+    RMNode rmNode1=rm1.getRMContext().getRMNodes().get(nm1.getNodeId());
+    RMNode rmNode2=rm1.getRMContext().getRMNodes().get(nm2.getNodeId());
+    cs.handle(new NodeUpdateSchedulerEvent(rmNode1));
+    cs.handle(new NodeUpdateSchedulerEvent(rmNode1));
+    FiCaSchedulerApp schedulerApp1=cs.getApplicationAttempt(am1.getApplicationAttemptId());
+    Assert.assertEquals(2,schedulerApp1.getLiveContainers().size());
+    Assert.assertEquals(1,schedulerApp1.getReservedContainers().size());
+    cs.handle(new NodeUpdateSchedulerEvent(rmNode2));
+    Assert.assertEquals(3,schedulerApp1.getLiveContainers().size());
+    Assert.assertEquals(0,schedulerApp1.getReservedContainers().size());
+    rm1.close();
+  }
+  @Test public void testPendingResourcesConsideringUserLimit() throws Exception {
+    CapacitySchedulerConfiguration newConf=new CapacitySchedulerConfiguration(conf);
+    newConf.setUserLimitFactor(CapacitySchedulerConfiguration.ROOT + ".default",0.5f);
+    newConf.setMaximumAMResourcePercentPerPartition(CapacitySchedulerConfiguration.ROOT + ".default","",1.0f);
+    MockRM rm1=new MockRM(newConf);
+    rm1.getRMContext().setNodeLabelManager(mgr);
+    rm1.start();
+    MockNM nm1=rm1.registerNode("h1:1234",8 * GB);
+    MockNM nm2=rm1.registerNode("h2:1234",8 * GB);
+    RMApp app1=rm1.submitApp(2 * GB,"app","u1",null,"default");
+    MockAM am1=MockRM.launchAndRegisterAM(app1,rm1,nm1);
+    RMApp app2=rm1.submitApp(4 * GB,"app","u2",null,"default");
+    MockAM am2=MockRM.launchAndRegisterAM(app2,rm1,nm1);
+    am1.allocate("*",3 * GB,1,null);
+    am2.allocate("*",5 * GB,4,null);
+    CapacityScheduler cs=(CapacityScheduler)rm1.getResourceScheduler();
+    RMNode rmNode1=rm1.getRMContext().getRMNodes().get(nm1.getNodeId());
+    RMNode rmNode2=rm1.getRMContext().getRMNodes().get(nm2.getNodeId());
+    cs.handle(new NodeUpdateSchedulerEvent(rmNode1));
+    FiCaSchedulerApp schedulerApp1=cs.getApplicationAttempt(am1.getApplicationAttemptId());
+    Assert.assertEquals(1,schedulerApp1.getReservedContainers().size());
+    Assert.assertEquals(2 * GB,schedulerApp1.getAppAttemptResourceUsage().getUsed().getMemorySize());
+    Assert.assertEquals(3 * GB,schedulerApp1.getAppAttemptResourceUsage().getReserved().getMemorySize());
+    Assert.assertEquals(3 * GB,schedulerApp1.getAppAttemptResourceUsage().getPending().getMemorySize());
+    FiCaSchedulerApp schedulerApp2=cs.getApplicationAttempt(am2.getApplicationAttemptId());
+    Assert.assertEquals(4 * GB,schedulerApp2.getAppAttemptResourceUsage().getUsed().getMemorySize());
+    Assert.assertEquals(0 * GB,schedulerApp2.getAppAttemptResourceUsage().getReserved().getMemorySize());
+    Assert.assertEquals(5 * 4 * GB,schedulerApp2.getAppAttemptResourceUsage().getPending().getMemorySize());
+    LeafQueue lq=(LeafQueue)cs.getQueue("default");
+    Assert.assertEquals(7 * GB,lq.getTotalPendingResourcesConsideringUserLimit(Resources.createResource(20 * GB),"",false).getMemorySize());
+    Assert.assertEquals(4 * GB,lq.getTotalPendingResourcesConsideringUserLimit(Resources.createResource(20 * GB),"",true).getMemorySize());
+    rm1.close();
+  }
+  @Test(timeout=60000) public void testQueuePriorityOrdering() throws Exception {
+    CapacitySchedulerConfiguration newConf=(CapacitySchedulerConfiguration)TestUtils.getConfigurationWithMultipleQueues(conf);
+    newConf.setQueueOrderingPolicy(CapacitySchedulerConfiguration.ROOT,CapacitySchedulerConfiguration.QUEUE_PRIORITY_UTILIZATION_ORDERING_POLICY);
+    newConf.setMaximumCapacity(CapacitySchedulerConfiguration.ROOT + ".a",20);
+    newConf.setQueuePriority(CapacitySchedulerConfiguration.ROOT + ".c",1);
+    newConf.setQueuePriority(CapacitySchedulerConfiguration.ROOT + ".b",2);
+    newConf.setQueuePriority(CapacitySchedulerConfiguration.ROOT + ".a",3);
+    MockRM rm1=new MockRM(newConf);
+    rm1.getRMContext().setNodeLabelManager(mgr);
+    rm1.start();
+    MockNM nm1=rm1.registerNode("h1:1234",100 * GB);
+    RMApp app1=rm1.submitApp(2 * GB,"app","user",null,"a");
+    MockAM am1=MockRM.launchAndRegisterAM(app1,rm1,nm1);
+    RMApp app2=rm1.submitApp(2 * GB,"app","user",null,"b");
+    MockAM am2=MockRM.launchAndRegisterAM(app2,rm1,nm1);
+    RMApp app3=rm1.submitApp(2 * GB,"app","user",null,"c");
+    MockAM am3=MockRM.launchAndRegisterAM(app3,rm1,nm1);
+    am1.allocate("*",5 * GB,10,null);
+    am2.allocate("*",5 * GB,10,null);
+    am3.allocate("*",5 * GB,10,null);
+    CapacityScheduler cs=(CapacityScheduler)rm1.getResourceScheduler();
+    RMNode rmNode1=rm1.getRMContext().getRMNodes().get(nm1.getNodeId());
+    FiCaSchedulerApp schedulerApp1=cs.getApplicationAttempt(am1.getApplicationAttemptId());
+    FiCaSchedulerApp schedulerApp2=cs.getApplicationAttempt(am2.getApplicationAttemptId());
+    FiCaSchedulerApp schedulerApp3=cs.getApplicationAttempt(am3.getApplicationAttemptId());
+    cs.handle(new NodeUpdateSchedulerEvent(rmNode1));
+    Assert.assertEquals(2,schedulerApp1.getLiveContainers().size());
+    Assert.assertEquals(1,schedulerApp2.getLiveContainers().size());
+    Assert.assertEquals(1,schedulerApp3.getLiveContainers().size());
+    cs.handle(new NodeUpdateSchedulerEvent(rmNode1));
+    Assert.assertEquals(3,schedulerApp1.getLiveContainers().size());
+    Assert.assertEquals(1,schedulerApp2.getLiveContainers().size());
+    Assert.assertEquals(1,schedulerApp3.getLiveContainers().size());
+    cs.handle(new NodeUpdateSchedulerEvent(rmNode1));
+    Assert.assertEquals(3,schedulerApp1.getLiveContainers().size());
+    Assert.assertEquals(2,schedulerApp2.getLiveContainers().size());
+    Assert.assertEquals(1,schedulerApp3.getLiveContainers().size());
+    for (int i=0; i < 3; i++) {
+      cs.handle(new NodeUpdateSchedulerEvent(rmNode1));
+    }
+    Assert.assertEquals(3,schedulerApp1.getLiveContainers().size());
+    Assert.assertEquals(5,schedulerApp2.getLiveContainers().size());
+    Assert.assertEquals(1,schedulerApp3.getLiveContainers().size());
+    for (int i=0; i < 10; i++) {
+      cs.handle(new NodeUpdateSchedulerEvent(rmNode1));
+    }
+    Assert.assertEquals(3,schedulerApp1.getLiveContainers().size());
+    Assert.assertEquals(5,schedulerApp2.getLiveContainers().size());
+    Assert.assertEquals(11,schedulerApp3.getLiveContainers().size());
+    for (int i=0; i < 20; i++) {
+      cs.handle(new NodeUpdateSchedulerEvent(rmNode1));
+    }
+    Assert.assertEquals(4,schedulerApp1.getLiveContainers().size());
+    Assert.assertEquals(6,schedulerApp2.getLiveContainers().size());
+    Assert.assertEquals(11,schedulerApp3.getLiveContainers().size());
+    rm1.close();
+  }
+  @Test(timeout=60000) public void testUserLimitAllocationMultipleContainers() throws Exception {
+    CapacitySchedulerConfiguration newConf=(CapacitySchedulerConfiguration)TestUtils.getConfigurationWithMultipleQueues(conf);
+    newConf.setUserLimit("root.c",50);
+    MockRM rm1=new MockRM(newConf);
+    rm1.getRMContext().setNodeLabelManager(mgr);
+    rm1.start();
+    MockNM nm1=rm1.registerNode("h1:1234",1000 * GB);
+    RMApp app1=rm1.submitApp(2 * GB,"app","user1",null,"c");
+    MockAM am1=MockRM.launchAndRegisterAM(app1,rm1,nm1);
+    RMApp app2=rm1.submitApp(2 * GB,"app","user2",null,"c");
+    MockAM am2=MockRM.launchAndRegisterAM(app2,rm1,nm1);
+    am1.allocate("*",5 * GB,1000,null);
+    am1.allocate("h1",5 * GB,1000,null);
+    am1.allocate(NetworkTopology.DEFAULT_RACK,5 * GB,1000,null);
+    am2.allocate("*",5 * GB,1000,null);
+    am2.allocate("h1",5 * GB,1000,null);
+    am2.allocate(NetworkTopology.DEFAULT_RACK,5 * GB,1000,null);
+    CapacityScheduler cs=(CapacityScheduler)rm1.getResourceScheduler();
+    RMNode rmNode1=rm1.getRMContext().getRMNodes().get(nm1.getNodeId());
+    FiCaSchedulerApp schedulerApp1=cs.getApplicationAttempt(am1.getApplicationAttemptId());
+    FiCaSchedulerApp schedulerApp2=cs.getApplicationAttempt(am2.getApplicationAttemptId());
+    cs.handle(new NodeUpdateSchedulerEvent(rmNode1));
+    Assert.assertEquals(101,schedulerApp1.getLiveContainers().size());
+    Assert.assertEquals(100,schedulerApp2.getLiveContainers().size());
+    rm1.close();
+  }
+  @Test public void testActiveUsersWithOnlyPendingApps() throws Exception {
+    CapacitySchedulerConfiguration newConf=new CapacitySchedulerConfiguration(conf);
+    newConf.setMaximumAMResourcePercentPerPartition(CapacitySchedulerConfiguration.ROOT + ".default","",0.2f);
+    MockRM rm1=new MockRM(newConf);
+    rm1.getRMContext().setNodeLabelManager(mgr);
+    rm1.start();
+    MockNM nm1=rm1.registerNode("h1:1234",8 * GB);
+    RMApp app1=rm1.submitApp(1 * GB,"app","u1",null,"default");
+    MockAM am1=MockRM.launchAndRegisterAM(app1,rm1,nm1);
+    RMApp app2=rm1.submitApp(1 * GB,"app","u2",null,"default");
+    MockAM am2=MockRM.launchAndRegisterAM(app2,rm1,nm1);
+    RMApp app3=rm1.submitApp(1 * GB,"app","u3",null,"default");
+    RMApp app4=rm1.submitApp(1 * GB,"app","u4",null,"default");
+    am1.allocate("*",1 * GB,50,null);
+    am2.allocate("*",1 * GB,50,null);
+    CapacityScheduler cs=(CapacityScheduler)rm1.getResourceScheduler();
+    RMNode rmNode1=rm1.getRMContext().getRMNodes().get(nm1.getNodeId());
+    for (int i=0; i < 10; i++) {
+      cs.handle(new NodeUpdateSchedulerEvent(rmNode1));
+      Thread.sleep(1000);
+    }
+    LeafQueue lq=(LeafQueue)cs.getQueue("default");
+    UsersManager um=(UsersManager)lq.getAbstractUsersManager();
+    Assert.assertEquals(4,um.getNumActiveUsers());
+    Assert.assertEquals(2,um.getNumActiveUsersWithOnlyPendingApps());
+    Assert.assertEquals(2,lq.getMetrics().getAppsPending());
+    rm1.close();
+  }
+  @Test(timeout=60000) public void testUnreserveWhenClusterResourceHasEmptyResourceType() throws Exception {
+    TestResourceUtils.addNewTypesToResources("resource1");
+    CapacitySchedulerConfiguration newConf=(CapacitySchedulerConfiguration)TestUtils.getConfigurationWithMultipleQueues(conf);
+    newConf.setClass(CapacitySchedulerConfiguration.RESOURCE_CALCULATOR_CLASS,DominantResourceCalculator.class,ResourceCalculator.class);
+    newConf.setBoolean(TestResourceProfiles.TEST_CONF_RESET_RESOURCE_TYPES,false);
+    newConf.setMaximumCapacity(CapacitySchedulerConfiguration.ROOT + ".a",50);
+    MockRM rm1=new MockRM(newConf);
+    RMNodeLabelsManager nodeLabelsManager=new NullRMNodeLabelsManager();
+    nodeLabelsManager.init(newConf);
+    rm1.getRMContext().setNodeLabelManager(nodeLabelsManager);
+    rm1.start();
+    MockNM nm1=rm1.registerNode("h1:1234",8 * GB);
+    MockNM nm2=rm1.registerNode("h2:1234",8 * GB);
+    RMApp app1=rm1.submitApp(1 * GB,"app","user",null,"a");
+    MockAM am1=MockRM.launchAndRegisterAM(app1,rm1,nm1);
+    RMApp app2=rm1.submitApp(1 * GB,"app","user",null,"b");
+    MockRM.launchAndRegisterAM(app2,rm1,nm1);
+    am1.allocate("*",7 * GB,2,new ArrayList<ContainerId>());
+    CapacityScheduler cs=(CapacityScheduler)rm1.getResourceScheduler();
+    RMNode rmNode1=rm1.getRMContext().getRMNodes().get(nm1.getNodeId());
+    RMNode rmNode2=rm1.getRMContext().getRMNodes().get(nm2.getNodeId());
+    FiCaSchedulerApp schedulerApp1=cs.getApplicationAttempt(am1.getApplicationAttemptId());
+    cs.handle(new NodeUpdateSchedulerEvent(rmNode1));
+    Assert.assertEquals(1,schedulerApp1.getLiveContainers().size());
+    Assert.assertEquals(1,schedulerApp1.getReservedContainers().size());
+    cs.handle(new NodeUpdateSchedulerEvent(rmNode2));
+    Assert.assertEquals(2,schedulerApp1.getLiveContainers().size());
+    Assert.assertEquals(0,schedulerApp1.getReservedContainers().size());
+    rm1.close();
+  }
+  @Test(timeout=60000) public void testAllocationCannotBeBlockedWhenFormerQueueReachedItsLimit() throws Exception {
+    CapacitySchedulerConfiguration newConf=(CapacitySchedulerConfiguration)TestUtils.getConfigurationWithMultipleQueues(conf);
+    newConf.setQueues(CapacitySchedulerConfiguration.ROOT + ".c",new String[]{"c1","c2"});
+    newConf.setCapacity(CapacitySchedulerConfiguration.ROOT + ".c.c1",10);
+    newConf.setMaximumCapacity(CapacitySchedulerConfiguration.ROOT + ".c.c1",10);
+    newConf.setCapacity(CapacitySchedulerConfiguration.ROOT + ".c.c2",90);
+    newConf.setClass(CapacitySchedulerConfiguration.RESOURCE_CALCULATOR_CLASS,DominantResourceCalculator.class,ResourceCalculator.class);
+    MockRM rm1=new MockRM(newConf);
+    RMNodeLabelsManager nodeLabelsManager=new NullRMNodeLabelsManager();
+    nodeLabelsManager.init(newConf);
+    rm1.getRMContext().setNodeLabelManager(nodeLabelsManager);
+    rm1.start();
+    MockNM nm1=rm1.registerNode("h1:1234",10 * GB);
+    MockNM nm2=rm1.registerNode("h2:1234",10 * GB);
+    RMApp app1=rm1.submitApp(1 * GB,"app","user",null,"c1");
+    MockAM am1=MockRM.launchAndRegisterAM(app1,rm1,nm1);
+    RMApp app2=rm1.submitApp(1 * GB,"app","user",null,"b");
+    MockAM am2=MockRM.launchAndRegisterAM(app2,rm1,nm1);
+    am1.allocate("*",2 * GB,1,new ArrayList<ContainerId>());
+    am2.allocate("*",2 * GB,1,new ArrayList<ContainerId>());
+    CapacityScheduler cs=(CapacityScheduler)rm1.getResourceScheduler();
+    RMNode rmNode1=rm1.getRMContext().getRMNodes().get(nm1.getNodeId());
+    FiCaSchedulerApp schedulerApp1=cs.getApplicationAttempt(am1.getApplicationAttemptId());
+    FiCaSchedulerApp schedulerApp2=cs.getApplicationAttempt(am2.getApplicationAttemptId());
+    cs.handle(new NodeUpdateSchedulerEvent(rmNode1));
+    rm1.drainEvents();
+    Assert.assertEquals(1,schedulerApp1.getLiveContainers().size());
+    Assert.assertEquals(2,schedulerApp2.getLiveContainers().size());
+    rm1.close();
+  }
+  @Test(timeout=60000) public void testContainerRejectionWhenAskBeyondDynamicMax() throws Exception {
+    CapacitySchedulerConfiguration newConf=(CapacitySchedulerConfiguration)TestUtils.getConfigurationWithMultipleQueues(conf);
+    newConf.setClass(CapacitySchedulerConfiguration.RESOURCE_CALCULATOR_CLASS,DominantResourceCalculator.class,ResourceCalculator.class);
+    newConf.set(CapacitySchedulerConfiguration.getQueuePrefix("root.a") + MAXIMUM_ALLOCATION_MB,"4096");
+    MockRM rm1=new MockRM(newConf);
+    rm1.start();
+    boolean submitFailed=false;
+    MockNM nm1=rm1.registerNode("h1:1234",2 * GB,1);
+    RMApp app1=rm1.submitApp(1 * GB,"app","user",null,"a");
+    MockAM am1=MockRM.launchAndRegisterAM(app1,rm1,nm1);
+    try {
+      am1.allocate("*",5 * GB,1,null);
+    }
+ catch (    InvalidResourceRequestException e) {
+      submitFailed=true;
+    }
+    Assert.assertTrue(submitFailed);
+    am1.allocate("*",4 * GB,1,null);
+    CapacityScheduler cs=(CapacityScheduler)rm1.getResourceScheduler();
+    cs.getNodeTracker().setForceConfiguredMaxAllocation(false);
+    rm1.registerNode("h2:1234",3 * GB,1);
+    submitFailed=false;
+    try {
+      am1.allocate("*",4 * GB,1,null);
+    }
+ catch (    InvalidResourceRequestException e) {
+      submitFailed=true;
+    }
+    Assert.assertTrue(submitFailed);
+    am1.allocate("*",3 * GB,1,null);
+    rm1.close();
+  }
+}

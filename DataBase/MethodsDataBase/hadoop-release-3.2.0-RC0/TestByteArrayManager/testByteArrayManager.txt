@@ -1,0 +1,70 @@
+@Test public void testByteArrayManager() throws Exception {
+  final int countThreshold=32;
+  final int countLimit=64;
+  final long countResetTimePeriodMs=10000L;
+  final ByteArrayManager.Impl bam=new ByteArrayManager.Impl(new ByteArrayManager.Conf(countThreshold,countLimit,countResetTimePeriodMs));
+  final CounterMap counters=bam.getCounters();
+  final ManagerMap managers=bam.getManagers();
+  final ExecutorService pool=Executors.newFixedThreadPool(128);
+  final Runner[] runners=new Runner[Runner.NUM_RUNNERS];
+  final Thread[] threads=new Thread[runners.length];
+  final int num=1 << 10;
+  for (int i=0; i < runners.length; i++) {
+    runners[i]=new Runner(i,countThreshold,countLimit,pool,i,bam);
+    threads[i]=runners[i].start(num);
+  }
+  final List<Exception> exceptions=new ArrayList<Exception>();
+  final Thread randomRecycler=new Thread(){
+    @Override public void run(){
+      LOG.info("randomRecycler start");
+      for (int i=0; shouldRun(); i++) {
+        final int j=ThreadLocalRandom.current().nextInt(runners.length);
+        try {
+          runners[j].recycle();
+        }
+ catch (        Exception e) {
+          e.printStackTrace();
+          exceptions.add(new Exception(this + " has an exception",e));
+        }
+        if ((i & 0xFF) == 0) {
+          LOG.info("randomRecycler sleep, i=" + i);
+          sleepMs(100);
+        }
+      }
+      LOG.info("randomRecycler done");
+    }
+    boolean shouldRun(){
+      for (int i=0; i < runners.length; i++) {
+        if (threads[i].isAlive()) {
+          return true;
+        }
+        if (!runners[i].isEmpty()) {
+          return true;
+        }
+      }
+      return false;
+    }
+  }
+;
+  randomRecycler.start();
+  randomRecycler.join();
+  Assert.assertTrue(exceptions.isEmpty());
+  Assert.assertNull(counters.get(0,false));
+  for (int i=1; i < runners.length; i++) {
+    if (!runners[i].assertionErrors.isEmpty()) {
+      for (      AssertionError e : runners[i].assertionErrors) {
+        LOG.error("AssertionError " + i,e);
+      }
+      Assert.fail(runners[i].assertionErrors.size() + " AssertionError(s)");
+    }
+    final int arrayLength=Runner.index2arrayLength(i);
+    final boolean exceedCountThreshold=counters.get(arrayLength,false).getCount() > countThreshold;
+    final FixedLengthManager m=managers.get(arrayLength,false);
+    if (exceedCountThreshold) {
+      Assert.assertNotNull(m);
+    }
+ else {
+      Assert.assertNull(m);
+    }
+  }
+}

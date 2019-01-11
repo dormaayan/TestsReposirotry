@@ -1,0 +1,68 @@
+@Test(timeout=120000) public void testMaintenanceNodes() throws Exception {
+  LOG.info("Starting testMaintenanceNodes");
+  int expirationInMs=30 * 1000;
+  Configuration conf=new Configuration();
+  conf.setInt(DFSConfigKeys.DFS_HEARTBEAT_INTERVAL_KEY,1);
+  conf.setInt(DFSConfigKeys.DFS_NAMENODE_HEARTBEAT_RECHECK_INTERVAL_KEY,expirationInMs);
+  conf.setClass(DFSConfigKeys.DFS_NAMENODE_HOSTS_PROVIDER_CLASSNAME_KEY,CombinedHostFileManager.class,HostConfigManager.class);
+  MiniDFSCluster cluster=null;
+  HostsFileWriter hostsFileWriter=new HostsFileWriter();
+  hostsFileWriter.initialize(conf,"temp/TestNameNodeMXBean");
+  try {
+    cluster=new MiniDFSCluster.Builder(conf).numDataNodes(3).build();
+    cluster.waitActive();
+    FSNamesystem fsn=cluster.getNameNode().namesystem;
+    MBeanServer mbs=ManagementFactory.getPlatformMBeanServer();
+    ObjectName mxbeanName=new ObjectName("Hadoop:service=NameNode,name=NameNodeInfo");
+    List<String> hosts=new ArrayList<>();
+    for (    DataNode dn : cluster.getDataNodes()) {
+      hosts.add(dn.getDisplayName());
+    }
+    hostsFileWriter.initIncludeHosts(hosts.toArray(new String[hosts.size()]));
+    fsn.getBlockManager().getDatanodeManager().refreshNodes(conf);
+    String liveNodesInfo=(String)(mbs.getAttribute(mxbeanName,"LiveNodes"));
+    LOG.info("Live Nodes: " + liveNodesInfo);
+    Map<String,Map<String,Object>> liveNodes=(Map<String,Map<String,Object>>)JSON.parse(liveNodesInfo);
+    assertEquals(fsn.getLiveNodes(),liveNodesInfo);
+    assertEquals(fsn.getNumLiveDataNodes(),liveNodes.size());
+    for (    Map<String,Object> liveNode : liveNodes.values()) {
+      assertTrue(liveNode.containsKey("lastContact"));
+      assertTrue(liveNode.containsKey("xferaddr"));
+    }
+    Map<String,Long> maintenanceNodes=new HashMap<>();
+    maintenanceNodes.put(cluster.getDataNodes().get(0).getDisplayName(),Time.now() + expirationInMs);
+    hostsFileWriter.initOutOfServiceHosts(null,maintenanceNodes);
+    fsn.getBlockManager().getDatanodeManager().refreshNodes(conf);
+    boolean recheck=true;
+    while (recheck) {
+      String enteringMaintenanceNodesInfo=(String)(mbs.getAttribute(mxbeanName,"EnteringMaintenanceNodes"));
+      Map<String,Map<String,Object>> enteringMaintenanceNodes=(Map<String,Map<String,Object>>)JSON.parse(enteringMaintenanceNodesInfo);
+      if (enteringMaintenanceNodes.size() <= 0) {
+        LOG.info("Waiting for a node to Enter Maintenance state!");
+        Uninterruptibles.sleepUninterruptibly(1,TimeUnit.SECONDS);
+        continue;
+      }
+      LOG.info("Nodes entering Maintenance: " + enteringMaintenanceNodesInfo);
+      recheck=false;
+      assertEquals(fsn.getEnteringMaintenanceNodes(),enteringMaintenanceNodesInfo);
+      assertEquals(fsn.getNumEnteringMaintenanceDataNodes(),enteringMaintenanceNodes.size());
+      assertEquals(0,fsn.getNumInMaintenanceLiveDataNodes());
+      assertEquals(0,fsn.getNumInMaintenanceDeadDataNodes());
+    }
+    while (fsn.getNumInMaintenanceLiveDataNodes() != 1) {
+      Uninterruptibles.sleepUninterruptibly(1,TimeUnit.SECONDS);
+    }
+    String enteringMaintenanceNodesInfo=(String)(mbs.getAttribute(mxbeanName,"EnteringMaintenanceNodes"));
+    Map<String,Map<String,Object>> enteringMaintenanceNodes=(Map<String,Map<String,Object>>)JSON.parse(enteringMaintenanceNodesInfo);
+    assertEquals(0,enteringMaintenanceNodes.size());
+    assertEquals(fsn.getEnteringMaintenanceNodes(),enteringMaintenanceNodesInfo);
+    assertEquals(1,fsn.getNumInMaintenanceLiveDataNodes());
+    assertEquals(0,fsn.getNumInMaintenanceDeadDataNodes());
+  }
+  finally {
+    if (cluster != null) {
+      cluster.shutdown();
+    }
+    hostsFileWriter.cleanup();
+  }
+}

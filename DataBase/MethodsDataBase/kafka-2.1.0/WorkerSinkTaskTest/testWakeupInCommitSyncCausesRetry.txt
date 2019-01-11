@@ -1,0 +1,69 @@
+@Test public void testWakeupInCommitSyncCausesRetry() throws Exception {
+  createTask(initialState);
+  expectInitializeTask();
+  expectPollInitialAssignment();
+  expectConsumerPoll(1);
+  expectConversionAndTransformation(1);
+  sinkTask.put(EasyMock.<Collection<SinkRecord>>anyObject());
+  EasyMock.expectLastCall();
+  final List<TopicPartition> partitions=asList(TOPIC_PARTITION,TOPIC_PARTITION2);
+  final Map<TopicPartition,OffsetAndMetadata> offsets=new HashMap<>();
+  offsets.put(TOPIC_PARTITION,new OffsetAndMetadata(FIRST_OFFSET + 1));
+  offsets.put(TOPIC_PARTITION2,new OffsetAndMetadata(FIRST_OFFSET));
+  sinkTask.preCommit(offsets);
+  EasyMock.expectLastCall().andReturn(offsets);
+  consumer.commitSync(EasyMock.<Map<TopicPartition,OffsetAndMetadata>>anyObject());
+  EasyMock.expectLastCall().andThrow(new WakeupException());
+  consumer.commitSync(EasyMock.<Map<TopicPartition,OffsetAndMetadata>>anyObject());
+  EasyMock.expectLastCall();
+  sinkTask.close(new HashSet<>(partitions));
+  EasyMock.expectLastCall();
+  EasyMock.expect(consumer.position(TOPIC_PARTITION)).andReturn(FIRST_OFFSET);
+  EasyMock.expect(consumer.position(TOPIC_PARTITION2)).andReturn(FIRST_OFFSET);
+  sinkTask.open(partitions);
+  EasyMock.expectLastCall();
+  EasyMock.expect(consumer.poll(Duration.ofMillis(EasyMock.anyLong()))).andAnswer(new IAnswer<ConsumerRecords<byte[],byte[]>>(){
+    @Override public ConsumerRecords<byte[],byte[]> answer() throws Throwable {
+      rebalanceListener.getValue().onPartitionsRevoked(partitions);
+      rebalanceListener.getValue().onPartitionsAssigned(partitions);
+      return ConsumerRecords.empty();
+    }
+  }
+);
+  EasyMock.expect(consumer.assignment()).andReturn(new HashSet<>(partitions));
+  consumer.resume(Collections.singleton(TOPIC_PARTITION));
+  EasyMock.expectLastCall();
+  consumer.resume(Collections.singleton(TOPIC_PARTITION2));
+  EasyMock.expectLastCall();
+  statusListener.onResume(taskId);
+  EasyMock.expectLastCall();
+  PowerMock.replayAll();
+  workerTask.initialize(TASK_CONFIG);
+  time.sleep(30000L);
+  workerTask.initializeAndStart();
+  time.sleep(30000L);
+  workerTask.iteration();
+  time.sleep(30000L);
+  workerTask.iteration();
+  workerTask.iteration();
+  time.sleep(30000L);
+  assertSinkMetricValue("partition-count",2);
+  assertSinkMetricValue("sink-record-read-total",1.0);
+  assertSinkMetricValue("sink-record-send-total",1.0);
+  assertSinkMetricValue("sink-record-active-count",0.0);
+  assertSinkMetricValue("sink-record-active-count-max",1.0);
+  assertSinkMetricValue("sink-record-active-count-avg",0.33333);
+  assertSinkMetricValue("offset-commit-seq-no",1.0);
+  assertSinkMetricValue("offset-commit-completion-total",1.0);
+  assertSinkMetricValue("offset-commit-skip-total",0.0);
+  assertTaskMetricValue("status","running");
+  assertTaskMetricValue("running-ratio",1.0);
+  assertTaskMetricValue("pause-ratio",0.0);
+  assertTaskMetricValue("batch-size-max",1.0);
+  assertTaskMetricValue("batch-size-avg",1.0);
+  assertTaskMetricValue("offset-commit-max-time-ms",0.0);
+  assertTaskMetricValue("offset-commit-avg-time-ms",0.0);
+  assertTaskMetricValue("offset-commit-failure-percentage",0.0);
+  assertTaskMetricValue("offset-commit-success-percentage",1.0);
+  PowerMock.verifyAll();
+}

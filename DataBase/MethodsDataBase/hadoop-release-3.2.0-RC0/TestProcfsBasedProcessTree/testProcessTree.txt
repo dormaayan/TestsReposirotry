@@ -1,0 +1,79 @@
+@Test(timeout=30000) public void testProcessTree() throws Exception {
+  try {
+    Assert.assertTrue(ProcfsBasedProcessTree.isAvailable());
+  }
+ catch (  Exception e) {
+    LOG.info(StringUtils.stringifyException(e));
+    Assert.assertTrue("ProcfsBaseProcessTree should be available on Linux",false);
+    return;
+  }
+  Random rm=new Random();
+  File tempFile=new File(TEST_ROOT_DIR,getClass().getName() + "_shellScript_" + rm.nextInt()+ ".sh");
+  tempFile.deleteOnExit();
+  shellScript=TEST_ROOT_DIR + File.separator + tempFile.getName();
+  tempFile=new File(TEST_ROOT_DIR,getClass().getName() + "_pidFile_" + rm.nextInt()+ ".pid");
+  tempFile.deleteOnExit();
+  pidFile=TEST_ROOT_DIR + File.separator + tempFile.getName();
+  lowestDescendant=TEST_ROOT_DIR + File.separator + "lowestDescendantPidFile";
+  lostDescendant=TEST_ROOT_DIR + File.separator + "lostDescendantPidFile";
+  File file=new File(shellScript);
+  FileUtils.writeStringToFile(file,"# rogue task\n" + "sleep 1\n" + "echo hello\n"+ "if [ $1 -ne 0 ]\n"+ "then\n"+ " sh " + shellScript + " $(($1-1))\n"+ "else\n"+ " echo $$ > "+ lowestDescendant+ "\n"+ "(sleep 300&\n"+ "echo $! > "+ lostDescendant+ ")\n"+ " while true\n do\n"+ "  sleep 5\n"+ " done\n"+ "fi",StandardCharsets.UTF_8);
+  Thread t=new RogueTaskThread();
+  t.start();
+  String pid=getRogueTaskPID();
+  LOG.info("Root process pid: " + pid);
+  ProcfsBasedProcessTree p=createProcessTree(pid);
+  p.updateProcessTree();
+  LOG.info("ProcessTree: " + p);
+  File leaf=new File(lowestDescendant);
+  while (!leaf.exists()) {
+    try {
+      Thread.sleep(500);
+    }
+ catch (    InterruptedException ie) {
+      break;
+    }
+  }
+  p.updateProcessTree();
+  LOG.info("ProcessTree: " + p);
+  String lostpid=getPidFromPidFile(lostDescendant);
+  LOG.info("Orphaned pid: " + lostpid);
+  Assert.assertTrue("Child process owned by init escaped process tree.",p.contains(lostpid));
+  String processTreeDump=p.getProcessTreeDump();
+  destroyProcessTree(pid);
+  boolean isAlive=true;
+  for (int tries=100; tries > 0; tries--) {
+    if (isSetsidAvailable()) {
+      isAlive=isAnyProcessInTreeAlive(p);
+    }
+ else {
+      isAlive=isAlive(pid);
+    }
+    if (!isAlive) {
+      break;
+    }
+    Thread.sleep(100);
+  }
+  if (isAlive) {
+    fail("ProcessTree shouldn't be alive");
+  }
+  LOG.info("Process-tree dump follows: \n" + processTreeDump);
+  Assert.assertTrue("Process-tree dump doesn't start with a proper header",processTreeDump.startsWith("\t|- PID PPID PGRPID SESSID CMD_NAME " + "USER_MODE_TIME(MILLIS) SYSTEM_TIME(MILLIS) VMEM_USAGE(BYTES) " + "RSSMEM_USAGE(PAGES) FULL_CMD_LINE\n"));
+  for (int i=N; i >= 0; i--) {
+    String cmdLineDump="\\|- [0-9]+ [0-9]+ [0-9]+ [0-9]+ \\(sh\\)" + " [0-9]+ [0-9]+ [0-9]+ [0-9]+ sh " + shellScript + " "+ i;
+    Pattern pat=Pattern.compile(cmdLineDump);
+    Matcher mat=pat.matcher(processTreeDump);
+    Assert.assertTrue("Process-tree dump doesn't contain the cmdLineDump of " + i + "th process!",mat.find());
+  }
+  try {
+    t.join(2000);
+    LOG.info("RogueTaskThread successfully joined.");
+  }
+ catch (  InterruptedException ie) {
+    LOG.info("Interrupted while joining RogueTaskThread.");
+  }
+  p.updateProcessTree();
+  Assert.assertFalse("ProcessTree must have been gone",isAlive(pid));
+  Assert.assertTrue("vmem for the gone-process is " + p.getVirtualMemorySize() + " . It should be UNAVAILABLE(-1).",p.getVirtualMemorySize() == UNAVAILABLE);
+  Assert.assertEquals("[ ]",p.toString());
+}

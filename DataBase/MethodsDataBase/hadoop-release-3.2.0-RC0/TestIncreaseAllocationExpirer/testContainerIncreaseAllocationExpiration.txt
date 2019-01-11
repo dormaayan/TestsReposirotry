@@ -1,0 +1,42 @@
+@Test public void testContainerIncreaseAllocationExpiration() throws Exception {
+  conf.setLong(YarnConfiguration.RM_CONTAINER_ALLOC_EXPIRY_INTERVAL_MS,5000);
+  final DrainDispatcher disp=new DrainDispatcher();
+  MockRM rm1=new MockRM(conf){
+    @Override protected Dispatcher createDispatcher(){
+      return disp;
+    }
+  }
+;
+  rm1.start();
+  MockNM nm1=rm1.registerNode("127.0.0.1:1234",20 * GB);
+  RMApp app1=rm1.submitApp(1 * GB,"app","user",null,"default");
+  MockAM am1=MockRM.launchAndRegisterAM(app1,rm1,nm1);
+  nm1.nodeHeartbeat(app1.getCurrentAppAttempt().getAppAttemptId(),1,ContainerState.RUNNING);
+  am1.allocate("127.0.0.1",1 * GB,1,new ArrayList<ContainerId>());
+  ContainerId containerId2=ContainerId.newContainerId(am1.getApplicationAttemptId(),2);
+  rm1.waitForState(nm1,containerId2,RMContainerState.ALLOCATED);
+  List<Container> containers=am1.allocate(null,null).getAllocatedContainers();
+  Assert.assertEquals(containerId2,containers.get(0).getId());
+  Assert.assertNotNull(containers.get(0).getContainerToken());
+  checkUsedResource(rm1,"default",2 * GB,null);
+  FiCaSchedulerApp app=TestUtils.getFiCaSchedulerApp(rm1,app1.getApplicationId());
+  Assert.assertEquals(2 * GB,app.getAppAttemptResourceUsage().getUsed().getMemorySize());
+  verifyAvailableResourceOfSchedulerNode(rm1,nm1.getNodeId(),18 * GB);
+  nm1.nodeHeartbeat(app1.getCurrentAppAttempt().getAppAttemptId(),2,ContainerState.RUNNING);
+  rm1.waitForState(nm1,containerId2,RMContainerState.RUNNING);
+  am1.sendContainerResizingRequest(Collections.singletonList(UpdateContainerRequest.newInstance(0,containerId2,ContainerUpdateType.INCREASE_RESOURCE,Resources.createResource(3 * GB),null)));
+  nm1.nodeHeartbeat(true);
+  Thread.sleep(1000);
+  am1.allocate(null,null);
+  checkUsedResource(rm1,"default",4 * GB,null);
+  Assert.assertEquals(4 * GB,app.getAppAttemptResourceUsage().getUsed().getMemorySize());
+  verifyAvailableResourceOfSchedulerNode(rm1,nm1.getNodeId(),16 * GB);
+  Thread.sleep(10000);
+  am1.allocate(null,null);
+  Assert.assertEquals(1 * GB,rm1.getResourceScheduler().getRMContainer(containerId2).getAllocatedResource().getMemorySize());
+  disp.waitForEventThreadToWait();
+  checkUsedResource(rm1,"default",2 * GB,null);
+  Assert.assertEquals(2 * GB,app.getAppAttemptResourceUsage().getUsed().getMemorySize());
+  verifyAvailableResourceOfSchedulerNode(rm1,nm1.getNodeId(),18 * GB);
+  rm1.stop();
+}

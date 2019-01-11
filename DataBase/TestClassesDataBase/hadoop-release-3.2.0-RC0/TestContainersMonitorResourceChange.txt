@@ -1,0 +1,158 @@
+public class TestContainersMonitorResourceChange {
+  static final Logger LOG=Logger.getLogger(TestContainersMonitorResourceChange.class);
+  private ContainersMonitorImpl containersMonitor;
+  private MockExecutor executor;
+  private Configuration conf;
+  private AsyncDispatcher dispatcher;
+  private Context context;
+  private MockContainerEventHandler containerEventHandler;
+  private ConcurrentMap<ContainerId,Container> containerMap;
+  static final int WAIT_MS_PER_LOOP=20;
+private static class MockExecutor extends ContainerExecutor {
+    @Override public void init(    Context nmContext) throws IOException {
+    }
+    @Override public void startLocalizer(    LocalizerStartContext ctx) throws IOException, InterruptedException {
+    }
+    @Override public int launchContainer(    ContainerStartContext ctx) throws IOException, ConfigurationException {
+      return 0;
+    }
+    @Override public int relaunchContainer(    ContainerStartContext ctx) throws IOException, ConfigurationException {
+      return 0;
+    }
+    @Override public boolean signalContainer(    ContainerSignalContext ctx) throws IOException {
+      return true;
+    }
+    @Override public boolean reapContainer(    ContainerReapContext ctx) throws IOException {
+      return true;
+    }
+    @Override public void deleteAsUser(    DeletionAsUserContext ctx) throws IOException, InterruptedException {
+    }
+    @Override public void symLink(    String target,    String symlink) throws IOException {
+    }
+    @Override public String getProcessId(    ContainerId containerId){
+      return String.valueOf(containerId.getContainerId());
+    }
+    @Override public boolean isContainerAlive(    ContainerLivenessContext ctx) throws IOException {
+      return true;
+    }
+  }
+private static class MockContainerEventHandler implements EventHandler<ContainerEvent> {
+    final private Set<ContainerId> killedContainer=new HashSet<>();
+    @Override public void handle(    ContainerEvent event){
+      if (event.getType() == ContainerEventType.KILL_CONTAINER) {
+synchronized (killedContainer) {
+          killedContainer.add(event.getContainerID());
+        }
+      }
+    }
+    public boolean isContainerKilled(    ContainerId containerId){
+synchronized (killedContainer) {
+        return killedContainer.contains(containerId);
+      }
+    }
+  }
+  @Before public void setup(){
+    executor=new MockExecutor();
+    dispatcher=new AsyncDispatcher();
+    context=Mockito.mock(Context.class);
+    containerMap=new ConcurrentSkipListMap<>();
+    Container container=Mockito.mock(ContainerImpl.class);
+    containerMap.put(getContainerId(1),container);
+    Mockito.doReturn(containerMap).when(context).getContainers();
+    conf=new Configuration();
+    conf.set(YarnConfiguration.NM_CONTAINER_MON_RESOURCE_CALCULATOR,MockResourceCalculatorPlugin.class.getCanonicalName());
+    conf.set(YarnConfiguration.NM_CONTAINER_MON_PROCESS_TREE,MockResourceCalculatorProcessTree.class.getCanonicalName());
+    dispatcher.init(conf);
+    dispatcher.start();
+    containerEventHandler=new MockContainerEventHandler();
+    dispatcher.register(ContainerEventType.class,containerEventHandler);
+  }
+  @After public void tearDown() throws Exception {
+    if (containersMonitor != null) {
+      containersMonitor.stop();
+    }
+    if (dispatcher != null) {
+      dispatcher.stop();
+    }
+  }
+  @Test public void testContainersResourceChangePolling() throws Exception {
+    conf.setLong(YarnConfiguration.NM_CONTAINER_MON_INTERVAL_MS,20L);
+    conf.setBoolean(YarnConfiguration.NM_MEMORY_RESOURCE_ENFORCED,false);
+    containersMonitor=createContainersMonitor(executor,dispatcher,context);
+    containersMonitor.init(conf);
+    containersMonitor.start();
+    containersMonitor.handle(new ContainerStartMonitoringEvent(getContainerId(1),2100L,1000L,1,0,0));
+    assertNotNull(getProcessTreeInfo(getContainerId(1)));
+    assertEquals(1000L,getProcessTreeInfo(getContainerId(1)).getPmemLimit());
+    assertEquals(2100L,getProcessTreeInfo(getContainerId(1)).getVmemLimit());
+    Thread.sleep(200);
+    MockResourceCalculatorProcessTree mockTree=(MockResourceCalculatorProcessTree)getProcessTreeInfo(getContainerId(1)).getProcessTree();
+    mockTree.setRssMemorySize(2500L);
+    for (int waitMs=0; waitMs < 5000; waitMs+=50) {
+      if (containerEventHandler.isContainerKilled(getContainerId(1))) {
+        break;
+      }
+      Thread.sleep(50);
+    }
+    assertTrue(containerEventHandler.isContainerKilled(getContainerId(1)));
+    containersMonitor.handle(new ContainerStartMonitoringEvent(getContainerId(2),2202009L,1048576L,1,0,0));
+    assertNotNull(getProcessTreeInfo(getContainerId(2)));
+    assertEquals(1048576L,getProcessTreeInfo(getContainerId(2)).getPmemLimit());
+    assertEquals(2202009L,getProcessTreeInfo(getContainerId(2)).getVmemLimit());
+    containersMonitor.handle(new ChangeMonitoringContainerResourceEvent(getContainerId(2),Resource.newInstance(2,1)));
+    assertEquals(2097152L,getProcessTreeInfo(getContainerId(2)).getPmemLimit());
+    assertEquals(4404019L,getProcessTreeInfo(getContainerId(2)).getVmemLimit());
+    Thread.sleep(200);
+    mockTree=(MockResourceCalculatorProcessTree)getProcessTreeInfo(getContainerId(2)).getProcessTree();
+    mockTree.setRssMemorySize(2000000L);
+    Thread.sleep(200);
+    assertFalse(containerEventHandler.isContainerKilled(getContainerId(2)));
+    containersMonitor.stop();
+  }
+  @Test public void testContainersResourceChangeIsTriggeredImmediately() throws Exception {
+    conf.setLong(YarnConfiguration.NM_CONTAINER_MON_INTERVAL_MS,20000L);
+    containersMonitor=createContainersMonitor(executor,dispatcher,context);
+    containersMonitor.init(conf);
+    containersMonitor.start();
+    Thread.sleep(1000);
+    containersMonitor.handle(new ContainerStartMonitoringEvent(getContainerId(3),2202009L,1048576L,1,0,0));
+    assertNotNull(getProcessTreeInfo(getContainerId(3)));
+    containersMonitor.handle(new ChangeMonitoringContainerResourceEvent(getContainerId(3),Resource.newInstance(2,1)));
+    assertEquals(2097152L,getProcessTreeInfo(getContainerId(3)).getPmemLimit());
+    assertEquals(4404019L,getProcessTreeInfo(getContainerId(3)).getVmemLimit());
+    containersMonitor.stop();
+  }
+  @Test public void testContainersCPUResourceForDefaultValue() throws Exception {
+    Configuration newConf=new Configuration(conf);
+    newConf.setLong(YarnConfiguration.NM_CONTAINER_MON_INTERVAL_MS,20L);
+    containersMonitor=createContainersMonitor(executor,dispatcher,context);
+    newConf.set(YarnConfiguration.NM_CONTAINER_MON_PROCESS_TREE,MockCPUResourceCalculatorProcessTree.class.getCanonicalName());
+    containersMonitor.init(newConf);
+    containersMonitor.start();
+    containersMonitor.handle(new ContainerStartMonitoringEvent(getContainerId(1),2100L,1000L,1,0,0));
+    assertEquals("Resource utilization must be default with MonitorThread's first run",0,containersMonitor.getContainersUtilization().compareTo(ResourceUtilization.newInstance(0,0,0.0f)));
+    waitForContainerResourceUtilizationChange(containersMonitor,100);
+    containersMonitor.stop();
+  }
+  public static void waitForContainerResourceUtilizationChange(  ContainersMonitorImpl containersMonitor,  int timeoutMsecs) throws InterruptedException {
+    int timeWaiting=0;
+    while (0 == containersMonitor.getContainersUtilization().compareTo(ResourceUtilization.newInstance(0,0,0.0f))) {
+      if (timeWaiting >= timeoutMsecs) {
+        break;
+      }
+      LOG.info("Monitor thread is waiting for resource utlization change.");
+      Thread.sleep(WAIT_MS_PER_LOOP);
+      timeWaiting+=WAIT_MS_PER_LOOP;
+    }
+    assertTrue("Resource utilization is not changed from second run onwards",0 != containersMonitor.getContainersUtilization().compareTo(ResourceUtilization.newInstance(0,0,0.0f)));
+  }
+  private ContainersMonitorImpl createContainersMonitor(  ContainerExecutor containerExecutor,  AsyncDispatcher dispatcher,  Context context){
+    return new ContainersMonitorImpl(containerExecutor,dispatcher,context);
+  }
+  private ContainerId getContainerId(  int id){
+    return ContainerId.newContainerId(ApplicationAttemptId.newInstance(ApplicationId.newInstance(123456L,1),1),id);
+  }
+  private ProcessTreeInfo getProcessTreeInfo(  ContainerId id){
+    return containersMonitor.trackingContainers.get(id);
+  }
+}

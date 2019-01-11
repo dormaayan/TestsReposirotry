@@ -1,0 +1,211 @@
+/** 
+ * Erasure coder test base with utilities.
+ */
+public abstract class TestErasureCoderBase extends TestCoderBase {
+  protected Class<? extends ErasureCoder> encoderClass;
+  protected Class<? extends ErasureCoder> decoderClass;
+  private ErasureCoder encoder;
+  private ErasureCoder decoder;
+  protected int numChunksInBlock=16;
+  /** 
+ * It's just a block for this test purpose. We don't use HDFS block here at all for simple.
+ */
+protected static class TestBlock extends ECBlock {
+    protected ECChunk[] chunks;
+    public TestBlock(    ECChunk[] chunks){
+      this.chunks=chunks;
+    }
+  }
+  /** 
+ * Generating source data, encoding, recovering and then verifying. RawErasureCoder mainly uses ECChunk to pass input and output data buffers, it supports two kinds of ByteBuffers, one is array backed, the other is direct ByteBuffer. Have usingDirectBuffer to indicate which case to test.
+ * @param usingDirectBuffer
+ */
+  protected void testCoding(  boolean usingDirectBuffer){
+    this.usingDirectBuffer=usingDirectBuffer;
+    prepareCoders();
+    performTestCoding(baseChunkSize,true);
+    performTestCoding(baseChunkSize - 17,false);
+    performTestCoding(baseChunkSize + 16,true);
+  }
+  private void performTestCoding(  int chunkSize,  boolean usingSlicedBuffer){
+    setChunkSize(chunkSize);
+    prepareBufferAllocator(usingSlicedBuffer);
+    ECBlockGroup blockGroup=prepareBlockGroupForEncoding();
+    TestBlock[] clonedDataBlocks=cloneBlocksWithData((TestBlock[])blockGroup.getDataBlocks());
+    TestBlock[] parityBlocks=(TestBlock[])blockGroup.getParityBlocks();
+    ErasureCodingStep codingStep;
+    codingStep=encoder.calculateCoding(blockGroup);
+    try {
+      performCodingStep(codingStep);
+    }
+ catch (    IOException e) {
+      fail("Should not expect IOException: " + e.getMessage());
+    }
+    TestBlock[] backupBlocks=backupAndEraseBlocks(clonedDataBlocks,parityBlocks);
+    blockGroup=new ECBlockGroup(clonedDataBlocks,blockGroup.getParityBlocks());
+    codingStep=decoder.calculateCoding(blockGroup);
+    try {
+      performCodingStep(codingStep);
+    }
+ catch (    IOException e) {
+      fail("Should not expect IOException: " + e.getMessage());
+    }
+    compareAndVerify(backupBlocks,codingStep.getOutputBlocks());
+  }
+  /** 
+ * This is typically how a coding step should be performed.
+ * @param codingStep
+ */
+  protected void performCodingStep(  ErasureCodingStep codingStep) throws IOException {
+    ECBlock[] inputBlocks=codingStep.getInputBlocks();
+    ECBlock[] outputBlocks=codingStep.getOutputBlocks();
+    ECChunk[] inputChunks=new ECChunk[inputBlocks.length];
+    ECChunk[] outputChunks=new ECChunk[outputBlocks.length];
+    for (int i=0; i < numChunksInBlock; ++i) {
+      for (int j=0; j < inputBlocks.length; ++j) {
+        inputChunks[j]=((TestBlock)inputBlocks[j]).chunks[i];
+      }
+      for (int j=0; j < outputBlocks.length; ++j) {
+        outputChunks[j]=allocateOutputChunk();
+        ((TestBlock)outputBlocks[j]).chunks[i]=outputChunks[j];
+      }
+      codingStep.performCoding(inputChunks,outputChunks);
+    }
+    codingStep.finish();
+  }
+  /** 
+ * Compare and verify if recovered blocks data are the same with the erased blocks data.
+ * @param erasedBlocks
+ * @param recoveredBlocks
+ */
+  protected void compareAndVerify(  ECBlock[] erasedBlocks,  ECBlock[] recoveredBlocks){
+    for (int i=0; i < erasedBlocks.length; ++i) {
+      compareAndVerify(((TestBlock)erasedBlocks[i]).chunks,((TestBlock)recoveredBlocks[i]).chunks);
+    }
+  }
+  private void prepareCoders(){
+    if (encoder == null) {
+      encoder=createEncoder();
+    }
+    if (decoder == null) {
+      decoder=createDecoder();
+    }
+  }
+  /** 
+ * Create the raw erasure encoder to test
+ * @return
+ */
+  protected ErasureCoder createEncoder(){
+    ErasureCoder encoder;
+    try {
+      ErasureCoderOptions options=new ErasureCoderOptions(numDataUnits,numParityUnits,allowChangeInputs,allowDump);
+      Constructor<? extends ErasureCoder> constructor=(Constructor<? extends ErasureCoder>)encoderClass.getConstructor(ErasureCoderOptions.class);
+      encoder=constructor.newInstance(options);
+    }
+ catch (    Exception e) {
+      throw new RuntimeException("Failed to create encoder",e);
+    }
+    encoder.setConf(getConf());
+    return encoder;
+  }
+  /** 
+ * create the raw erasure decoder to test
+ * @return
+ */
+  protected ErasureCoder createDecoder(){
+    ErasureCoder decoder;
+    try {
+      ErasureCoderOptions options=new ErasureCoderOptions(numDataUnits,numParityUnits,allowChangeInputs,allowDump);
+      Constructor<? extends ErasureCoder> constructor=(Constructor<? extends ErasureCoder>)decoderClass.getConstructor(ErasureCoderOptions.class);
+      decoder=constructor.newInstance(options);
+    }
+ catch (    Exception e) {
+      throw new RuntimeException("Failed to create decoder",e);
+    }
+    decoder.setConf(getConf());
+    return decoder;
+  }
+  /** 
+ * Prepare a block group for encoding.
+ * @return
+ */
+  protected ECBlockGroup prepareBlockGroupForEncoding(){
+    ECBlock[] dataBlocks=new TestBlock[numDataUnits];
+    ECBlock[] parityBlocks=new TestBlock[numParityUnits];
+    for (int i=0; i < numDataUnits; i++) {
+      dataBlocks[i]=generateDataBlock();
+    }
+    for (int i=0; i < numParityUnits; i++) {
+      parityBlocks[i]=allocateOutputBlock();
+    }
+    return new ECBlockGroup(dataBlocks,parityBlocks);
+  }
+  /** 
+ * Generate random data and return a data block.
+ * @return
+ */
+  protected ECBlock generateDataBlock(){
+    ECChunk[] chunks=new ECChunk[numChunksInBlock];
+    for (int i=0; i < numChunksInBlock; ++i) {
+      chunks[i]=generateDataChunk();
+    }
+    return new TestBlock(chunks);
+  }
+  /** 
+ * Erase blocks to test the recovering of them. Before erasure clone them first so could return themselves.
+ * @param dataBlocks
+ * @return clone of erased dataBlocks
+ */
+  protected TestBlock[] backupAndEraseBlocks(  TestBlock[] dataBlocks,  TestBlock[] parityBlocks){
+    TestBlock[] toEraseBlocks=new TestBlock[erasedDataIndexes.length + erasedParityIndexes.length];
+    int idx=0;
+    TestBlock block;
+    for (int i=0; i < erasedDataIndexes.length; i++) {
+      block=dataBlocks[erasedDataIndexes[i]];
+      toEraseBlocks[idx++]=cloneBlockWithData(block);
+      eraseDataFromBlock(block);
+    }
+    for (int i=0; i < erasedParityIndexes.length; i++) {
+      block=parityBlocks[erasedParityIndexes[i]];
+      toEraseBlocks[idx++]=cloneBlockWithData(block);
+      eraseDataFromBlock(block);
+    }
+    return toEraseBlocks;
+  }
+  /** 
+ * Allocate an output block. Note the chunk buffer will be allocated by the up caller when performing the coding step.
+ * @return
+ */
+  protected TestBlock allocateOutputBlock(){
+    ECChunk[] chunks=new ECChunk[numChunksInBlock];
+    return new TestBlock(chunks);
+  }
+  /** 
+ * Clone blocks with data copied along with, avoiding affecting the original blocks.
+ * @param blocks
+ * @return
+ */
+  protected TestBlock[] cloneBlocksWithData(  TestBlock[] blocks){
+    TestBlock[] results=new TestBlock[blocks.length];
+    for (int i=0; i < blocks.length; ++i) {
+      results[i]=cloneBlockWithData(blocks[i]);
+    }
+    return results;
+  }
+  /** 
+ * Clone exactly a block, avoiding affecting the original block.
+ * @param block
+ * @return a new block
+ */
+  protected TestBlock cloneBlockWithData(  TestBlock block){
+    ECChunk[] newChunks=cloneChunksWithData(block.chunks);
+    return new TestBlock(newChunks);
+  }
+  /** 
+ * Erase data from a block.
+ */
+  protected void eraseDataFromBlock(  TestBlock theBlock){
+    eraseDataFromChunks(theBlock.chunks);
+    theBlock.setErased(true);
+  }
+}

@@ -1,0 +1,61 @@
+@Test(timeout=5000) public void testWriteTaskRejected() throws Exception {
+  final SingleThreadEventExecutor executor=new SingleThreadEventExecutor(null,new DefaultThreadFactory("executorPool"),true,1,RejectedExecutionHandlers.reject()){
+    @Override protected void run(){
+      do {
+        Runnable task=takeTask();
+        if (task != null) {
+          task.run();
+          updateLastExecutionTime();
+        }
+      }
+ while (!confirmShutdown());
+    }
+    @Override protected Queue<Runnable> newTaskQueue(    int maxPendingTasks){
+      return super.newTaskQueue(1);
+    }
+  }
+;
+  final CountDownLatch handlerAddedLatch=new CountDownLatch(1);
+  EmbeddedChannel ch=new EmbeddedChannel();
+  ch.pipeline().addLast(executor,new ChannelOutboundHandlerAdapter(){
+    @Override public void write(    ChannelHandlerContext ctx,    Object msg,    ChannelPromise promise) throws Exception {
+      promise.setFailure(new AssertionError("Should not be called"));
+    }
+    @Override public void handlerAdded(    ChannelHandlerContext ctx) throws Exception {
+      handlerAddedLatch.countDown();
+    }
+  }
+);
+  handlerAddedLatch.await();
+  final CountDownLatch executeLatch=new CountDownLatch(1);
+  final CountDownLatch runLatch=new CountDownLatch(1);
+  executor.execute(new Runnable(){
+    @Override public void run(){
+      try {
+        runLatch.countDown();
+        executeLatch.await();
+      }
+ catch (      InterruptedException e) {
+        Thread.currentThread().interrupt();
+      }
+    }
+  }
+);
+  runLatch.await();
+  executor.execute(new Runnable(){
+    @Override public void run(){
+    }
+  }
+);
+  assertEquals(1,executor.pendingTasks());
+  assertEquals(0,ch.unsafe().outboundBuffer().totalPendingWriteBytes());
+  ByteBuf buffer=buffer(128).writeZero(128);
+  ChannelFuture future=ch.write(buffer);
+  ch.runPendingTasks();
+  assertTrue(future.cause() instanceof RejectedExecutionException);
+  assertEquals(0,buffer.refCnt());
+  assertEquals(0,ch.unsafe().outboundBuffer().totalPendingWriteBytes());
+  executeLatch.countDown();
+  safeClose(ch);
+  executor.shutdownGracefully();
+}

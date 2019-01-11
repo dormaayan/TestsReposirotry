@@ -1,0 +1,36 @@
+@Test public void testAppendInExpiryCallback() throws InterruptedException {
+  int messagesPerBatch=10;
+  final AtomicInteger expiryCallbackCount=new AtomicInteger(0);
+  final AtomicReference<Exception> unexpectedException=new AtomicReference<>();
+  final byte[] key="key".getBytes();
+  final byte[] value="value".getBytes();
+  final long maxBlockTimeMs=1000;
+  Callback callback=new Callback(){
+    @Override public void onCompletion(    RecordMetadata metadata,    Exception exception){
+      if (exception instanceof TimeoutException) {
+        expiryCallbackCount.incrementAndGet();
+        try {
+          accumulator.append(tp1,0L,key,value,Record.EMPTY_HEADERS,null,maxBlockTimeMs);
+        }
+ catch (        InterruptedException e) {
+          throw new RuntimeException("Unexpected interruption",e);
+        }
+      }
+ else       if (exception != null)       unexpectedException.compareAndSet(null,exception);
+    }
+  }
+;
+  for (int i=0; i < messagesPerBatch; i++)   accumulator.append(tp1,0L,key,value,null,callback,maxBlockTimeMs);
+  time.sleep(10000);
+  Node clusterNode=this.cluster.nodes().get(0);
+  Map<Integer,List<ProducerBatch>> drainedBatches=accumulator.drain(cluster,Collections.singleton(clusterNode),Integer.MAX_VALUE,time.milliseconds());
+  sender.addToInflightBatches(drainedBatches);
+  client.disconnect(clusterNode.idString());
+  client.blackout(clusterNode,100);
+  sender.run(time.milliseconds());
+  assertEquals("Callbacks not invoked for expiry",messagesPerBatch,expiryCallbackCount.get());
+  assertNull("Unexpected exception",unexpectedException.get());
+  assertTrue(accumulator.batches().containsKey(tp1));
+  assertEquals(1,accumulator.batches().get(tp1).size());
+  assertEquals(messagesPerBatch,accumulator.batches().get(tp1).peekFirst().recordCount);
+}

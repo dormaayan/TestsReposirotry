@@ -1,0 +1,83 @@
+/** 
+ * Simple test of  {@link RouterPolicyFacade}.
+ */
+public class TestRouterPolicyFacade {
+  private RouterPolicyFacade routerFacade;
+  private List<SubClusterId> subClusterIds;
+  private FederationStateStore store;
+  private String queue1="queue1";
+  private String defQueueKey=YarnConfiguration.DEFAULT_FEDERATION_POLICY_KEY;
+  @Before public void setup() throws YarnException {
+    FederationStateStoreFacade fedFacade=FederationStateStoreFacade.getInstance();
+    YarnConfiguration conf=new YarnConfiguration();
+    conf.set(YarnConfiguration.FEDERATION_CACHE_TIME_TO_LIVE_SECS,"0");
+    store=new MemoryFederationStateStore();
+    store.init(conf);
+    fedFacade.reinitialize(store,conf);
+    FederationStateStoreTestUtil storeTestUtil=new FederationStateStoreTestUtil(store);
+    storeTestUtil.registerSubClusters(10);
+    subClusterIds=storeTestUtil.getAllSubClusterIds(true);
+    store.setPolicyConfiguration(SetSubClusterPolicyConfigurationRequest.newInstance(getUniformPolicy(queue1)));
+    SubClusterResolver resolver=FederationPoliciesTestUtil.initResolver();
+    routerFacade=new RouterPolicyFacade(new YarnConfiguration(),fedFacade,resolver,subClusterIds.get(0));
+  }
+  @Test public void testConfigurationUpdate() throws YarnException {
+    ApplicationSubmissionContext applicationSubmissionContext=mock(ApplicationSubmissionContext.class);
+    when(applicationSubmissionContext.getQueue()).thenReturn(queue1);
+    SubClusterId chosen=routerFacade.getHomeSubcluster(applicationSubmissionContext,null);
+    Assert.assertTrue(subClusterIds.contains(chosen));
+    Assert.assertTrue(routerFacade.globalPolicyMap.get(queue1) instanceof UniformRandomRouterPolicy);
+    store.setPolicyConfiguration(SetSubClusterPolicyConfigurationRequest.newInstance(getPriorityPolicy(queue1)));
+    chosen=routerFacade.getHomeSubcluster(applicationSubmissionContext,null);
+    Assert.assertTrue(chosen.equals(subClusterIds.get(0)));
+    Assert.assertTrue(routerFacade.globalPolicyMap.get(queue1) instanceof PriorityRouterPolicy);
+  }
+  @Test public void testGetHomeSubcluster() throws YarnException {
+    ApplicationSubmissionContext applicationSubmissionContext=mock(ApplicationSubmissionContext.class);
+    when(applicationSubmissionContext.getQueue()).thenReturn(queue1);
+    Assert.assertTrue(routerFacade.globalPolicyMap.containsKey(defQueueKey) && routerFacade.globalPolicyMap.size() == 1);
+    SubClusterId chosen=routerFacade.getHomeSubcluster(applicationSubmissionContext,null);
+    Assert.assertTrue(subClusterIds.contains(chosen));
+    Assert.assertTrue(routerFacade.globalPolicyMap.size() == 2);
+    Assert.assertTrue(routerFacade.globalPolicyMap.get(queue1) instanceof UniformRandomRouterPolicy);
+    routerFacade.reset();
+    Assert.assertTrue(routerFacade.globalPolicyMap.containsKey(defQueueKey) && routerFacade.globalPolicyMap.size() == 1);
+  }
+  @Test public void testFallbacks() throws YarnException {
+    ApplicationSubmissionContext applicationSubmissionContext=mock(ApplicationSubmissionContext.class);
+    String uninitQueue="non-initialized-queue";
+    when(applicationSubmissionContext.getQueue()).thenReturn(uninitQueue);
+    SubClusterId chosen=routerFacade.getHomeSubcluster(applicationSubmissionContext,null);
+    Assert.assertTrue(subClusterIds.contains(chosen));
+    Assert.assertFalse(routerFacade.globalPolicyMap.containsKey(uninitQueue));
+    when(applicationSubmissionContext.getQueue()).thenReturn("");
+    chosen=routerFacade.getHomeSubcluster(applicationSubmissionContext,null);
+    Assert.assertTrue(subClusterIds.contains(chosen));
+    Assert.assertFalse(routerFacade.globalPolicyMap.containsKey(uninitQueue));
+    when(applicationSubmissionContext.getQueue()).thenReturn(null);
+    chosen=routerFacade.getHomeSubcluster(applicationSubmissionContext,null);
+    Assert.assertTrue(subClusterIds.contains(chosen));
+    Assert.assertFalse(routerFacade.globalPolicyMap.containsKey(uninitQueue));
+  }
+  public static SubClusterPolicyConfiguration getUniformPolicy(  String queue) throws FederationPolicyInitializationException {
+    UniformBroadcastPolicyManager wfp=new UniformBroadcastPolicyManager();
+    wfp.setQueue(queue);
+    SubClusterPolicyConfiguration fpc=wfp.serializeConf();
+    return fpc;
+  }
+  public SubClusterPolicyConfiguration getPriorityPolicy(  String queue) throws FederationPolicyInitializationException {
+    PriorityBroadcastPolicyManager wfp=new PriorityBroadcastPolicyManager();
+    Map<SubClusterIdInfo,Float> routerWeights=new HashMap<>();
+    for (    SubClusterId s : subClusterIds) {
+      routerWeights.put(new SubClusterIdInfo(s),0.9f / subClusterIds.size());
+    }
+    SubClusterIdInfo favorite=new SubClusterIdInfo((subClusterIds.get(0)));
+    routerWeights.put(favorite,(0.1f + 0.9f / subClusterIds.size()));
+    WeightedPolicyInfo policyInfo=new WeightedPolicyInfo();
+    policyInfo.setRouterPolicyWeights(routerWeights);
+    wfp.setWeightedPolicyInfo(policyInfo);
+    wfp.setQueue(queue);
+    SubClusterPolicyConfiguration fpc=wfp.serializeConf();
+    return fpc;
+  }
+}

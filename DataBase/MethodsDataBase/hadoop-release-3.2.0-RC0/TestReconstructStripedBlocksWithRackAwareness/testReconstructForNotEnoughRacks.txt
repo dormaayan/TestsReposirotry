@@ -1,0 +1,56 @@
+/** 
+ * When there are all the internal blocks available but they are not placed on enough racks, NameNode should avoid normal decoding reconstruction but copy an internal block to a new rack. In this test, we first need to create a scenario that a striped block has all the internal blocks but distributed in <6 racks. Then we check if the redundancy monitor can correctly schedule the reconstruction work for it.
+ */
+@Test public void testReconstructForNotEnoughRacks() throws Exception {
+  LOG.info("cluster hosts: {}, racks: {}",Arrays.asList(hosts),Arrays.asList(racks));
+  cluster=new MiniDFSCluster.Builder(conf).racks(racks).hosts(hosts).numDataNodes(hosts.length).build();
+  cluster.waitActive();
+  fs=cluster.getFileSystem();
+  fs.enableErasureCodingPolicy(StripedFileTestUtil.getDefaultECPolicy().getName());
+  fs.setErasureCodingPolicy(new Path("/"),StripedFileTestUtil.getDefaultECPolicy().getName());
+  FSNamesystem fsn=cluster.getNamesystem();
+  BlockManager bm=fsn.getBlockManager();
+  MiniDFSCluster.DataNodeProperties lastHost=stopDataNode(hosts[hosts.length - 1]);
+  final Path file=new Path("/foo");
+  DFSTestUtil.createFile(fs,file,cellSize * dataBlocks * 2,(short)1,0L);
+  Assert.assertEquals(0,bm.numOfUnderReplicatedBlocks());
+  final INodeFile fileNode=fsn.getFSDirectory().getINode4Write(file.toString()).asFile();
+  BlockInfoStriped blockInfo=(BlockInfoStriped)fileNode.getLastBlock();
+  Set<String> rackSet=new HashSet<>();
+  for (  DatanodeStorageInfo storage : blockInfo.storages) {
+    rackSet.add(storage.getDatanodeDescriptor().getNetworkLocation());
+  }
+  Assert.assertEquals(dataBlocks - 1,rackSet.size());
+  cluster.restartDataNode(lastHost);
+  cluster.waitActive();
+  NetworkTopology topology=bm.getDatanodeManager().getNetworkTopology();
+  Assert.assertEquals(hosts.length,topology.getNumOfLeaves());
+  Assert.assertEquals(dataBlocks,topology.getNumOfRacks());
+  for (  DataNode dn : cluster.getDataNodes()) {
+    DataNodeTestUtils.setHeartbeatsDisabledForTests(dn,true);
+  }
+  fsn.writeLock();
+  try {
+    bm.processMisReplicatedBlocks();
+  }
+  finally {
+    fsn.writeUnlock();
+  }
+  boolean scheduled=false;
+  for (int i=0; i < 5; i++) {
+    for (    DatanodeStorageInfo storage : blockInfo.storages) {
+      if (storage != null) {
+        DatanodeDescriptor dn=storage.getDatanodeDescriptor();
+        Assert.assertEquals(0,dn.getNumberOfBlocksToBeErasureCoded());
+        if (dn.getNumberOfBlocksToBeReplicated() == 1) {
+          scheduled=true;
+        }
+      }
+    }
+    if (scheduled) {
+      break;
+    }
+    Thread.sleep(1000);
+  }
+  Assert.assertTrue(scheduled);
+}

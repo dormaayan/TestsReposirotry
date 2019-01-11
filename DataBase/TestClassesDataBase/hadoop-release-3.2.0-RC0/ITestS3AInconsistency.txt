@@ -1,0 +1,100 @@
+/** 
+ * Tests S3A behavior under forced inconsistency via  {@link InconsistentAmazonS3Client}. These tests are for validating expected behavior *without* S3Guard, but may also run with S3Guard enabled.  For tests that validate S3Guard's consistency features, see  {@link ITestS3GuardListConsistency}.
+ */
+public class ITestS3AInconsistency extends AbstractS3ATestBase {
+  private static final int OPEN_READ_ITERATIONS=20;
+  @Override protected AbstractFSContract createContract(  Configuration conf){
+    conf.setClass(S3_CLIENT_FACTORY_IMPL,InconsistentS3ClientFactory.class,S3ClientFactory.class);
+    conf.set(FAIL_INJECT_INCONSISTENCY_KEY,DEFAULT_DELAY_KEY_SUBSTRING);
+    conf.setFloat(FAIL_INJECT_INCONSISTENCY_PROBABILITY,1.0f);
+    conf.setLong(FAIL_INJECT_INCONSISTENCY_MSEC,DEFAULT_DELAY_KEY_MSEC);
+    return new S3AContract(conf);
+  }
+  @Test public void testGetFileStatus() throws Exception {
+    S3AFileSystem fs=getFileSystem();
+    Path dir=path("ancestor");
+    fs.delete(dir,true);
+    waitUntilDeleted(dir);
+    touch(getFileSystem(),path("ancestor/file-" + DEFAULT_DELAY_KEY_SUBSTRING));
+    try {
+      FileStatus status=fs.getFileStatus(dir);
+      if (fs.hasMetadataStore()) {
+        assertTrue("Ancestor is dir",status.isDirectory());
+      }
+ else {
+        fail("getFileStatus should fail due to delayed visibility.");
+      }
+    }
+ catch (    FileNotFoundException e) {
+      if (fs.hasMetadataStore()) {
+        fail("S3Guard failed to list parent of inconsistent child.");
+      }
+      LOG.info("File not found, as expected.");
+    }
+  }
+  /** 
+ * Ensure that deleting a file with an open read stream does eventually cause readers to get a FNFE, even with S3Guard and its retries enabled. In real usage, S3Guard should be enabled for all clients that modify the file, so the delete would be immediately recorded in the MetadataStore. Here, however, we test deletion from under S3Guard to make sure it still eventually propagates the FNFE after any retry policies are exhausted.
+ */
+  @Test public void testOpenDeleteRead() throws Exception {
+    S3AFileSystem fs=getFileSystem();
+    Path p=path("testOpenDeleteRead.txt");
+    writeTextFile(fs,p,"1337c0d3z",true);
+    try (InputStream s=fs.open(p)){
+      MetadataStore metadataStore=fs.getMetadataStore();
+      fs.setMetadataStore(new NullMetadataStore());
+      fs.delete(p,false);
+      fs.setMetadataStore(metadataStore);
+      eventually(1000,200,() -> {
+        intercept(FileNotFoundException.class,() -> s.read());
+      }
+);
+    }
+   }
+  /** 
+ * Test read() path behavior when getFileStatus() succeeds but subsequent read() on the input stream fails due to eventual consistency. There are many points in the InputStream codepaths that can fail. We set a probability of failure and repeat the test multiple times to achieve decent coverage.
+ */
+  @Test public void testOpenFailOnRead() throws Exception {
+    S3AFileSystem fs=getFileSystem();
+    Configuration conf=fs.getConf();
+    conf.setFloat(FAIL_INJECT_INCONSISTENCY_PROBABILITY,0.5f);
+    InconsistentAmazonS3Client.setFailureInjectionPolicy(fs,new FailureInjectionPolicy(conf));
+    Path dir=path("ancestor");
+    fs.delete(dir,true);
+    waitUntilDeleted(dir);
+    describe("creating test file");
+    Path path=path("ancestor/file-to-read-" + DEFAULT_DELAY_KEY_SUBSTRING);
+    writeTextFile(getFileSystem(),path,"Reading is fun",false);
+    if (!fs.hasMetadataStore()) {
+      InconsistentAmazonS3Client.clearInconsistency(fs);
+    }
+    for (int i=0; i < OPEN_READ_ITERATIONS; i++) {
+      doOpenFailOnReadTest(fs,path,i);
+    }
+  }
+  private void doOpenFailOnReadTest(  S3AFileSystem fs,  Path path,  int iteration) throws Exception {
+    describe(String.format("i=%d: opening test file",iteration));
+    try (InputStream in=fs.open(path)){
+      int l=4;
+      byte[] buf=new byte[l];
+      describe("reading test file");
+      if ((iteration % 2) == 0) {
+        assertEquals(l,in.read(buf,0,l));
+      }
+ else {
+        in.read();
+      }
+    }
+ catch (    FileNotFoundException e) {
+      if (fs.hasMetadataStore()) {
+        LOG.error("Error:",e);
+        ContractTestUtils.fail("S3Guard failed to handle fail-on-read",e);
+      }
+ else {
+        LOG.info("File not found on read(), as expected.");
+      }
+    }
+  }
+  private void waitUntilDeleted(  final Path p) throws Exception {
+    LambdaTestUtils.eventually(30 * 1000,1000,() -> assertPathDoesNotExist("Dir should be deleted",p));
+  }
+}

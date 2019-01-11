@@ -1,0 +1,52 @@
+@Test public void testWriteInWritePromiseCompletePreservesOrder() throws InterruptedException {
+  Bootstrap cb=new Bootstrap();
+  ServerBootstrap sb=new ServerBootstrap();
+  final CountDownLatch messageLatch=new CountDownLatch(2);
+  final ByteBuf data=Unpooled.wrappedBuffer(new byte[1024]);
+  final ByteBuf data2=Unpooled.wrappedBuffer(new byte[512]);
+  try {
+    cb.group(group1).channel(LocalChannel.class).handler(new TestHandler());
+    sb.group(group2).channel(LocalServerChannel.class).childHandler(new ChannelInboundHandlerAdapter(){
+      @Override public void channelRead(      ChannelHandlerContext ctx,      Object msg) throws Exception {
+        final long count=messageLatch.getCount();
+        if ((data.equals(msg) && count == 2) || (data2.equals(msg) && count == 1)) {
+          ReferenceCountUtil.safeRelease(msg);
+          messageLatch.countDown();
+        }
+ else {
+          super.channelRead(ctx,msg);
+        }
+      }
+    }
+);
+    Channel sc=null;
+    Channel cc=null;
+    try {
+      sc=sb.bind(TEST_ADDRESS).syncUninterruptibly().channel();
+      cc=cb.connect(sc.localAddress()).syncUninterruptibly().channel();
+      final Channel ccCpy=cc;
+      cc.pipeline().lastContext().executor().execute(new Runnable(){
+        @Override public void run(){
+          ChannelPromise promise=ccCpy.newPromise();
+          promise.addListener(new ChannelFutureListener(){
+            @Override public void operationComplete(            ChannelFuture future) throws Exception {
+              ccCpy.writeAndFlush(data2.retainedDuplicate(),ccCpy.newPromise());
+            }
+          }
+);
+          ccCpy.writeAndFlush(data.retainedDuplicate(),promise);
+        }
+      }
+);
+      assertTrue(messageLatch.await(5,SECONDS));
+    }
+  finally {
+      closeChannel(cc);
+      closeChannel(sc);
+    }
+  }
+  finally {
+    data.release();
+    data2.release();
+  }
+}

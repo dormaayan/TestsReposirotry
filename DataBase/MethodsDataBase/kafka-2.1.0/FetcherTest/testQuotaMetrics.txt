@@ -1,0 +1,34 @@
+@Test public void testQuotaMetrics(){
+  MockSelector selector=new MockSelector(time);
+  Sensor throttleTimeSensor=Fetcher.throttleTimeSensor(metrics,metricsRegistry);
+  Cluster cluster=TestUtils.singletonCluster("test",1);
+  Node node=cluster.nodes().get(0);
+  NetworkClient client=new NetworkClient(selector,metadata,"mock",Integer.MAX_VALUE,1000,1000,64 * 1024,64 * 1024,1000,ClientDnsLookup.DEFAULT,time,true,new ApiVersions(),throttleTimeSensor,new LogContext());
+  short apiVersionsResponseVersion=ApiKeys.API_VERSIONS.latestVersion();
+  ByteBuffer buffer=ApiVersionsResponse.createApiVersionsResponse(400,RecordBatch.CURRENT_MAGIC_VALUE).serialize(apiVersionsResponseVersion,new ResponseHeader(0));
+  selector.delayedReceive(new DelayedReceive(node.idString(),new NetworkReceive(node.idString(),buffer)));
+  while (!client.ready(node,time.milliseconds())) {
+    client.poll(1,time.milliseconds());
+    time.sleep(client.throttleDelayMs(node,time.milliseconds()));
+  }
+  selector.clear();
+  for (int i=1; i <= 3; i++) {
+    int throttleTimeMs=100 * i;
+    FetchRequest.Builder builder=FetchRequest.Builder.forConsumer(100,100,new LinkedHashMap<>());
+    ClientRequest request=client.newClientRequest(node.idString(),builder,time.milliseconds(),true);
+    client.send(request,time.milliseconds());
+    client.poll(1,time.milliseconds());
+    FetchResponse response=fullFetchResponse(tp0,nextRecords,Errors.NONE,i,throttleTimeMs);
+    buffer=response.serialize(ApiKeys.FETCH.latestVersion(),new ResponseHeader(request.correlationId()));
+    selector.completeReceive(new NetworkReceive(node.idString(),buffer));
+    client.poll(1,time.milliseconds());
+    time.sleep(client.throttleDelayMs(node,time.milliseconds()));
+    selector.clear();
+  }
+  Map<MetricName,KafkaMetric> allMetrics=metrics.metrics();
+  KafkaMetric avgMetric=allMetrics.get(metrics.metricInstance(metricsRegistry.fetchThrottleTimeAvg));
+  KafkaMetric maxMetric=allMetrics.get(metrics.metricInstance(metricsRegistry.fetchThrottleTimeMax));
+  assertEquals(250,(Double)avgMetric.metricValue(),EPSILON);
+  assertEquals(400,(Double)maxMetric.metricValue(),EPSILON);
+  client.close();
+}

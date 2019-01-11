@@ -1,0 +1,44 @@
+/** 
+ * Test manually requesting that the DataNode send a block report.
+ */
+public final class TestTriggerBlockReport {
+  private void testTriggerBlockReport(  boolean incremental) throws Exception {
+    Configuration conf=new HdfsConfiguration();
+    conf.setLong(DFSConfigKeys.DFS_BLOCKREPORT_INTERVAL_MSEC_KEY,10800000L);
+    conf.setLong(DFSConfigKeys.DFS_HEARTBEAT_INTERVAL_KEY,1080L);
+    final MiniDFSCluster cluster=new MiniDFSCluster.Builder(conf).numDataNodes(1).build();
+    cluster.waitActive();
+    FileSystem fs=cluster.getFileSystem();
+    DatanodeProtocolClientSideTranslatorPB spy=InternalDataNodeTestUtils.spyOnBposToNN(cluster.getDataNodes().get(0),cluster.getNameNode());
+    DFSTestUtil.createFile(fs,new Path("/abc"),16,(short)1,1L);
+    Mockito.verify(spy,timeout(60000).times(1)).blockReceivedAndDeleted(any(DatanodeRegistration.class),anyString(),any(StorageReceivedDeletedBlocks[].class));
+    for (int i=0; i < 3; i++) {
+      Thread.sleep(10);
+      Mockito.verify(spy,times(0)).blockReport(any(DatanodeRegistration.class),anyString(),any(StorageBlockReport[].class),Mockito.<BlockReportContext>anyObject());
+      Mockito.verify(spy,times(1)).blockReceivedAndDeleted(any(DatanodeRegistration.class),anyString(),any(StorageReceivedDeletedBlocks[].class));
+    }
+    ReceivedDeletedBlockInfo rdbi=new ReceivedDeletedBlockInfo(new Block(5678,512,1000),BlockStatus.DELETED_BLOCK,null);
+    DataNode datanode=cluster.getDataNodes().get(0);
+    BPServiceActor actor=datanode.getAllBpOs().get(0).getBPServiceActors().get(0);
+    final FsDatasetSpi<?> dataset=datanode.getFSDataset();
+    final DatanodeStorage storage;
+    try (FsDatasetSpi.FsVolumeReferences volumes=dataset.getFsVolumeReferences()){
+      storage=dataset.getStorage(volumes.get(0).getStorageID());
+    }
+     actor.getIbrManager().addRDBI(rdbi,storage);
+    datanode.triggerBlockReport(new BlockReportOptions.Factory().setIncremental(incremental).build());
+    if (incremental) {
+      Mockito.verify(spy,timeout(60000).times(2)).blockReceivedAndDeleted(any(DatanodeRegistration.class),anyString(),any(StorageReceivedDeletedBlocks[].class));
+    }
+ else {
+      Mockito.verify(spy,timeout(60000)).blockReport(any(DatanodeRegistration.class),anyString(),any(StorageBlockReport[].class),Mockito.<BlockReportContext>anyObject());
+    }
+    cluster.shutdown();
+  }
+  @Test public void testTriggerFullBlockReport() throws Exception {
+    testTriggerBlockReport(false);
+  }
+  @Test public void testTriggerIncrementalBlockReport() throws Exception {
+    testTriggerBlockReport(true);
+  }
+}

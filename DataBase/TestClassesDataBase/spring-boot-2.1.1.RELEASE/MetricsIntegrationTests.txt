@@ -1,0 +1,46 @@
+/** 
+ * Integration tests for Metrics.
+ * @author Jon Schneider
+ */
+@RunWith(SpringRunner.class) @SpringBootTest(webEnvironment=WebEnvironment.RANDOM_PORT,classes=MetricsIntegrationTests.MetricsApp.class,properties="management.metrics.use-global-registry=false") public class MetricsIntegrationTests {
+  @Autowired private ApplicationContext context;
+  @Autowired private RestTemplate external;
+  @Autowired private TestRestTemplate loopback;
+  @Autowired private MeterRegistry registry;
+  @SuppressWarnings("unchecked") @Test public void restTemplateIsInstrumented(){
+    MockRestServiceServer server=MockRestServiceServer.bindTo(this.external).build();
+    server.expect(once(),requestTo("/api/external")).andExpect(method(HttpMethod.GET)).andRespond(withSuccess("{\"message\": \"hello\"}",MediaType.APPLICATION_JSON));
+    assertThat(this.external.getForObject("/api/external",Map.class)).containsKey("message");
+    assertThat(this.registry.get("http.client.requests").timer().count()).isEqualTo(1);
+  }
+  @Test public void requestMappingIsInstrumented(){
+    this.loopback.getForObject("/api/people",Set.class);
+    assertThat(this.registry.get("http.server.requests").timer().count()).isEqualTo(1);
+  }
+  @Test public void automaticallyRegisteredBinders(){
+    assertThat(this.context.getBeansOfType(MeterBinder.class).values()).hasAtLeastOneElementOfType(LogbackMetrics.class).hasAtLeastOneElementOfType(JvmMemoryMetrics.class);
+  }
+  @Test @SuppressWarnings({"rawtypes","unchecked"}) public void metricsFilterRegisteredForAsyncDispatches(){
+    Map<String,FilterRegistrationBean> filterRegistrations=this.context.getBeansOfType(FilterRegistrationBean.class);
+    assertThat(filterRegistrations).containsKey("webMvcMetricsFilter");
+    FilterRegistrationBean registration=filterRegistrations.get("webMvcMetricsFilter");
+    assertThat(registration.getFilter()).isInstanceOf(WebMvcMetricsFilter.class);
+    assertThat((Set<DispatcherType>)ReflectionTestUtils.getField(registration,"dispatcherTypes")).containsExactlyInAnyOrder(DispatcherType.REQUEST,DispatcherType.ASYNC);
+  }
+@Configuration @ImportAutoConfiguration({MetricsAutoConfiguration.class,JvmMetricsAutoConfiguration.class,LogbackMetricsAutoConfiguration.class,SystemMetricsAutoConfiguration.class,RabbitMetricsAutoConfiguration.class,CacheMetricsAutoConfiguration.class,DataSourcePoolMetricsAutoConfiguration.class,HibernateMetricsAutoConfiguration.class,HttpClientMetricsAutoConfiguration.class,WebFluxMetricsAutoConfiguration.class,WebMvcMetricsAutoConfiguration.class,JacksonAutoConfiguration.class,HttpMessageConvertersAutoConfiguration.class,RestTemplateAutoConfiguration.class,WebMvcAutoConfiguration.class,DispatcherServletAutoConfiguration.class,ServletWebServerFactoryAutoConfiguration.class}) @Import(PersonController.class) static class MetricsApp {
+    @Primary @Bean public MeterRegistry registry(){
+      return new SimpleMeterRegistry(SimpleConfig.DEFAULT,new MockClock());
+    }
+    @Bean public RestTemplate restTemplate(    RestTemplateBuilder restTemplateBuilder){
+      return restTemplateBuilder.build();
+    }
+    @Bean public CyclicBarrier cyclicBarrier(){
+      return new CyclicBarrier(2);
+    }
+  }
+@RestController static class PersonController {
+    @GetMapping("/api/people") Set<String> personName(){
+      return Collections.singleton("Jon");
+    }
+  }
+}

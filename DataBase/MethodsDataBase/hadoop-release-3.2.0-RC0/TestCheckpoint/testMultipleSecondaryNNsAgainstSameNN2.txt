@@ -1,0 +1,50 @@
+/** 
+ * Test case where two secondary namenodes are checkpointing the same NameNode. This differs from  {@link #testMultipleSecondaryNamenodes()}since that test runs against two distinct NNs. This case tests the following interleaving: - 2NN A) calls rollEdits() - 2NN B) calls rollEdits() - 2NN A) paused at getRemoteEditLogManifest() - 2NN B) calls getRemoteEditLogManifest() (returns up to txid 4) - 2NN B) uploads checkpoint fsimage_4 - 2NN A) allowed to proceed, also returns up to txid 4 - 2NN A) uploads checkpoint fsimage_4 as well, should fail gracefully It verifies that one of the two gets an error that it's uploading a duplicate checkpoint, and the other one succeeds.
+ */
+@Test public void testMultipleSecondaryNNsAgainstSameNN2() throws Exception {
+  Configuration conf=new HdfsConfiguration();
+  MiniDFSCluster cluster=null;
+  SecondaryNameNode secondary1=null, secondary2=null;
+  try {
+    cluster=new MiniDFSCluster.Builder(conf).numDataNodes(0).format(true).build();
+    secondary1=startSecondaryNameNode(conf,1);
+    secondary2=startSecondaryNameNode(conf,2);
+    final NamenodeProtocol origNN=secondary1.getNameNode();
+    final Answer<Object> delegator=new GenericTestUtils.DelegateAnswer(origNN);
+    NamenodeProtocol spyNN=Mockito.mock(NamenodeProtocol.class,delegator);
+    DelayAnswer delayer=new DelayAnswer(LOG){
+      @Override protected Object passThrough(      InvocationOnMock invocation) throws Throwable {
+        return delegator.answer(invocation);
+      }
+    }
+;
+    secondary1.setNameNode(spyNN);
+    Mockito.doAnswer(delayer).when(spyNN).getEditLogManifest(Mockito.anyLong());
+    DoCheckpointThread checkpointThread=new DoCheckpointThread(secondary1);
+    checkpointThread.start();
+    delayer.waitForCall();
+    secondary2.doCheckpoint();
+    NNStorage storage=cluster.getNameNode().getFSImage().getStorage();
+    assertEquals(4,storage.getMostRecentCheckpointTxId());
+    delayer.proceed();
+    checkpointThread.join();
+    checkpointThread.propagateExceptions();
+    assertEquals(4,storage.getMostRecentCheckpointTxId());
+    secondary2.doCheckpoint();
+    assertEquals(6,storage.getMostRecentCheckpointTxId());
+    assertNNHasCheckpoints(cluster,ImmutableList.of(4,6));
+    secondary1.setNameNode(origNN);
+    secondary1.doCheckpoint();
+    assertEquals(8,storage.getMostRecentCheckpointTxId());
+    assertParallelFilesInvariant(cluster,ImmutableList.of(secondary1,secondary2));
+    assertNNHasCheckpoints(cluster,ImmutableList.of(6,8));
+  }
+  finally {
+    cleanup(secondary1);
+    secondary1=null;
+    cleanup(secondary2);
+    secondary2=null;
+    cleanup(cluster);
+    cluster=null;
+  }
+}

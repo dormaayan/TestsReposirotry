@@ -1,0 +1,71 @@
+@Test public void testPreadWithDNFailure() throws Exception {
+  final int numBlocks=4;
+  final int failedDNIdx=dataBlocks - 1;
+  DFSTestUtil.createStripedFile(cluster,filePath,null,numBlocks,stripesPerBlock,false,ecPolicy);
+  LocatedBlocks lbs=fs.getClient().namenode.getBlockLocations(filePath.toString(),0,blockGroupSize);
+  assert lbs.get(0) instanceof LocatedStripedBlock;
+  LocatedStripedBlock bg=(LocatedStripedBlock)(lbs.get(0));
+  for (int i=0; i < dataBlocks + parityBlocks; i++) {
+    Block blk=new Block(bg.getBlock().getBlockId() + i,stripesPerBlock * cellSize,bg.getBlock().getGenerationStamp());
+    blk.setGenerationStamp(bg.getBlock().getGenerationStamp());
+    cluster.injectBlocks(i,Arrays.asList(blk),bg.getBlock().getBlockPoolId());
+  }
+  DFSStripedInputStream in=new DFSStripedInputStream(fs.getClient(),filePath.toString(),false,ecPolicy,null);
+  int readSize=blockGroupSize;
+  byte[] readBuffer=new byte[readSize];
+  byte[] expected=new byte[readSize];
+  for (int i=0; i < stripesPerBlock; i++) {
+    for (int j=0; j < dataBlocks; j++) {
+      for (int k=0; k < cellSize; k++) {
+        int posInBlk=i * cellSize + k;
+        int posInFile=i * cellSize * dataBlocks + j * cellSize + k;
+        expected[posInFile]=SimulatedFSDataset.simulatedByte(new Block(bg.getBlock().getBlockId() + j),posInBlk);
+      }
+    }
+  }
+  ErasureCoderOptions coderOptions=new ErasureCoderOptions(dataBlocks,parityBlocks);
+  RawErasureDecoder rawDecoder=CodecUtil.createRawDecoder(conf,ecPolicy.getCodecName(),coderOptions);
+  int[] missingBlkIdx=new int[parityBlocks];
+  for (int i=0; i < missingBlkIdx.length; i++) {
+    if (i == 0) {
+      missingBlkIdx[i]=failedDNIdx;
+    }
+ else {
+      missingBlkIdx[i]=dataBlocks + i;
+    }
+  }
+  cluster.stopDataNode(failedDNIdx);
+  for (int i=0; i < stripesPerBlock; i++) {
+    byte[][] decodeInputs=new byte[dataBlocks + parityBlocks][cellSize];
+    byte[][] decodeOutputs=new byte[missingBlkIdx.length][cellSize];
+    for (int j=0; j < dataBlocks; j++) {
+      int posInBuf=i * cellSize * dataBlocks + j * cellSize;
+      if (j != failedDNIdx) {
+        System.arraycopy(expected,posInBuf,decodeInputs[j],0,cellSize);
+      }
+    }
+    for (int j=dataBlocks; j < dataBlocks + parityBlocks; j++) {
+      for (int k=0; k < cellSize; k++) {
+        int posInBlk=i * cellSize + k;
+        decodeInputs[j][k]=SimulatedFSDataset.simulatedByte(new Block(bg.getBlock().getBlockId() + j),posInBlk);
+      }
+    }
+    for (    int m : missingBlkIdx) {
+      decodeInputs[m]=null;
+    }
+    rawDecoder.decode(decodeInputs,missingBlkIdx,decodeOutputs);
+    int posInBuf=i * cellSize * dataBlocks + failedDNIdx * cellSize;
+    System.arraycopy(decodeOutputs[0],0,expected,posInBuf,cellSize);
+  }
+  int delta=10;
+  int done=0;
+  done+=in.read(0,readBuffer,0,delta);
+  assertEquals(delta,done);
+  assertArrayEquals(Arrays.copyOf(expected,done),Arrays.copyOf(readBuffer,done));
+  done+=in.read(delta,readBuffer,delta,cellSize * (dataBlocks - 1) - 2 * delta);
+  assertEquals(cellSize * (dataBlocks - 1) - delta,done);
+  assertArrayEquals(Arrays.copyOf(expected,done),Arrays.copyOf(readBuffer,done));
+  done+=in.read(done,readBuffer,done,readSize - done);
+  assertEquals(readSize,done);
+  assertArrayEquals(expected,readBuffer);
+}

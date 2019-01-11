@@ -1,0 +1,65 @@
+@SuppressWarnings("unchecked") @Test(timeout=10000) public void testAMRMClientAsync() throws Exception {
+  Configuration conf=new Configuration();
+  final AtomicBoolean heartbeatBlock=new AtomicBoolean(true);
+  List<ContainerStatus> completed1=Arrays.asList(ContainerStatus.newInstance(newContainerId(0,0,0,0),ContainerState.COMPLETE,"",0));
+  List<Container> containers=Arrays.asList(Container.newInstance(null,null,null,null,null,null));
+  final AllocateResponse response1=createAllocateResponse(new ArrayList<ContainerStatus>(),containers,null);
+  final AllocateResponse response2=createAllocateResponse(completed1,new ArrayList<Container>(),null);
+  final AllocateResponse response3=createAllocateResponse(new ArrayList<ContainerStatus>(),new ArrayList<Container>(),containers,containers,null);
+  final AllocateResponse emptyResponse=createAllocateResponse(new ArrayList<ContainerStatus>(),new ArrayList<Container>(),null);
+  TestCallbackHandler callbackHandler=new TestCallbackHandler();
+  final AMRMClient<ContainerRequest> client=mock(AMRMClientImpl.class);
+  final AtomicInteger secondHeartbeatSync=new AtomicInteger(0);
+  when(client.allocate(anyFloat())).thenReturn(response1).thenAnswer(new Answer<AllocateResponse>(){
+    @Override public AllocateResponse answer(    InvocationOnMock invocation) throws Throwable {
+      secondHeartbeatSync.incrementAndGet();
+      while (heartbeatBlock.get()) {
+synchronized (heartbeatBlock) {
+          heartbeatBlock.wait();
+        }
+      }
+      secondHeartbeatSync.incrementAndGet();
+      return response2;
+    }
+  }
+).thenReturn(response3).thenReturn(emptyResponse);
+  when(client.registerApplicationMaster(anyString(),anyInt(),anyString())).thenReturn(null);
+  when(client.getAvailableResources()).thenAnswer(new Answer<Resource>(){
+    @Override public Resource answer(    InvocationOnMock invocation) throws Throwable {
+synchronized (client) {
+        Thread.sleep(10);
+      }
+      return null;
+    }
+  }
+);
+  AMRMClientAsync<ContainerRequest> asyncClient=AMRMClientAsync.createAMRMClientAsync(client,20,callbackHandler);
+  asyncClient.init(conf);
+  asyncClient.start();
+  asyncClient.registerApplicationMaster("localhost",1234,null);
+  while (secondHeartbeatSync.get() < 1) {
+    Thread.sleep(10);
+  }
+  assert (secondHeartbeatSync.get() < 2);
+  asyncClient.getAvailableResources();
+  assert (secondHeartbeatSync.get() < 2);
+synchronized (heartbeatBlock) {
+    heartbeatBlock.set(false);
+    heartbeatBlock.notifyAll();
+  }
+  Assert.assertEquals(null,callbackHandler.takeCompletedContainers());
+  while (callbackHandler.takeAllocatedContainers() == null) {
+    Assert.assertEquals(null,callbackHandler.takeCompletedContainers());
+    Thread.sleep(10);
+  }
+  while (callbackHandler.takeCompletedContainers() == null) {
+    Thread.sleep(10);
+  }
+  while (callbackHandler.takeChangedContainers() == null) {
+    Thread.sleep(10);
+  }
+  asyncClient.stop();
+  Assert.assertEquals(null,callbackHandler.takeAllocatedContainers());
+  Assert.assertEquals(null,callbackHandler.takeCompletedContainers());
+  Assert.assertEquals(null,callbackHandler.takeChangedContainers());
+}

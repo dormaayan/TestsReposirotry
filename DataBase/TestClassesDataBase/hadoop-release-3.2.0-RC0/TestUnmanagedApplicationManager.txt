@@ -1,0 +1,210 @@
+/** 
+ * Unit test for UnmanagedApplicationManager.
+ */
+public class TestUnmanagedApplicationManager {
+  private static final Logger LOG=LoggerFactory.getLogger(TestUnmanagedApplicationManager.class);
+  private TestableUnmanagedApplicationManager uam;
+  private Configuration conf=new YarnConfiguration();
+  private CountingCallback callback;
+  private ApplicationAttemptId attemptId;
+  @Before public void setup(){
+    conf.set(YarnConfiguration.RM_CLUSTER_ID,"subclusterId");
+    callback=new CountingCallback();
+    attemptId=ApplicationAttemptId.newInstance(ApplicationId.newInstance(0,1),1);
+    uam=new TestableUnmanagedApplicationManager(conf,attemptId.getApplicationId(),null,"submitter","appNameSuffix",true);
+  }
+  protected void waitForCallBackCountAndCheckZeroPending(  CountingCallback callBack,  int expectCallBackCount){
+synchronized (callBack) {
+      while (callBack.callBackCount != expectCallBackCount) {
+        try {
+          callBack.wait();
+        }
+ catch (        InterruptedException e) {
+        }
+      }
+      Assert.assertEquals("Non zero pending requests when number of allocate callbacks reaches " + expectCallBackCount,0,callBack.requestQueueSize);
+    }
+  }
+  @Test(timeout=5000) public void testBasicUsage() throws YarnException, IOException, InterruptedException {
+    launchUAM(attemptId);
+    registerApplicationMaster(RegisterApplicationMasterRequest.newInstance(null,0,null),attemptId);
+    allocateAsync(AllocateRequest.newInstance(0,0,null,null,null),callback,attemptId);
+    waitForCallBackCountAndCheckZeroPending(callback,1);
+    finishApplicationMaster(FinishApplicationMasterRequest.newInstance(null,null,null),attemptId);
+  }
+  @Test(timeout=5000) public void testUAMReAttach() throws YarnException, IOException, InterruptedException {
+    launchUAM(attemptId);
+    registerApplicationMaster(RegisterApplicationMasterRequest.newInstance(null,0,null),attemptId);
+    allocateAsync(AllocateRequest.newInstance(0,0,null,null,null),callback,attemptId);
+    waitForCallBackCountAndCheckZeroPending(callback,1);
+    MockResourceManagerFacade rmProxy=uam.getRMProxy();
+    uam=new TestableUnmanagedApplicationManager(conf,attemptId.getApplicationId(),null,"submitter","appNameSuffix",true);
+    uam.setRMProxy(rmProxy);
+    reAttachUAM(null,attemptId);
+    registerApplicationMaster(RegisterApplicationMasterRequest.newInstance(null,0,null),attemptId);
+    allocateAsync(AllocateRequest.newInstance(0,0,null,null,null),callback,attemptId);
+    waitForCallBackCountAndCheckZeroPending(callback,2);
+    finishApplicationMaster(FinishApplicationMasterRequest.newInstance(null,null,null),attemptId);
+  }
+  @Test(timeout=5000) public void testReRegister() throws YarnException, IOException, InterruptedException {
+    launchUAM(attemptId);
+    registerApplicationMaster(RegisterApplicationMasterRequest.newInstance(null,0,null),attemptId);
+    uam.setShouldReRegisterNext();
+    allocateAsync(AllocateRequest.newInstance(0,0,null,null,null),callback,attemptId);
+    waitForCallBackCountAndCheckZeroPending(callback,1);
+    uam.setShouldReRegisterNext();
+    finishApplicationMaster(FinishApplicationMasterRequest.newInstance(null,null,null),attemptId);
+  }
+  /** 
+ * If register is slow, async allocate requests in the meanwhile should not throw or be dropped.
+ */
+  @Test(timeout=5000) public void testSlowRegisterCall() throws YarnException, IOException, InterruptedException {
+    Thread registerAMThread=new Thread(new Runnable(){
+      @Override public void run(){
+        try {
+          launchUAM(attemptId);
+          registerApplicationMaster(RegisterApplicationMasterRequest.newInstance(null,1001,null),attemptId);
+        }
+ catch (        Exception e) {
+          LOG.info("Register thread exception",e);
+        }
+      }
+    }
+);
+    Object syncObj=MockResourceManagerFacade.getSyncObj();
+synchronized (syncObj) {
+      LOG.info("Starting register thread");
+      registerAMThread.start();
+      try {
+        LOG.info("Test main starts waiting");
+        syncObj.wait();
+        LOG.info("Test main wait finished");
+      }
+ catch (      Exception e) {
+        LOG.info("Test main wait interrupted",e);
+      }
+    }
+    allocateAsync(AllocateRequest.newInstance(0,0,null,null,null),callback,attemptId);
+synchronized (syncObj) {
+      syncObj.notifyAll();
+    }
+    LOG.info("Test main wait for register thread to finish");
+    registerAMThread.join();
+    LOG.info("Register thread finished");
+    allocateAsync(AllocateRequest.newInstance(0,0,null,null,null),callback,attemptId);
+    waitForCallBackCountAndCheckZeroPending(callback,2);
+    finishApplicationMaster(FinishApplicationMasterRequest.newInstance(null,null,null),attemptId);
+    allocateAsync(AllocateRequest.newInstance(0,0,null,null,null),callback,attemptId);
+    allocateAsync(AllocateRequest.newInstance(0,0,null,null,null),callback,attemptId);
+    Assert.assertEquals(0,callback.requestQueueSize);
+    try {
+      Thread.sleep(100);
+    }
+ catch (    InterruptedException e) {
+    }
+    Assert.assertEquals(2,callback.callBackCount);
+  }
+  @Test(expected=Exception.class) public void testAllocateWithoutRegister() throws YarnException, IOException, InterruptedException {
+    allocateAsync(AllocateRequest.newInstance(0,0,null,null,null),callback,attemptId);
+  }
+  @Test(expected=Exception.class) public void testFinishWithoutRegister() throws YarnException, IOException, InterruptedException {
+    finishApplicationMaster(FinishApplicationMasterRequest.newInstance(null,null,null),attemptId);
+  }
+  @Test public void testForceKill() throws YarnException, IOException, InterruptedException {
+    launchUAM(attemptId);
+    registerApplicationMaster(RegisterApplicationMasterRequest.newInstance(null,0,null),attemptId);
+    uam.forceKillApplication();
+    try {
+      uam.forceKillApplication();
+      Assert.fail("Should fail because application is already killed");
+    }
+ catch (    YarnException t) {
+    }
+  }
+  protected UserGroupInformation getUGIWithToken(  ApplicationAttemptId appAttemptId){
+    UserGroupInformation ugi=UserGroupInformation.createRemoteUser(appAttemptId.toString());
+    AMRMTokenIdentifier token=new AMRMTokenIdentifier(appAttemptId,1);
+    ugi.addTokenIdentifier(token);
+    return ugi;
+  }
+  protected Token<AMRMTokenIdentifier> launchUAM(  ApplicationAttemptId appAttemptId) throws IOException, InterruptedException {
+    return getUGIWithToken(appAttemptId).doAs(new PrivilegedExceptionAction<Token<AMRMTokenIdentifier>>(){
+      @Override public Token<AMRMTokenIdentifier> run() throws Exception {
+        return uam.launchUAM();
+      }
+    }
+);
+  }
+  protected void reAttachUAM(  final Token<AMRMTokenIdentifier> uamToken,  ApplicationAttemptId appAttemptId) throws IOException, InterruptedException {
+    getUGIWithToken(appAttemptId).doAs(new PrivilegedExceptionAction<Object>(){
+      @Override public Token<AMRMTokenIdentifier> run() throws Exception {
+        uam.reAttachUAM(uamToken);
+        return null;
+      }
+    }
+);
+  }
+  protected RegisterApplicationMasterResponse registerApplicationMaster(  final RegisterApplicationMasterRequest request,  ApplicationAttemptId appAttemptId) throws YarnException, IOException, InterruptedException {
+    return getUGIWithToken(appAttemptId).doAs(new PrivilegedExceptionAction<RegisterApplicationMasterResponse>(){
+      @Override public RegisterApplicationMasterResponse run() throws YarnException, IOException {
+        return uam.registerApplicationMaster(request);
+      }
+    }
+);
+  }
+  protected void allocateAsync(  final AllocateRequest request,  final AsyncCallback<AllocateResponse> callBack,  ApplicationAttemptId appAttemptId) throws YarnException, IOException, InterruptedException {
+    getUGIWithToken(appAttemptId).doAs(new PrivilegedExceptionAction<Object>(){
+      @Override public Object run() throws YarnException {
+        uam.allocateAsync(request,callBack);
+        return null;
+      }
+    }
+);
+  }
+  protected FinishApplicationMasterResponse finishApplicationMaster(  final FinishApplicationMasterRequest request,  ApplicationAttemptId appAttemptId) throws YarnException, IOException, InterruptedException {
+    return getUGIWithToken(appAttemptId).doAs(new PrivilegedExceptionAction<FinishApplicationMasterResponse>(){
+      @Override public FinishApplicationMasterResponse run() throws YarnException, IOException {
+        FinishApplicationMasterResponse response=uam.finishApplicationMaster(request);
+        return response;
+      }
+    }
+);
+  }
+protected class CountingCallback implements AsyncCallback<AllocateResponse> {
+    private int callBackCount;
+    private int requestQueueSize;
+    @Override public void callback(    AllocateResponse response){
+synchronized (this) {
+        callBackCount++;
+        requestQueueSize=uam.getRequestQueueSize();
+        this.notifyAll();
+      }
+    }
+  }
+  /** 
+ * Testable UnmanagedApplicationManager that talks to a mock RM.
+ */
+public static class TestableUnmanagedApplicationManager extends UnmanagedApplicationManager {
+    private MockResourceManagerFacade rmProxy;
+    public TestableUnmanagedApplicationManager(    Configuration conf,    ApplicationId appId,    String queueName,    String submitter,    String appNameSuffix,    boolean keepContainersAcrossApplicationAttempts){
+      super(conf,appId,queueName,submitter,appNameSuffix,keepContainersAcrossApplicationAttempts,"TEST");
+    }
+    @SuppressWarnings("unchecked") @Override protected <T>T createRMProxy(    final Class<T> protocol,    Configuration config,    UserGroupInformation user,    Token<AMRMTokenIdentifier> token){
+      if (rmProxy == null) {
+        rmProxy=new MockResourceManagerFacade(config,0);
+      }
+      return (T)rmProxy;
+    }
+    public void setShouldReRegisterNext(){
+      if (rmProxy != null) {
+        rmProxy.setShouldReRegisterNext();
+      }
+    }
+    public MockResourceManagerFacade getRMProxy(){
+      return rmProxy;
+    }
+    public void setRMProxy(    MockResourceManagerFacade proxy){
+      this.rmProxy=proxy;
+    }
+  }
+}

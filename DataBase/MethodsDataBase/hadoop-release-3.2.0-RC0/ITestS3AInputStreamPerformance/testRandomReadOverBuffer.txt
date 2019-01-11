@@ -1,0 +1,69 @@
+@Test public void testRandomReadOverBuffer() throws Throwable {
+  describe("read over a buffer, making sure that the requests" + " spans readahead ranges");
+  int datasetLen=_32K;
+  S3AFileSystem fs=getFileSystem();
+  Path dataFile=path("testReadOverBuffer.bin");
+  byte[] sourceData=dataset(datasetLen,0,64);
+  writeDataset(fs,dataFile,sourceData,datasetLen,_16K,true);
+  byte[] buffer=new byte[datasetLen];
+  int readahead=_8K;
+  int halfReadahead=_4K;
+  in=openDataFile(fs,dataFile,S3AInputPolicy.Random,readahead);
+  LOG.info("Starting initial reads");
+  S3AInputStream s3aStream=getS3aStream();
+  assertEquals(readahead,s3aStream.getReadahead());
+  byte[] oneByte=new byte[1];
+  assertEquals(1,in.read(0,oneByte,0,1));
+  assertEquals("remaining in\n" + in,readahead - 1,s3aStream.remainingInCurrentRequest());
+  assertEquals("range start in\n" + in,0,s3aStream.getContentRangeStart());
+  assertEquals("range finish in\n" + in,readahead,s3aStream.getContentRangeFinish());
+  assertStreamOpenedExactlyOnce();
+  describe("Starting sequence of positioned read calls over\n%s",in);
+  NanoTimer readTimer=new NanoTimer();
+  int currentPos=halfReadahead;
+  int offset=currentPos;
+  int bytesRead=0;
+  int readOps=0;
+  while (bytesRead < halfReadahead) {
+    int length=buffer.length - offset;
+    int read=in.read(currentPos,buffer,offset,length);
+    bytesRead+=read;
+    offset+=read;
+    readOps++;
+    assertEquals("open operations on request #" + readOps + " after reading "+ bytesRead+ " current position in stream "+ currentPos+ " in\n"+ fs+ "\n "+ in,1,streamStatistics.openOperations);
+    for (int i=currentPos; i < currentPos + read; i++) {
+      assertEquals("Wrong value from byte " + i,sourceData[i],buffer[i]);
+    }
+    currentPos+=read;
+  }
+  assertStreamOpenedExactlyOnce();
+  assertEquals(readahead,currentPos);
+  readTimer.end("read %d in %d operations",bytesRead,readOps);
+  bandwidth(readTimer,bytesRead);
+  LOG.info("Time per byte(): {} nS",toHuman(readTimer.nanosPerOperation(bytesRead)));
+  LOG.info("Time per read(): {} nS",toHuman(readTimer.nanosPerOperation(readOps)));
+  describe("read last byte");
+  int read=in.read(currentPos,buffer,bytesRead,1);
+  assertTrue("-1 from last read",read >= 0);
+  assertOpenOperationCount(2);
+  assertEquals("Wrong value from read ",sourceData[currentPos],(int)buffer[currentPos]);
+  currentPos++;
+  describe("read() to EOF over \n%s",in);
+  long readCount=0;
+  NanoTimer timer=new NanoTimer();
+  LOG.info("seeking");
+  in.seek(currentPos);
+  LOG.info("reading");
+  while (currentPos < datasetLen) {
+    int r=in.read();
+    assertTrue("Negative read() at position " + currentPos + " in\n"+ in,r >= 0);
+    buffer[currentPos]=(byte)r;
+    assertEquals("Wrong value from read from\n" + in,sourceData[currentPos],r);
+    currentPos++;
+    readCount++;
+  }
+  timer.end("read %d bytes",readCount);
+  bandwidth(timer,readCount);
+  LOG.info("Time per read(): {} nS",toHuman(timer.nanosPerOperation(readCount)));
+  assertEquals("last read in " + in,-1,in.read());
+}

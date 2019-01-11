@@ -1,0 +1,145 @@
+public class TestFrameDecoder {
+static {
+    GenericTestUtils.setLogLevel(RpcProgram.LOG,Level.TRACE);
+  }
+  private static int resultSize;
+  static void testRequest(  XDR request,  int serverPort){
+    resultSize=0;
+    SimpleTcpClient tcpClient=new SimpleTcpClient("localhost",serverPort,request,true);
+    tcpClient.run();
+  }
+static class TestRpcProgram extends RpcProgram {
+    protected TestRpcProgram(    String program,    String host,    int port,    int progNumber,    int lowProgVersion,    int highProgVersion,    boolean allowInsecurePorts){
+      super(program,host,port,progNumber,lowProgVersion,highProgVersion,null,allowInsecurePorts);
+    }
+    @Override protected void handleInternal(    ChannelHandlerContext ctx,    RpcInfo info){
+      RpcCall rpcCall=(RpcCall)info.header();
+      final int procedure=rpcCall.getProcedure();
+      if (procedure != 0) {
+        boolean portMonitorSuccess=doPortMonitoring(info.remoteAddress());
+        if (!portMonitorSuccess) {
+          sendRejectedReply(rpcCall,info.remoteAddress(),ctx);
+          return;
+        }
+      }
+      resultSize=info.data().readableBytes();
+      RpcAcceptedReply reply=RpcAcceptedReply.getAcceptInstance(1234,new VerifierNone());
+      XDR out=new XDR();
+      reply.write(out);
+      ChannelBuffer b=ChannelBuffers.wrappedBuffer(out.asReadOnlyWrap().buffer());
+      RpcResponse rsp=new RpcResponse(b,info.remoteAddress());
+      RpcUtil.sendRpcResponse(ctx,rsp);
+    }
+    @Override protected boolean isIdempotent(    RpcCall call){
+      return false;
+    }
+  }
+  @Test public void testSingleFrame(){
+    RpcFrameDecoder decoder=new RpcFrameDecoder();
+    ByteBuffer buffer=ByteBuffer.allocate(1);
+    ChannelBuffer buf=new ByteBufferBackedChannelBuffer(buffer);
+    ChannelBuffer channelBuffer=(ChannelBuffer)decoder.decode(Mockito.mock(ChannelHandlerContext.class),Mockito.mock(Channel.class),buf);
+    assertTrue(channelBuffer == null);
+    byte[] fragment=new byte[4 + 9];
+    fragment[0]=(byte)(1 << 7);
+    fragment[1]=0;
+    fragment[2]=0;
+    fragment[3]=(byte)10;
+    assertTrue(XDR.isLastFragment(fragment));
+    assertTrue(XDR.fragmentSize(fragment) == 10);
+    buffer=ByteBuffer.allocate(4 + 9);
+    buffer.put(fragment);
+    buffer.flip();
+    buf=new ByteBufferBackedChannelBuffer(buffer);
+    channelBuffer=(ChannelBuffer)decoder.decode(Mockito.mock(ChannelHandlerContext.class),Mockito.mock(Channel.class),buf);
+    assertTrue(channelBuffer == null);
+  }
+  @Test public void testMultipleFrames(){
+    RpcFrameDecoder decoder=new RpcFrameDecoder();
+    byte[] fragment1=new byte[4 + 10];
+    fragment1[0]=0;
+    fragment1[1]=0;
+    fragment1[2]=0;
+    fragment1[3]=(byte)10;
+    assertFalse(XDR.isLastFragment(fragment1));
+    assertTrue(XDR.fragmentSize(fragment1) == 10);
+    ByteBuffer buffer=ByteBuffer.allocate(4 + 10);
+    buffer.put(fragment1);
+    buffer.flip();
+    ChannelBuffer buf=new ByteBufferBackedChannelBuffer(buffer);
+    ChannelBuffer channelBuffer=(ChannelBuffer)decoder.decode(Mockito.mock(ChannelHandlerContext.class),Mockito.mock(Channel.class),buf);
+    assertTrue(channelBuffer == null);
+    byte[] fragment2=new byte[4 + 10];
+    fragment2[0]=(byte)(1 << 7);
+    fragment2[1]=0;
+    fragment2[2]=0;
+    fragment2[3]=(byte)10;
+    assertTrue(XDR.isLastFragment(fragment2));
+    assertTrue(XDR.fragmentSize(fragment2) == 10);
+    buffer=ByteBuffer.allocate(4 + 10);
+    buffer.put(fragment2);
+    buffer.flip();
+    buf=new ByteBufferBackedChannelBuffer(buffer);
+    channelBuffer=(ChannelBuffer)decoder.decode(Mockito.mock(ChannelHandlerContext.class),Mockito.mock(Channel.class),buf);
+    assertTrue(channelBuffer != null);
+    assertEquals(20,channelBuffer.readableBytes());
+  }
+  @Test public void testFrames(){
+    int serverPort=startRpcServer(true);
+    XDR xdrOut=createGetportMount();
+    int headerSize=xdrOut.size();
+    int bufsize=2 * 1024 * 1024;
+    byte[] buffer=new byte[bufsize];
+    xdrOut.writeFixedOpaque(buffer);
+    int requestSize=xdrOut.size() - headerSize;
+    testRequest(xdrOut,serverPort);
+    assertEquals(requestSize,resultSize);
+  }
+  @Test public void testUnprivilegedPort(){
+    int serverPort=startRpcServer(false);
+    XDR xdrOut=createGetportMount();
+    int bufsize=2 * 1024 * 1024;
+    byte[] buffer=new byte[bufsize];
+    xdrOut.writeFixedOpaque(buffer);
+    testRequest(xdrOut,serverPort);
+    assertEquals(0,resultSize);
+    xdrOut=new XDR();
+    createPortmapXDRheader(xdrOut,0);
+    int headerSize=xdrOut.size();
+    buffer=new byte[bufsize];
+    xdrOut.writeFixedOpaque(buffer);
+    int requestSize=xdrOut.size() - headerSize;
+    testRequest(xdrOut,serverPort);
+    assertEquals(requestSize,resultSize);
+  }
+  private static int startRpcServer(  boolean allowInsecurePorts){
+    Random rand=new Random();
+    int serverPort=30000 + rand.nextInt(10000);
+    int retries=10;
+    while (true) {
+      try {
+        RpcProgram program=new TestFrameDecoder.TestRpcProgram("TestRpcProgram","localhost",serverPort,100000,1,2,allowInsecurePorts);
+        SimpleTcpServer tcpServer=new SimpleTcpServer(serverPort,program,1);
+        tcpServer.run();
+        break;
+      }
+ catch (      ChannelException ce) {
+        if (retries-- > 0) {
+          serverPort+=rand.nextInt(20);
+        }
+ else {
+          throw ce;
+        }
+      }
+    }
+    return serverPort;
+  }
+  static void createPortmapXDRheader(  XDR xdr_out,  int procedure){
+    RpcCall.getInstance(0,100000,2,procedure,new CredentialsNone(),new VerifierNone()).write(xdr_out);
+  }
+  static XDR createGetportMount(){
+    XDR xdr_out=new XDR();
+    createPortmapXDRheader(xdr_out,3);
+    return xdr_out;
+  }
+}

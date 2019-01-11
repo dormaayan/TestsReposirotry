@@ -1,0 +1,67 @@
+@Test public void testSniWithApnHandler() throws Exception {
+  SslContext nettyContext=makeSslContext(provider,true);
+  SslContext sniContext=makeSslContext(provider,true);
+  final SslContext clientContext=makeSslClientContext(provider,true);
+  try {
+    final CountDownLatch serverApnDoneLatch=new CountDownLatch(1);
+    final CountDownLatch clientApnDoneLatch=new CountDownLatch(1);
+    final DomainNameMapping<SslContext> mapping=new DomainNameMappingBuilder<SslContext>(nettyContext).add("*.netty.io",nettyContext).add("sni.fake.site",sniContext).build();
+    final SniHandler handler=new SniHandler(mapping);
+    EventLoopGroup group=new NioEventLoopGroup(2);
+    Channel serverChannel=null;
+    Channel clientChannel=null;
+    try {
+      ServerBootstrap sb=new ServerBootstrap();
+      sb.group(group);
+      sb.channel(NioServerSocketChannel.class);
+      sb.childHandler(new ChannelInitializer<Channel>(){
+        @Override protected void initChannel(        Channel ch) throws Exception {
+          ChannelPipeline p=ch.pipeline();
+          p.addLast(handler);
+          p.addLast(new ApplicationProtocolNegotiationHandler("foo"){
+            @Override protected void configurePipeline(            ChannelHandlerContext ctx,            String protocol){
+              serverApnDoneLatch.countDown();
+            }
+          }
+);
+        }
+      }
+);
+      Bootstrap cb=new Bootstrap();
+      cb.group(group);
+      cb.channel(NioSocketChannel.class);
+      cb.handler(new ChannelInitializer<Channel>(){
+        @Override protected void initChannel(        Channel ch) throws Exception {
+          ch.pipeline().addLast(new SslHandler(clientContext.newEngine(ch.alloc(),"sni.fake.site",-1)));
+          ch.pipeline().addLast(new ApplicationProtocolNegotiationHandler("foo"){
+            @Override protected void configurePipeline(            ChannelHandlerContext ctx,            String protocol){
+              clientApnDoneLatch.countDown();
+            }
+          }
+);
+        }
+      }
+);
+      serverChannel=sb.bind(new InetSocketAddress(0)).sync().channel();
+      ChannelFuture ccf=cb.connect(serverChannel.localAddress());
+      assertTrue(ccf.awaitUninterruptibly().isSuccess());
+      clientChannel=ccf.channel();
+      assertTrue(serverApnDoneLatch.await(5,TimeUnit.SECONDS));
+      assertTrue(clientApnDoneLatch.await(5,TimeUnit.SECONDS));
+      assertThat(handler.hostname(),is("sni.fake.site"));
+      assertThat(handler.sslContext(),is(sniContext));
+    }
+  finally {
+      if (serverChannel != null) {
+        serverChannel.close().sync();
+      }
+      if (clientChannel != null) {
+        clientChannel.close().sync();
+      }
+      group.shutdownGracefully(0,0,TimeUnit.MICROSECONDS);
+    }
+  }
+  finally {
+    releaseAll(clientContext,nettyContext,sniContext);
+  }
+}

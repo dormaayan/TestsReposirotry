@@ -1,0 +1,42 @@
+/** 
+ * Though the AWS SDK claims in documentation to handle retries and exponential backoff, we have witnessed com.amazonaws...dynamodbv2.model.ProvisionedThroughputExceededException (Status Code: 400; Error Code: ProvisionedThroughputExceededException) Hypothesis: Happens when the size of a batched write is bigger than the number of provisioned write units.  This test ensures we handle the case correctly, retrying w/ smaller batch instead of surfacing exceptions.
+ */
+@Test public void test_030_BatchedWrite() throws Exception {
+  final int iterations=15;
+  final ArrayList<PathMetadata> toCleanup=new ArrayList<>();
+  toCleanup.ensureCapacity(THREADS * iterations);
+  assertTrue("Maximum batch size must big enough to run this test",S3GUARD_DDB_BATCH_WRITE_REQUEST_LIMIT >= BATCH_SIZE);
+  try {
+    describe("Running %d iterations of batched put, size %d",iterations,BATCH_SIZE);
+    ThrottleTracker result=execute("prune",1,true,() -> {
+      ThrottleTracker tracker=new ThrottleTracker();
+      long pruneItems=0;
+      for (long i=0; i < iterations; i++) {
+        Path longPath=pathOfDepth(BATCH_SIZE,String.valueOf(i));
+        FileStatus status=basicFileStatus(longPath,0,false,12345,12345);
+        PathMetadata pm=new PathMetadata(status);
+synchronized (toCleanup) {
+          toCleanup.add(pm);
+        }
+        ddbms.put(pm);
+        pruneItems++;
+        if (pruneItems == BATCH_SIZE) {
+          describe("pruning files");
+          ddbms.prune(Long.MAX_VALUE);
+          pruneItems=0;
+        }
+        if (tracker.probe()) {
+          break;
+        }
+      }
+    }
+);
+    assertNotEquals("No batch retries in " + result,0,result.batchThrottles);
+  }
+  finally {
+    describe("Cleaning up table %s",tableName);
+    for (    PathMetadata pm : toCleanup) {
+      cleanupMetadata(ddbms,pm);
+    }
+  }
+}

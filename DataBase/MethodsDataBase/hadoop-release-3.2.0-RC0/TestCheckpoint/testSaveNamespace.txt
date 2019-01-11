@@ -1,0 +1,75 @@
+/** 
+ * Tests save namespace.
+ */
+@Test public void testSaveNamespace() throws IOException {
+  MiniDFSCluster cluster=null;
+  DistributedFileSystem fs=null;
+  FileContext fc;
+  try {
+    Configuration conf=new HdfsConfiguration();
+    cluster=new MiniDFSCluster.Builder(conf).numDataNodes(numDatanodes).format(true).build();
+    cluster.waitActive();
+    fs=(cluster.getFileSystem());
+    fc=FileContext.getFileContext(cluster.getURI(0));
+    DFSAdmin admin=new DFSAdmin(conf);
+    String[] args=new String[]{"-saveNamespace"};
+    try {
+      admin.run(args);
+    }
+ catch (    IOException eIO) {
+      assertTrue(eIO.getLocalizedMessage().contains("Safe mode should be turned ON"));
+    }
+catch (    Exception e) {
+      throw new IOException(e);
+    }
+    Path file=new Path("namespace.dat");
+    DFSTestUtil.createFile(fs,file,fileSize,fileSize,blockSize,replication,seed);
+    checkFile(fs,file,replication);
+    Path symlink=new Path("file.link");
+    fc.createSymlink(file,symlink,false);
+    assertTrue(fc.getFileLinkStatus(symlink).isSymlink());
+    Collection<URI> editsDirs=cluster.getNameEditsDirs(0);
+    for (    URI uri : editsDirs) {
+      File ed=new File(uri.getPath());
+      assertTrue(new File(ed,"current/" + NNStorage.getInProgressEditsFileName(1)).length() > Integer.SIZE / Byte.SIZE);
+    }
+    fs.setSafeMode(SafeModeAction.SAFEMODE_ENTER);
+    try {
+      admin.run(args);
+    }
+ catch (    Exception e) {
+      throw new IOException(e);
+    }
+    final int EXPECTED_TXNS_FIRST_SEG=13;
+    for (    URI uri : editsDirs) {
+      File ed=new File(uri.getPath());
+      File curDir=new File(ed,"current");
+      LOG.info("Files in " + curDir + ":\n  "+ Joiner.on("\n  ").join(curDir.list()));
+      File originalEdits=new File(curDir,NNStorage.getInProgressEditsFileName(1));
+      assertFalse(originalEdits.exists());
+      File finalizedEdits=new File(curDir,NNStorage.getFinalizedEditsFileName(1,EXPECTED_TXNS_FIRST_SEG));
+      GenericTestUtils.assertExists(finalizedEdits);
+      assertTrue(finalizedEdits.length() > Integer.SIZE / Byte.SIZE);
+      GenericTestUtils.assertExists(new File(ed,"current/" + NNStorage.getInProgressEditsFileName(EXPECTED_TXNS_FIRST_SEG + 1)));
+    }
+    Collection<URI> imageDirs=cluster.getNameDirs(0);
+    for (    URI uri : imageDirs) {
+      File imageDir=new File(uri.getPath());
+      File savedImage=new File(imageDir,"current/" + NNStorage.getImageFileName(EXPECTED_TXNS_FIRST_SEG));
+      assertTrue("Should have saved image at " + savedImage,savedImage.exists());
+    }
+    cluster.shutdown();
+    cluster=null;
+    cluster=new MiniDFSCluster.Builder(conf).numDataNodes(numDatanodes).format(false).build();
+    cluster.waitActive();
+    fs=(cluster.getFileSystem());
+    checkFile(fs,file,replication);
+    fc=FileContext.getFileContext(cluster.getURI(0));
+    assertTrue(fc.getFileLinkStatus(symlink).isSymlink());
+  }
+  finally {
+    if (fs != null)     fs.close();
+    cleanup(cluster);
+    cluster=null;
+  }
+}

@@ -1,0 +1,47 @@
+@Test public void testRefresh() throws Exception {
+  for (  int numExpectedRefreshes : new int[]{0,1,2}) {
+    for (    boolean clientReloginAllowedBeforeLogout : new boolean[]{true,false}) {
+      Subject subject=new Subject();
+      final LoginContext mockLoginContext=mock(LoginContext.class);
+      when(mockLoginContext.getSubject()).thenReturn(subject);
+      MockTime mockTime=new MockTime();
+      long startMs=mockTime.milliseconds();
+      long lifetimeMinutes=100L;
+      long refreshEveryMinutes=80L;
+      long absoluteLastRefreshMs=startMs + (1 + numExpectedRefreshes) * 1000 * 60* refreshEveryMinutes - 1000 * 60 * refreshEveryMinutes / 2;
+      short minPeriodSeconds=(short)0;
+      short bufferSeconds=minPeriodSeconds;
+      MockScheduler mockScheduler=new MockScheduler(mockTime);
+      List<KafkaFutureImpl<Long>> waiters=addWaiters(mockScheduler,1000 * 60 * refreshEveryMinutes,numExpectedRefreshes + 1);
+      TestLoginContextFactory testLoginContextFactory=new TestLoginContextFactory();
+      TestExpiringCredentialRefreshingLogin testExpiringCredentialRefreshingLogin=new TestExpiringCredentialRefreshingLogin(refreshConfigThatPerformsReloginEveryGivenPercentageOfLifetime(1.0 * refreshEveryMinutes / lifetimeMinutes,minPeriodSeconds,bufferSeconds,clientReloginAllowedBeforeLogout),testLoginContextFactory,mockTime,1000 * 60 * lifetimeMinutes,absoluteLastRefreshMs,clientReloginAllowedBeforeLogout);
+      testLoginContextFactory.configure(mockLoginContext,testExpiringCredentialRefreshingLogin);
+      long expectedFinalMs=startMs + numExpectedRefreshes * 1000 * 60* refreshEveryMinutes;
+      assertFalse(testLoginContextFactory.refresherThreadStartedFuture().isDone());
+      assertFalse(testLoginContextFactory.refresherThreadDoneFuture().isDone());
+      testExpiringCredentialRefreshingLogin.login();
+      assertTrue(testLoginContextFactory.refresherThreadStartedFuture().isDone());
+      testLoginContextFactory.refresherThreadDoneFuture().get(1L,TimeUnit.SECONDS);
+      assertEquals(expectedFinalMs,mockTime.milliseconds());
+      for (int i=0; i < numExpectedRefreshes; ++i) {
+        KafkaFutureImpl<Long> waiter=waiters.get(i);
+        assertTrue(waiter.isDone());
+        assertEquals((i + 1) * 1000 * 60* refreshEveryMinutes,waiter.get().longValue() - startMs);
+      }
+      assertFalse(waiters.get(numExpectedRefreshes).isDone());
+      InOrder inOrder=inOrder(mockLoginContext);
+      inOrder.verify(mockLoginContext).login();
+      inOrder.verify(mockLoginContext).getSubject();
+      for (int i=0; i < numExpectedRefreshes; ++i) {
+        if (clientReloginAllowedBeforeLogout) {
+          inOrder.verify(mockLoginContext).login();
+          inOrder.verify(mockLoginContext).logout();
+        }
+ else {
+          inOrder.verify(mockLoginContext).logout();
+          inOrder.verify(mockLoginContext).login();
+        }
+      }
+    }
+  }
+}

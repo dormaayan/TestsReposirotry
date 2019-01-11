@@ -1,0 +1,49 @@
+/** 
+ * Create a file, write something, hflush but not close. Then change lease period and wait for lease recovery. Finally, read the block directly from each Datanode and verify the content.
+ */
+@Test public void testLeaseExpireHardLimit() throws Exception {
+  System.out.println("testLeaseExpireHardLimit start");
+  final long leasePeriod=1000;
+  final int DATANODE_NUM=3;
+  Configuration conf=new HdfsConfiguration();
+  conf.setInt(DFS_NAMENODE_HEARTBEAT_RECHECK_INTERVAL_KEY,1000);
+  conf.setInt(DFS_HEARTBEAT_INTERVAL_KEY,1);
+  MiniDFSCluster cluster=new MiniDFSCluster.Builder(conf).numDataNodes(DATANODE_NUM).build();
+  DistributedFileSystem dfs=null;
+  try {
+    cluster.waitActive();
+    dfs=cluster.getFileSystem();
+    final String f=DIR + "foo";
+    final Path fpath=new Path(f);
+    HdfsDataOutputStream out=create(dfs,fpath,DATANODE_NUM);
+    out.write("something".getBytes());
+    out.hflush();
+    int actualRepl=out.getCurrentBlockReplication();
+    assertTrue(f + " should be replicated to " + DATANODE_NUM+ " datanodes.",actualRepl == DATANODE_NUM);
+    cluster.setLeasePeriod(leasePeriod,leasePeriod);
+    try {
+      Thread.sleep(5 * leasePeriod);
+    }
+ catch (    InterruptedException e) {
+    }
+    LocatedBlocks locations=dfs.dfs.getNamenode().getBlockLocations(f,0,Long.MAX_VALUE);
+    assertEquals(1,locations.locatedBlockCount());
+    LocatedBlock locatedblock=locations.getLocatedBlocks().get(0);
+    int successcount=0;
+    for (    DatanodeInfo datanodeinfo : locatedblock.getLocations()) {
+      DataNode datanode=cluster.getDataNode(datanodeinfo.getIpcPort());
+      ExtendedBlock blk=locatedblock.getBlock();
+      try (BufferedReader in=new BufferedReader(new InputStreamReader(datanode.getFSDataset().getBlockInputStream(blk,0)))){
+        assertEquals("something",in.readLine());
+        successcount++;
+      }
+     }
+    System.out.println("successcount=" + successcount);
+    assertTrue(successcount > 0);
+  }
+  finally {
+    IOUtils.closeStream(dfs);
+    cluster.shutdown();
+  }
+  System.out.println("testLeaseExpireHardLimit successful");
+}

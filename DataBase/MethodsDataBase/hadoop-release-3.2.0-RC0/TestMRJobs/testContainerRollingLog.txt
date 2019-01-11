@@ -1,0 +1,81 @@
+@Test(timeout=120000) public void testContainerRollingLog() throws IOException, InterruptedException, ClassNotFoundException {
+  if (!(new File(MiniMRYarnCluster.APPJAR)).exists()) {
+    LOG.info("MRAppJar " + MiniMRYarnCluster.APPJAR + " not found. Not running test.");
+    return;
+  }
+  final SleepJob sleepJob=new SleepJob();
+  final JobConf sleepConf=new JobConf(mrCluster.getConfig());
+  sleepConf.set(MRJobConfig.MAP_LOG_LEVEL,Level.ALL.toString());
+  final long userLogKb=4;
+  sleepConf.setLong(MRJobConfig.TASK_USERLOG_LIMIT,userLogKb);
+  sleepConf.setInt(MRJobConfig.TASK_LOG_BACKUPS,3);
+  sleepConf.set(MRJobConfig.MR_AM_LOG_LEVEL,Level.ALL.toString());
+  final long amLogKb=7;
+  sleepConf.setLong(MRJobConfig.MR_AM_LOG_KB,amLogKb);
+  sleepConf.setInt(MRJobConfig.MR_AM_LOG_BACKUPS,7);
+  sleepJob.setConf(sleepConf);
+  final Job job=sleepJob.createJob(1,0,1L,100,0L,0);
+  job.setJarByClass(SleepJob.class);
+  job.addFileToClassPath(APP_JAR);
+  job.waitForCompletion(true);
+  final JobId jobId=TypeConverter.toYarn(job.getJobID());
+  final ApplicationId appID=jobId.getAppId();
+  int pollElapsed=0;
+  while (true) {
+    Thread.sleep(1000);
+    pollElapsed+=1000;
+    if (TERMINAL_RM_APP_STATES.contains(mrCluster.getResourceManager().getRMContext().getRMApps().get(appID).getState())) {
+      break;
+    }
+    if (pollElapsed >= 60000) {
+      LOG.warn("application did not reach terminal state within 60 seconds");
+      break;
+    }
+  }
+  Assert.assertEquals(RMAppState.FINISHED,mrCluster.getResourceManager().getRMContext().getRMApps().get(appID).getState());
+  final String appIdStr=appID.toString();
+  final String appIdSuffix=appIdStr.substring("application_".length(),appIdStr.length());
+  final String containerGlob="container_" + appIdSuffix + "_*_*";
+  final String syslogGlob=appIdStr + Path.SEPARATOR + containerGlob+ Path.SEPARATOR+ TaskLog.LogName.SYSLOG;
+  int numAppMasters=0;
+  int numMapTasks=0;
+  for (int i=0; i < NUM_NODE_MGRS; i++) {
+    final Configuration nmConf=mrCluster.getNodeManager(i).getConfig();
+    for (    String logDir : nmConf.getTrimmedStrings(YarnConfiguration.NM_LOG_DIRS)) {
+      final Path absSyslogGlob=new Path(logDir + Path.SEPARATOR + syslogGlob);
+      LOG.info("Checking for glob: " + absSyslogGlob);
+      final FileStatus[] syslogs=localFs.globStatus(absSyslogGlob);
+      for (      FileStatus slog : syslogs) {
+        boolean foundAppMaster=job.isUber();
+        final Path containerPathComponent=slog.getPath().getParent();
+        if (!foundAppMaster) {
+          final ContainerId cid=ContainerId.fromString(containerPathComponent.getName());
+          foundAppMaster=((cid.getContainerId() & ContainerId.CONTAINER_ID_BITMASK) == 1);
+        }
+        final FileStatus[] sysSiblings=localFs.globStatus(new Path(containerPathComponent,TaskLog.LogName.SYSLOG + "*"));
+        Arrays.sort(sysSiblings);
+        if (foundAppMaster) {
+          numAppMasters++;
+        }
+ else {
+          numMapTasks++;
+        }
+        if (foundAppMaster) {
+          Assert.assertSame("Unexpected number of AM sylog* files",sleepConf.getInt(MRJobConfig.MR_AM_LOG_BACKUPS,0) + 1,sysSiblings.length);
+          Assert.assertTrue("AM syslog.1 length kb should be >= " + amLogKb,sysSiblings[1].getLen() >= amLogKb * 1024);
+        }
+ else {
+          Assert.assertSame("Unexpected number of MR task sylog* files",sleepConf.getInt(MRJobConfig.TASK_LOG_BACKUPS,0) + 1,sysSiblings.length);
+          Assert.assertTrue("MR syslog.1 length kb should be >= " + userLogKb,sysSiblings[1].getLen() >= userLogKb * 1024);
+        }
+      }
+    }
+  }
+  Assert.assertEquals("No AppMaster log found!",1,numAppMasters);
+  if (sleepConf.getBoolean(MRJobConfig.JOB_UBERTASK_ENABLE,false)) {
+    Assert.assertEquals("MapTask log with uber found!",0,numMapTasks);
+  }
+ else {
+    Assert.assertEquals("No MapTask log found!",1,numMapTasks);
+  }
+}

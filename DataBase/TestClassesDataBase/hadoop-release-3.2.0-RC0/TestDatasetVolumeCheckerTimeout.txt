@@ -1,0 +1,51 @@
+/** 
+ * Test that timeout is triggered during Disk Volume Checker.
+ */
+public class TestDatasetVolumeCheckerTimeout {
+  public static final org.slf4j.Logger LOG=LoggerFactory.getLogger(TestDatasetVolumeCheckerTimeout.class);
+  @Rule public TestName testName=new TestName();
+  static Configuration conf;
+  private static final long DISK_CHECK_TIMEOUT=10;
+  private static final long DISK_CHECK_TIME=100;
+  static ReentrantLock lock=new ReentrantLock();
+static {
+    conf=new HdfsConfiguration();
+    conf.setTimeDuration(DFSConfigKeys.DFS_DATANODE_DISK_CHECK_TIMEOUT_KEY,DISK_CHECK_TIMEOUT,TimeUnit.MILLISECONDS);
+  }
+  static FsVolumeSpi makeSlowVolume() throws Exception {
+    final FsVolumeSpi volume=mock(FsVolumeSpi.class);
+    final FsVolumeReference reference=mock(FsVolumeReference.class);
+    final StorageLocation location=mock(StorageLocation.class);
+    when(reference.getVolume()).thenReturn(volume);
+    when(volume.obtainReference()).thenReturn(reference);
+    when(volume.getStorageLocation()).thenReturn(location);
+    when(volume.check(anyObject())).thenAnswer(new Answer<VolumeCheckResult>(){
+      @Override public VolumeCheckResult answer(      InvocationOnMock invocationOnMock) throws Throwable {
+        lock.lock();
+        lock.unlock();
+        return VolumeCheckResult.HEALTHY;
+      }
+    }
+);
+    return volume;
+  }
+  @Test(timeout=300000) public void testDiskCheckTimeout() throws Exception {
+    LOG.info("Executing {}",testName.getMethodName());
+    final FsVolumeSpi volume=makeSlowVolume();
+    final DatasetVolumeChecker checker=new DatasetVolumeChecker(conf,new FakeTimer());
+    final AtomicLong numCallbackInvocations=new AtomicLong(0);
+    lock.lock();
+    boolean result=checker.checkVolume(volume,new DatasetVolumeChecker.Callback(){
+      @Override public void call(      Set<FsVolumeSpi> healthyVolumes,      Set<FsVolumeSpi> failedVolumes){
+        numCallbackInvocations.incrementAndGet();
+        assertThat(healthyVolumes.size(),is(0));
+        assertThat(failedVolumes.size(),is(1));
+      }
+    }
+);
+    Thread.sleep(DISK_CHECK_TIME);
+    lock.unlock();
+    verify(volume,times(1)).check(anyObject());
+    assertThat(numCallbackInvocations.get(),is(1L));
+  }
+}

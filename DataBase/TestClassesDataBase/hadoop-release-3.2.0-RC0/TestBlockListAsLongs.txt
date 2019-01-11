@@ -1,0 +1,125 @@
+public class TestBlockListAsLongs {
+  static Block b1=new Block(1,11,111);
+  static Block b2=new Block(2,22,222);
+  static Block b3=new Block(3,33,333);
+  static Block b4=new Block(4,44,444);
+  @Test public void testEmptyReport(){
+    BlockListAsLongs blocks=checkReport();
+    assertArrayEquals(new long[]{0,0,-1,-1,-1},blocks.getBlockListAsLongs());
+  }
+  @Test public void testFinalized(){
+    BlockListAsLongs blocks=checkReport(new FinalizedReplica(b1,null,null));
+    assertArrayEquals(new long[]{1,0,1,11,111,-1,-1,-1},blocks.getBlockListAsLongs());
+  }
+  @Test public void testUc(){
+    BlockListAsLongs blocks=checkReport(new ReplicaBeingWritten(b1,null,null,null));
+    assertArrayEquals(new long[]{0,1,-1,-1,-1,1,11,111,ReplicaState.RBW.getValue()},blocks.getBlockListAsLongs());
+  }
+  @Test public void testMix(){
+    BlockListAsLongs blocks=checkReport(new FinalizedReplica(b1,null,null),new FinalizedReplica(b2,null,null),new ReplicaBeingWritten(b3,null,null,null),new ReplicaWaitingToBeRecovered(b4,null,null));
+    assertArrayEquals(new long[]{2,2,1,11,111,2,22,222,-1,-1,-1,3,33,333,ReplicaState.RBW.getValue(),4,44,444,ReplicaState.RWR.getValue()},blocks.getBlockListAsLongs());
+  }
+  @Test public void testFuzz() throws InterruptedException {
+    Replica[] replicas=new Replica[100000];
+    Random rand=new Random(0);
+    for (int i=0; i < replicas.length; i++) {
+      Block b=new Block(rand.nextLong(),i,i << 4);
+switch (rand.nextInt(2)) {
+case 0:
+        replicas[i]=new FinalizedReplica(b,null,null);
+      break;
+case 1:
+    replicas[i]=new ReplicaBeingWritten(b,null,null,null);
+  break;
+case 2:
+replicas[i]=new ReplicaWaitingToBeRecovered(b,null,null);
+break;
+}
+}
+checkReport(replicas);
+}
+private BlockListAsLongs checkReport(Replica... replicas){
+Map<Long,Replica> expectedReplicas=new HashMap<>();
+for (Replica replica : replicas) {
+expectedReplicas.put(replica.getBlockId(),replica);
+}
+expectedReplicas=Collections.unmodifiableMap(expectedReplicas);
+BlockListAsLongs blocks=BlockListAsLongs.encode(expectedReplicas.values());
+List<ByteString> buffers=blocks.getBlocksBuffers();
+List<Long> longs=new ArrayList<Long>();
+for (long value : blocks.getBlockListAsLongs()) {
+longs.add(value);
+}
+BlockListAsLongs decodedBlocks=BlockListAsLongs.decodeBuffers(expectedReplicas.size(),buffers);
+checkReplicas(expectedReplicas,decodedBlocks);
+BlockListAsLongs decodedList=BlockListAsLongs.decodeLongs(longs);
+checkReplicas(expectedReplicas,decodedList);
+return blocks;
+}
+private void checkReplicas(Map<Long,Replica> expectedReplicas,BlockListAsLongs decodedBlocks){
+assertEquals(expectedReplicas.size(),decodedBlocks.getNumberOfBlocks());
+Map<Long,Replica> reportReplicas=new HashMap<>(expectedReplicas);
+for (BlockReportReplica replica : decodedBlocks) {
+assertNotNull(replica);
+Replica expected=reportReplicas.remove(replica.getBlockId());
+assertNotNull(expected);
+assertEquals("wrong bytes",expected.getNumBytes(),replica.getNumBytes());
+assertEquals("wrong genstamp",expected.getGenerationStamp(),replica.getGenerationStamp());
+assertEquals("wrong replica state",expected.getState(),replica.getState());
+}
+assertTrue(reportReplicas.isEmpty());
+}
+private BlockListAsLongs getBlockList(Replica... replicas){
+int numBlocks=replicas.length;
+List<Long> longs=new ArrayList<Long>(2 + numBlocks);
+longs.add(Long.valueOf(numBlocks));
+longs.add(0L);
+for (Replica r : replicas) {
+longs.add(r.getBlockId());
+longs.add(r.getBytesOnDisk());
+longs.add(r.getGenerationStamp());
+}
+BlockListAsLongs blockList=BlockListAsLongs.decodeLongs(longs);
+return blockList;
+}
+@Test public void testCapabilitiesInited(){
+NamespaceInfo nsInfo=new NamespaceInfo();
+assertTrue(nsInfo.isCapabilitySupported(Capability.STORAGE_BLOCK_REPORT_BUFFERS));
+}
+@Test public void testDatanodeDetect() throws ServiceException, IOException {
+final AtomicReference<BlockReportRequestProto> request=new AtomicReference<>();
+DatanodeProtocolPB mockProxy=mock(DatanodeProtocolPB.class);
+doAnswer(new Answer<BlockReportResponseProto>(){
+public BlockReportResponseProto answer(InvocationOnMock invocation){
+Object[] args=invocation.getArguments();
+request.set((BlockReportRequestProto)args[1]);
+return BlockReportResponseProto.newBuilder().build();
+}
+}
+).when(mockProxy).blockReport(any(RpcController.class),any(BlockReportRequestProto.class));
+@SuppressWarnings("resource") DatanodeProtocolClientSideTranslatorPB nn=new DatanodeProtocolClientSideTranslatorPB(mockProxy);
+DatanodeRegistration reg=DFSTestUtil.getLocalDatanodeRegistration();
+NamespaceInfo nsInfo=new NamespaceInfo(1,"cluster","bp",1);
+reg.setNamespaceInfo(nsInfo);
+Replica r=new FinalizedReplica(new Block(1,2,3),null,null);
+BlockListAsLongs bbl=BlockListAsLongs.encode(Collections.singleton(r));
+DatanodeStorage storage=new DatanodeStorage("s1");
+StorageBlockReport[] sbr={new StorageBlockReport(storage,bbl)};
+request.set(null);
+nsInfo.setCapabilities(Capability.STORAGE_BLOCK_REPORT_BUFFERS.getMask());
+nn.blockReport(reg,"pool",sbr,new BlockReportContext(1,0,System.nanoTime(),0L,true));
+BlockReportRequestProto proto=request.get();
+assertNotNull(proto);
+assertTrue(proto.getReports(0).getBlocksList().isEmpty());
+assertFalse(proto.getReports(0).getBlocksBuffersList().isEmpty());
+request.set(null);
+nsInfo.setCapabilities(Capability.UNKNOWN.getMask());
+BlockListAsLongs blockList=getBlockList(r);
+StorageBlockReport[] obp=new StorageBlockReport[]{new StorageBlockReport(new DatanodeStorage("s1"),blockList)};
+nn.blockReport(reg,"pool",obp,new BlockReportContext(1,0,System.nanoTime(),0L,true));
+proto=request.get();
+assertNotNull(proto);
+assertFalse(proto.getReports(0).getBlocksList().isEmpty());
+assertTrue(proto.getReports(0).getBlocksBuffersList().isEmpty());
+}
+}

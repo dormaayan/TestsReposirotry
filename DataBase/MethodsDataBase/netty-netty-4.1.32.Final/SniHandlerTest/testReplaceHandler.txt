@@ -1,0 +1,92 @@
+@Test(timeout=30000) public void testReplaceHandler() throws Exception {
+switch (provider) {
+case OPENSSL:
+case OPENSSL_REFCNT:
+    final String sniHost="sni.netty.io";
+  LocalAddress address=new LocalAddress("testReplaceHandler-" + Math.random());
+EventLoopGroup group=new DefaultEventLoopGroup(1);
+Channel sc=null;
+Channel cc=null;
+SslContext sslContext=null;
+SelfSignedCertificate cert=new SelfSignedCertificate();
+try {
+final SslContext sslServerContext=SslContextBuilder.forServer(cert.key(),cert.cert()).sslProvider(provider).build();
+final Mapping<String,SslContext> mapping=new Mapping<String,SslContext>(){
+@Override public SslContext map(String input){
+return sslServerContext;
+}
+}
+;
+final Promise<Void> releasePromise=group.next().newPromise();
+final SniHandler handler=new SniHandler(mapping){
+@Override protected void replaceHandler(ChannelHandlerContext ctx,String hostname,final SslContext sslContext) throws Exception {
+boolean success=false;
+try {
+SSLEngine sslEngine=sslContext.newEngine(ctx.alloc());
+try {
+SslHandler customSslHandler=new CustomSslHandler(sslContext,sslEngine){
+  @Override public void handlerRemoved0(  ChannelHandlerContext ctx) throws Exception {
+    try {
+      super.handlerRemoved0(ctx);
+    }
+  finally {
+      releasePromise.trySuccess(null);
+    }
+  }
+}
+;
+ctx.pipeline().replace(this,CustomSslHandler.class.getName(),customSslHandler);
+success=true;
+}
+  finally {
+if (!success) {
+  ReferenceCountUtil.safeRelease(sslEngine);
+}
+}
+}
+  finally {
+if (!success) {
+ReferenceCountUtil.safeRelease(sslContext);
+releasePromise.cancel(true);
+}
+}
+}
+}
+;
+ServerBootstrap sb=new ServerBootstrap();
+sc=sb.group(group).channel(LocalServerChannel.class).childHandler(new ChannelInitializer<Channel>(){
+@Override protected void initChannel(Channel ch) throws Exception {
+ch.pipeline().addFirst(handler);
+}
+}
+).bind(address).syncUninterruptibly().channel();
+sslContext=SslContextBuilder.forClient().sslProvider(provider).trustManager(InsecureTrustManagerFactory.INSTANCE).build();
+Bootstrap cb=new Bootstrap();
+cc=cb.group(group).channel(LocalChannel.class).handler(new SslHandler(sslContext.newEngine(ByteBufAllocator.DEFAULT,sniHost,-1))).connect(address).syncUninterruptibly().channel();
+cc.writeAndFlush(Unpooled.wrappedBuffer("Hello, World!".getBytes())).syncUninterruptibly();
+assertEquals(1,((ReferenceCounted)sslServerContext).refCnt());
+cc.close().syncUninterruptibly();
+if (!releasePromise.awaitUninterruptibly(10L,TimeUnit.SECONDS)) {
+throw new IllegalStateException("It doesn't seem #replaceHandler() got called.");
+}
+assertEquals(0,((ReferenceCounted)sslServerContext).refCnt());
+}
+  finally {
+if (cc != null) {
+cc.close().syncUninterruptibly();
+}
+if (sc != null) {
+sc.close().syncUninterruptibly();
+}
+if (sslContext != null) {
+ReferenceCountUtil.release(sslContext);
+}
+group.shutdownGracefully();
+cert.delete();
+}
+case JDK:
+return;
+default :
+throw new Error();
+}
+}

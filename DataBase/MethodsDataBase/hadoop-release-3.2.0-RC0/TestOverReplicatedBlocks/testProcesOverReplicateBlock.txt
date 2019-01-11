@@ -1,0 +1,55 @@
+/** 
+ * Test processOverReplicatedBlock can handle corrupt replicas fine. It make sure that it won't treat corrupt replicas as valid ones  thus prevents NN deleting valid replicas but keeping corrupt ones.
+ */
+@Test public void testProcesOverReplicateBlock() throws Exception {
+  Configuration conf=new HdfsConfiguration();
+  conf.setLong(DFSConfigKeys.DFS_DATANODE_SCAN_PERIOD_HOURS_KEY,100L);
+  conf.setLong(DFSConfigKeys.DFS_BLOCKREPORT_INTERVAL_MSEC_KEY,1000L);
+  conf.set(DFSConfigKeys.DFS_NAMENODE_RECONSTRUCTION_PENDING_TIMEOUT_SEC_KEY,Integer.toString(2));
+  MiniDFSCluster cluster=new MiniDFSCluster.Builder(conf).numDataNodes(3).build();
+  FileSystem fs=cluster.getFileSystem();
+  try {
+    final Path fileName=new Path("/foo1");
+    DFSTestUtil.createFile(fs,fileName,2,(short)3,0L);
+    DFSTestUtil.waitReplication(fs,fileName,(short)3);
+    ExtendedBlock block=DFSTestUtil.getFirstBlock(fs,fileName);
+    cluster.corruptReplica(0,block);
+    DataNodeProperties dnProps=cluster.stopDataNode(0);
+    File scanCursor=new File(new File(MiniDFSCluster.getFinalizedDir(cluster.getInstanceStorageDir(0,0),cluster.getNamesystem().getBlockPoolId()).getParent()).getParent(),"scanner.cursor");
+    for (int i=0; !scanCursor.delete(); i++) {
+      assertTrue("Could not delete " + scanCursor.getAbsolutePath() + " in one minute",i < 60);
+      try {
+        Thread.sleep(1000);
+      }
+ catch (      InterruptedException ignored) {
+      }
+    }
+    cluster.restartDataNode(dnProps);
+    DFSTestUtil.waitReplication(fs,fileName,(short)2);
+    String blockPoolId=cluster.getNamesystem().getBlockPoolId();
+    final DatanodeID corruptDataNode=InternalDataNodeTestUtils.getDNRegistrationForBP(cluster.getDataNodes().get(2),blockPoolId);
+    final FSNamesystem namesystem=cluster.getNamesystem();
+    final BlockManager bm=namesystem.getBlockManager();
+    final HeartbeatManager hm=bm.getDatanodeManager().getHeartbeatManager();
+    try {
+      namesystem.writeLock();
+synchronized (hm) {
+        String corruptMachineName=corruptDataNode.getXferAddr();
+        for (        DatanodeDescriptor datanode : hm.getDatanodes()) {
+          if (!corruptMachineName.equals(datanode.getXferAddr())) {
+            datanode.getStorageInfos()[0].setUtilizationForTesting(100L,100L,0,100L);
+            datanode.updateHeartbeat(BlockManagerTestUtil.getStorageReportsForDatanode(datanode),0L,0L,0,0,null);
+          }
+        }
+        NameNodeAdapter.setReplication(namesystem,fileName.toString(),(short)1);
+        assertEquals(1,bm.countNodes(bm.getStoredBlock(block.getLocalBlock())).liveReplicas());
+      }
+    }
+  finally {
+      namesystem.writeUnlock();
+    }
+  }
+  finally {
+    cluster.shutdown();
+  }
+}

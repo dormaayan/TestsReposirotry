@@ -1,0 +1,135 @@
+/** 
+ * Tests for  {@link SlowPeerTracker}.
+ */
+public class TestSlowPeerTracker {
+  public static final Logger LOG=LoggerFactory.getLogger(TestSlowPeerTracker.class);
+  /** 
+ * Set a timeout for every test case.
+ */
+  @Rule public Timeout testTimeout=new Timeout(300_000);
+  private Configuration conf;
+  private SlowPeerTracker tracker;
+  private FakeTimer timer;
+  private long reportValidityMs;
+  private static final ObjectReader READER=new ObjectMapper().readerFor(new TypeReference<Set<ReportForJson>>(){
+  }
+);
+  @Before public void setup(){
+    conf=new HdfsConfiguration();
+    timer=new FakeTimer();
+    tracker=new SlowPeerTracker(conf,timer);
+    reportValidityMs=tracker.getReportValidityMs();
+  }
+  /** 
+ * Edge case, there are no reports to retrieve.
+ */
+  @Test public void testEmptyReports(){
+    assertTrue(tracker.getReportsForAllDataNodes().isEmpty());
+    assertTrue(tracker.getReportsForNode("noSuchNode").isEmpty());
+  }
+  @Test public void testReportsAreRetrieved(){
+    tracker.addReport("node2","node1");
+    tracker.addReport("node3","node1");
+    tracker.addReport("node3","node2");
+    assertThat(tracker.getReportsForAllDataNodes().size(),is(2));
+    assertThat(tracker.getReportsForNode("node2").size(),is(1));
+    assertThat(tracker.getReportsForNode("node3").size(),is(2));
+    assertThat(tracker.getReportsForNode("node1").size(),is(0));
+  }
+  /** 
+ * Test that when all reports are expired, we get back nothing.
+ */
+  @Test public void testAllReportsAreExpired(){
+    tracker.addReport("node2","node1");
+    tracker.addReport("node3","node2");
+    tracker.addReport("node1","node3");
+    timer.advance(1);
+    assertThat(tracker.getReportsForAllDataNodes().size(),is(3));
+    timer.advance(reportValidityMs);
+    assertTrue(tracker.getReportsForAllDataNodes().isEmpty());
+    assertTrue(tracker.getReportsForNode("node1").isEmpty());
+    assertTrue(tracker.getReportsForNode("node2").isEmpty());
+    assertTrue(tracker.getReportsForNode("node3").isEmpty());
+  }
+  /** 
+ * Test the case when a subset of reports has expired. Ensure that we only get back non-expired reports.
+ */
+  @Test public void testSomeReportsAreExpired(){
+    tracker.addReport("node3","node1");
+    tracker.addReport("node3","node2");
+    timer.advance(reportValidityMs);
+    tracker.addReport("node3","node4");
+    assertThat(tracker.getReportsForAllDataNodes().size(),is(1));
+    assertThat(tracker.getReportsForNode("node3").size(),is(1));
+    assertTrue(tracker.getReportsForNode("node3").contains("node4"));
+  }
+  /** 
+ * Test the case when an expired report is replaced by a valid one.
+ */
+  @Test public void testReplacement(){
+    tracker.addReport("node2","node1");
+    timer.advance(reportValidityMs);
+    assertThat(tracker.getReportsForAllDataNodes().size(),is(0));
+    tracker.addReport("node2","node1");
+    assertThat(tracker.getReportsForAllDataNodes().size(),is(1));
+    assertThat(tracker.getReportsForNode("node2").size(),is(1));
+  }
+  @Test public void testGetJson() throws IOException {
+    tracker.addReport("node1","node2");
+    tracker.addReport("node2","node3");
+    tracker.addReport("node2","node1");
+    tracker.addReport("node4","node1");
+    final Set<ReportForJson> reports=getAndDeserializeJson();
+    assertThat(reports.size(),is(3));
+    assertTrue(isNodeInReports(reports,"node1"));
+    assertTrue(isNodeInReports(reports,"node2"));
+    assertTrue(isNodeInReports(reports,"node4"));
+    assertFalse(isNodeInReports(reports,"node3"));
+  }
+  @Test public void testGetJsonSizeIsLimited() throws IOException {
+    tracker.addReport("node1","node2");
+    tracker.addReport("node1","node3");
+    tracker.addReport("node2","node3");
+    tracker.addReport("node2","node4");
+    tracker.addReport("node3","node4");
+    tracker.addReport("node3","node5");
+    tracker.addReport("node4","node6");
+    tracker.addReport("node5","node6");
+    tracker.addReport("node5","node7");
+    tracker.addReport("node6","node7");
+    tracker.addReport("node6","node8");
+    final Set<ReportForJson> reports=getAndDeserializeJson();
+    assertFalse(isNodeInReports(reports,"node4"));
+    assertTrue(isNodeInReports(reports,"node1"));
+    assertTrue(isNodeInReports(reports,"node2"));
+    assertTrue(isNodeInReports(reports,"node3"));
+    assertTrue(isNodeInReports(reports,"node5"));
+    assertTrue(isNodeInReports(reports,"node6"));
+  }
+  @Test public void testLowRankedElementsIgnored() throws IOException {
+    for (int i=0; i < 5; ++i) {
+      tracker.addReport("node" + i,"reporter1");
+      tracker.addReport("node" + i,"reporter2");
+    }
+    for (int i=10; i < 20; ++i) {
+      tracker.addReport("node" + i,"reporter1");
+    }
+    final Set<ReportForJson> reports=getAndDeserializeJson();
+    for (int i=0; i < 5; ++i) {
+      assertTrue(isNodeInReports(reports,"node" + i));
+    }
+  }
+  private boolean isNodeInReports(  Set<ReportForJson> reports,  String node){
+    for (    ReportForJson report : reports) {
+      if (report.getSlowNode().equalsIgnoreCase(node)) {
+        return true;
+      }
+    }
+    return false;
+  }
+  private Set<ReportForJson> getAndDeserializeJson() throws IOException {
+    final String json=tracker.getJson();
+    LOG.info("Got JSON: {}",json);
+    return READER.readValue(json);
+  }
+}

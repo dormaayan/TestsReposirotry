@@ -1,0 +1,86 @@
+private static class ServerHandler extends SimpleChannelInboundHandler<ByteBuf> {
+  private final int[] autoRead;
+  private final int[] multipleMessage;
+  volatile Channel channel;
+  volatile int step;
+  final AtomicReference<Throwable> exception=new AtomicReference<Throwable>();
+  ServerHandler(  int[] autoRead,  int[] multipleMessage){
+    this.autoRead=autoRead;
+    this.multipleMessage=Arrays.copyOf(multipleMessage,multipleMessage.length);
+  }
+  @Override public void channelActive(  ChannelHandlerContext ctx) throws Exception {
+    channel=ctx.channel();
+  }
+  @Override public void channelRead0(  final ChannelHandlerContext ctx,  ByteBuf in) throws Exception {
+    byte[] actual=new byte[in.readableBytes()];
+    int nb=actual.length / messageSize;
+    loggerServer.info("Step: " + step + " Read: "+ nb+ " blocks");
+    in.readBytes(actual);
+    long timestamp=TrafficCounter.milliSecondFromNano();
+    int isAutoRead=0;
+    int laststep=step;
+    for (int i=0; i < nb; i++) {
+      multipleMessage[step]--;
+      if (multipleMessage[step] == 0) {
+        if (autoRead != null) {
+          isAutoRead=autoRead[step];
+        }
+        step++;
+      }
+    }
+    if (laststep != step) {
+      if (autoRead != null && isAutoRead != 2) {
+        if (isAutoRead != 0) {
+          loggerServer.info("Step: " + step + " Set AutoRead: "+ (isAutoRead > 0));
+          channel.config().setAutoRead(isAutoRead > 0);
+        }
+ else {
+          loggerServer.info("Step: " + step + " AutoRead: NO");
+        }
+      }
+    }
+    Thread.sleep(10);
+    loggerServer.debug("Step: " + step + " Write: "+ nb);
+    for (int i=0; i < nb; i++) {
+      channel.write(Unpooled.copyLong(timestamp));
+    }
+    channel.flush();
+    if (laststep != step) {
+      if (isAutoRead != 0) {
+        if (isAutoRead < 0) {
+          final int exactStep=step;
+          long wait=isAutoRead == -1 ? minimalms : stepms + minimalms;
+          if (isAutoRead == -3) {
+            wait=stepms * 3;
+          }
+          executor.schedule(new Runnable(){
+            @Override public void run(){
+              loggerServer.info("Step: " + exactStep + " Reset AutoRead");
+              channel.config().setAutoRead(true);
+            }
+          }
+,wait,TimeUnit.MILLISECONDS);
+        }
+ else {
+          if (isAutoRead > 1) {
+            loggerServer.debug("Step: " + step + " Will Set AutoRead: True");
+            final int exactStep=step;
+            executor.schedule(new Runnable(){
+              @Override public void run(){
+                loggerServer.info("Step: " + exactStep + " Set AutoRead: True");
+                channel.config().setAutoRead(true);
+              }
+            }
+,stepms + minimalms,TimeUnit.MILLISECONDS);
+          }
+        }
+      }
+    }
+  }
+  @Override public void exceptionCaught(  ChannelHandlerContext ctx,  Throwable cause) throws Exception {
+    if (exception.compareAndSet(null,cause)) {
+      cause.printStackTrace();
+      ctx.close();
+    }
+  }
+}

@@ -1,0 +1,55 @@
+/** 
+ * Test that block will be recovered even if there are less than the specified minReplication datanodes involved in its recovery. Check that, after recovering, the block will be successfully replicated.
+ */
+@Test(timeout=300000L) public void testRecoveryWillIgnoreMinReplication() throws Exception {
+  tearDown();
+  final int blockSize=4096;
+  final int numReplicas=3;
+  final String filename="/testIgnoreMinReplication";
+  final Path filePath=new Path(filename);
+  Configuration configuration=new HdfsConfiguration();
+  configuration.setInt(DFS_NAMENODE_HEARTBEAT_RECHECK_INTERVAL_KEY,2000);
+  configuration.setInt(DFS_NAMENODE_REPLICATION_MIN_KEY,2);
+  configuration.setLong(DFS_BLOCK_SIZE_KEY,blockSize);
+  MiniDFSCluster cluster=null;
+  try {
+    cluster=new MiniDFSCluster.Builder(configuration).numDataNodes(5).build();
+    cluster.waitActive();
+    final DistributedFileSystem dfs=cluster.getFileSystem();
+    final FSNamesystem fsn=cluster.getNamesystem();
+    FSDataOutputStream out=dfs.create(filePath,(short)numReplicas);
+    out.write(AppendTestUtil.randomBytes(0,blockSize));
+    out.hsync();
+    DFSClient dfsClient=new DFSClient(new InetSocketAddress("localhost",cluster.getNameNodePort()),configuration);
+    LocatedBlock blk=dfsClient.getNamenode().getBlockLocations(filename,0,blockSize).getLastLocatedBlock();
+    List<DatanodeInfo> dataNodes=Arrays.asList(blk.getLocations());
+    assertEquals(dataNodes.size(),numReplicas);
+    for (    DatanodeInfo dataNode : dataNodes.subList(0,numReplicas - 1)) {
+      cluster.stopDataNode(dataNode.getName());
+    }
+    GenericTestUtils.waitFor(new Supplier<Boolean>(){
+      @Override public Boolean get(){
+        return fsn.getNumDeadDataNodes() == 2;
+      }
+    }
+,300,300000);
+    cluster.setLeasePeriod(100L,100L);
+    GenericTestUtils.waitFor(new Supplier<Boolean>(){
+      @Override public Boolean get(){
+        try {
+          return dfs.isFileClosed(filePath);
+        }
+ catch (        IOException e) {
+        }
+        return false;
+      }
+    }
+,300,300000);
+    DFSTestUtil.waitForReplication(cluster,DFSTestUtil.getFirstBlock(dfs,filePath),1,numReplicas,0);
+  }
+  finally {
+    if (cluster != null) {
+      cluster.shutdown();
+    }
+  }
+}

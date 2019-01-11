@@ -1,0 +1,78 @@
+@Test public void testRenewDelegationToken() throws Exception {
+  client().addFilter(new LoggingFilter(System.out));
+  rm.start();
+  final String renewer="client2";
+  this.client().addFilter(new LoggingFilter(System.out));
+  final DelegationToken dummyToken=new DelegationToken();
+  dummyToken.setRenewer(renewer);
+  String[] mediaTypes={MediaType.APPLICATION_JSON,MediaType.APPLICATION_XML};
+  for (  final String mediaType : mediaTypes) {
+    for (    final String contentType : mediaTypes) {
+      if (isKerberosAuth == false) {
+        verifySimpleAuthRenew(mediaType,contentType);
+        continue;
+      }
+      final DelegationToken responseToken=KerberosTestUtils.doAsClient(new Callable<DelegationToken>(){
+        @Override public DelegationToken call() throws Exception {
+          ClientResponse response=resource().path("ws").path("v1").path("cluster").path("delegation-token").accept(contentType).entity(dummyToken,mediaType).post(ClientResponse.class);
+          assertResponseStatusCode(Status.OK,response.getStatusInfo());
+          DelegationToken tok=getDelegationTokenFromResponse(response);
+          assertFalse(tok.getToken().isEmpty());
+          String body=generateRenewTokenBody(mediaType,tok.getToken());
+          response=resource().path("ws").path("v1").path("cluster").path("delegation-token").path("expiration").header(yarnTokenHeader,tok.getToken()).accept(contentType).entity(body,mediaType).post(ClientResponse.class);
+          assertResponseStatusCode(Status.FORBIDDEN,response.getStatusInfo());
+          return tok;
+        }
+      }
+);
+      KerberosTestUtils.doAs(renewer,new Callable<DelegationToken>(){
+        @Override public DelegationToken call() throws Exception {
+          long oldExpirationTime=Time.now();
+          assertValidRMToken(responseToken.getToken());
+          String body=generateRenewTokenBody(mediaType,responseToken.getToken());
+          ClientResponse response=resource().path("ws").path("v1").path("cluster").path("delegation-token").path("expiration").header(yarnTokenHeader,responseToken.getToken()).accept(contentType).entity(body,mediaType).post(ClientResponse.class);
+          assertResponseStatusCode(Status.OK,response.getStatusInfo());
+          DelegationToken tok=getDelegationTokenFromResponse(response);
+          String message="Expiration time not as expected: old = " + oldExpirationTime + "; new = "+ tok.getNextExpirationTime();
+          assertTrue(message,tok.getNextExpirationTime() > oldExpirationTime);
+          oldExpirationTime=tok.getNextExpirationTime();
+          Thread.sleep(1000);
+          response=resource().path("ws").path("v1").path("cluster").path("delegation-token").path("expiration").header(yarnTokenHeader,responseToken.getToken()).accept(contentType).entity(body,mediaType).post(ClientResponse.class);
+          assertResponseStatusCode(Status.OK,response.getStatusInfo());
+          tok=getDelegationTokenFromResponse(response);
+          message="Expiration time not as expected: old = " + oldExpirationTime + "; new = "+ tok.getNextExpirationTime();
+          assertTrue(message,tok.getNextExpirationTime() > oldExpirationTime);
+          return tok;
+        }
+      }
+);
+      KerberosTestUtils.doAs("client3",new Callable<DelegationToken>(){
+        @Override public DelegationToken call() throws Exception {
+          String body=generateRenewTokenBody(mediaType,responseToken.getToken());
+          ClientResponse response=resource().path("ws").path("v1").path("cluster").path("delegation-token").path("expiration").header(yarnTokenHeader,responseToken.getToken()).accept(contentType).entity(body,mediaType).post(ClientResponse.class);
+          assertResponseStatusCode(Status.FORBIDDEN,response.getStatusInfo());
+          return null;
+        }
+      }
+);
+      KerberosTestUtils.doAsClient(new Callable<Void>(){
+        @Override public Void call() throws Exception {
+          String token="TEST_TOKEN_STRING";
+          String body="";
+          if (mediaType.equals(MediaType.APPLICATION_JSON)) {
+            body="{\"token\": \"" + token + "\" }";
+          }
+ else {
+            body="<delegation-token><token>" + token + "</token></delegation-token>";
+          }
+          ClientResponse response=resource().path("ws").path("v1").path("cluster").path("delegation-token").path("expiration").accept(contentType).entity(body,mediaType).post(ClientResponse.class);
+          assertResponseStatusCode(Status.BAD_REQUEST,response.getStatusInfo());
+          return null;
+        }
+      }
+);
+    }
+  }
+  rm.stop();
+  return;
+}

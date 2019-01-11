@@ -1,0 +1,58 @@
+@SuppressWarnings("deprecation") @Test public void testMRNewTimelineServiceEventHandling() throws Exception {
+  LOG.info("testMRNewTimelineServiceEventHandling start.");
+  String testDir=new File("target",getClass().getSimpleName() + "-test_dir").getAbsolutePath();
+  String storageDir=testDir + File.separator + "timeline_service_data";
+  Configuration conf=new YarnConfiguration();
+  conf.setBoolean(YarnConfiguration.TIMELINE_SERVICE_ENABLED,true);
+  conf.setFloat(YarnConfiguration.TIMELINE_SERVICE_VERSION,2.0f);
+  conf.setClass(YarnConfiguration.TIMELINE_SERVICE_WRITER_CLASS,FileSystemTimelineWriterImpl.class,TimelineWriter.class);
+  conf.setBoolean(MRJobConfig.MAPREDUCE_JOB_EMIT_TIMELINE_DATA,true);
+  conf.set(FileSystemTimelineWriterImpl.TIMELINE_SERVICE_STORAGE_DIR_ROOT,storageDir);
+  conf.set(YarnConfiguration.NM_AUX_SERVICES,TIMELINE_AUX_SERVICE_NAME);
+  conf.set(YarnConfiguration.NM_AUX_SERVICES + "." + TIMELINE_AUX_SERVICE_NAME+ ".class",PerNodeTimelineCollectorsAuxService.class.getName());
+  conf.setBoolean(YarnConfiguration.SYSTEM_METRICS_PUBLISHER_ENABLED,true);
+  MiniMRYarnCluster cluster=null;
+  try {
+    cluster=new MiniMRYarnCluster(TestMRTimelineEventHandling.class.getSimpleName(),1,true);
+    cluster.init(conf);
+    cluster.start();
+    LOG.info("A MiniMRYarnCluster get start.");
+    Path inDir=new Path(testDir,"input");
+    Path outDir=new Path(testDir,"output");
+    LOG.info("Run 1st job which should be successful.");
+    JobConf successConf=new JobConf(conf);
+    successConf.set("dummy_conf1",UtilsForTests.createConfigValue(51 * 1024));
+    successConf.set("dummy_conf2",UtilsForTests.createConfigValue(51 * 1024));
+    successConf.set("huge_dummy_conf1",UtilsForTests.createConfigValue(101 * 1024));
+    successConf.set("huge_dummy_conf2",UtilsForTests.createConfigValue(101 * 1024));
+    RunningJob job=UtilsForTests.runJobSucceed(successConf,inDir,outDir);
+    Assert.assertEquals(JobStatus.SUCCEEDED,job.getJobStatus().getState().getValue());
+    YarnClient yarnClient=YarnClient.createYarnClient();
+    yarnClient.init(new Configuration(cluster.getConfig()));
+    yarnClient.start();
+    EnumSet<YarnApplicationState> appStates=EnumSet.allOf(YarnApplicationState.class);
+    ApplicationId firstAppId=null;
+    List<ApplicationReport> apps=yarnClient.getApplications(appStates);
+    Assert.assertEquals(apps.size(),1);
+    ApplicationReport appReport=apps.get(0);
+    firstAppId=appReport.getApplicationId();
+    UtilsForTests.waitForAppFinished(job,cluster);
+    checkNewTimelineEvent(firstAppId,appReport,storageDir);
+    LOG.info("Run 2nd job which should be failed.");
+    job=UtilsForTests.runJobFail(new JobConf(conf),inDir,outDir);
+    Assert.assertEquals(JobStatus.FAILED,job.getJobStatus().getState().getValue());
+    apps=yarnClient.getApplications(appStates);
+    Assert.assertEquals(apps.size(),2);
+    appReport=apps.get(0).getApplicationId().equals(firstAppId) ? apps.get(0) : apps.get(1);
+    checkNewTimelineEvent(firstAppId,appReport,storageDir);
+  }
+  finally {
+    if (cluster != null) {
+      cluster.stop();
+    }
+    File testDirFolder=new File(testDir);
+    if (testDirFolder.isDirectory()) {
+      FileUtils.deleteDirectory(testDirFolder);
+    }
+  }
+}

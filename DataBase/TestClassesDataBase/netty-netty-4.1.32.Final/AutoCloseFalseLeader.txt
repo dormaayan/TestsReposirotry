@@ -1,0 +1,56 @@
+private static final class AutoCloseFalseLeader extends SimpleChannelInboundHandler<ByteBuf> {
+  private final int expectedBytes;
+  private final CountDownLatch followerCloseLatch;
+  private final CountDownLatch doneLatch;
+  private final AtomicReference<Throwable> causeRef;
+  private int bytesRead;
+  private boolean seenOutputShutdown;
+  AutoCloseFalseLeader(  int expectedBytes,  CountDownLatch followerCloseLatch,  CountDownLatch doneLatch,  AtomicReference<Throwable> causeRef){
+    this.expectedBytes=expectedBytes;
+    this.followerCloseLatch=followerCloseLatch;
+    this.doneLatch=doneLatch;
+    this.causeRef=causeRef;
+  }
+  @Override public void channelActive(  ChannelHandlerContext ctx) throws Exception {
+    ByteBuf buf=ctx.alloc().buffer(expectedBytes);
+    buf.writerIndex(buf.writerIndex() + expectedBytes);
+    ctx.writeAndFlush(buf.retainedDuplicate());
+    followerCloseLatch.await();
+    ctx.writeAndFlush(buf).addListener(new ChannelFutureListener(){
+      @Override public void operationComplete(      ChannelFuture future) throws Exception {
+        if (future.cause() == null) {
+          causeRef.set(new IllegalStateException("second write should have failed!"));
+          doneLatch.countDown();
+        }
+      }
+    }
+);
+  }
+  @Override protected void channelRead0(  ChannelHandlerContext ctx,  ByteBuf msg) throws Exception {
+    bytesRead+=msg.readableBytes();
+    if (bytesRead >= expectedBytes) {
+      if (!seenOutputShutdown) {
+        causeRef.set(new IllegalStateException(ChannelOutputShutdownEvent.class.getSimpleName() + " event was not seen"));
+      }
+      doneLatch.countDown();
+    }
+  }
+  @Override public void userEventTriggered(  ChannelHandlerContext ctx,  Object evt){
+    if (evt instanceof ChannelOutputShutdownEvent) {
+      seenOutputShutdown=true;
+    }
+  }
+  @Override public void channelInactive(  ChannelHandlerContext ctx){
+    checkPrematureClose();
+  }
+  @Override public void exceptionCaught(  ChannelHandlerContext ctx,  Throwable cause){
+    ctx.close();
+    checkPrematureClose();
+  }
+  private void checkPrematureClose(){
+    if (bytesRead < expectedBytes || !seenOutputShutdown) {
+      causeRef.set(new IllegalStateException("leader premature close"));
+      doneLatch.countDown();
+    }
+  }
+}

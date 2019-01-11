@@ -1,0 +1,56 @@
+@Test(timeout=30000L) public void testInterAppCompositeConstraints() throws Exception {
+  YarnConfiguration config=new YarnConfiguration();
+  config.set(YarnConfiguration.RM_PLACEMENT_CONSTRAINTS_HANDLER,YarnConfiguration.SCHEDULER_RM_PLACEMENT_CONSTRAINTS_HANDLER);
+  config.setClass(YarnConfiguration.RM_SCHEDULER,CapacityScheduler.class,ResourceScheduler.class);
+  MockRM rm=new MockRM(config);
+  try {
+    rm.start();
+    MockNM nm1=rm.registerNode("192.168.0.1:1234",100 * GB,100);
+    MockNM nm2=rm.registerNode("192.168.0.2:1234",100 * GB,100);
+    MockNM nm3=rm.registerNode("192.168.0.3:1234",100 * GB,100);
+    MockNM nm4=rm.registerNode("192.168.0.4:1234",100 * GB,100);
+    MockNM nm5=rm.registerNode("192.168.0.5:1234",100 * GB,100);
+    RMApp app1=rm.submitApp(1 * GB,ImmutableSet.of("hbase"));
+    MockAM am1=MockRM.launchAndRegisterAM(app1,rm,nm1);
+    PlacementConstraint pc=targetNotIn("node",allocationTag("hbase-master")).build();
+    am1.addSchedulingRequest(ImmutableList.of(schedulingRequest(1,2,1,2048,pc,"hbase-master")));
+    List<Container> allocated=waitForAllocation(2,3000,am1,nm1,nm2);
+    Assert.assertEquals(2,allocated.size());
+    Assert.assertEquals(2,getContainerNodesNum(allocated));
+    pc=targetNotIn("node",allocationTag("hbase-rs")).build();
+    am1.addSchedulingRequest(ImmutableList.of(schedulingRequest(2,4,1,1024,pc,"hbase-rs")));
+    allocated=waitForAllocation(4,3000,am1,nm1,nm2,nm3,nm4,nm5);
+    Assert.assertEquals(4,allocated.size());
+    Assert.assertEquals(4,getContainerNodesNum(allocated));
+    RMApp app2=rm.submitApp(1 * GB,ImmutableSet.of("web-server"));
+    MockAM am2=MockRM.launchAndRegisterAM(app2,rm,nm2);
+    pc=and(targetIn("node",allocationTagWithNamespace(new TargetApplicationsNamespace.All().toString(),"hbase-master")),targetNotIn("node",allocationTag("ws-inst"))).build();
+    am2.addSchedulingRequest(ImmutableList.of(schedulingRequest(1,2,1,2048,pc,"ws-inst")));
+    allocated=waitForAllocation(2,3000,am2,nm1,nm2,nm3,nm4,nm5);
+    Assert.assertEquals(2,allocated.size());
+    Assert.assertEquals(2,getContainerNodesNum(allocated));
+    ConcurrentMap<NodeId,RMNode> rmNodes=rm.getRMContext().getRMNodes();
+    for (    Container c : allocated) {
+      RMNode rmNode=rmNodes.get(c.getNodeId());
+      Assert.assertNotNull(rmNode);
+      Assert.assertTrue("If ws-inst is allocated to a node," + " this node should have inherited the ws-inst tag ",rmNode.getAllocationTagsWithCount().get("ws-inst") == 1);
+      Assert.assertTrue("ws-inst should be co-allocated to " + "hbase-master nodes",rmNode.getAllocationTagsWithCount().get("hbase-master") == 1);
+    }
+    RMApp app3=rm.submitApp(1 * GB,ImmutableSet.of("ws-servants"));
+    MockAM am3=MockRM.launchAndRegisterAM(app3,rm,nm3);
+    pc=and(targetIn("node",allocationTagWithNamespace(new TargetApplicationsNamespace.AppTag("web-server").toString(),"ws-inst")),cardinality("node",0,2,"ws-servant")).build();
+    am3.addSchedulingRequest(ImmutableList.of(schedulingRequest(1,10,1,512,pc,"ws-servant")));
+    allocated=waitForAllocation(6,10000,am3,nm1,nm2,nm3,nm4,nm5);
+    Assert.assertEquals(6,allocated.size());
+    Assert.assertEquals(2,getContainerNodesNum(allocated));
+    for (    Container c : allocated) {
+      RMNode rmNode=rmNodes.get(c.getNodeId());
+      Assert.assertNotNull(rmNode);
+      Assert.assertTrue("Node has ws-servant allocated must have 3 instances",rmNode.getAllocationTagsWithCount().get("ws-servant") == 3);
+      Assert.assertTrue("Every ws-servant container should be co-allocated" + " with ws-inst",rmNode.getAllocationTagsWithCount().get("ws-inst") == 1);
+    }
+  }
+  finally {
+    rm.stop();
+  }
+}

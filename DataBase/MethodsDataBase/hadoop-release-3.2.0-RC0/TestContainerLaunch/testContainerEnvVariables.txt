@@ -1,0 +1,159 @@
+/** 
+ * See if environment variable is forwarded using sanitizeEnv.
+ * @throws Exception
+ */
+@Test(timeout=60000) public void testContainerEnvVariables() throws Exception {
+  containerManager.start();
+  ContainerLaunchContext containerLaunchContext=recordFactory.newRecordInstance(ContainerLaunchContext.class);
+  ApplicationId appId=ApplicationId.newInstance(0,0);
+  ApplicationAttemptId appAttemptId=ApplicationAttemptId.newInstance(appId,1);
+  ContainerId cId=ContainerId.newContainerId(appAttemptId,0);
+  Map<String,String> userSetEnv=new HashMap<String,String>();
+  userSetEnv.put(Environment.CONTAINER_ID.name(),"user_set_container_id");
+  userSetEnv.put(Environment.NM_HOST.name(),"user_set_NM_HOST");
+  userSetEnv.put(Environment.NM_PORT.name(),"user_set_NM_PORT");
+  userSetEnv.put(Environment.NM_HTTP_PORT.name(),"user_set_NM_HTTP_PORT");
+  userSetEnv.put(Environment.LOCAL_DIRS.name(),"user_set_LOCAL_DIR");
+  userSetEnv.put(Environment.USER.key(),"user_set_" + Environment.USER.key());
+  userSetEnv.put(Environment.LOGNAME.name(),"user_set_LOGNAME");
+  userSetEnv.put(Environment.PWD.name(),"user_set_PWD");
+  userSetEnv.put(Environment.HOME.name(),"user_set_HOME");
+  final String userConfDir="user_set_HADOOP_CONF_DIR";
+  userSetEnv.put(Environment.HADOOP_CONF_DIR.name(),userConfDir);
+  containerLaunchContext.setEnvironment(userSetEnv);
+  File scriptFile=Shell.appendScriptExtension(tmpDir,"scriptFile");
+  PrintWriter fileWriter=new PrintWriter(scriptFile);
+  File processStartFile=new File(tmpDir,"env_vars.tmp").getAbsoluteFile();
+  final File processFinalFile=new File(tmpDir,"env_vars.txt").getAbsoluteFile();
+  if (Shell.WINDOWS) {
+    fileWriter.println("@echo " + Environment.CONTAINER_ID.$() + "> "+ processStartFile);
+    fileWriter.println("@echo " + Environment.NM_HOST.$() + ">> "+ processStartFile);
+    fileWriter.println("@echo " + Environment.NM_PORT.$() + ">> "+ processStartFile);
+    fileWriter.println("@echo " + Environment.NM_HTTP_PORT.$() + ">> "+ processStartFile);
+    fileWriter.println("@echo " + Environment.LOCAL_DIRS.$() + ">> "+ processStartFile);
+    fileWriter.println("@echo " + Environment.USER.$() + ">> "+ processStartFile);
+    fileWriter.println("@echo " + Environment.LOGNAME.$() + ">> "+ processStartFile);
+    fileWriter.println("@echo " + Environment.PWD.$() + ">> "+ processStartFile);
+    fileWriter.println("@echo " + Environment.HOME.$() + ">> "+ processStartFile);
+    fileWriter.println("@echo " + Environment.HADOOP_CONF_DIR.$() + ">> "+ processStartFile);
+    for (    String serviceName : containerManager.getAuxServiceMetaData().keySet()) {
+      fileWriter.println("@echo %" + AuxiliaryServiceHelper.NM_AUX_SERVICE + serviceName+ "%>> "+ processStartFile);
+    }
+    fileWriter.println("@echo " + cId + ">> "+ processStartFile);
+    fileWriter.println("@move /Y " + processStartFile + " "+ processFinalFile);
+    fileWriter.println("@ping -n 100 127.0.0.1 >nul");
+  }
+ else {
+    fileWriter.write("\numask 0");
+    fileWriter.write("\necho $" + Environment.CONTAINER_ID.name() + " > "+ processStartFile);
+    fileWriter.write("\necho $" + Environment.NM_HOST.name() + " >> "+ processStartFile);
+    fileWriter.write("\necho $" + Environment.NM_PORT.name() + " >> "+ processStartFile);
+    fileWriter.write("\necho $" + Environment.NM_HTTP_PORT.name() + " >> "+ processStartFile);
+    fileWriter.write("\necho $" + Environment.LOCAL_DIRS.name() + " >> "+ processStartFile);
+    fileWriter.write("\necho $" + Environment.USER.name() + " >> "+ processStartFile);
+    fileWriter.write("\necho $" + Environment.LOGNAME.name() + " >> "+ processStartFile);
+    fileWriter.write("\necho $" + Environment.PWD.name() + " >> "+ processStartFile);
+    fileWriter.write("\necho $" + Environment.HOME.name() + " >> "+ processStartFile);
+    fileWriter.write("\necho $" + Environment.HADOOP_CONF_DIR.name() + " >> "+ processStartFile);
+    for (    String serviceName : containerManager.getAuxServiceMetaData().keySet()) {
+      fileWriter.write("\necho $" + AuxiliaryServiceHelper.NM_AUX_SERVICE + serviceName+ " >> "+ processStartFile);
+    }
+    fileWriter.write("\necho $$ >> " + processStartFile);
+    fileWriter.write("\nmv " + processStartFile + " "+ processFinalFile);
+    fileWriter.write("\nexec sleep 100");
+  }
+  fileWriter.close();
+  URL resource_alpha=URL.fromPath(localFS.makeQualified(new Path(scriptFile.getAbsolutePath())));
+  LocalResource rsrc_alpha=recordFactory.newRecordInstance(LocalResource.class);
+  rsrc_alpha.setResource(resource_alpha);
+  rsrc_alpha.setSize(-1);
+  rsrc_alpha.setVisibility(LocalResourceVisibility.APPLICATION);
+  rsrc_alpha.setType(LocalResourceType.FILE);
+  rsrc_alpha.setTimestamp(scriptFile.lastModified());
+  String destinationFile="dest_file";
+  Map<String,LocalResource> localResources=new HashMap<String,LocalResource>();
+  localResources.put(destinationFile,rsrc_alpha);
+  containerLaunchContext.setLocalResources(localResources);
+  List<String> commands=Arrays.asList(Shell.getRunScriptCommand(scriptFile));
+  containerLaunchContext.setCommands(commands);
+  StartContainerRequest scRequest=StartContainerRequest.newInstance(containerLaunchContext,createContainerToken(cId,Priority.newInstance(0),0));
+  List<StartContainerRequest> list=new ArrayList<StartContainerRequest>();
+  list.add(scRequest);
+  StartContainersRequest allRequests=StartContainersRequest.newInstance(list);
+  containerManager.startContainers(allRequests);
+  GenericTestUtils.waitFor(new Supplier<Boolean>(){
+    @Override public Boolean get(){
+      return processFinalFile.exists();
+    }
+  }
+,10,20000);
+  List<String> localDirs=dirsHandler.getLocalDirs();
+  List<String> logDirs=dirsHandler.getLogDirs();
+  List<Path> appDirs=new ArrayList<Path>(localDirs.size());
+  for (  String localDir : localDirs) {
+    Path usersdir=new Path(localDir,ContainerLocalizer.USERCACHE);
+    Path userdir=new Path(usersdir,user);
+    Path appsdir=new Path(userdir,ContainerLocalizer.APPCACHE);
+    appDirs.add(new Path(appsdir,appId.toString()));
+  }
+  List<String> containerLogDirs=new ArrayList<String>();
+  String relativeContainerLogDir=ContainerLaunch.getRelativeContainerLogDir(appId.toString(),cId.toString());
+  for (  String logDir : logDirs) {
+    containerLogDirs.add(logDir + Path.SEPARATOR + relativeContainerLogDir);
+  }
+  BufferedReader reader=new BufferedReader(new FileReader(processFinalFile));
+  Assert.assertEquals(cId.toString(),reader.readLine());
+  Assert.assertEquals(context.getNodeId().getHost(),reader.readLine());
+  Assert.assertEquals(String.valueOf(context.getNodeId().getPort()),reader.readLine());
+  Assert.assertEquals(String.valueOf(HTTP_PORT),reader.readLine());
+  Assert.assertEquals(StringUtils.join(",",appDirs),reader.readLine());
+  Assert.assertEquals(user,reader.readLine());
+  Assert.assertEquals(user,reader.readLine());
+  String obtainedPWD=reader.readLine();
+  boolean found=false;
+  for (  Path localDir : appDirs) {
+    if (new Path(localDir,cId.toString()).toString().equals(obtainedPWD)) {
+      found=true;
+      break;
+    }
+  }
+  Assert.assertTrue("Wrong local-dir found : " + obtainedPWD,found);
+  Assert.assertEquals(conf.get(YarnConfiguration.NM_USER_HOME_DIR,YarnConfiguration.DEFAULT_NM_USER_HOME_DIR),reader.readLine());
+  Assert.assertEquals(userConfDir,reader.readLine());
+  for (  String serviceName : containerManager.getAuxServiceMetaData().keySet()) {
+    Assert.assertEquals(containerManager.getAuxServiceMetaData().get(serviceName),ByteBuffer.wrap(Base64.decodeBase64(reader.readLine().getBytes())));
+  }
+  Assert.assertEquals(cId.toString(),containerLaunchContext.getEnvironment().get(Environment.CONTAINER_ID.name()));
+  Assert.assertEquals(context.getNodeId().getHost(),containerLaunchContext.getEnvironment().get(Environment.NM_HOST.name()));
+  Assert.assertEquals(String.valueOf(context.getNodeId().getPort()),containerLaunchContext.getEnvironment().get(Environment.NM_PORT.name()));
+  Assert.assertEquals(String.valueOf(HTTP_PORT),containerLaunchContext.getEnvironment().get(Environment.NM_HTTP_PORT.name()));
+  Assert.assertEquals(StringUtils.join(",",appDirs),containerLaunchContext.getEnvironment().get(Environment.LOCAL_DIRS.name()));
+  Assert.assertEquals(StringUtils.join(",",containerLogDirs),containerLaunchContext.getEnvironment().get(Environment.LOG_DIRS.name()));
+  Assert.assertEquals(user,containerLaunchContext.getEnvironment().get(Environment.USER.name()));
+  Assert.assertEquals(user,containerLaunchContext.getEnvironment().get(Environment.LOGNAME.name()));
+  found=false;
+  obtainedPWD=containerLaunchContext.getEnvironment().get(Environment.PWD.name());
+  for (  Path localDir : appDirs) {
+    if (new Path(localDir,cId.toString()).toString().equals(obtainedPWD)) {
+      found=true;
+      break;
+    }
+  }
+  Assert.assertTrue("Wrong local-dir found : " + obtainedPWD,found);
+  Assert.assertEquals(conf.get(YarnConfiguration.NM_USER_HOME_DIR,YarnConfiguration.DEFAULT_NM_USER_HOME_DIR),containerLaunchContext.getEnvironment().get(Environment.HOME.name()));
+  Assert.assertEquals(userConfDir,containerLaunchContext.getEnvironment().get(Environment.HADOOP_CONF_DIR.name()));
+  String pid=reader.readLine().trim();
+  Assert.assertEquals(null,reader.readLine());
+  Assert.assertTrue("Process is not alive!",DefaultContainerExecutor.containerIsAlive(pid));
+  Assert.assertTrue("Process is not alive!",DefaultContainerExecutor.containerIsAlive(pid));
+  List<ContainerId> containerIds=new ArrayList<ContainerId>();
+  containerIds.add(cId);
+  StopContainersRequest stopRequest=StopContainersRequest.newInstance(containerIds);
+  containerManager.stopContainers(stopRequest);
+  BaseContainerManagerTest.waitForContainerState(containerManager,cId,ContainerState.COMPLETE);
+  GetContainerStatusesRequest gcsRequest=GetContainerStatusesRequest.newInstance(containerIds);
+  ContainerStatus containerStatus=containerManager.getContainerStatuses(gcsRequest).getContainerStatuses().get(0);
+  int expectedExitCode=ContainerExitStatus.KILLED_BY_APPMASTER;
+  Assert.assertEquals(expectedExitCode,containerStatus.getExitStatus());
+  Assert.assertFalse("Process is still alive!",DefaultContainerExecutor.containerIsAlive(pid));
+}

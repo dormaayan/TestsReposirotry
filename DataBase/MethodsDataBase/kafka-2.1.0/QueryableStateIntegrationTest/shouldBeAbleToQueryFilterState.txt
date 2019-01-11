@@ -1,0 +1,40 @@
+@Test public void shouldBeAbleToQueryFilterState() throws Exception {
+  streamsConfiguration.put(StreamsConfig.DEFAULT_KEY_SERDE_CLASS_CONFIG,Serdes.String().getClass());
+  streamsConfiguration.put(StreamsConfig.DEFAULT_VALUE_SERDE_CLASS_CONFIG,Serdes.Long().getClass());
+  final StreamsBuilder builder=new StreamsBuilder();
+  final String[] keys={"hello","goodbye","welcome","go","kafka"};
+  final Set<KeyValue<String,Long>> batch1=new HashSet<>(Arrays.asList(new KeyValue<>(keys[0],1L),new KeyValue<>(keys[1],1L),new KeyValue<>(keys[2],3L),new KeyValue<>(keys[3],5L),new KeyValue<>(keys[4],2L)));
+  final Set<KeyValue<String,Long>> expectedBatch1=new HashSet<>(Collections.singleton(new KeyValue<>(keys[4],2L)));
+  IntegrationTestUtils.produceKeyValuesSynchronously(streamOne,batch1,TestUtils.producerConfig(CLUSTER.bootstrapServers(),StringSerializer.class,LongSerializer.class,new Properties()),mockTime);
+  final Predicate<String,Long> filterPredicate=new Predicate<String,Long>(){
+    @Override public boolean test(    final String key,    final Long value){
+      return key.contains("kafka");
+    }
+  }
+;
+  final KTable<String,Long> t1=builder.table(streamOne);
+  final KTable<String,Long> t2=t1.filter(filterPredicate,Materialized.<String,Long,KeyValueStore<Bytes,byte[]>>as("queryFilter"));
+  t1.filterNot(filterPredicate,Materialized.<String,Long,KeyValueStore<Bytes,byte[]>>as("queryFilterNot"));
+  t2.toStream().to(outputTopic);
+  kafkaStreams=new KafkaStreams(builder.build(),streamsConfiguration);
+  kafkaStreams.start();
+  waitUntilAtLeastNumRecordProcessed(outputTopic,2);
+  final ReadOnlyKeyValueStore<String,Long> myFilterStore=kafkaStreams.store("queryFilter",QueryableStoreTypes.<String,Long>keyValueStore());
+  final ReadOnlyKeyValueStore<String,Long> myFilterNotStore=kafkaStreams.store("queryFilterNot",QueryableStoreTypes.<String,Long>keyValueStore());
+  for (  final KeyValue<String,Long> expectedEntry : expectedBatch1) {
+    TestUtils.waitForCondition(() -> expectedEntry.value.equals(myFilterStore.get(expectedEntry.key)),"Cannot get expected result");
+  }
+  for (  final KeyValue<String,Long> batchEntry : batch1) {
+    if (!expectedBatch1.contains(batchEntry)) {
+      TestUtils.waitForCondition(() -> myFilterStore.get(batchEntry.key) == null,"Cannot get null result");
+    }
+  }
+  for (  final KeyValue<String,Long> expectedEntry : expectedBatch1) {
+    TestUtils.waitForCondition(() -> myFilterNotStore.get(expectedEntry.key) == null,"Cannot get null result");
+  }
+  for (  final KeyValue<String,Long> batchEntry : batch1) {
+    if (!expectedBatch1.contains(batchEntry)) {
+      TestUtils.waitForCondition(() -> batchEntry.value.equals(myFilterNotStore.get(batchEntry.key)),"Cannot get expected result");
+    }
+  }
+}

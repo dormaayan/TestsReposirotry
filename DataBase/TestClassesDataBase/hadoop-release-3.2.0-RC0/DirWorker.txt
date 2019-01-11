@@ -1,0 +1,114 @@
+static class DirWorker extends Worker {
+  final Path dir;
+  final File localDir;
+  final FileWorker[] files;
+  private Map<String,Path> snapshotPaths=new HashMap<String,Path>();
+  private AtomicInteger snapshotCount=new AtomicInteger();
+  DirWorker(  Path dir,  File localDir,  int nFiles) throws IOException {
+    super(dir.getName());
+    this.dir=dir;
+    this.localDir=localDir;
+    this.files=new FileWorker[nFiles];
+    for (int i=0; i < files.length; i++) {
+      files[i]=new FileWorker(dir,localDir,String.format("file%02d",i));
+    }
+  }
+  static String getSnapshotName(  int n){
+    return String.format("s%02d",n);
+  }
+  String createSnapshot(  String snapshot) throws IOException {
+    final StringBuilder b=new StringBuilder("createSnapshot: ").append(snapshot).append(" for ").append(dir);
+{
+      final File subDir=new File(localDir,snapshot);
+      Assert.assertFalse(subDir.exists());
+      subDir.mkdir();
+      for (      File f : localDir.listFiles(FILE_ONLY)) {
+        FileUtils.copyFile(f,new File(subDir,f.getName()));
+      }
+    }
+    final Path p=dfs.createSnapshot(dir,snapshot);
+    snapshotPaths.put(snapshot,p);
+    return b.toString();
+  }
+  String checkSnapshot(  String snapshot) throws IOException {
+    final StringBuilder b=new StringBuilder("checkSnapshot: ").append(snapshot);
+    final File subDir=new File(localDir,snapshot);
+    Assert.assertTrue(subDir.exists());
+    final File[] localFiles=subDir.listFiles(FILE_ONLY);
+    final Path p=snapshotPaths.get(snapshot);
+    final FileStatus[] statuses=dfs.listStatus(p);
+    Assert.assertEquals(localFiles.length,statuses.length);
+    b.append(p).append(" vs ").append(subDir).append(", ").append(statuses.length).append(" entries");
+    Arrays.sort(localFiles);
+    Arrays.sort(statuses);
+    for (int i=0; i < statuses.length; i++) {
+      FileWorker.checkFullFile(statuses[i].getPath(),localFiles[i]);
+    }
+    return b.toString();
+  }
+  String deleteSnapshot(  String snapshot) throws IOException {
+    final StringBuilder b=new StringBuilder("deleteSnapshot: ").append(snapshot).append(" from ").append(dir);
+    FileUtil.fullyDelete(new File(localDir,snapshot));
+    dfs.deleteSnapshot(dir,snapshot);
+    snapshotPaths.remove(snapshot);
+    return b.toString();
+  }
+  @Override public String call() throws Exception {
+    final int op=ThreadLocalRandom.current().nextInt(6);
+    if (op <= 1) {
+      pauseAllFiles();
+      try {
+        final String snapshot=getSnapshotName(snapshotCount.getAndIncrement());
+        return createSnapshot(snapshot);
+      }
+  finally {
+        startAllFiles();
+      }
+    }
+ else     if (op <= 3) {
+      final String[] keys=snapshotPaths.keySet().toArray(EMPTY_STRINGS);
+      if (keys.length == 0) {
+        return "NO-OP";
+      }
+      final String snapshot=keys[ThreadLocalRandom.current().nextInt(keys.length)];
+      final String s=checkSnapshot(snapshot);
+      if (op == 2) {
+        return deleteSnapshot(snapshot);
+      }
+      return s;
+    }
+ else {
+      return "NO-OP";
+    }
+  }
+  void pauseAllFiles(){
+    for (    FileWorker f : files) {
+      f.pause();
+    }
+    for (int i=0; i < files.length; ) {
+      sleep(100);
+      for (; i < files.length && files[i].isPaused(); i++)       ;
+    }
+  }
+  void startAllFiles(){
+    for (    FileWorker f : files) {
+      f.start();
+    }
+  }
+  void stopAllFiles() throws InterruptedException {
+    for (    FileWorker f : files) {
+      f.stop();
+    }
+  }
+  void checkEverything() throws IOException {
+    LOG.info("checkEverything");
+    for (    FileWorker f : files) {
+      f.checkFullFile();
+      f.checkErrorState();
+    }
+    for (    String snapshot : snapshotPaths.keySet()) {
+      checkSnapshot(snapshot);
+    }
+    checkErrorState();
+  }
+}

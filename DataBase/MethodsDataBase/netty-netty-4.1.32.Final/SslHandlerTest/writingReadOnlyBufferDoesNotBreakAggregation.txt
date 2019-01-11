@@ -1,0 +1,53 @@
+@Test public void writingReadOnlyBufferDoesNotBreakAggregation() throws Exception {
+  SelfSignedCertificate ssc=new SelfSignedCertificate();
+  final SslContext sslServerCtx=SslContextBuilder.forServer(ssc.certificate(),ssc.privateKey()).build();
+  final SslContext sslClientCtx=SslContextBuilder.forClient().trustManager(InsecureTrustManagerFactory.INSTANCE).build();
+  EventLoopGroup group=new NioEventLoopGroup();
+  Channel sc=null;
+  Channel cc=null;
+  final CountDownLatch serverReceiveLatch=new CountDownLatch(1);
+  try {
+    final int expectedBytes=11;
+    sc=new ServerBootstrap().group(group).channel(NioServerSocketChannel.class).childHandler(new ChannelInitializer<Channel>(){
+      @Override protected void initChannel(      Channel ch) throws Exception {
+        ch.pipeline().addLast(sslServerCtx.newHandler(ch.alloc()));
+        ch.pipeline().addLast(new SimpleChannelInboundHandler<ByteBuf>(){
+          private int readBytes;
+          @Override protected void channelRead0(          ChannelHandlerContext ctx,          ByteBuf msg) throws Exception {
+            readBytes+=msg.readableBytes();
+            if (readBytes >= expectedBytes) {
+              serverReceiveLatch.countDown();
+            }
+          }
+        }
+);
+      }
+    }
+).bind(new InetSocketAddress(0)).syncUninterruptibly().channel();
+    cc=new Bootstrap().group(group).channel(NioSocketChannel.class).handler(new ChannelInitializer<Channel>(){
+      @Override protected void initChannel(      Channel ch) throws Exception {
+        ch.pipeline().addLast(sslClientCtx.newHandler(ch.alloc()));
+      }
+    }
+).connect(sc.localAddress()).syncUninterruptibly().channel();
+    ByteBuf firstBuffer=Unpooled.buffer(10);
+    firstBuffer.writeByte(0);
+    firstBuffer=firstBuffer.asReadOnly();
+    ByteBuf secondBuffer=Unpooled.buffer(10);
+    secondBuffer.writeZero(secondBuffer.capacity());
+    cc.write(firstBuffer);
+    cc.writeAndFlush(secondBuffer).syncUninterruptibly();
+    serverReceiveLatch.countDown();
+  }
+  finally {
+    if (cc != null) {
+      cc.close().syncUninterruptibly();
+    }
+    if (sc != null) {
+      sc.close().syncUninterruptibly();
+    }
+    group.shutdownGracefully();
+    ReferenceCountUtil.release(sslServerCtx);
+    ReferenceCountUtil.release(sslClientCtx);
+  }
+}

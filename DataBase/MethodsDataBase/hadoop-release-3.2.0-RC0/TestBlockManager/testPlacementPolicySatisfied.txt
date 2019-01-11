@@ -1,0 +1,43 @@
+@Test(timeout=300000) public void testPlacementPolicySatisfied() throws Exception {
+  LOG.info("Starting testPlacementPolicySatisfied.");
+  final String[] initialRacks=new String[]{"/rack0","/rack1","/rack2","/rack3","/rack4","/rack5"};
+  final String[] initialHosts=new String[]{"host0","host1","host2","host3","host4","host5"};
+  final int numDataBlocks=StripedFileTestUtil.getDefaultECPolicy().getNumDataUnits();
+  final int numParityBlocks=StripedFileTestUtil.getDefaultECPolicy().getNumParityUnits();
+  final long blockSize=6 * 1024 * 1024;
+  Configuration conf=new Configuration();
+  conf.setLong(DFSConfigKeys.DFS_BLOCK_SIZE_KEY,blockSize);
+  conf.setLong(DFSConfigKeys.DFS_NAMENODE_REDUNDANCY_INTERVAL_SECONDS_KEY,1);
+  MiniDFSCluster cluster=null;
+  try {
+    cluster=new MiniDFSCluster.Builder(conf).racks(initialRacks).hosts(initialHosts).numDataNodes(initialRacks.length).build();
+    cluster.waitActive();
+    final DistributedFileSystem dfs=cluster.getFileSystem();
+    final Path ecDir=new Path("/ec");
+    final Path testFileUnsatisfied=new Path(ecDir,"test1");
+    final Path testFileSatisfied=new Path(ecDir,"test2");
+    dfs.enableErasureCodingPolicy(StripedFileTestUtil.getDefaultECPolicy().getName());
+    cluster.getFileSystem().getClient().mkdirs(ecDir.toString(),null,true);
+    cluster.getFileSystem().getClient().setErasureCodingPolicy(ecDir.toString(),StripedFileTestUtil.getDefaultECPolicy().getName());
+    long fileLen=blockSize * numDataBlocks;
+    DFSTestUtil.createFile(dfs,testFileUnsatisfied,fileLen,(short)1,1);
+    verifyPlacementPolicy(cluster,testFileUnsatisfied,true);
+    LOG.info("Adding 3 new hosts in the existing racks.");
+    cluster.startDataNodes(conf,3,true,null,new String[]{"/rack3","/rack4","/rack5"},new String[]{"host3-2","host4-2","host5-2"},null);
+    cluster.triggerHeartbeats();
+    LOG.info("Waiting for EC reconstruction to complete.");
+    DFSTestUtil.waitForReplication(dfs,testFileUnsatisfied,(short)(numDataBlocks + numParityBlocks),30 * 1000);
+    verifyPlacementPolicy(cluster,testFileUnsatisfied,true);
+    LOG.info("Adding 3 new hosts in 3 new racks.");
+    cluster.startDataNodes(conf,3,true,null,new String[]{"/rack6","/rack7","/rack8"},new String[]{"host6","host7","host8"},null);
+    cluster.triggerHeartbeats();
+    verifyPlacementPolicy(cluster,testFileUnsatisfied,false);
+    DFSTestUtil.createFile(dfs,testFileSatisfied,fileLen,(short)1,1);
+    verifyPlacementPolicy(cluster,testFileUnsatisfied,false);
+  }
+  finally {
+    if (cluster != null) {
+      cluster.shutdown();
+    }
+  }
+}

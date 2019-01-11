@@ -1,0 +1,248 @@
+public class TestBlocksWithNotEnoughRacks {
+  public static final Logger LOG=LoggerFactory.getLogger(TestBlocksWithNotEnoughRacks.class);
+static {
+    GenericTestUtils.setLogLevel(FSNamesystem.LOG,Level.TRACE);
+    GenericTestUtils.setLogLevel(LOG,Level.TRACE);
+  }
+  private Configuration getConf(){
+    Configuration conf=new HdfsConfiguration();
+    conf.setLong(DFSConfigKeys.DFS_HEARTBEAT_INTERVAL_KEY,1L);
+    conf.setInt(DFSConfigKeys.DFS_NAMENODE_REDUNDANCY_INTERVAL_SECONDS_KEY,1);
+    conf.setInt(DFSConfigKeys.DFS_NAMENODE_RECONSTRUCTION_PENDING_TIMEOUT_SEC_KEY,1);
+    conf.setLong(DFSConfigKeys.DFS_BLOCKREPORT_INTERVAL_MSEC_KEY,1000L);
+    conf.set(DFSConfigKeys.NET_TOPOLOGY_SCRIPT_FILE_NAME_KEY,"xyz");
+    return conf;
+  }
+  @Test public void testSufficientlyReplBlocksUsesNewRack() throws Exception {
+    Configuration conf=getConf();
+    final short REPLICATION_FACTOR=3;
+    final Path filePath=new Path("/testFile");
+    String racks[]={"/rack1","/rack1","/rack1"};
+    MiniDFSCluster cluster=new MiniDFSCluster.Builder(conf).numDataNodes(racks.length).racks(racks).build();
+    try {
+      final FileSystem fs=cluster.getFileSystem();
+      DFSTestUtil.createFile(fs,filePath,1L,REPLICATION_FACTOR,1L);
+      ExtendedBlock b=DFSTestUtil.getFirstBlock(fs,filePath);
+      DFSTestUtil.waitForReplication(cluster,b,1,REPLICATION_FACTOR,0);
+      String newRacks[]={"/rack2"};
+      cluster.startDataNodes(conf,1,true,null,newRacks);
+      cluster.waitActive();
+      DFSTestUtil.waitForReplication(cluster,b,2,REPLICATION_FACTOR,0);
+    }
+  finally {
+      cluster.shutdown();
+    }
+  }
+  @Test public void testSufficientlySingleReplBlockUsesNewRack() throws Exception {
+    Configuration conf=getConf();
+    short REPLICATION_FACTOR=1;
+    final Path filePath=new Path("/testFile");
+    String racks[]={"/rack1","/rack1","/rack1","/rack2"};
+    MiniDFSCluster cluster=new MiniDFSCluster.Builder(conf).numDataNodes(racks.length).racks(racks).build();
+    final FSNamesystem ns=cluster.getNameNode().getNamesystem();
+    try {
+      final FileSystem fs=cluster.getFileSystem();
+      DFSTestUtil.createFile(fs,filePath,1L,REPLICATION_FACTOR,1L);
+      ExtendedBlock b=DFSTestUtil.getFirstBlock(fs,filePath);
+      DFSTestUtil.waitForReplication(cluster,b,1,REPLICATION_FACTOR,0);
+      REPLICATION_FACTOR=2;
+      NameNodeAdapter.setReplication(ns,"/testFile",REPLICATION_FACTOR);
+      DFSTestUtil.waitForReplication(cluster,b,2,REPLICATION_FACTOR,0);
+    }
+  finally {
+      cluster.shutdown();
+    }
+  }
+  @Test public void testUnderReplicatedUsesNewRacks() throws Exception {
+    Configuration conf=getConf();
+    short REPLICATION_FACTOR=3;
+    final Path filePath=new Path("/testFile");
+    String racks[]={"/rack1","/rack1","/rack1","/rack1","/rack1"};
+    MiniDFSCluster cluster=new MiniDFSCluster.Builder(conf).numDataNodes(racks.length).racks(racks).build();
+    final FSNamesystem ns=cluster.getNameNode().getNamesystem();
+    try {
+      final FileSystem fs=cluster.getFileSystem();
+      DFSTestUtil.createFile(fs,filePath,1L,REPLICATION_FACTOR,1L);
+      ExtendedBlock b=DFSTestUtil.getFirstBlock(fs,filePath);
+      DFSTestUtil.waitForReplication(cluster,b,1,REPLICATION_FACTOR,0);
+      String newRacks[]={"/rack2","/rack2"};
+      cluster.startDataNodes(conf,2,true,null,newRacks);
+      REPLICATION_FACTOR=5;
+      NameNodeAdapter.setReplication(ns,"/testFile",REPLICATION_FACTOR);
+      DFSTestUtil.waitForReplication(cluster,b,2,REPLICATION_FACTOR,0);
+    }
+  finally {
+      cluster.shutdown();
+    }
+  }
+  @Test public void testCorruptBlockRereplicatedAcrossRacks() throws Exception {
+    Configuration conf=getConf();
+    short REPLICATION_FACTOR=2;
+    int fileLen=512;
+    final Path filePath=new Path("/testFile");
+    String racks[]={"/rack1","/rack1","/rack2","/rack2"};
+    MiniDFSCluster cluster=new MiniDFSCluster.Builder(conf).numDataNodes(racks.length).racks(racks).build();
+    final FSNamesystem ns=cluster.getNameNode().getNamesystem();
+    try {
+      final FileSystem fs=cluster.getFileSystem();
+      DFSTestUtil.createFile(fs,filePath,fileLen,REPLICATION_FACTOR,1L);
+      final byte[] fileContent=DFSTestUtil.readFileAsBytes(fs,filePath);
+      ExtendedBlock b=DFSTestUtil.getFirstBlock(fs,filePath);
+      DFSTestUtil.waitForReplication(cluster,b,2,REPLICATION_FACTOR,0);
+      int dnToCorrupt=DFSTestUtil.firstDnWithBlock(cluster,b);
+      cluster.corruptReplica(dnToCorrupt,b);
+      cluster.restartDataNode(dnToCorrupt);
+      DFSTestUtil.waitCorruptReplicas(fs,ns,filePath,b,1);
+      DFSTestUtil.waitForReplication(cluster,b,2,REPLICATION_FACTOR,0);
+      for (int i=0; i < racks.length; i++) {
+        byte[] blockContent=cluster.readBlockOnDataNodeAsBytes(i,b);
+        if (blockContent != null && i != dnToCorrupt) {
+          assertArrayEquals("Corrupt replica",fileContent,blockContent);
+        }
+      }
+    }
+  finally {
+      cluster.shutdown();
+    }
+  }
+  @Test public void testReduceReplFactorRespectsRackPolicy() throws Exception {
+    Configuration conf=getConf();
+    short REPLICATION_FACTOR=3;
+    final Path filePath=new Path("/testFile");
+    String racks[]={"/rack1","/rack1","/rack2","/rack2"};
+    MiniDFSCluster cluster=new MiniDFSCluster.Builder(conf).numDataNodes(racks.length).racks(racks).build();
+    final FSNamesystem ns=cluster.getNameNode().getNamesystem();
+    try {
+      final FileSystem fs=cluster.getFileSystem();
+      DFSTestUtil.createFile(fs,filePath,1L,REPLICATION_FACTOR,1L);
+      ExtendedBlock b=DFSTestUtil.getFirstBlock(fs,filePath);
+      DFSTestUtil.waitForReplication(cluster,b,2,REPLICATION_FACTOR,0);
+      REPLICATION_FACTOR=2;
+      NameNodeAdapter.setReplication(ns,"/testFile",REPLICATION_FACTOR);
+      DFSTestUtil.waitForReplication(cluster,b,2,REPLICATION_FACTOR,0);
+    }
+  finally {
+      cluster.shutdown();
+    }
+  }
+  @Test public void testReplDueToNodeFailRespectsRackPolicy() throws Exception {
+    Configuration conf=getConf();
+    short REPLICATION_FACTOR=3;
+    final Path filePath=new Path("/testFile");
+    String racks[]={"/rack1","/rack1","/rack1","/rack2","/rack2"};
+    MiniDFSCluster cluster=new MiniDFSCluster.Builder(conf).numDataNodes(racks.length).racks(racks).build();
+    final FSNamesystem ns=cluster.getNameNode().getNamesystem();
+    final DatanodeManager dm=ns.getBlockManager().getDatanodeManager();
+    try {
+      final FileSystem fs=cluster.getFileSystem();
+      DFSTestUtil.createFile(fs,filePath,1L,REPLICATION_FACTOR,1L);
+      ExtendedBlock b=DFSTestUtil.getFirstBlock(fs,filePath);
+      DFSTestUtil.waitForReplication(cluster,b,2,REPLICATION_FACTOR,0);
+      ArrayList<DataNode> datanodes=cluster.getDataNodes();
+      int idx=datanodes.size() - 1;
+      DataNode dataNode=datanodes.get(idx);
+      DatanodeID dnId=dataNode.getDatanodeId();
+      cluster.stopDataNode(idx);
+      dm.removeDatanode(dnId);
+      DFSTestUtil.waitForReplication(cluster,b,2,REPLICATION_FACTOR,0);
+      datanodes=cluster.getDataNodes();
+      idx=datanodes.size() - 1;
+      dataNode=datanodes.get(idx);
+      dnId=dataNode.getDatanodeId();
+      cluster.stopDataNode(idx);
+      dm.removeDatanode(dnId);
+      DFSTestUtil.waitForReplication(cluster,b,1,REPLICATION_FACTOR,0);
+    }
+  finally {
+      cluster.shutdown();
+    }
+  }
+  @Test public void testReduceReplFactorDueToRejoinRespectsRackPolicy() throws Exception {
+    Configuration conf=getConf();
+    short REPLICATION_FACTOR=2;
+    final Path filePath=new Path("/testFile");
+    String racks[]={"/rack1","/rack1","/rack2"};
+    MiniDFSCluster cluster=new MiniDFSCluster.Builder(conf).numDataNodes(racks.length).racks(racks).build();
+    final FSNamesystem ns=cluster.getNameNode().getNamesystem();
+    final DatanodeManager dm=ns.getBlockManager().getDatanodeManager();
+    try {
+      final FileSystem fs=cluster.getFileSystem();
+      DFSTestUtil.createFile(fs,filePath,1L,REPLICATION_FACTOR,1L);
+      ExtendedBlock b=DFSTestUtil.getFirstBlock(fs,filePath);
+      DFSTestUtil.waitForReplication(cluster,b,2,REPLICATION_FACTOR,0);
+      ArrayList<DataNode> datanodes=cluster.getDataNodes();
+      assertEquals(3,datanodes.size());
+      DataNode dataNode=datanodes.get(2);
+      DatanodeID dnId=dataNode.getDatanodeId();
+      cluster.stopDataNode(2);
+      dm.removeDatanode(dnId);
+      DFSTestUtil.waitForReplication(cluster,b,1,REPLICATION_FACTOR,0);
+      String rack2[]={"/rack2"};
+      cluster.startDataNodes(conf,1,true,null,rack2);
+      cluster.waitActive();
+      DFSTestUtil.waitForReplication(cluster,b,2,REPLICATION_FACTOR,0);
+    }
+  finally {
+      cluster.shutdown();
+    }
+  }
+  @Test public void testNodeDecomissionRespectsRackPolicy() throws Exception {
+    Configuration conf=getConf();
+    short REPLICATION_FACTOR=2;
+    final Path filePath=new Path("/testFile");
+    HostsFileWriter hostsFileWriter=new HostsFileWriter();
+    hostsFileWriter.initialize(conf,"temp/decommission");
+    String racks[]={"/rack1","/rack1","/rack2","/rack2"};
+    MiniDFSCluster cluster=new MiniDFSCluster.Builder(conf).numDataNodes(racks.length).racks(racks).build();
+    final FSNamesystem ns=cluster.getNameNode().getNamesystem();
+    try {
+      final FileSystem fs=cluster.getFileSystem();
+      DFSTestUtil.createFile(fs,filePath,1L,REPLICATION_FACTOR,1L);
+      ExtendedBlock b=DFSTestUtil.getFirstBlock(fs,filePath);
+      DFSTestUtil.waitForReplication(cluster,b,2,REPLICATION_FACTOR,0);
+      BlockLocation locs[]=fs.getFileBlockLocations(fs.getFileStatus(filePath),0,Long.MAX_VALUE);
+      String name=locs[0].getNames()[0];
+      hostsFileWriter.initExcludeHost(name);
+      ns.getBlockManager().getDatanodeManager().refreshNodes(conf);
+      DFSTestUtil.waitForDecommission(fs,name);
+      DFSTestUtil.waitForReplication(cluster,b,2,REPLICATION_FACTOR,0);
+    }
+  finally {
+      cluster.shutdown();
+      hostsFileWriter.cleanup();
+    }
+  }
+  @Test public void testNodeDecomissionWithOverreplicationRespectsRackPolicy() throws Exception {
+    Configuration conf=getConf();
+    short REPLICATION_FACTOR=5;
+    final Path filePath=new Path("/testFile");
+    HostsFileWriter hostsFileWriter=new HostsFileWriter();
+    hostsFileWriter.initialize(conf,"temp/decommission");
+    String racks[]={"/rack1","/rack2","/rack1","/rack1","/rack1"};
+    MiniDFSCluster cluster=new MiniDFSCluster.Builder(conf).numDataNodes(racks.length).racks(racks).build();
+    final FSNamesystem ns=cluster.getNameNode().getNamesystem();
+    try {
+      final FileSystem fs=cluster.getFileSystem();
+      DFSTestUtil.createFile(fs,filePath,1L,REPLICATION_FACTOR,1L);
+      ExtendedBlock b=DFSTestUtil.getFirstBlock(fs,filePath);
+      DFSTestUtil.waitForReplication(cluster,b,2,REPLICATION_FACTOR,0);
+      REPLICATION_FACTOR=2;
+      fs.setReplication(filePath,REPLICATION_FACTOR);
+      BlockLocation locs[]=fs.getFileBlockLocations(fs.getFileStatus(filePath),0,Long.MAX_VALUE);
+      for (      String top : locs[0].getTopologyPaths()) {
+        if (!top.startsWith("/rack2")) {
+          String name=top.substring("/rack1".length() + 1);
+          hostsFileWriter.initExcludeHost(name);
+          ns.getBlockManager().getDatanodeManager().refreshNodes(conf);
+          DFSTestUtil.waitForDecommission(fs,name);
+          break;
+        }
+      }
+      DFSTestUtil.waitForReplication(cluster,b,2,REPLICATION_FACTOR,0);
+    }
+  finally {
+      cluster.shutdown();
+      hostsFileWriter.cleanup();
+    }
+  }
+}

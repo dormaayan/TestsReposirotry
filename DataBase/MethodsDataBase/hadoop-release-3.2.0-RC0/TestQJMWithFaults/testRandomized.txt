@@ -1,0 +1,62 @@
+/** 
+ * Test case in which three JournalNodes randomly flip flop between up and down states every time they get an RPC. The writer keeps track of the latest ACKed edit, and on every recovery operation, ensures that it recovers at least to that point or higher. Since at any given point, a majority of JNs may be injecting faults, any writer operation is allowed to fail, so long as the exception message indicates it failed due to injected faults. Given a random seed, the test should be entirely deterministic.
+ */
+@Test public void testRandomized() throws Exception {
+  long seed;
+  Long userSpecifiedSeed=Long.getLong(RAND_SEED_PROPERTY);
+  if (userSpecifiedSeed != null) {
+    LOG.info("Using seed specified in system property");
+    seed=userSpecifiedSeed;
+    GenericTestUtils.setLogLevel(ProtobufRpcEngine.LOG,Level.ALL);
+  }
+ else {
+    seed=new Random().nextLong();
+  }
+  LOG.info("Random seed: " + seed);
+  Random r=new Random(seed);
+  MiniJournalCluster cluster=new MiniJournalCluster.Builder(conf).build();
+  cluster.waitActive();
+  QuorumJournalManager qjmForInitialFormat=createInjectableQJM(cluster);
+  qjmForInitialFormat.format(FAKE_NSINFO,false);
+  qjmForInitialFormat.close();
+  try {
+    long txid=0;
+    long lastAcked=0;
+    for (int i=0; i < NUM_WRITER_ITERS; i++) {
+      LOG.info("Starting writer " + i + "\n-------------------");
+      QuorumJournalManager qjm=createRandomFaultyQJM(cluster,r);
+      try {
+        long recovered;
+        try {
+          recovered=QJMTestUtil.recoverAndReturnLastTxn(qjm);
+        }
+ catch (        Throwable t) {
+          LOG.info("Failed recovery",t);
+          checkException(t);
+          continue;
+        }
+        assertTrue("Recovered only up to txnid " + recovered + " but had gotten an ack for "+ lastAcked,recovered >= lastAcked);
+        txid=recovered + 1;
+        if (txid > 100 && i % 10 == 1) {
+          qjm.purgeLogsOlderThan(txid - 100);
+        }
+        Holder<Throwable> thrown=new Holder<Throwable>(null);
+        for (int j=0; j < SEGMENTS_PER_WRITER; j++) {
+          lastAcked=writeSegmentUntilCrash(cluster,qjm,txid,4,thrown);
+          if (thrown.held != null) {
+            LOG.info("Failed write",thrown.held);
+            checkException(thrown.held);
+            break;
+          }
+          txid+=4;
+        }
+      }
+  finally {
+        qjm.close();
+      }
+    }
+  }
+  finally {
+    cluster.shutdown();
+  }
+}

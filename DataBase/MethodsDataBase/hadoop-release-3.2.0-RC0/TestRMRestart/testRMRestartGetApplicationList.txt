@@ -1,0 +1,66 @@
+@Test(timeout=60000) public void testRMRestartGetApplicationList() throws Exception {
+  conf.setInt(YarnConfiguration.RM_AM_MAX_ATTEMPTS,1);
+  MockRM rm1=new MockRM(conf){
+    @Override protected SystemMetricsPublisher createSystemMetricsPublisher(){
+      return spy(super.createSystemMetricsPublisher());
+    }
+  }
+;
+  rms.add(rm1);
+  rm1.start();
+  MockNM nm1=new MockNM("127.0.0.1:1234",15120,rm1.getResourceTrackerService());
+  nm1.registerNode();
+  MockMemoryRMStateStore memStore=(MockMemoryRMStateStore)rm1.getRMStateStore();
+  RMApp app0=rm1.submitApp(200,"name","user",null,false,"default",1,null,"myType");
+  MockAM am0=launchAM(app0,rm1,nm1);
+  finishApplicationMaster(app0,rm1,nm1,am0);
+  RMApp app1=rm1.submitApp(200,"name","user",null,false,"default",1,null,"myType");
+  MockAM am1=launchAM(app1,rm1,nm1);
+  nm1.nodeHeartbeat(am1.getApplicationAttemptId(),1,ContainerState.COMPLETE);
+  rm1.waitForState(am1.getApplicationAttemptId(),RMAppAttemptState.FAILED);
+  rm1.waitForState(app1.getApplicationId(),RMAppState.FAILED);
+  RMApp app2=rm1.submitApp(200,"name","user",null,false,"default",1,null,"myType");
+  MockAM am2=launchAM(app2,rm1,nm1);
+  rm1.killApp(app2.getApplicationId());
+  rm1.waitForState(app2.getApplicationId(),RMAppState.KILLED);
+  rm1.waitForState(am2.getApplicationAttemptId(),RMAppAttemptState.KILLED);
+  verify(rm1.getRMContext().getSystemMetricsPublisher(),Mockito.times(3)).appCreated(any(RMApp.class),anyLong());
+  MockRM rm2=new MockRM(conf,memStore){
+    @Override protected RMAppManager createRMAppManager(){
+      return spy(super.createRMAppManager());
+    }
+    @Override protected SystemMetricsPublisher createSystemMetricsPublisher(){
+      return spy(super.createSystemMetricsPublisher());
+    }
+  }
+;
+  rms.add(rm2);
+  rm2.start();
+  verify(rm2.getRMContext().getSystemMetricsPublisher(),Mockito.times(3)).appCreated(any(RMApp.class),anyLong());
+  GetApplicationsRequest request1=GetApplicationsRequest.newInstance(EnumSet.of(YarnApplicationState.FINISHED,YarnApplicationState.KILLED,YarnApplicationState.FAILED));
+  GetApplicationsResponse response1=rm2.getClientRMService().getApplications(request1);
+  List<ApplicationReport> appList1=response1.getApplicationList();
+  boolean forApp0=false, forApp1=false, forApp2=false;
+  for (  ApplicationReport report : appList1) {
+    if (report.getApplicationId().equals(app0.getApplicationId())) {
+      Assert.assertEquals(YarnApplicationState.FINISHED,report.getYarnApplicationState());
+      forApp0=true;
+    }
+    if (report.getApplicationId().equals(app1.getApplicationId())) {
+      Assert.assertEquals(YarnApplicationState.FAILED,report.getYarnApplicationState());
+      forApp1=true;
+    }
+    if (report.getApplicationId().equals(app2.getApplicationId())) {
+      Assert.assertEquals(YarnApplicationState.KILLED,report.getYarnApplicationState());
+      forApp2=true;
+    }
+  }
+  Assert.assertTrue(forApp0 && forApp1 && forApp2);
+  Set<String> appTypes=new HashSet<String>();
+  appTypes.add("myType");
+  GetApplicationsRequest request2=GetApplicationsRequest.newInstance(appTypes);
+  GetApplicationsResponse response2=rm2.getClientRMService().getApplications(request2);
+  List<ApplicationReport> appList2=response2.getApplicationList();
+  Assert.assertTrue(3 == appList2.size());
+  verify(rm2.getRMAppManager(),timeout(1000).times(3)).logApplicationSummary(isA(ApplicationId.class));
+}

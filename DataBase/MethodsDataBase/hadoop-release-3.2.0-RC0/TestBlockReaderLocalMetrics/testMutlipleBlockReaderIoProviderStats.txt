@@ -1,0 +1,35 @@
+@Test(timeout=300_000) public void testMutlipleBlockReaderIoProviderStats() throws IOException, InterruptedException, TimeoutException {
+  BlockReaderLocalMetrics metrics=BlockReaderLocalMetrics.create();
+  MutableRollingAverages shortCircuitReadRollingAverages=metrics.getShortCircuitReadRollingAverages();
+  MetricsTestHelper.replaceRollingAveragesScheduler(shortCircuitReadRollingAverages,ROLLING_AVERAGE_NUM_WINDOWS,ROLLING_AVERAGES_WINDOW_LENGTH_MS,TimeUnit.MILLISECONDS);
+  FileChannel dataIn1=Mockito.mock(FileChannel.class);
+  FileChannel dataIn2=Mockito.mock(FileChannel.class);
+  Mockito.when(dataIn1.read(any(ByteBuffer.class),anyLong())).thenAnswer(new Answer<Object>(){
+    @Override public Object answer(    InvocationOnMock invocation) throws Throwable {
+      TIMER.advance(SLOW_READ_DELAY);
+      return 0;
+    }
+  }
+);
+  Mockito.when(dataIn2.read(any(ByteBuffer.class),anyLong())).thenAnswer(new Answer<Object>(){
+    @Override public Object answer(    InvocationOnMock invocation) throws Throwable {
+      TIMER.advance(SLOW_READ_DELAY * 3);
+      return 0;
+    }
+  }
+);
+  BlockReaderIoProvider blockReaderIoProvider1=new BlockReaderIoProvider(clientConf.getShortCircuitConf(),metrics,TIMER);
+  BlockReaderIoProvider blockReaderIoProvider2=new BlockReaderIoProvider(clientConf.getShortCircuitConf(),metrics,TIMER);
+  blockReaderIoProvider1.read(dataIn1,any(ByteBuffer.class),anyLong());
+  blockReaderIoProvider2.read(dataIn2,any(ByteBuffer.class),anyLong());
+  GenericTestUtils.waitFor(new Supplier<Boolean>(){
+    @Override public Boolean get(){
+      metrics.collectThreadLocalStates();
+      return shortCircuitReadRollingAverages.getStats(0).size() > 0;
+    }
+  }
+,500,10000);
+  MetricsRecordBuilder rb=getMetrics(SHORT_CIRCUIT_READ_METRIC_REGISTERED_NAME);
+  double averageLatency=getDoubleGauge(SHORT_CIRCUIT_LOCAL_READS_METRIC_VALUE_FULL_NAME,rb);
+  assertTrue("Average Latency of Short Circuit Reads lower than expected",averageLatency >= SLOW_READ_DELAY * 2);
+}

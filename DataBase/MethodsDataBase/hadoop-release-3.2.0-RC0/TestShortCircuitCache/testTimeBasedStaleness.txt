@@ -1,0 +1,52 @@
+@Test(timeout=60000) public void testTimeBasedStaleness() throws Exception {
+  final ShortCircuitCache cache=new ShortCircuitCache(2,10000000,1,10000000,1,10,0);
+  final TestFileDescriptorPair pairs[]=new TestFileDescriptorPair[]{new TestFileDescriptorPair(),new TestFileDescriptorPair()};
+  ShortCircuitReplicaInfo replicaInfos[]=new ShortCircuitReplicaInfo[]{null,null};
+  final long HOUR_IN_MS=60 * 60 * 1000;
+  for (int i=0; i < pairs.length; i++) {
+    final Integer iVal=i;
+    final ExtendedBlockId key=new ExtendedBlockId(i,"test_bp1");
+    replicaInfos[i]=cache.fetchOrCreate(key,new ShortCircuitReplicaCreator(){
+      @Override public ShortCircuitReplicaInfo createShortCircuitReplicaInfo(){
+        try {
+          return new ShortCircuitReplicaInfo(new ShortCircuitReplica(key,pairs[iVal].getFileInputStreams()[0],pairs[iVal].getFileInputStreams()[1],cache,Time.monotonicNow() + (iVal * HOUR_IN_MS),null));
+        }
+ catch (        IOException e) {
+          throw new RuntimeException(e);
+        }
+      }
+    }
+);
+    Preconditions.checkNotNull(replicaInfos[i].getReplica());
+    Preconditions.checkState(replicaInfos[i].getInvalidTokenException() == null);
+    pairs[i].compareWith(replicaInfos[i].getReplica().getDataStream(),replicaInfos[i].getReplica().getMetaStream());
+  }
+  GenericTestUtils.waitFor(new Supplier<Boolean>(){
+    @Override public Boolean get(){
+      ShortCircuitReplicaInfo info=cache.fetchOrCreate(new ExtendedBlockId(0,"test_bp1"),new ShortCircuitReplicaCreator(){
+        @Override public ShortCircuitReplicaInfo createShortCircuitReplicaInfo(){
+          return null;
+        }
+      }
+);
+      if (info.getReplica() != null) {
+        info.getReplica().unref();
+        return false;
+      }
+      return true;
+    }
+  }
+,500,60000);
+  ShortCircuitReplicaInfo info=cache.fetchOrCreate(new ExtendedBlockId(1,"test_bp1"),new ShortCircuitReplicaCreator(){
+    @Override public ShortCircuitReplicaInfo createShortCircuitReplicaInfo(){
+      Assert.fail("second replica went stale, despite 1 " + "hour staleness time.");
+      return null;
+    }
+  }
+);
+  info.getReplica().unref();
+  for (int i=1; i < pairs.length; i++) {
+    replicaInfos[i].getReplica().unref();
+  }
+  cache.close();
+}

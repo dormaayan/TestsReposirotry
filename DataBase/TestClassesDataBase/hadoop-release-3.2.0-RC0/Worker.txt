@@ -1,0 +1,78 @@
+static abstract class Worker implements Callable<String> {
+  enum State {  IDLE(false),   RUNNING(false),   STOPPED(true),   ERROR(true);   final boolean isTerminated;
+  State(  boolean isTerminated){
+    this.isTerminated=isTerminated;
+  }
+}
+  final String name;
+  final AtomicReference<State> state=new AtomicReference<State>(State.IDLE);
+  final AtomicBoolean isCalling=new AtomicBoolean();
+  final AtomicReference<Thread> thread=new AtomicReference<Thread>();
+  private Throwable thrown=null;
+  Worker(  String name){
+    this.name=name;
+  }
+  State checkErrorState(){
+    final State s=state.get();
+    if (s == State.ERROR) {
+      throw new IllegalStateException(name + " has " + s,thrown);
+    }
+    return s;
+  }
+  void setErrorState(  Throwable t){
+    checkErrorState();
+    LOG.error("Worker " + name + " failed.",t);
+    state.set(State.ERROR);
+    thrown=t;
+  }
+  void start(){
+    Preconditions.checkState(state.compareAndSet(State.IDLE,State.RUNNING));
+    if (thread.get() == null) {
+      final Thread t=new Thread(null,new Runnable(){
+        @Override public void run(){
+          for (State s; !(s=checkErrorState()).isTerminated; ) {
+            if (s == State.RUNNING) {
+              isCalling.set(true);
+              try {
+                LOG.info(call());
+              }
+ catch (              Throwable t) {
+                setErrorState(t);
+                return;
+              }
+              isCalling.set(false);
+            }
+            sleep(ThreadLocalRandom.current().nextInt(100) + 50);
+          }
+        }
+      }
+,name);
+      Preconditions.checkState(thread.compareAndSet(null,t));
+      t.start();
+    }
+  }
+  boolean isPaused(){
+    final State s=checkErrorState();
+    if (s == State.STOPPED) {
+      throw new IllegalStateException(name + " is " + s);
+    }
+    return s == State.IDLE && !isCalling.get();
+  }
+  void pause(){
+    checkErrorState();
+    Preconditions.checkState(state.compareAndSet(State.RUNNING,State.IDLE),"%s: state=%s != %s",name,state.get(),State.RUNNING);
+  }
+  void stop() throws InterruptedException {
+    checkErrorState();
+    state.set(State.STOPPED);
+    thread.get().join();
+  }
+  static void sleep(  final long sleepTimeMs){
+    try {
+      Thread.sleep(sleepTimeMs);
+    }
+ catch (    InterruptedException e) {
+      throw new RuntimeException(e);
+    }
+  }
+}

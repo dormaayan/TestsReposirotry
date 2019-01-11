@@ -1,0 +1,41 @@
+@Test(timeout=60000) public void testStatisticsForErasureCodingRead() throws IOException {
+  HdfsConfiguration conf=new HdfsConfiguration();
+  final ErasureCodingPolicy ecPolicy=StripedFileTestUtil.getDefaultECPolicy();
+  final int numDataNodes=ecPolicy.getNumDataUnits() + ecPolicy.getNumParityUnits();
+  final int length=ecPolicy.getCellSize() * (numDataNodes + 1) + 123;
+  final long randomSeed=4567L;
+  final short repl=1;
+  try (MiniDFSCluster cluster=new MiniDFSCluster.Builder(conf).numDataNodes(numDataNodes).build()){
+    cluster.waitActive();
+    DistributedFileSystem fs=cluster.getFileSystem();
+    fs.enableErasureCodingPolicy(ecPolicy.getName());
+    Path ecDir=new Path("/ec");
+    fs.mkdirs(ecDir);
+    fs.setErasureCodingPolicy(ecDir,ecPolicy.getName());
+    Path nonEcDir=new Path("/noEc");
+    fs.mkdirs(nonEcDir);
+    byte[] buf=new byte[length];
+    Path nonEcFile=new Path(nonEcDir,"file1");
+    DFSTestUtil.createFile(fs,nonEcFile,length,repl,randomSeed);
+    try (HdfsDataInputStream in=(HdfsDataInputStream)fs.open(nonEcFile)){
+      IOUtils.readFully(in,buf,0,length);
+      ReadStatistics stats=in.getReadStatistics();
+      Assert.assertEquals(BlockType.CONTIGUOUS,stats.getBlockType());
+      Assert.assertEquals(length,stats.getTotalBytesRead());
+      Assert.assertEquals(length,stats.getTotalLocalBytesRead());
+    }
+     Path ecFile=new Path(ecDir,"file2");
+    DFSTestUtil.createFile(fs,ecFile,length,repl,randomSeed);
+    final BlockLocation[] locs=fs.getFileBlockLocations(ecFile,0,length);
+    final String[] nodes=locs[0].getNames();
+    cluster.stopDataNode(nodes[0]);
+    try (HdfsDataInputStream in=(HdfsDataInputStream)fs.open(ecFile)){
+      IOUtils.readFully(in,buf,0,length);
+      ReadStatistics stats=in.getReadStatistics();
+      Assert.assertEquals(BlockType.STRIPED,stats.getBlockType());
+      Assert.assertEquals(length,stats.getTotalLocalBytesRead());
+      Assert.assertEquals(length,stats.getTotalBytesRead());
+      Assert.assertTrue(stats.getTotalEcDecodingTimeMillis() > 0);
+    }
+   }
+ }

@@ -1,0 +1,137 @@
+/** 
+ * Test that we do proper data integrity validation with MD5 checks as configured.
+ */
+public class ITestBlobDataValidation extends AbstractWasbTestWithTimeout {
+  private AzureBlobStorageTestAccount testAccount;
+  @After public void tearDown() throws Exception {
+    testAccount=AzureTestUtils.cleanupTestAccount(testAccount);
+  }
+  /** 
+ * Test that by default we don't store the blob-level MD5.
+ */
+  @Test public void testBlobMd5StoreOffByDefault() throws Exception {
+    testAccount=AzureBlobStorageTestAccount.create();
+    testStoreBlobMd5(false);
+  }
+  /** 
+ * Test that we get blob-level MD5 storage and validation if we specify that in the configuration.
+ */
+  @Test public void testStoreBlobMd5() throws Exception {
+    Configuration conf=new Configuration();
+    conf.setBoolean(KEY_STORE_BLOB_MD5,true);
+    testAccount=AzureBlobStorageTestAccount.create(conf);
+    testStoreBlobMd5(true);
+  }
+  /** 
+ * Trims a suffix/prefix from the given string. For example if s is given as "/xy" and toTrim is "/", this method returns "xy"
+ */
+  private static String trim(  String s,  String toTrim){
+    return StringUtils.removeEnd(StringUtils.removeStart(s,toTrim),toTrim);
+  }
+  private void testStoreBlobMd5(  boolean expectMd5Stored) throws Exception {
+    assumeNotNull(testAccount);
+    NativeAzureFileSystem fs=testAccount.getFileSystem();
+    Path testFilePath=AzureTestUtils.pathForTests(fs,methodName.getMethodName());
+    String testFileKey=trim(testFilePath.toUri().getPath(),"/");
+    OutputStream outStream=fs.create(testFilePath);
+    outStream.write(new byte[]{5,15});
+    outStream.close();
+    CloudBlockBlob blob=testAccount.getBlobReference(testFileKey);
+    blob.downloadAttributes();
+    String obtainedMd5=blob.getProperties().getContentMD5();
+    if (expectMd5Stored) {
+      assertNotNull(obtainedMd5);
+    }
+ else {
+      assertNull("Expected no MD5, found: " + obtainedMd5,obtainedMd5);
+    }
+    String newBlockId=Base64.encode(new byte[]{55,44,33,22});
+    blob.uploadBlock(newBlockId,new ByteArrayInputStream(new byte[]{6,45}),2);
+    blob.commitBlockList(Arrays.asList(new BlockEntry[]{new BlockEntry(newBlockId,BlockSearchMode.UNCOMMITTED)}));
+    InputStream inStream=fs.open(testFilePath);
+    try {
+      byte[] inBuf=new byte[100];
+      while (inStream.read(inBuf) > 0) {
+      }
+      inStream.close();
+      if (expectMd5Stored) {
+        fail("Should've thrown because of data corruption.");
+      }
+    }
+ catch (    IOException ex) {
+      if (!expectMd5Stored) {
+        throw ex;
+      }
+      StorageException cause=(StorageException)ex.getCause();
+      assertNotNull(cause);
+      assertEquals("Unexpected cause: " + cause,StorageErrorCodeStrings.INVALID_MD5,cause.getErrorCode());
+    }
+  }
+  /** 
+ * Test that by default we check block-level MD5.
+ */
+  @Test public void testCheckBlockMd5() throws Exception {
+    testAccount=AzureBlobStorageTestAccount.create();
+    testCheckBlockMd5(true);
+  }
+  /** 
+ * Test that we don't check block-level MD5 if we specify that in the configuration.
+ */
+  @Test public void testDontCheckBlockMd5() throws Exception {
+    Configuration conf=new Configuration();
+    conf.setBoolean(KEY_CHECK_BLOCK_MD5,false);
+    testAccount=AzureBlobStorageTestAccount.create(conf);
+    testCheckBlockMd5(false);
+  }
+  /** 
+ * Connection inspector to check that MD5 fields for content is set/not set as expected.
+ */
+private static class ContentMD5Checker extends StorageEvent<ResponseReceivedEvent> {
+    private final boolean expectMd5;
+    public ContentMD5Checker(    boolean expectMd5){
+      this.expectMd5=expectMd5;
+    }
+    @Override public void eventOccurred(    ResponseReceivedEvent eventArg){
+      HttpURLConnection connection=(HttpURLConnection)eventArg.getConnectionObject();
+      if (isGetRange(connection)) {
+        checkObtainedMd5(connection.getHeaderField(Constants.HeaderConstants.CONTENT_MD5));
+      }
+ else       if (isPutBlock(connection)) {
+        checkObtainedMd5(connection.getRequestProperty(Constants.HeaderConstants.CONTENT_MD5));
+      }
+    }
+    private void checkObtainedMd5(    String obtainedMd5){
+      if (expectMd5) {
+        assertNotNull(obtainedMd5);
+      }
+ else {
+        assertNull("Expected no MD5, found: " + obtainedMd5,obtainedMd5);
+      }
+    }
+    private static boolean isPutBlock(    HttpURLConnection connection){
+      return connection.getRequestMethod().equals("PUT") && connection.getURL().getQuery() != null && connection.getURL().getQuery().contains("blockid");
+    }
+    private static boolean isGetRange(    HttpURLConnection connection){
+      return connection.getRequestMethod().equals("GET") && connection.getHeaderField(Constants.HeaderConstants.STORAGE_RANGE_HEADER) != null;
+    }
+  }
+  private void testCheckBlockMd5(  final boolean expectMd5Checked) throws Exception {
+    assumeNotNull(testAccount);
+    Path testFilePath=new Path("/testFile");
+    testAccount.getFileSystem().getStore().addTestHookToOperationContext(new TestHookOperationContext(){
+      @Override public OperationContext modifyOperationContext(      OperationContext original){
+        original.getResponseReceivedEventHandler().addListener(new ContentMD5Checker(expectMd5Checked));
+        return original;
+      }
+    }
+);
+    OutputStream outStream=testAccount.getFileSystem().create(testFilePath);
+    outStream.write(new byte[]{5,15});
+    outStream.close();
+    InputStream inStream=testAccount.getFileSystem().open(testFilePath);
+    byte[] inBuf=new byte[100];
+    while (inStream.read(inBuf) > 0) {
+    }
+    inStream.close();
+  }
+}

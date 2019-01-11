@@ -1,0 +1,94 @@
+@Test public void testWriteWhilePeerIsClosedReleaseObjectAndFailPromise() throws InterruptedException {
+  Bootstrap cb=new Bootstrap();
+  ServerBootstrap sb=new ServerBootstrap();
+  final CountDownLatch serverMessageLatch=new CountDownLatch(1);
+  final LatchChannelFutureListener serverChannelCloseLatch=new LatchChannelFutureListener(1);
+  final LatchChannelFutureListener clientChannelCloseLatch=new LatchChannelFutureListener(1);
+  final CountDownLatch writeFailLatch=new CountDownLatch(1);
+  final ByteBuf data=Unpooled.wrappedBuffer(new byte[1024]);
+  final ByteBuf data2=Unpooled.wrappedBuffer(new byte[512]);
+  final CountDownLatch serverChannelLatch=new CountDownLatch(1);
+  final AtomicReference<Channel> serverChannelRef=new AtomicReference<Channel>();
+  try {
+    cb.group(group1).channel(LocalChannel.class).handler(new TestHandler());
+    sb.group(group2).channel(LocalServerChannel.class).childHandler(new ChannelInitializer<LocalChannel>(){
+      @Override public void initChannel(      LocalChannel ch) throws Exception {
+        ch.pipeline().addLast(new ChannelInboundHandlerAdapter(){
+          @Override public void channelRead(          ChannelHandlerContext ctx,          Object msg) throws Exception {
+            if (data.equals(msg)) {
+              ReferenceCountUtil.safeRelease(msg);
+              serverMessageLatch.countDown();
+            }
+ else {
+              super.channelRead(ctx,msg);
+            }
+          }
+        }
+);
+        serverChannelRef.set(ch);
+        serverChannelLatch.countDown();
+      }
+    }
+);
+    Channel sc=null;
+    Channel cc=null;
+    try {
+      sc=sb.bind(TEST_ADDRESS).syncUninterruptibly().channel();
+      cc=cb.connect(sc.localAddress()).syncUninterruptibly().channel();
+      assertTrue(serverChannelLatch.await(5,SECONDS));
+      final Channel ccCpy=cc;
+      final Channel serverChannelCpy=serverChannelRef.get();
+      serverChannelCpy.closeFuture().addListener(serverChannelCloseLatch);
+      ccCpy.closeFuture().addListener(clientChannelCloseLatch);
+      cc.pipeline().lastContext().executor().execute(new Runnable(){
+        @Override public void run(){
+          ccCpy.writeAndFlush(data.retainedDuplicate(),ccCpy.newPromise()).addListener(new ChannelFutureListener(){
+            @Override public void operationComplete(            ChannelFuture future) throws Exception {
+              serverChannelCpy.eventLoop().execute(new Runnable(){
+                @Override public void run(){
+                  int waitCount=0;
+                  while (ccCpy.isOpen()) {
+                    try {
+                      Thread.sleep(50);
+                    }
+ catch (                    InterruptedException ignored) {
+                    }
+                    if (++waitCount > 5) {
+                      fail();
+                    }
+                  }
+                  serverChannelCpy.writeAndFlush(data2.retainedDuplicate(),serverChannelCpy.newPromise()).addListener(new ChannelFutureListener(){
+                    @Override public void operationComplete(                    ChannelFuture future) throws Exception {
+                      if (!future.isSuccess() && future.cause() instanceof ClosedChannelException) {
+                        writeFailLatch.countDown();
+                      }
+                    }
+                  }
+);
+                }
+              }
+);
+              ccCpy.close();
+            }
+          }
+);
+        }
+      }
+);
+      assertTrue(serverMessageLatch.await(5,SECONDS));
+      assertTrue(writeFailLatch.await(5,SECONDS));
+      assertTrue(serverChannelCloseLatch.await(5,SECONDS));
+      assertTrue(clientChannelCloseLatch.await(5,SECONDS));
+      assertFalse(ccCpy.isOpen());
+      assertFalse(serverChannelCpy.isOpen());
+    }
+  finally {
+      closeChannel(cc);
+      closeChannel(sc);
+    }
+  }
+  finally {
+    data.release();
+    data2.release();
+  }
+}

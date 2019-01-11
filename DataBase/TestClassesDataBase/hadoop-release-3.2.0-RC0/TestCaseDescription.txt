@@ -1,0 +1,80 @@
+private class TestCaseDescription {
+  private final Map<File,FakeRoot> dirRoots=Maps.newLinkedHashMap();
+  private final Set<File> expectedPurgedLogs=Sets.newLinkedHashSet();
+  private final Set<File> expectedPurgedImages=Sets.newLinkedHashSet();
+private class FakeRoot {
+    final NameNodeDirType type;
+    final List<File> files;
+    FakeRoot(    NameNodeDirType type){
+      this.type=type;
+      files=Lists.newArrayList();
+    }
+    StorageDirectory mockStorageDir(){
+      return FSImageTestUtil.mockStorageDirectory(type,false,filesToPaths(files).toArray(new String[0]));
+    }
+  }
+  void addRoot(  String root,  NameNodeDirType dir){
+    dirRoots.put(new File(root),new FakeRoot(dir));
+  }
+  private void addFile(  File file){
+    for (    Map.Entry<File,FakeRoot> entry : dirRoots.entrySet()) {
+      if (fileToPath(file).startsWith(fileToPath(entry.getKey()))) {
+        entry.getValue().files.add(file);
+      }
+    }
+  }
+  void addLog(  String path,  boolean expectPurge){
+    File file=new File(path);
+    addFile(file);
+    if (expectPurge) {
+      expectedPurgedLogs.add(file);
+    }
+  }
+  void addImage(  String path,  boolean expectPurge){
+    File file=new File(path);
+    addFile(file);
+    if (expectPurge) {
+      expectedPurgedImages.add(file);
+    }
+  }
+  NNStorage mockStorage() throws IOException {
+    List<StorageDirectory> sds=Lists.newArrayList();
+    for (    FakeRoot root : dirRoots.values()) {
+      sds.add(root.mockStorageDir());
+    }
+    return mockStorageForDirs(sds.toArray(new StorageDirectory[0]));
+  }
+  @SuppressWarnings("unchecked") public FSEditLog mockEditLog(  StoragePurger purger) throws IOException {
+    final List<JournalManager> jms=Lists.newArrayList();
+    final JournalSet journalSet=new JournalSet(0);
+    for (    FakeRoot root : dirRoots.values()) {
+      if (!root.type.isOfType(NameNodeDirType.EDITS))       continue;
+      FileJournalManager fjm=new FileJournalManager(conf,root.mockStorageDir(),null);
+      fjm.purger=purger;
+      jms.add(fjm);
+      journalSet.add(fjm,false);
+    }
+    FSEditLog mockLog=Mockito.mock(FSEditLog.class);
+    Mockito.doAnswer(new Answer<Void>(){
+      @Override public Void answer(      InvocationOnMock invocation) throws Throwable {
+        Object[] args=invocation.getArguments();
+        assert args.length == 1;
+        long txId=(Long)args[0];
+        for (        JournalManager jm : jms) {
+          jm.purgeLogsOlderThan(txId);
+        }
+        return null;
+      }
+    }
+).when(mockLog).purgeLogsOlderThan(Mockito.anyLong());
+    Mockito.doAnswer(new Answer<Void>(){
+      @Override public Void answer(      InvocationOnMock invocation) throws Throwable {
+        Object[] args=invocation.getArguments();
+        journalSet.selectInputStreams((Collection<EditLogInputStream>)args[0],(Long)args[1],(Boolean)args[2],(Boolean)args[3]);
+        return null;
+      }
+    }
+).when(mockLog).selectInputStreams(Mockito.anyCollection(),Mockito.anyLong(),Mockito.anyBoolean(),Mockito.anyBoolean());
+    return mockLog;
+  }
+}

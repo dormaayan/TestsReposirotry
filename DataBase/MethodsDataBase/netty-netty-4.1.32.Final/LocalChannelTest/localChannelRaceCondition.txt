@@ -1,0 +1,57 @@
+@Test public void localChannelRaceCondition() throws Exception {
+  final CountDownLatch closeLatch=new CountDownLatch(1);
+  final EventLoopGroup clientGroup=new DefaultEventLoopGroup(1){
+    @Override protected EventLoop newChild(    Executor threadFactory,    Object... args) throws Exception {
+      return new SingleThreadEventLoop(this,threadFactory,true){
+        @Override protected void run(){
+          for (; ; ) {
+            Runnable task=takeTask();
+            if (task != null) {
+              if (task.getClass().getEnclosingClass() == LocalChannel.class) {
+                try {
+                  closeLatch.await();
+                }
+ catch (                InterruptedException e) {
+                  throw new Error(e);
+                }
+              }
+              task.run();
+              updateLastExecutionTime();
+            }
+            if (confirmShutdown()) {
+              break;
+            }
+          }
+        }
+      }
+;
+    }
+  }
+;
+  Channel sc=null;
+  Channel cc=null;
+  try {
+    ServerBootstrap sb=new ServerBootstrap();
+    sc=sb.group(group2).channel(LocalServerChannel.class).childHandler(new ChannelInitializer<Channel>(){
+      @Override protected void initChannel(      Channel ch) throws Exception {
+        ch.close();
+        closeLatch.countDown();
+      }
+    }
+).bind(TEST_ADDRESS).sync().channel();
+    Bootstrap bootstrap=new Bootstrap();
+    bootstrap.group(clientGroup).channel(LocalChannel.class).handler(new ChannelInitializer<Channel>(){
+      @Override protected void initChannel(      Channel ch) throws Exception {
+      }
+    }
+);
+    ChannelFuture future=bootstrap.connect(sc.localAddress());
+    assertTrue("Connection should finish, not time out",future.await(200));
+    cc=future.channel();
+  }
+  finally {
+    closeChannel(cc);
+    closeChannel(sc);
+    clientGroup.shutdownGracefully(0,0,SECONDS).await();
+  }
+}

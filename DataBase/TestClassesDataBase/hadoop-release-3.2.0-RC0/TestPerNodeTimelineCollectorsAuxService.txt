@@ -1,0 +1,140 @@
+public class TestPerNodeTimelineCollectorsAuxService {
+  private ApplicationAttemptId appAttemptId;
+  private PerNodeTimelineCollectorsAuxService auxService;
+  private Configuration conf;
+  private ApplicationId appId;
+  public TestPerNodeTimelineCollectorsAuxService(){
+    appId=ApplicationId.newInstance(System.currentTimeMillis(),1);
+    appAttemptId=ApplicationAttemptId.newInstance(appId,1);
+    conf=new YarnConfiguration();
+    conf.setBoolean(YarnConfiguration.TIMELINE_SERVICE_ENABLED,true);
+    conf.setFloat(YarnConfiguration.TIMELINE_SERVICE_VERSION,2.0f);
+    conf.setClass(YarnConfiguration.TIMELINE_SERVICE_WRITER_CLASS,FileSystemTimelineWriterImpl.class,TimelineWriter.class);
+    conf.setLong(YarnConfiguration.ATS_APP_COLLECTOR_LINGER_PERIOD_IN_MS,1000L);
+  }
+  @After public void tearDown() throws Shell.ExitCodeException {
+    if (auxService != null) {
+      auxService.stop();
+    }
+  }
+  @Test public void testAddApplication() throws Exception {
+    auxService=createCollectorAndAddApplication();
+    assertTrue(auxService.hasApplication(appAttemptId.getApplicationId()));
+    auxService.close();
+  }
+  @Test public void testAddApplicationNonAMContainer() throws Exception {
+    auxService=createCollector();
+    ContainerId containerId=getContainerId(2L);
+    ContainerInitializationContext context=mock(ContainerInitializationContext.class);
+    when(context.getContainerId()).thenReturn(containerId);
+    auxService.initializeContainer(context);
+    assertFalse(auxService.hasApplication(appAttemptId.getApplicationId()));
+  }
+  @Test public void testRemoveApplication() throws Exception {
+    auxService=createCollectorAndAddApplication();
+    assertTrue(auxService.hasApplication(appAttemptId.getApplicationId()));
+    ContainerId containerId=getAMContainerId();
+    ContainerTerminationContext context=mock(ContainerTerminationContext.class);
+    when(context.getContainerId()).thenReturn(containerId);
+    when(context.getContainerType()).thenReturn(ContainerType.APPLICATION_MASTER);
+    auxService.stopContainer(context);
+    assertFalse(auxService.hasApplication(appAttemptId.getApplicationId()));
+    auxService.close();
+  }
+  @Test public void testRemoveApplicationNonAMContainer() throws Exception {
+    auxService=createCollectorAndAddApplication();
+    assertTrue(auxService.hasApplication(appAttemptId.getApplicationId()));
+    ContainerId containerId=getContainerId(2L);
+    ContainerTerminationContext context=mock(ContainerTerminationContext.class);
+    when(context.getContainerId()).thenReturn(containerId);
+    auxService.stopContainer(context);
+    assertTrue(auxService.hasApplication(appAttemptId.getApplicationId()));
+    auxService.close();
+  }
+  @Test(timeout=60000) public void testLaunch() throws Exception {
+    ExitUtil.disableSystemExit();
+    try {
+      auxService=PerNodeTimelineCollectorsAuxService.launchServer(new String[0],createCollectorManager(),conf);
+    }
+ catch (    ExitUtil.ExitException e) {
+      assertEquals(0,e.status);
+      ExitUtil.resetFirstExitException();
+      fail();
+    }
+  }
+  private PerNodeTimelineCollectorsAuxService createCollectorAndAddApplication(){
+    PerNodeTimelineCollectorsAuxService service=createCollector();
+    ContainerInitializationContext context=createContainerInitalizationContext(1);
+    service.initializeContainer(context);
+    return service;
+  }
+  ContainerInitializationContext createContainerInitalizationContext(  int attempt){
+    appAttemptId=ApplicationAttemptId.newInstance(appId,attempt);
+    ContainerId containerId=getAMContainerId();
+    ContainerInitializationContext context=mock(ContainerInitializationContext.class);
+    when(context.getContainerId()).thenReturn(containerId);
+    when(context.getContainerType()).thenReturn(ContainerType.APPLICATION_MASTER);
+    return context;
+  }
+  ContainerTerminationContext createContainerTerminationContext(  int attempt){
+    appAttemptId=ApplicationAttemptId.newInstance(appId,attempt);
+    ContainerId containerId=getAMContainerId();
+    ContainerTerminationContext context=mock(ContainerTerminationContext.class);
+    when(context.getContainerId()).thenReturn(containerId);
+    when(context.getContainerType()).thenReturn(ContainerType.APPLICATION_MASTER);
+    return context;
+  }
+  private PerNodeTimelineCollectorsAuxService createCollector(){
+    NodeTimelineCollectorManager collectorManager=createCollectorManager();
+    PerNodeTimelineCollectorsAuxService service=spy(new PerNodeTimelineCollectorsAuxService(collectorManager){
+      @Override protected Future removeApplicationCollector(      ContainerId containerId){
+        Future future=super.removeApplicationCollector(containerId);
+        try {
+          future.get();
+        }
+ catch (        Exception e) {
+          Assert.fail("Expeption thrown while removing collector");
+        }
+        return future;
+      }
+    }
+);
+    service.init(conf);
+    service.start();
+    return service;
+  }
+  private NodeTimelineCollectorManager createCollectorManager(){
+    NodeTimelineCollectorManager collectorManager=spy(new NodeTimelineCollectorManager());
+    doReturn(new Configuration()).when(collectorManager).getConfig();
+    CollectorNodemanagerProtocol nmCollectorService=mock(CollectorNodemanagerProtocol.class);
+    GetTimelineCollectorContextResponse response=GetTimelineCollectorContextResponse.newInstance(null,null,null,0L);
+    try {
+      when(nmCollectorService.getTimelineCollectorContext(any(GetTimelineCollectorContextRequest.class))).thenReturn(response);
+    }
+ catch (    YarnException|IOException e) {
+      fail();
+    }
+    doReturn(nmCollectorService).when(collectorManager).getNMCollectorService();
+    return collectorManager;
+  }
+  private ContainerId getAMContainerId(){
+    return getContainerId(1L);
+  }
+  private ContainerId getContainerId(  long id){
+    return ContainerId.newContainerId(appAttemptId,id);
+  }
+  @Test(timeout=60000) public void testRemoveAppWhenSecondAttemptAMCotainerIsLaunchedSameNode() throws Exception {
+    auxService=createCollectorAndAddApplication();
+    assertTrue(auxService.hasApplication(appAttemptId.getApplicationId()));
+    ContainerInitializationContext containerInitalizationContext=createContainerInitalizationContext(2);
+    auxService.initializeContainer(containerInitalizationContext);
+    assertTrue("Applicatin not found in collectors.",auxService.hasApplication(appAttemptId.getApplicationId()));
+    ContainerTerminationContext context=createContainerTerminationContext(1);
+    auxService.stopContainer(context);
+    assertTrue("collector has removed application though 2nd attempt" + " is running this node",auxService.hasApplication(appAttemptId.getApplicationId()));
+    context=createContainerTerminationContext(2);
+    auxService.stopContainer(context);
+    assertFalse("Application is not removed from collector",auxService.hasApplication(appAttemptId.getApplicationId()));
+    auxService.close();
+  }
+}

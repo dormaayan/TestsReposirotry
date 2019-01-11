@@ -1,0 +1,97 @@
+public final class HandshakeCertificatesTest {
+  private ExecutorService executorService;
+  private ServerSocket serverSocket;
+  @Before public void setUp(){
+    executorService=Executors.newCachedThreadPool();
+  }
+  @After public void tearDown(){
+    executorService.shutdown();
+    Util.closeQuietly(serverSocket);
+  }
+  @Test public void clientAndServer() throws Exception {
+    HeldCertificate clientRoot=new HeldCertificate.Builder().certificateAuthority(1).build();
+    HeldCertificate clientIntermediate=new HeldCertificate.Builder().certificateAuthority(0).signedBy(clientRoot).build();
+    HeldCertificate clientCertificate=new HeldCertificate.Builder().signedBy(clientIntermediate).build();
+    HeldCertificate serverRoot=new HeldCertificate.Builder().certificateAuthority(1).build();
+    HeldCertificate serverIntermediate=new HeldCertificate.Builder().certificateAuthority(0).signedBy(serverRoot).build();
+    HeldCertificate serverCertificate=new HeldCertificate.Builder().signedBy(serverIntermediate).build();
+    HandshakeCertificates server=new HandshakeCertificates.Builder().addTrustedCertificate(clientRoot.certificate()).heldCertificate(serverCertificate,serverIntermediate.certificate()).build();
+    HandshakeCertificates client=new HandshakeCertificates.Builder().addTrustedCertificate(serverRoot.certificate()).heldCertificate(clientCertificate,clientIntermediate.certificate()).build();
+    InetSocketAddress serverAddress=startTlsServer();
+    Future<Handshake> serverHandshakeFuture=doServerHandshake(server);
+    Future<Handshake> clientHandshakeFuture=doClientHandshake(client,serverAddress);
+    Handshake serverHandshake=serverHandshakeFuture.get();
+    assertEquals(serverHandshake.peerCertificates(),Arrays.asList(clientCertificate.certificate(),clientIntermediate.certificate()));
+    assertEquals(serverHandshake.localCertificates(),Arrays.asList(serverCertificate.certificate(),serverIntermediate.certificate()));
+    Handshake clientHandshake=clientHandshakeFuture.get();
+    assertEquals(clientHandshake.peerCertificates(),Arrays.asList(serverCertificate.certificate(),serverIntermediate.certificate()));
+    assertEquals(clientHandshake.localCertificates(),Arrays.asList(clientCertificate.certificate(),clientIntermediate.certificate()));
+  }
+  @Test public void keyManager(){
+    HeldCertificate root=new HeldCertificate.Builder().certificateAuthority(1).build();
+    HeldCertificate intermediate=new HeldCertificate.Builder().certificateAuthority(0).signedBy(root).build();
+    HeldCertificate certificate=new HeldCertificate.Builder().signedBy(intermediate).build();
+    HandshakeCertificates handshakeCertificates=new HandshakeCertificates.Builder().heldCertificate(certificate,intermediate.certificate()).build();
+    assertPrivateKeysEquals(certificate.keyPair().getPrivate(),handshakeCertificates.keyManager().getPrivateKey("private"));
+    assertEquals(Arrays.asList(certificate.certificate(),intermediate.certificate()),Arrays.asList(handshakeCertificates.keyManager().getCertificateChain("private")));
+  }
+  @Test public void platformTrustedCertificates(){
+    HandshakeCertificates handshakeCertificates=new HandshakeCertificates.Builder().addPlatformTrustedCertificates().build();
+    Set<String> names=new LinkedHashSet<>();
+    for (    X509Certificate certificate : handshakeCertificates.trustManager().getAcceptedIssuers()) {
+      String name=certificate.getSubjectDN().getName();
+      names.add(name.substring(0,name.indexOf(" ")));
+    }
+    assertTrue(names.toString(),names.contains("CN=Entrust"));
+  }
+  private InetSocketAddress startTlsServer() throws IOException {
+    ServerSocketFactory serverSocketFactory=ServerSocketFactory.getDefault();
+    serverSocket=serverSocketFactory.createServerSocket();
+    InetAddress serverAddress=InetAddress.getByName("localhost");
+    serverSocket.bind(new InetSocketAddress(serverAddress,0),50);
+    return new InetSocketAddress(serverAddress,serverSocket.getLocalPort());
+  }
+  private Future<Handshake> doServerHandshake(  final HandshakeCertificates server){
+    return executorService.submit(new Callable<Handshake>(){
+      @Override public Handshake call() throws Exception {
+        Socket rawSocket=null;
+        SSLSocket sslSocket=null;
+        try {
+          rawSocket=serverSocket.accept();
+          sslSocket=(SSLSocket)server.sslSocketFactory().createSocket(rawSocket,rawSocket.getInetAddress().getHostAddress(),rawSocket.getPort(),true);
+          sslSocket.setUseClientMode(false);
+          sslSocket.setWantClientAuth(true);
+          sslSocket.startHandshake();
+          return Handshake.get(sslSocket.getSession());
+        }
+  finally {
+          Util.closeQuietly(rawSocket);
+          Util.closeQuietly(sslSocket);
+        }
+      }
+    }
+);
+  }
+  private Future<Handshake> doClientHandshake(  final HandshakeCertificates client,  final InetSocketAddress serverAddress){
+    return executorService.submit(new Callable<Handshake>(){
+      @Override public Handshake call() throws Exception {
+        Socket rawSocket=SocketFactory.getDefault().createSocket();
+        rawSocket.connect(serverAddress);
+        SSLSocket sslSocket=null;
+        try {
+          sslSocket=(SSLSocket)client.sslSocketFactory().createSocket(rawSocket,rawSocket.getInetAddress().getHostAddress(),rawSocket.getPort(),true);
+          sslSocket.startHandshake();
+          return Handshake.get(sslSocket.getSession());
+        }
+  finally {
+          Util.closeQuietly(rawSocket);
+          Util.closeQuietly(sslSocket);
+        }
+      }
+    }
+);
+  }
+  private void assertPrivateKeysEquals(  PrivateKey expected,  PrivateKey actual){
+    assertEquals(ByteString.of(expected.getEncoded()),ByteString.of(actual.getEncoded()));
+  }
+}

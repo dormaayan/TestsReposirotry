@@ -1,0 +1,148 @@
+public class TestSpeculativeExecution {
+public static class TestSpecEstimator extends LegacyTaskRuntimeEstimator {
+    private static final long SPECULATE_THIS=999999L;
+    public TestSpecEstimator(){
+      super();
+    }
+    @Override public long estimatedRuntime(    TaskAttemptId id){
+      if ((id.getTaskId().getId() == 0) && (id.getId() == 0)) {
+        return SPECULATE_THIS;
+      }
+      return super.estimatedRuntime(id);
+    }
+  }
+  private static final Logger LOG=LoggerFactory.getLogger(TestSpeculativeExecution.class);
+  protected static MiniMRYarnCluster mrCluster;
+  private static Configuration initialConf=new Configuration();
+  private static FileSystem localFs;
+static {
+    try {
+      localFs=FileSystem.getLocal(initialConf);
+    }
+ catch (    IOException io) {
+      throw new RuntimeException("problem getting local fs",io);
+    }
+  }
+  private static Path TEST_ROOT_DIR=new Path("target",TestSpeculativeExecution.class.getName() + "-tmpDir").makeQualified(localFs.getUri(),localFs.getWorkingDirectory());
+  static Path APP_JAR=new Path(TEST_ROOT_DIR,"MRAppJar.jar");
+  private static Path TEST_OUT_DIR=new Path(TEST_ROOT_DIR,"test.out.dir");
+  @BeforeClass public static void setup() throws IOException {
+    if (!(new File(MiniMRYarnCluster.APPJAR)).exists()) {
+      LOG.info("MRAppJar " + MiniMRYarnCluster.APPJAR + " not found. Not running test.");
+      return;
+    }
+    if (mrCluster == null) {
+      mrCluster=new MiniMRYarnCluster(TestSpeculativeExecution.class.getName(),4);
+      Configuration conf=new Configuration();
+      mrCluster.init(conf);
+      mrCluster.start();
+    }
+    localFs.copyFromLocalFile(new Path(MiniMRYarnCluster.APPJAR),APP_JAR);
+    localFs.setPermission(APP_JAR,new FsPermission("700"));
+  }
+  @AfterClass public static void tearDown(){
+    if (mrCluster != null) {
+      mrCluster.stop();
+      mrCluster=null;
+    }
+  }
+public static class SpeculativeMapper extends Mapper<Object,Text,Text,IntWritable> {
+    public void map(    Object key,    Text value,    Context context) throws IOException, InterruptedException {
+      TaskAttemptID taid=context.getTaskAttemptID();
+      long sleepTime=100;
+      Configuration conf=context.getConfiguration();
+      boolean test_speculate_map=conf.getBoolean(MRJobConfig.MAP_SPECULATIVE,false);
+      if ((taid.getTaskType() == TaskType.MAP) && test_speculate_map && (taid.getTaskID().getId() == 0)&& (taid.getId() == 0)) {
+        sleepTime=10000;
+      }
+      try {
+        Thread.sleep(sleepTime);
+      }
+ catch (      InterruptedException ie) {
+      }
+      context.write(value,new IntWritable(1));
+    }
+  }
+public static class SpeculativeReducer extends Reducer<Text,IntWritable,Text,IntWritable> {
+    public void reduce(    Text key,    Iterable<IntWritable> values,    Context context) throws IOException, InterruptedException {
+      TaskAttemptID taid=context.getTaskAttemptID();
+      long sleepTime=100;
+      Configuration conf=context.getConfiguration();
+      boolean test_speculate_reduce=conf.getBoolean(MRJobConfig.REDUCE_SPECULATIVE,false);
+      if ((taid.getTaskType() == TaskType.REDUCE) && test_speculate_reduce && (taid.getTaskID().getId() == 0)&& (taid.getId() == 0)) {
+        sleepTime=10000;
+      }
+      try {
+        Thread.sleep(sleepTime);
+      }
+ catch (      InterruptedException ie) {
+      }
+      context.write(key,new IntWritable(0));
+    }
+  }
+  @Test public void testSpeculativeExecution() throws Exception {
+    if (!(new File(MiniMRYarnCluster.APPJAR)).exists()) {
+      LOG.info("MRAppJar " + MiniMRYarnCluster.APPJAR + " not found. Not running test.");
+      return;
+    }
+    Job job=runSpecTest(false,false);
+    boolean succeeded=job.waitForCompletion(true);
+    Assert.assertTrue(succeeded);
+    Assert.assertEquals(JobStatus.State.SUCCEEDED,job.getJobState());
+    Counters counters=job.getCounters();
+    Assert.assertEquals(2,counters.findCounter(JobCounter.TOTAL_LAUNCHED_MAPS).getValue());
+    Assert.assertEquals(2,counters.findCounter(JobCounter.TOTAL_LAUNCHED_REDUCES).getValue());
+    Assert.assertEquals(0,counters.findCounter(JobCounter.NUM_FAILED_MAPS).getValue());
+    job=runSpecTest(true,false);
+    succeeded=job.waitForCompletion(true);
+    Assert.assertTrue(succeeded);
+    Assert.assertEquals(JobStatus.State.SUCCEEDED,job.getJobState());
+    counters=job.getCounters();
+    Assert.assertEquals(3,counters.findCounter(JobCounter.TOTAL_LAUNCHED_MAPS).getValue());
+    Assert.assertEquals(2,counters.findCounter(JobCounter.TOTAL_LAUNCHED_REDUCES).getValue());
+    Assert.assertEquals(0,counters.findCounter(JobCounter.NUM_FAILED_MAPS).getValue());
+    Assert.assertEquals(1,counters.findCounter(JobCounter.NUM_KILLED_MAPS).getValue());
+    job=runSpecTest(false,true);
+    succeeded=job.waitForCompletion(true);
+    Assert.assertTrue(succeeded);
+    Assert.assertEquals(JobStatus.State.SUCCEEDED,job.getJobState());
+    counters=job.getCounters();
+    Assert.assertEquals(2,counters.findCounter(JobCounter.TOTAL_LAUNCHED_MAPS).getValue());
+    Assert.assertEquals(3,counters.findCounter(JobCounter.TOTAL_LAUNCHED_REDUCES).getValue());
+  }
+  private Path createTempFile(  String filename,  String contents) throws IOException {
+    Path path=new Path(TEST_ROOT_DIR,filename);
+    FSDataOutputStream os=localFs.create(path);
+    os.writeBytes(contents);
+    os.close();
+    localFs.setPermission(path,new FsPermission("700"));
+    return path;
+  }
+  private Job runSpecTest(  boolean mapspec,  boolean redspec) throws IOException, ClassNotFoundException, InterruptedException {
+    Path first=createTempFile("specexec_map_input1","a\nz");
+    Path secnd=createTempFile("specexec_map_input2","a\nz");
+    Configuration conf=mrCluster.getConfig();
+    conf.setBoolean(MRJobConfig.MAP_SPECULATIVE,mapspec);
+    conf.setBoolean(MRJobConfig.REDUCE_SPECULATIVE,redspec);
+    conf.setClass(MRJobConfig.MR_AM_TASK_ESTIMATOR,TestSpecEstimator.class,TaskRuntimeEstimator.class);
+    Job job=Job.getInstance(conf);
+    job.setJarByClass(TestSpeculativeExecution.class);
+    job.setMapperClass(SpeculativeMapper.class);
+    job.setReducerClass(SpeculativeReducer.class);
+    job.setOutputKeyClass(Text.class);
+    job.setOutputValueClass(IntWritable.class);
+    job.setNumReduceTasks(2);
+    FileInputFormat.setInputPaths(job,first);
+    FileInputFormat.addInputPath(job,secnd);
+    FileOutputFormat.setOutputPath(job,TEST_OUT_DIR);
+    try {
+      localFs.delete(TEST_OUT_DIR,true);
+    }
+ catch (    IOException e) {
+    }
+    job.addFileToClassPath(APP_JAR);
+    job.setMaxMapAttempts(2);
+    job.submit();
+    return job;
+  }
+}

@@ -1,0 +1,52 @@
+@Test(timeout=60000) public void testApplicationLifetimeMonitor() throws Exception {
+  MockRM rm=null;
+  try {
+    rm=new MockRM(conf);
+    rm.start();
+    Priority appPriority=Priority.newInstance(0);
+    MockNM nm1=rm.registerNode("127.0.0.1:1234",16 * 1024);
+    Map<ApplicationTimeoutType,Long> timeouts=new HashMap<ApplicationTimeoutType,Long>();
+    timeouts.put(ApplicationTimeoutType.LIFETIME,10L);
+    RMApp app1=rm.submitApp(1024,appPriority,timeouts);
+    timeouts.put(ApplicationTimeoutType.LIFETIME,20L);
+    RMApp app2=rm.submitApp(1024,appPriority,timeouts);
+    RMApp app3=rm.submitApp(1024,appPriority,Collections.emptyMap());
+    timeouts.put(ApplicationTimeoutType.LIFETIME,40L);
+    RMApp app4=rm.submitApp(1024,appPriority,timeouts);
+    nm1.nodeHeartbeat(true);
+    MockAM am1=rm.sendAMLaunched(app1.getCurrentAppAttempt().getAppAttemptId());
+    am1.registerAppAttempt();
+    rm.waitForState(app1.getApplicationId(),RMAppState.KILLED);
+    Assert.assertTrue("Application killed before lifetime value",(System.currentTimeMillis() - app1.getSubmitTime()) > 10000);
+    Map<ApplicationTimeoutType,String> updateTimeout=new HashMap<ApplicationTimeoutType,String>();
+    long newLifetime=40L;
+    String formatISO8601=Times.formatISO8601(System.currentTimeMillis() + newLifetime * 1000);
+    updateTimeout.put(ApplicationTimeoutType.LIFETIME,formatISO8601);
+    UpdateApplicationTimeoutsRequest request=UpdateApplicationTimeoutsRequest.newInstance(app2.getApplicationId(),updateTimeout);
+    Map<ApplicationTimeoutType,Long> applicationTimeouts=app2.getApplicationTimeouts();
+    long beforeUpdate=applicationTimeouts.get(ApplicationTimeoutType.LIFETIME);
+    rm.getRMContext().getClientRMService().updateApplicationTimeouts(request);
+    applicationTimeouts=app2.getApplicationTimeouts();
+    long afterUpdate=applicationTimeouts.get(ApplicationTimeoutType.LIFETIME);
+    Assert.assertTrue("Application lifetime value not updated",afterUpdate > beforeUpdate);
+    RecordFactory recordFactory=RecordFactoryProvider.getRecordFactory(null);
+    GetApplicationReportRequest appRequest=recordFactory.newRecordInstance(GetApplicationReportRequest.class);
+    appRequest.setApplicationId(app2.getApplicationId());
+    Map<ApplicationTimeoutType,ApplicationTimeout> appTimeouts=rm.getRMContext().getClientRMService().getApplicationReport(appRequest).getApplicationReport().getApplicationTimeouts();
+    Assert.assertTrue("Application Timeout are empty.",!appTimeouts.isEmpty());
+    ApplicationTimeout timeout=appTimeouts.get(ApplicationTimeoutType.LIFETIME);
+    Assert.assertTrue("Application remaining time is incorrect",timeout.getRemainingTime() > 0);
+    rm.waitForState(app2.getApplicationId(),RMAppState.KILLED);
+    Assert.assertTrue("Application killed before lifetime value",app2.getFinishTime() > afterUpdate);
+    if (scheduler.equals(CapacityScheduler.class)) {
+      rm.waitForState(app3.getApplicationId(),RMAppState.KILLED);
+      rm.waitForState(app4.getApplicationId(),RMAppState.KILLED);
+      long totalTimeRun=(app4.getFinishTime() - app4.getSubmitTime()) / 1000;
+      Assert.assertTrue("Application killed before lifetime value",totalTimeRun > maxLifetime);
+      Assert.assertTrue("Application killed before lifetime value " + totalTimeRun,totalTimeRun < maxLifetime + 10L);
+    }
+  }
+  finally {
+    stopRM(rm);
+  }
+}

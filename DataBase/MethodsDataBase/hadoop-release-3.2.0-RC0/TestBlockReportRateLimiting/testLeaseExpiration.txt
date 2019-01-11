@@ -1,0 +1,45 @@
+/** 
+ * Start a 2-node cluster with only one block report lease.  When the first datanode gets a lease, kill it.  Then wait for the lease to expire, and the second datanode to send a full block report.
+ */
+@Test(timeout=180000) public void testLeaseExpiration() throws Exception {
+  Configuration conf=new Configuration();
+  conf.setInt(DFS_NAMENODE_MAX_FULL_BLOCK_REPORT_LEASES,1);
+  conf.setLong(DFS_NAMENODE_FULL_BLOCK_REPORT_LEASE_LENGTH_MS,100L);
+  final Semaphore gotFbrSem=new Semaphore(0);
+  final AtomicReference<String> failure=new AtomicReference<>();
+  final AtomicReference<MiniDFSCluster> cluster=new AtomicReference<>();
+  final AtomicReference<String> datanodeToStop=new AtomicReference<>();
+  final BlockManagerFaultInjector injector=new BlockManagerFaultInjector(){
+    @Override public void incomingBlockReportRpc(    DatanodeID nodeID,    BlockReportContext context) throws IOException {
+      if (context.getLeaseId() == 0) {
+        setFailure(failure,"Got unexpected rate-limiting-" + "bypassing full block report RPC from " + nodeID);
+      }
+      if (nodeID.getXferAddr().equals(datanodeToStop.get())) {
+        throw new IOException("Injecting failure into block " + "report RPC for " + nodeID);
+      }
+      gotFbrSem.release();
+    }
+    @Override public void requestBlockReportLease(    DatanodeDescriptor node,    long leaseId){
+      if (leaseId == 0) {
+        return;
+      }
+      datanodeToStop.compareAndSet(null,node.getXferAddr());
+    }
+    @Override public void removeBlockReportLease(    DatanodeDescriptor node,    long leaseId){
+    }
+  }
+;
+  try {
+    BlockManagerFaultInjector.instance=injector;
+    cluster.set(new MiniDFSCluster.Builder(conf).numDataNodes(2).build());
+    cluster.get().waitActive();
+    Assert.assertNotNull(cluster.get().stopDataNode(datanodeToStop.get()));
+    gotFbrSem.acquire();
+    Assert.assertNull(failure.get());
+  }
+  finally {
+    if (cluster.get() != null) {
+      cluster.get().shutdown();
+    }
+  }
+}

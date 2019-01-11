@@ -1,0 +1,195 @@
+public final class TestUtils {
+  private static final InternalLogger logger=InternalLoggerFactory.getInstance(TestUtils.class);
+  private static final Method hotspotMXBeanDumpHeap;
+  private static final Object hotspotMXBean;
+  private static final long DUMP_PROGRESS_LOGGING_INTERVAL=TimeUnit.SECONDS.toNanos(5);
+static {
+    Object mxBean;
+    Method mxBeanDumpHeap;
+    try {
+      Class<?> clazz=Class.forName("com.sun.management.HotSpotDiagnosticMXBean");
+      MBeanServer server=ManagementFactory.getPlatformMBeanServer();
+      mxBean=ManagementFactory.newPlatformMXBeanProxy(server,"com.sun.management:type=HotSpotDiagnostic",clazz);
+      mxBeanDumpHeap=clazz.getMethod("dumpHeap",String.class,boolean.class);
+    }
+ catch (    Exception ignored) {
+      mxBean=null;
+      mxBeanDumpHeap=null;
+    }
+    hotspotMXBean=mxBean;
+    hotspotMXBeanDumpHeap=mxBeanDumpHeap;
+  }
+  /** 
+ * Return  {@code true} if SCTP is supported by the running os.
+ */
+  public static boolean isSctpSupported(){
+    String os=System.getProperty("os.name").toLowerCase(Locale.UK);
+    if ("unix".equals(os) || "linux".equals(os) || "sun".equals(os)|| "solaris".equals(os)) {
+      try {
+        Class<?> sctpChannelClass=Class.forName("com.sun.nio.sctp.SctpChannel");
+        Channel channel=(Channel)sctpChannelClass.getMethod("open").invoke(null);
+        try {
+          channel.close();
+        }
+ catch (        IOException e) {
+        }
+      }
+ catch (      UnsupportedOperationException e) {
+        System.out.print("Not supported: " + e.getMessage());
+        return false;
+      }
+catch (      Throwable t) {
+        if (!(t instanceof IOException)) {
+          return false;
+        }
+      }
+      return true;
+    }
+    return false;
+  }
+  /** 
+ * Returns the method name of the current test.
+ */
+  public static String testMethodName(  TestName testName){
+    String testMethodName=testName.getMethodName();
+    if (testMethodName.contains("[")) {
+      testMethodName=testMethodName.substring(0,testMethodName.indexOf('['));
+    }
+    return testMethodName;
+  }
+  public static void dump(  String filenamePrefix) throws IOException {
+    if (filenamePrefix == null) {
+      throw new NullPointerException("filenamePrefix");
+    }
+    final String timestamp=timestamp();
+    final File heapDumpFile=new File(filenamePrefix + '.' + timestamp+ ".hprof");
+    if (heapDumpFile.exists()) {
+      if (!heapDumpFile.delete()) {
+        throw new IOException("Failed to remove the old heap dump: " + heapDumpFile);
+      }
+    }
+    final File threadDumpFile=new File(filenamePrefix + '.' + timestamp+ ".threads");
+    if (threadDumpFile.exists()) {
+      if (!threadDumpFile.delete()) {
+        throw new IOException("Failed to remove the old thread dump: " + threadDumpFile);
+      }
+    }
+    dumpHeap(heapDumpFile);
+    dumpThreads(threadDumpFile);
+  }
+  public static void compressHeapDumps() throws IOException {
+    final File[] files=new File(System.getProperty("user.dir")).listFiles(new FilenameFilter(){
+      @Override public boolean accept(      File dir,      String name){
+        return name.endsWith(".hprof");
+      }
+    }
+);
+    final byte[] buf=new byte[65536];
+    final LZMA2Options options=new LZMA2Options(LZMA2Options.PRESET_DEFAULT);
+    for (    File file : files) {
+      final String filename=file.toString();
+      final String xzFilename=filename + ".xz";
+      final long fileLength=file.length();
+      logger.info("Compressing the heap dump: {}",xzFilename);
+      long lastLogTime=System.nanoTime();
+      long counter=0;
+      InputStream in=null;
+      OutputStream out=null;
+      try {
+        in=new FileInputStream(filename);
+        out=new XZOutputStream(new FileOutputStream(xzFilename),options);
+        for (; ; ) {
+          int readBytes=in.read(buf);
+          if (readBytes < 0) {
+            break;
+          }
+          if (readBytes == 0) {
+            continue;
+          }
+          out.write(buf,0,readBytes);
+          counter+=readBytes;
+          long currentTime=System.nanoTime();
+          if (currentTime - lastLogTime > DUMP_PROGRESS_LOGGING_INTERVAL) {
+            logger.info("Compressing the heap dump: {} ({}%)",xzFilename,counter * 100 / fileLength);
+            lastLogTime=currentTime;
+          }
+        }
+        out.close();
+        in.close();
+      }
+ catch (      Throwable t) {
+        logger.warn("Failed to compress the heap dump: {}",xzFilename,t);
+      }
+ finally {
+        if (in != null) {
+          try {
+            in.close();
+          }
+ catch (          IOException ignored) {
+          }
+        }
+        if (out != null) {
+          try {
+            out.close();
+          }
+ catch (          IOException ignored) {
+          }
+        }
+      }
+      if (!file.delete()) {
+        logger.warn("Failed to delete the uncompressed heap dump: {}",filename);
+      }
+    }
+  }
+  private static String timestamp(){
+    return new SimpleDateFormat("HHmmss.SSS").format(new Date());
+  }
+  private static void dumpHeap(  File file){
+    if (hotspotMXBean == null) {
+      logger.warn("Can't dump heap: HotSpotDiagnosticMXBean unavailable");
+      return;
+    }
+    final String filename=file.toString();
+    logger.info("Dumping heap: {}",filename);
+    try {
+      hotspotMXBeanDumpHeap.invoke(hotspotMXBean,filename,true);
+    }
+ catch (    Exception e) {
+      logger.warn("Failed to dump heap: {}",filename,e);
+    }
+  }
+  private static void dumpThreads(  File file){
+    final String filename=file.toString();
+    OutputStream out=null;
+    try {
+      logger.info("Dumping threads: {}",filename);
+      final StringBuilder buf=new StringBuilder(8192);
+      try {
+        for (        ThreadInfo info : ManagementFactory.getThreadMXBean().dumpAllThreads(true,true)) {
+          buf.append(info);
+        }
+        buf.append('\n');
+      }
+ catch (      UnsupportedOperationException ignored) {
+        logger.warn("Can't dump threads: ThreadMXBean.dumpAllThreads() unsupported");
+        return;
+      }
+      out=new FileOutputStream(file);
+      out.write(buf.toString().getBytes(CharsetUtil.UTF_8));
+    }
+ catch (    Exception e) {
+      logger.warn("Failed to dump threads: {}",filename,e);
+    }
+ finally {
+      if (out != null) {
+        try {
+          out.close();
+        }
+ catch (        IOException ignored) {
+        }
+      }
+    }
+  }
+  private TestUtils(){
+  }
+}

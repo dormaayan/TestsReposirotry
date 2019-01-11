@@ -1,0 +1,49 @@
+private static final class AutoCloseFalseFollower extends SimpleChannelInboundHandler<ByteBuf> {
+  private final int expectedBytes;
+  private final CountDownLatch followerCloseLatch;
+  private final CountDownLatch doneLatch;
+  private final AtomicReference<Throwable> causeRef;
+  private int bytesRead;
+  AutoCloseFalseFollower(  int expectedBytes,  CountDownLatch followerCloseLatch,  CountDownLatch doneLatch,  AtomicReference<Throwable> causeRef){
+    this.expectedBytes=expectedBytes;
+    this.followerCloseLatch=followerCloseLatch;
+    this.doneLatch=doneLatch;
+    this.causeRef=causeRef;
+  }
+  @Override public void channelInactive(  ChannelHandlerContext ctx){
+    checkPrematureClose();
+  }
+  @Override public void exceptionCaught(  ChannelHandlerContext ctx,  Throwable cause){
+    ctx.close();
+    checkPrematureClose();
+  }
+  @Override protected void channelRead0(  ChannelHandlerContext ctx,  ByteBuf msg) throws Exception {
+    bytesRead+=msg.readableBytes();
+    if (bytesRead >= expectedBytes) {
+      ByteBuf buf=ctx.alloc().buffer(expectedBytes);
+      buf.writerIndex(buf.writerIndex() + expectedBytes);
+      ctx.writeAndFlush(buf).addListener(new ChannelFutureListener(){
+        @Override public void operationComplete(        ChannelFuture future) throws Exception {
+          future.channel().close().addListener(new ChannelFutureListener(){
+            @Override public void operationComplete(            final ChannelFuture future) throws Exception {
+              future.channel().eventLoop().schedule(new Runnable(){
+                @Override public void run(){
+                  followerCloseLatch.countDown();
+                }
+              }
+,200,TimeUnit.MILLISECONDS);
+            }
+          }
+);
+        }
+      }
+);
+    }
+  }
+  private void checkPrematureClose(){
+    if (bytesRead < expectedBytes) {
+      causeRef.set(new IllegalStateException("follower premature close"));
+      doneLatch.countDown();
+    }
+  }
+}

@@ -1,0 +1,105 @@
+@SuppressWarnings("unchecked") private class WrappedApplication {
+  final DrainDispatcher dispatcher;
+  final EventHandler<LocalizationEvent> localizerBus;
+  final EventHandler<ContainersLauncherEvent> launcherBus;
+  final EventHandler<ContainersMonitorEvent> monitorBus;
+  final EventHandler<AuxServicesEvent> auxBus;
+  final EventHandler<ContainerEvent> containerBus;
+  final EventHandler<LogHandlerEvent> logAggregationBus;
+  final String user;
+  final List<Container> containers;
+  final Context context;
+  final Map<ContainerId,ContainerTokenIdentifier> containerTokenIdentifierMap;
+  final NMTokenSecretManagerInNM nmTokenSecretMgr;
+  final NMStateStoreService stateStoreService;
+  final ApplicationId appId;
+  final Application app;
+  WrappedApplication(  int id,  long timestamp,  String user,  int numContainers){
+    Configuration conf=new Configuration();
+    dispatcher=new DrainDispatcher();
+    containerTokenIdentifierMap=new HashMap<ContainerId,ContainerTokenIdentifier>();
+    dispatcher.init(conf);
+    localizerBus=mock(EventHandler.class);
+    launcherBus=mock(EventHandler.class);
+    monitorBus=mock(EventHandler.class);
+    auxBus=mock(EventHandler.class);
+    containerBus=mock(EventHandler.class);
+    logAggregationBus=mock(EventHandler.class);
+    dispatcher.register(LocalizationEventType.class,localizerBus);
+    dispatcher.register(ContainersLauncherEventType.class,launcherBus);
+    dispatcher.register(ContainersMonitorEventType.class,monitorBus);
+    dispatcher.register(AuxServicesEventType.class,auxBus);
+    dispatcher.register(ContainerEventType.class,containerBus);
+    dispatcher.register(LogHandlerEventType.class,logAggregationBus);
+    nmTokenSecretMgr=mock(NMTokenSecretManagerInNM.class);
+    stateStoreService=mock(NMStateStoreService.class);
+    context=mock(Context.class);
+    when(context.getContainerTokenSecretManager()).thenReturn(new NMContainerTokenSecretManager(conf));
+    when(context.getApplicationACLsManager()).thenReturn(new ApplicationACLsManager(conf));
+    when(context.getNMTokenSecretManager()).thenReturn(nmTokenSecretMgr);
+    when(context.getNMStateStore()).thenReturn(stateStoreService);
+    when(context.getConf()).thenReturn(conf);
+    MasterKey masterKey=new MasterKeyPBImpl();
+    masterKey.setKeyId(123);
+    masterKey.setBytes(ByteBuffer.wrap(new byte[]{(new Integer(123).byteValue())}));
+    context.getContainerTokenSecretManager().setMasterKey(masterKey);
+    this.user=user;
+    this.appId=BuilderUtils.newApplicationId(timestamp,id);
+    app=new ApplicationImpl(dispatcher,this.user,appId,null,context);
+    containers=new ArrayList<Container>();
+    for (int i=0; i < numContainers; i++) {
+      Container container=createMockedContainer(this.appId,i);
+      containers.add(container);
+      long currentTime=System.currentTimeMillis();
+      ContainerTokenIdentifier identifier=new ContainerTokenIdentifier(container.getContainerId(),"","",null,currentTime + 2000,masterKey.getKeyId(),currentTime,Priority.newInstance(0),0);
+      containerTokenIdentifierMap.put(identifier.getContainerID(),identifier);
+      context.getContainerTokenSecretManager().startContainerSuccessful(identifier);
+      Assert.assertFalse(context.getContainerTokenSecretManager().isValidStartContainerRequest(identifier));
+    }
+    dispatcher.start();
+  }
+  private void drainDispatcherEvents(){
+    dispatcher.await();
+  }
+  public void finished(){
+    dispatcher.stop();
+  }
+  public void initApplication(){
+    app.handle(new ApplicationInitEvent(appId,new HashMap<ApplicationAccessType,String>()));
+  }
+  public void initContainer(  int containerNum){
+    if (containerNum == -1) {
+      for (int i=0; i < containers.size(); i++) {
+        app.handle(new ApplicationContainerInitEvent(containers.get(i)));
+      }
+    }
+ else {
+      app.handle(new ApplicationContainerInitEvent(containers.get(containerNum)));
+    }
+    drainDispatcherEvents();
+  }
+  public void containerFinished(  int containerNum){
+    app.handle(new ApplicationContainerFinishedEvent(containers.get(containerNum).cloneAndGetContainerStatus(),0));
+    drainDispatcherEvents();
+  }
+  public void applicationInited(){
+    app.handle(new ApplicationInitedEvent(appId));
+    drainDispatcherEvents();
+  }
+  public long applicationLogInited(){
+    ApplicationEvent appEvt=new ApplicationEvent(app.getAppId(),ApplicationEventType.APPLICATION_LOG_HANDLING_INITED);
+    app.handle(appEvt);
+    return appEvt.getTimestamp();
+  }
+  public void appFinished(){
+    app.handle(new ApplicationFinishEvent(appId,"Finish Application"));
+    drainDispatcherEvents();
+  }
+  public void appResourcesCleanedup(){
+    app.handle(new ApplicationEvent(appId,ApplicationEventType.APPLICATION_RESOURCES_CLEANEDUP));
+    drainDispatcherEvents();
+  }
+  public ContainerTokenIdentifier getContainerTokenIdentifier(  ContainerId containerId){
+    return this.containerTokenIdentifierMap.get(containerId);
+  }
+}

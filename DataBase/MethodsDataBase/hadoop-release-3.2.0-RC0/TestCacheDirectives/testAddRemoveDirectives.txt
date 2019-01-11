@@ -1,0 +1,134 @@
+@Test(timeout=60000) public void testAddRemoveDirectives() throws Exception {
+  proto.addCachePool(new CachePoolInfo("pool1").setMode(new FsPermission((short)0777)));
+  proto.addCachePool(new CachePoolInfo("pool2").setMode(new FsPermission((short)0777)));
+  proto.addCachePool(new CachePoolInfo("pool3").setMode(new FsPermission((short)0777)));
+  proto.addCachePool(new CachePoolInfo("pool4").setMode(new FsPermission((short)0)));
+  proto.addCachePool(new CachePoolInfo("pool5").setMode(new FsPermission((short)0007)).setOwnerName(unprivilegedUser.getShortUserName()));
+  CacheDirectiveInfo alpha=new CacheDirectiveInfo.Builder().setPath(new Path("/alpha")).setPool("pool1").build();
+  CacheDirectiveInfo beta=new CacheDirectiveInfo.Builder().setPath(new Path("/beta")).setPool("pool2").build();
+  CacheDirectiveInfo delta=new CacheDirectiveInfo.Builder().setPath(new Path("/delta")).setPool("pool1").build();
+  long alphaId=addAsUnprivileged(alpha);
+  long alphaId2=addAsUnprivileged(alpha);
+  assertFalse("Expected to get unique directives when re-adding an " + "existing CacheDirectiveInfo",alphaId == alphaId2);
+  long betaId=addAsUnprivileged(beta);
+  try {
+    addAsUnprivileged(new CacheDirectiveInfo.Builder().setPath(new Path("/unicorn")).setPool("no_such_pool").build());
+    fail("expected an error when adding to a non-existent pool.");
+  }
+ catch (  InvalidRequestException ioe) {
+    GenericTestUtils.assertExceptionContains("Unknown pool",ioe);
+  }
+  try {
+    addAsUnprivileged(new CacheDirectiveInfo.Builder().setPath(new Path("/blackhole")).setPool("pool4").build());
+    fail("expected an error when adding to a pool with " + "mode 0 (no permissions for anyone).");
+  }
+ catch (  AccessControlException e) {
+    GenericTestUtils.assertExceptionContains("Permission denied while accessing pool",e);
+  }
+  try {
+    addAsUnprivileged(new CacheDirectiveInfo.Builder().setPath(new Path("/illegal:path/")).setPool("pool1").build());
+    fail("expected an error when adding a malformed path " + "to the cache directives.");
+  }
+ catch (  IllegalArgumentException e) {
+    GenericTestUtils.assertExceptionContains("is not a valid DFS filename",e);
+  }
+  try {
+    addAsUnprivileged(new CacheDirectiveInfo.Builder().setPath(new Path("/emptypoolname")).setReplication((short)1).setPool("").build());
+    fail("expected an error when adding a cache " + "directive with an empty pool name.");
+  }
+ catch (  InvalidRequestException e) {
+    GenericTestUtils.assertExceptionContains("Invalid empty pool name",e);
+  }
+  long deltaId=addAsUnprivileged(delta);
+  try {
+    addAsUnprivileged(new CacheDirectiveInfo.Builder().setPath(new Path("/epsilon")).setPool("pool5").build());
+    fail("expected an error when adding to a pool with " + "mode 007 (no permissions for pool owner).");
+  }
+ catch (  AccessControlException e) {
+    GenericTestUtils.assertExceptionContains("Permission denied while accessing pool",e);
+  }
+  long relativeId=addAsUnprivileged(new CacheDirectiveInfo.Builder().setPath(new Path("relative")).setPool("pool1").build());
+  RemoteIterator<CacheDirectiveEntry> iter;
+  iter=dfs.listCacheDirectives(null);
+  validateListAll(iter,alphaId,alphaId2,betaId,deltaId,relativeId);
+  iter=dfs.listCacheDirectives(new CacheDirectiveInfo.Builder().setPool("pool3").build());
+  assertFalse(iter.hasNext());
+  iter=dfs.listCacheDirectives(new CacheDirectiveInfo.Builder().setPool("pool1").build());
+  validateListAll(iter,alphaId,alphaId2,deltaId,relativeId);
+  iter=dfs.listCacheDirectives(new CacheDirectiveInfo.Builder().setPool("pool2").build());
+  validateListAll(iter,betaId);
+  iter=dfs.listCacheDirectives(new CacheDirectiveInfo.Builder().setId(alphaId2).build());
+  validateListAll(iter,alphaId2);
+  iter=dfs.listCacheDirectives(new CacheDirectiveInfo.Builder().setId(relativeId).build());
+  validateListAll(iter,relativeId);
+  dfs.removeCacheDirective(betaId);
+  iter=dfs.listCacheDirectives(new CacheDirectiveInfo.Builder().setPool("pool2").build());
+  assertFalse(iter.hasNext());
+  try {
+    dfs.removeCacheDirective(betaId);
+    fail("expected an error when removing a non-existent ID");
+  }
+ catch (  InvalidRequestException e) {
+    GenericTestUtils.assertExceptionContains("No directive with ID",e);
+  }
+  try {
+    proto.removeCacheDirective(-42l);
+    fail("expected an error when removing a negative ID");
+  }
+ catch (  InvalidRequestException e) {
+    GenericTestUtils.assertExceptionContains("Invalid negative ID",e);
+  }
+  try {
+    proto.removeCacheDirective(43l);
+    fail("expected an error when removing a non-existent ID");
+  }
+ catch (  InvalidRequestException e) {
+    GenericTestUtils.assertExceptionContains("No directive with ID",e);
+  }
+  dfs.removeCacheDirective(alphaId);
+  dfs.removeCacheDirective(alphaId2);
+  dfs.removeCacheDirective(deltaId);
+  dfs.modifyCacheDirective(new CacheDirectiveInfo.Builder().setId(relativeId).setReplication((short)555).build());
+  iter=dfs.listCacheDirectives(null);
+  assertTrue(iter.hasNext());
+  CacheDirectiveInfo modified=iter.next().getInfo();
+  assertEquals(relativeId,modified.getId().longValue());
+  assertEquals((short)555,modified.getReplication().shortValue());
+  dfs.removeCacheDirective(relativeId);
+  iter=dfs.listCacheDirectives(null);
+  assertFalse(iter.hasNext());
+  CacheDirectiveInfo directive=new CacheDirectiveInfo.Builder().setPath(new Path(".")).setPool("pool1").build();
+  long id=dfs.addCacheDirective(directive);
+  dfs.modifyCacheDirective(new CacheDirectiveInfo.Builder(directive).setId(id).setReplication((short)2).build());
+  dfs.removeCacheDirective(id);
+  DistributedFileSystem dfs1=(DistributedFileSystem)cluster.getNewFileSystemInstance(0);
+  dfs1.close();
+  try {
+    dfs1.listCacheDirectives(null);
+    fail("listCacheDirectives using a closed filesystem!");
+  }
+ catch (  IOException ioe) {
+    GenericTestUtils.assertExceptionContains("Filesystem closed",ioe);
+  }
+  try {
+    dfs1.addCacheDirective(alpha);
+    fail("addCacheDirective using a closed filesystem!");
+  }
+ catch (  IOException ioe) {
+    GenericTestUtils.assertExceptionContains("Filesystem closed",ioe);
+  }
+  try {
+    dfs1.modifyCacheDirective(alpha);
+    fail("modifyCacheDirective using a closed filesystem!");
+  }
+ catch (  IOException ioe) {
+    GenericTestUtils.assertExceptionContains("Filesystem closed",ioe);
+  }
+  try {
+    dfs1.removeCacheDirective(alphaId);
+    fail("removeCacheDirective using a closed filesystem!");
+  }
+ catch (  IOException ioe) {
+    GenericTestUtils.assertExceptionContains("Filesystem closed",ioe);
+  }
+}

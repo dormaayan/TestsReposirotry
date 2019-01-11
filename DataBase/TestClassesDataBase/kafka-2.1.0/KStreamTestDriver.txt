@@ -1,0 +1,163 @@
+/** 
+ * KStreamTestDriver
+ * @deprecated please use {@link org.apache.kafka.streams.TopologyTestDriver} instead
+ */
+@Deprecated public class KStreamTestDriver extends ExternalResource {
+  private static final long DEFAULT_CACHE_SIZE_BYTES=1024 * 1024L;
+  private ProcessorTopology topology;
+  private InternalMockProcessorContext context;
+  private ProcessorTopology globalTopology;
+  private final LogContext logContext=new LogContext("testCache ");
+  public void setUp(  final StreamsBuilder builder){
+    setUp(builder,null,Serdes.ByteArray(),Serdes.ByteArray());
+  }
+  public void setUp(  final StreamsBuilder builder,  final File stateDir){
+    setUp(builder,stateDir,Serdes.ByteArray(),Serdes.ByteArray());
+  }
+  public void setUp(  final StreamsBuilder builder,  final File stateDir,  final long cacheSize){
+    setUp(builder,stateDir,Serdes.ByteArray(),Serdes.ByteArray(),cacheSize);
+  }
+  public void setUp(  final StreamsBuilder builder,  final File stateDir,  final Serde<?> keySerde,  final Serde<?> valSerde){
+    setUp(builder,stateDir,keySerde,valSerde,DEFAULT_CACHE_SIZE_BYTES);
+  }
+  public void setUp(  final StreamsBuilder builder,  final File stateDir,  final Serde<?> keySerde,  final Serde<?> valSerde,  final long cacheSize){
+    final InternalTopologyBuilder internalTopologyBuilder=TopologyWrapper.getInternalTopologyBuilder(builder.build());
+    internalTopologyBuilder.setApplicationId("TestDriver");
+    topology=internalTopologyBuilder.build(null);
+    globalTopology=internalTopologyBuilder.buildGlobalStateTopology();
+    final ThreadCache cache=new ThreadCache(logContext,cacheSize,new MockStreamsMetrics(new Metrics()));
+    context=new InternalMockProcessorContext(stateDir,keySerde,valSerde,new MockRecordCollector(),cache);
+    context.setRecordContext(new ProcessorRecordContext(0,0,0,"topic",null));
+    if (globalTopology != null) {
+      initTopology(globalTopology,globalTopology.globalStateStores());
+    }
+    initTopology(topology,topology.stateStores());
+  }
+  @Override protected void after(){
+    if (topology != null) {
+      close();
+    }
+  }
+  private void initTopology(  final ProcessorTopology topology,  final List<StateStore> stores){
+    for (    final StateStore store : stores) {
+      try {
+        store.init(context,store);
+      }
+ catch (      final RuntimeException e) {
+        new RuntimeException("Fatal exception initializing store.",e).printStackTrace();
+        throw e;
+      }
+    }
+    for (    final ProcessorNode node : topology.processors()) {
+      context.setCurrentNode(node);
+      try {
+        node.init(context);
+      }
+  finally {
+        context.setCurrentNode(null);
+      }
+    }
+  }
+  public ProcessorTopology topology(){
+    return topology;
+  }
+  public ProcessorContext context(){
+    return context;
+  }
+  public void process(  final String topicName,  final Object key,  final Object value){
+    final ProcessorNode prevNode=context.currentNode();
+    final ProcessorNode currNode=sourceNodeByTopicName(topicName);
+    if (currNode != null) {
+      context.setRecordContext(createRecordContext(topicName,context.timestamp()));
+      context.setCurrentNode(currNode);
+      try {
+        context.forward(key,value);
+      }
+  finally {
+        context.setCurrentNode(prevNode);
+      }
+    }
+  }
+  private ProcessorNode sourceNodeByTopicName(  final String topicName){
+    ProcessorNode topicNode=topology.source(topicName);
+    if (topicNode == null) {
+      for (      final String sourceTopic : topology.sourceTopics()) {
+        if (Pattern.compile(sourceTopic).matcher(topicName).matches()) {
+          return topology.source(sourceTopic);
+        }
+      }
+      if (globalTopology != null) {
+        topicNode=globalTopology.source(topicName);
+      }
+    }
+    return topicNode;
+  }
+  public void setTime(  final long timestamp){
+    context.setTime(timestamp);
+  }
+  public void close(){
+    for (    final ProcessorNode node : topology.processors()) {
+      context.setCurrentNode(node);
+      try {
+        node.close();
+      }
+  finally {
+        context.setCurrentNode(null);
+      }
+    }
+    closeState();
+  }
+  public Set<String> allProcessorNames(){
+    final Set<String> names=new HashSet<>();
+    final List<ProcessorNode> nodes=topology.processors();
+    for (    final ProcessorNode node : nodes) {
+      names.add(node.name());
+    }
+    return names;
+  }
+  public ProcessorNode processor(  final String name){
+    final List<ProcessorNode> nodes=topology.processors();
+    for (    final ProcessorNode node : nodes) {
+      if (node.name().equals(name)) {
+        return node;
+      }
+    }
+    return null;
+  }
+  public Map<String,StateStore> allStateStores(){
+    return context.allStateStores();
+  }
+  public void flushState(){
+    for (    final StateStore stateStore : context.allStateStores().values()) {
+      stateStore.flush();
+    }
+  }
+  private void closeState(){
+    flushState();
+    for (    final StateStore stateStore : context.allStateStores().values()) {
+      stateStore.close();
+    }
+  }
+  private ProcessorRecordContext createRecordContext(  final String topicName,  final long timestamp){
+    return new ProcessorRecordContext(timestamp,-1,-1,topicName,null);
+  }
+private class MockRecordCollector extends RecordCollectorImpl {
+    MockRecordCollector(){
+      super("KStreamTestDriver",new LogContext("KStreamTestDriver "),new DefaultProductionExceptionHandler(),new Metrics().sensor("skipped-records"));
+    }
+    @Override public <K,V>void send(    final String topic,    final K key,    final V value,    final Headers headers,    final Long timestamp,    final Serializer<K> keySerializer,    final Serializer<V> valueSerializer,    final StreamPartitioner<? super K,? super V> partitioner){
+      if (sourceNodeByTopicName(topic) != null) {
+        process(topic,key,value);
+      }
+    }
+    @Override public <K,V>void send(    final String topic,    final K key,    final V value,    final Headers headers,    final Integer partition,    final Long timestamp,    final Serializer<K> keySerializer,    final Serializer<V> valueSerializer){
+      if (sourceNodeByTopicName(topic) != null) {
+        process(topic,key,value);
+      }
+    }
+    @Override public void flush(){
+    }
+    @Override public void close(){
+    }
+  }
+}

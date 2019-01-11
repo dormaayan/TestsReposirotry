@@ -1,0 +1,77 @@
+@Test(timeout=15000) public void testFetchApplictionLogsAsAnotherUser() throws Exception {
+  String remoteLogRootDir="target/logs/";
+  String rootLogDir="target/LocalLogs";
+  String testUser="test";
+  UserGroupInformation testUgi=UserGroupInformation.createRemoteUser(testUser);
+  Configuration configuration=new YarnConfiguration();
+  configuration.setBoolean(YarnConfiguration.LOG_AGGREGATION_ENABLED,true);
+  configuration.set(YarnConfiguration.NM_REMOTE_APP_LOG_DIR,remoteLogRootDir);
+  configuration.setBoolean(YarnConfiguration.YARN_ACL_ENABLE,true);
+  configuration.set(YarnConfiguration.YARN_ADMIN_ACL,"admin");
+  FileSystem fs=FileSystem.get(configuration);
+  ApplicationId appId=ApplicationId.newInstance(0,1);
+  ApplicationAttemptId appAttemptId=ApplicationAttemptId.newInstance(appId,1);
+  ContainerId containerId=ContainerId.newContainerId(appAttemptId,1);
+  NodeId nodeId=NodeId.newInstance("localhost",1234);
+  try {
+    Path rootLogDirPath=new Path(rootLogDir);
+    if (fs.exists(rootLogDirPath)) {
+      fs.delete(rootLogDirPath,true);
+    }
+    assertTrue(fs.mkdirs(rootLogDirPath));
+    final Path appLogsDir=new Path(rootLogDirPath,appId.toString());
+    if (fs.exists(appLogsDir)) {
+      fs.delete(appLogsDir,true);
+    }
+    assertTrue(fs.mkdirs(appLogsDir));
+    List<String> rootLogDirs=Arrays.asList(rootLogDir);
+    List<String> logTypes=new ArrayList<String>();
+    logTypes.add("syslog");
+    createContainerLogInLocalDir(appLogsDir,containerId,fs,logTypes);
+    Path path=new Path(remoteLogRootDir + testUser + "/logs/"+ appId);
+    if (fs.exists(path)) {
+      fs.delete(path,true);
+    }
+    assertTrue(fs.mkdirs(path));
+    uploadContainerLogIntoRemoteDir(testUgi,configuration,rootLogDirs,nodeId,containerId,path,fs);
+    YarnClient mockYarnClient=createMockYarnClient(YarnApplicationState.FINISHED,testUgi.getShortUserName());
+    LogsCLI cli=new LogsCLIForTest(mockYarnClient);
+    cli.setConf(configuration);
+    int exitCode=cli.run(new String[]{"-applicationId",appId.toString(),"-appOwner",testUser});
+    assertTrue(exitCode == 0);
+    assertTrue(sysOutStream.toString().contains(logMessage(containerId,"syslog")));
+    sysOutStream.reset();
+    exitCode=cli.run(new String[]{"-applicationId",appId.toString(),"-appOwner","invalid"});
+    assertTrue(exitCode == -1);
+    assertTrue(sysErrStream.toString().contains("Can not find the logs " + "for the application: " + appId.toString()));
+    sysErrStream.reset();
+    YarnClient mockYarnClient2=createMockYarnClientUnknownApp();
+    cli=new LogsCLIForTest(mockYarnClient2);
+    cli.setConf(configuration);
+    exitCode=cli.run(new String[]{"-applicationId",appId.toString()});
+    assertTrue(exitCode == 0);
+    assertTrue(sysOutStream.toString().contains(logMessage(containerId,"syslog")));
+    sysOutStream.reset();
+    ApplicationId appId2=ApplicationId.newInstance(System.currentTimeMillis(),2);
+    exitCode=cli.run(new String[]{"-applicationId",appId2.toString()});
+    assertTrue(exitCode == -1);
+    assertTrue(sysErrStream.toString().contains("Can not find the appOwner"));
+    sysErrStream.reset();
+    ApplicationId appTest=ApplicationId.newInstance(System.currentTimeMillis(),1000);
+    String priorityUser="priority";
+    Path pathWithoutPerm=new Path(remoteLogRootDir + priorityUser + "/logs/"+ appTest);
+    if (fs.exists(pathWithoutPerm)) {
+      fs.delete(pathWithoutPerm,true);
+    }
+    FsPermission permission=FsPermission.createImmutable((short)01300);
+    assertTrue(fs.mkdirs(pathWithoutPerm,permission));
+    exitCode=cli.run(new String[]{"-applicationId",appTest.toString()});
+    assertTrue(exitCode == -1);
+    assertTrue(sysErrStream.toString().contains("Can not find the logs for the application: " + appTest.toString()));
+    sysErrStream.reset();
+  }
+  finally {
+    fs.delete(new Path(remoteLogRootDir),true);
+    fs.delete(new Path(rootLogDir),true);
+  }
+}

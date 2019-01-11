@@ -1,0 +1,64 @@
+@Test(timeout=20000) public void testClientTokenRace() throws Exception {
+  conf.set(CommonConfigurationKeysPublic.HADOOP_SECURITY_AUTHENTICATION,"kerberos");
+  UserGroupInformation.setConfiguration(conf);
+  ContainerManagementProtocol containerManager=mock(ContainerManagementProtocol.class);
+  StartContainersResponse mockResponse=mock(StartContainersResponse.class);
+  when(containerManager.startContainers((StartContainersRequest)any())).thenReturn(mockResponse);
+  MockRM rm=new MockRMWithCustomAMLauncher(conf,containerManager){
+    protected ClientRMService createClientRMService(){
+      return new ClientRMService(this.rmContext,scheduler,this.rmAppManager,this.applicationACLsManager,this.queueACLsManager,getRMContext().getRMDelegationTokenSecretManager());
+    }
+    @Override protected void doSecureLogin() throws IOException {
+    }
+  }
+;
+  rm.start();
+  RMApp app=rm.submitApp(1024);
+  MockNM nm1=rm.registerNode("localhost:1234",3072);
+  nm1.nodeHeartbeat(true);
+  rm.drainEvents();
+  nm1.nodeHeartbeat(true);
+  rm.drainEvents();
+  ApplicationAttemptId appAttempt=app.getCurrentAppAttempt().getAppAttemptId();
+  final MockAM mockAM=new MockAM(rm.getRMContext(),rm.getApplicationMasterService(),app.getCurrentAppAttempt().getAppAttemptId());
+  UserGroupInformation appUgi=UserGroupInformation.createRemoteUser(appAttempt.toString());
+  RegisterApplicationMasterResponse response=appUgi.doAs(new PrivilegedAction<RegisterApplicationMasterResponse>(){
+    @Override public RegisterApplicationMasterResponse run(){
+      RegisterApplicationMasterResponse response=null;
+      try {
+        response=mockAM.registerAppAttempt();
+      }
+ catch (      Exception e) {
+        Assert.fail("Exception was not expected");
+      }
+      return response;
+    }
+  }
+);
+  GetApplicationReportRequest request=Records.newRecord(GetApplicationReportRequest.class);
+  request.setApplicationId(app.getApplicationId());
+  GetApplicationReportResponse reportResponse=rm.getClientRMService().getApplicationReport(request);
+  ApplicationReport appReport=reportResponse.getApplicationReport();
+  org.apache.hadoop.yarn.api.records.Token originalClientToAMToken=appReport.getClientToAMToken();
+  final ByteBuffer clientMasterKey=response.getClientToAMTokenMasterKey();
+  Assert.assertNotNull(clientMasterKey);
+  Assert.assertTrue(clientMasterKey.array().length > 0);
+  ApplicationAttemptId appAttemptId=app.getAppAttempts().keySet().iterator().next();
+  Assert.assertNotNull(appAttemptId);
+  final CustomAM am=new CustomAM(appAttemptId,null);
+  am.init(conf);
+  am.start();
+  SecurityUtil.setSecurityInfoProviders(new CustomSecurityInfo());
+  Token<ClientToAMTokenIdentifier> token=ConverterUtils.convertFromYarn(originalClientToAMToken,am.address);
+  Timer timer=new Timer();
+  TimerTask timerTask=new TimerTask(){
+    @Override public void run(){
+      am.setClientSecretKey(clientMasterKey.array());
+    }
+  }
+;
+  timer.schedule(timerTask,250);
+  verifyValidToken(conf,am,token);
+  am.stop();
+  rm.stop();
+}

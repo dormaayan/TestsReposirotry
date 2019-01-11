@@ -1,0 +1,57 @@
+@Test(timeout=10000) public void testSaslResponseOrdering() throws Exception {
+  SecurityUtil.setAuthenticationMethod(AuthenticationMethod.TOKEN,conf);
+  UserGroupInformation.setConfiguration(conf);
+  TestTokenSecretManager sm=new TestTokenSecretManager();
+  Server server=setupTestServer(conf,1,sm);
+  try {
+    final InetSocketAddress addr=NetUtils.getConnectAddress(server);
+    final UserGroupInformation clientUgi=UserGroupInformation.createRemoteUser("client");
+    clientUgi.setAuthenticationMethod(AuthenticationMethod.TOKEN);
+    TestTokenIdentifier tokenId=new TestTokenIdentifier(new Text(clientUgi.getUserName()));
+    Token<?> token=new Token<>(tokenId,sm);
+    SecurityUtil.setTokenService(token,addr);
+    clientUgi.addToken(token);
+    clientUgi.doAs(new PrivilegedExceptionAction<Void>(){
+      @Override public Void run() throws Exception {
+        final TestRpcService proxy=getClient(addr,conf);
+        final ExecutorService executor=Executors.newCachedThreadPool();
+        final AtomicInteger count=new AtomicInteger();
+        try {
+          Future<?>[] futures=new Future<?>[10];
+          for (int i=0; i < futures.length; i++) {
+            futures[i]=executor.submit(new Callable<Void>(){
+              @Override public Void call() throws Exception {
+                String expect="future" + count.getAndIncrement();
+                String answer=convert(proxy.echoPostponed(null,newEchoRequest(expect)));
+                assertEquals(expect,answer);
+                return null;
+              }
+            }
+);
+            try {
+              futures[i].get(100,TimeUnit.MILLISECONDS);
+            }
+ catch (            TimeoutException te) {
+              continue;
+            }
+            Assert.fail("future" + i + " did not block");
+          }
+          proxy.sendPostponed(null,newEmptyRequest());
+          for (int i=0; i < futures.length; i++) {
+            LOG.info("waiting for future" + i);
+            futures[i].get();
+          }
+        }
+  finally {
+          RPC.stopProxy(proxy);
+          executor.shutdownNow();
+        }
+        return null;
+      }
+    }
+);
+  }
+  finally {
+    server.stop();
+  }
+}

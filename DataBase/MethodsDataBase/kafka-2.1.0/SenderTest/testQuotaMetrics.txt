@@ -1,0 +1,34 @@
+@Test @SuppressWarnings("deprecation") public void testQuotaMetrics() throws Exception {
+  MockSelector selector=new MockSelector(time);
+  Sensor throttleTimeSensor=Sender.throttleTimeSensor(this.senderMetricsRegistry);
+  Cluster cluster=TestUtils.singletonCluster("test",1);
+  Node node=cluster.nodes().get(0);
+  NetworkClient client=new NetworkClient(selector,metadata,"mock",Integer.MAX_VALUE,1000,1000,64 * 1024,64 * 1024,1000,ClientDnsLookup.DEFAULT,time,true,new ApiVersions(),throttleTimeSensor,logContext);
+  short apiVersionsResponseVersion=ApiKeys.API_VERSIONS.latestVersion();
+  ByteBuffer buffer=ApiVersionsResponse.createApiVersionsResponse(400,RecordBatch.CURRENT_MAGIC_VALUE).serialize(apiVersionsResponseVersion,new ResponseHeader(0));
+  selector.delayedReceive(new DelayedReceive(node.idString(),new NetworkReceive(node.idString(),buffer)));
+  while (!client.ready(node,time.milliseconds())) {
+    client.poll(1,time.milliseconds());
+    time.sleep(client.throttleDelayMs(node,time.milliseconds()));
+  }
+  selector.clear();
+  for (int i=1; i <= 3; i++) {
+    int throttleTimeMs=100 * i;
+    ProduceRequest.Builder builder=ProduceRequest.Builder.forCurrentMagic((short)1,1000,Collections.emptyMap());
+    ClientRequest request=client.newClientRequest(node.idString(),builder,time.milliseconds(),true);
+    client.send(request,time.milliseconds());
+    client.poll(1,time.milliseconds());
+    ProduceResponse response=produceResponse(tp0,i,Errors.NONE,throttleTimeMs);
+    buffer=response.serialize(ApiKeys.PRODUCE.latestVersion(),new ResponseHeader(request.correlationId()));
+    selector.completeReceive(new NetworkReceive(node.idString(),buffer));
+    client.poll(1,time.milliseconds());
+    time.sleep(client.throttleDelayMs(node,time.milliseconds()));
+    selector.clear();
+  }
+  Map<MetricName,KafkaMetric> allMetrics=metrics.metrics();
+  KafkaMetric avgMetric=allMetrics.get(this.senderMetricsRegistry.produceThrottleTimeAvg);
+  KafkaMetric maxMetric=allMetrics.get(this.senderMetricsRegistry.produceThrottleTimeMax);
+  assertEquals(250,(Double)avgMetric.metricValue(),EPS);
+  assertEquals(400,(Double)maxMetric.metricValue(),EPS);
+  client.close();
+}

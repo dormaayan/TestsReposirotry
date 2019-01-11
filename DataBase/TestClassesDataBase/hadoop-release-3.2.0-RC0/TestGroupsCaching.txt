@@ -1,0 +1,510 @@
+public class TestGroupsCaching {
+  public static final Logger TESTLOG=LoggerFactory.getLogger(TestGroupsCaching.class);
+  private static String[] myGroups={"grp1","grp2"};
+  private Configuration conf;
+  @Before public void setup() throws IOException {
+    FakeGroupMapping.clearAll();
+    ExceptionalGroupMapping.resetRequestCount();
+    conf=new Configuration();
+    conf.setClass(CommonConfigurationKeys.HADOOP_SECURITY_GROUP_MAPPING,FakeGroupMapping.class,ShellBasedUnixGroupsMapping.class);
+  }
+public static class FakeGroupMapping extends ShellBasedUnixGroupsMapping {
+    private static Set<String> allGroups=new HashSet<String>();
+    private static Set<String> blackList=new HashSet<String>();
+    private static int requestCount=0;
+    private static long getGroupsDelayMs=0;
+    private static boolean throwException;
+    private static volatile CountDownLatch latch=null;
+    @Override public List<String> getGroups(    String user) throws IOException {
+      TESTLOG.info("Getting groups for " + user);
+      delayIfNecessary();
+      requestCount++;
+      if (throwException) {
+        throw new IOException("For test");
+      }
+      if (blackList.contains(user)) {
+        return new LinkedList<String>();
+      }
+      return new LinkedList<String>(allGroups);
+    }
+    /** 
+ * Delay returning on a latch or a specific amount of time.
+ */
+    private void delayIfNecessary(){
+      if (latch != null) {
+        try {
+          latch.await();
+          return;
+        }
+ catch (        InterruptedException e) {
+        }
+      }
+      if (getGroupsDelayMs > 0) {
+        try {
+          Thread.sleep(getGroupsDelayMs);
+        }
+ catch (        InterruptedException e) {
+          throw new RuntimeException(e);
+        }
+      }
+    }
+    @Override public void cacheGroupsRefresh() throws IOException {
+      TESTLOG.info("Cache is being refreshed.");
+      clearBlackList();
+      return;
+    }
+    public static void clearBlackList() throws IOException {
+      TESTLOG.info("Clearing the blacklist");
+      blackList.clear();
+    }
+    public static void clearAll() throws IOException {
+      TESTLOG.info("Resetting FakeGroupMapping");
+      blackList.clear();
+      allGroups.clear();
+      requestCount=0;
+      getGroupsDelayMs=0;
+      throwException=false;
+      latch=null;
+    }
+    @Override public void cacheGroupsAdd(    List<String> groups) throws IOException {
+      TESTLOG.info("Adding " + groups + " to groups.");
+      allGroups.addAll(groups);
+    }
+    public static void addToBlackList(    String user) throws IOException {
+      TESTLOG.info("Adding " + user + " to the blacklist");
+      blackList.add(user);
+    }
+    public static int getRequestCount(){
+      return requestCount;
+    }
+    public static void resetRequestCount(){
+      requestCount=0;
+    }
+    public static void setGetGroupsDelayMs(    long delayMs){
+      getGroupsDelayMs=delayMs;
+    }
+    public static void setThrowException(    boolean throwIfTrue){
+      throwException=throwIfTrue;
+    }
+    /** 
+ * Hold on returning the group names unless being notified, ensure this method is called before  {@link #getGroups(String)}. Call  {@link #resume()} will resume the process.
+ */
+    public static void pause(){
+      latch=new CountDownLatch(1);
+    }
+    /** 
+ * Resume the background refresh thread and return the value of group names.
+ */
+    public static void resume(){
+      if (latch != null) {
+        latch.countDown();
+      }
+    }
+  }
+public static class ExceptionalGroupMapping extends ShellBasedUnixGroupsMapping {
+    private static int requestCount=0;
+    @Override public List<String> getGroups(    String user) throws IOException {
+      requestCount++;
+      throw new IOException("For test");
+    }
+    public static int getRequestCount(){
+      return requestCount;
+    }
+    public static void resetRequestCount(){
+      requestCount=0;
+    }
+  }
+  @Test public void testGroupsCaching() throws Exception {
+    conf.setLong(CommonConfigurationKeys.HADOOP_SECURITY_GROUPS_NEGATIVE_CACHE_SECS,0);
+    Groups groups=new Groups(conf);
+    groups.cacheGroupsAdd(Arrays.asList(myGroups));
+    groups.refresh();
+    FakeGroupMapping.clearBlackList();
+    FakeGroupMapping.addToBlackList("user1");
+    assertTrue(groups.getGroups("me").size() == 2);
+    FakeGroupMapping.addToBlackList("me");
+    assertTrue(groups.getGroups("me").size() == 2);
+    try {
+      TESTLOG.error("We are not supposed to get here." + groups.getGroups("user1").toString());
+      fail();
+    }
+ catch (    IOException ioe) {
+      if (!ioe.getMessage().startsWith("No groups found")) {
+        TESTLOG.error("Got unexpected exception: " + ioe.getMessage());
+        fail();
+      }
+    }
+    FakeGroupMapping.clearBlackList();
+    assertTrue(groups.getGroups("user1").size() == 2);
+  }
+public static class FakeunPrivilegedGroupMapping extends FakeGroupMapping {
+    private static boolean invoked=false;
+    @Override public List<String> getGroups(    String user) throws IOException {
+      invoked=true;
+      return super.getGroups(user);
+    }
+  }
+  @Test public void testGroupLookupForStaticUsers() throws Exception {
+    conf.setClass(CommonConfigurationKeys.HADOOP_SECURITY_GROUP_MAPPING,FakeunPrivilegedGroupMapping.class,ShellBasedUnixGroupsMapping.class);
+    conf.set(CommonConfigurationKeys.HADOOP_USER_GROUP_STATIC_OVERRIDES,"me=;user1=group1;user2=group1,group2");
+    Groups groups=new Groups(conf);
+    List<String> userGroups=groups.getGroups("me");
+    assertTrue("non-empty groups for static user",userGroups.isEmpty());
+    assertFalse("group lookup done for static user",FakeunPrivilegedGroupMapping.invoked);
+    List<String> expected=new ArrayList<String>();
+    expected.add("group1");
+    FakeunPrivilegedGroupMapping.invoked=false;
+    userGroups=groups.getGroups("user1");
+    assertTrue("groups not correct",expected.equals(userGroups));
+    assertFalse("group lookup done for unprivileged user",FakeunPrivilegedGroupMapping.invoked);
+    expected.add("group2");
+    FakeunPrivilegedGroupMapping.invoked=false;
+    userGroups=groups.getGroups("user2");
+    assertTrue("groups not correct",expected.equals(userGroups));
+    assertFalse("group lookup done for unprivileged user",FakeunPrivilegedGroupMapping.invoked);
+  }
+  @Test public void testNegativeGroupCaching() throws Exception {
+    final String user="negcache";
+    final String failMessage="Did not throw IOException: ";
+    conf.setLong(CommonConfigurationKeys.HADOOP_SECURITY_GROUPS_NEGATIVE_CACHE_SECS,2);
+    FakeTimer timer=new FakeTimer();
+    Groups groups=new Groups(conf,timer);
+    groups.cacheGroupsAdd(Arrays.asList(myGroups));
+    groups.refresh();
+    FakeGroupMapping.addToBlackList(user);
+    try {
+      groups.getGroups(user);
+      fail(failMessage + "Failed to obtain groups from FakeGroupMapping.");
+    }
+ catch (    IOException e) {
+      GenericTestUtils.assertExceptionContains("No groups found for user",e);
+    }
+    try {
+      groups.getGroups(user);
+      fail(failMessage + "The user is in the negative cache.");
+    }
+ catch (    IOException e) {
+      GenericTestUtils.assertExceptionContains("No groups found for user",e);
+    }
+    FakeGroupMapping.clearBlackList();
+    try {
+      groups.getGroups(user);
+      fail(failMessage + "The user is still in the negative cache, even " + "FakeGroupMapping has resumed.");
+    }
+ catch (    IOException e) {
+      GenericTestUtils.assertExceptionContains("No groups found for user",e);
+    }
+    timer.advance(4 * 1000);
+    assertEquals(Arrays.asList(myGroups),groups.getGroups(user));
+  }
+  @Test public void testCachePreventsImplRequest() throws Exception {
+    conf.setLong(CommonConfigurationKeys.HADOOP_SECURITY_GROUPS_NEGATIVE_CACHE_SECS,0);
+    Groups groups=new Groups(conf);
+    groups.cacheGroupsAdd(Arrays.asList(myGroups));
+    groups.refresh();
+    FakeGroupMapping.clearBlackList();
+    assertEquals(0,FakeGroupMapping.getRequestCount());
+    assertTrue(groups.getGroups("me").size() == 2);
+    assertEquals(1,FakeGroupMapping.getRequestCount());
+    assertTrue(groups.getGroups("me").size() == 2);
+    assertEquals(1,FakeGroupMapping.getRequestCount());
+  }
+  @Test public void testExceptionsFromImplNotCachedInNegativeCache(){
+    conf.setClass(CommonConfigurationKeys.HADOOP_SECURITY_GROUP_MAPPING,ExceptionalGroupMapping.class,ShellBasedUnixGroupsMapping.class);
+    conf.setLong(CommonConfigurationKeys.HADOOP_SECURITY_GROUPS_NEGATIVE_CACHE_SECS,10000);
+    Groups groups=new Groups(conf);
+    groups.cacheGroupsAdd(Arrays.asList(myGroups));
+    groups.refresh();
+    assertEquals(0,ExceptionalGroupMapping.getRequestCount());
+    try {
+      groups.getGroups("anything");
+      fail("Should have thrown");
+    }
+ catch (    IOException e) {
+    }
+    assertEquals(1,ExceptionalGroupMapping.getRequestCount());
+    try {
+      groups.getGroups("anything");
+      fail("Should have thrown");
+    }
+ catch (    IOException e) {
+    }
+    assertEquals(2,ExceptionalGroupMapping.getRequestCount());
+  }
+  @Test public void testOnlyOneRequestWhenNoEntryIsCached() throws Exception {
+    conf.setLong(CommonConfigurationKeys.HADOOP_SECURITY_GROUPS_NEGATIVE_CACHE_SECS,0);
+    final Groups groups=new Groups(conf);
+    groups.cacheGroupsAdd(Arrays.asList(myGroups));
+    groups.refresh();
+    FakeGroupMapping.clearBlackList();
+    FakeGroupMapping.setGetGroupsDelayMs(100);
+    ArrayList<Thread> threads=new ArrayList<Thread>();
+    for (int i=0; i < 10; i++) {
+      threads.add(new Thread(){
+        public void run(){
+          try {
+            assertEquals(2,groups.getGroups("me").size());
+          }
+ catch (          IOException e) {
+            fail("Should not happen");
+          }
+        }
+      }
+);
+    }
+    for (    Thread t : threads) {
+      t.start();
+    }
+    for (    Thread t : threads) {
+      t.join();
+    }
+    assertEquals(1,FakeGroupMapping.getRequestCount());
+  }
+  @Test public void testOnlyOneRequestWhenExpiredEntryExists() throws Exception {
+    conf.setLong(CommonConfigurationKeys.HADOOP_SECURITY_GROUPS_CACHE_SECS,1);
+    FakeTimer timer=new FakeTimer();
+    final Groups groups=new Groups(conf,timer);
+    groups.cacheGroupsAdd(Arrays.asList(myGroups));
+    groups.refresh();
+    FakeGroupMapping.clearBlackList();
+    FakeGroupMapping.setGetGroupsDelayMs(100);
+    groups.getGroups("me");
+    int startingRequestCount=FakeGroupMapping.getRequestCount();
+    timer.advance(400 * 1000);
+    Thread.sleep(100);
+    ArrayList<Thread> threads=new ArrayList<Thread>();
+    for (int i=0; i < 10; i++) {
+      threads.add(new Thread(){
+        public void run(){
+          try {
+            assertEquals(2,groups.getGroups("me").size());
+          }
+ catch (          IOException e) {
+            fail("Should not happen");
+          }
+        }
+      }
+);
+    }
+    for (    Thread t : threads) {
+      t.start();
+    }
+    for (    Thread t : threads) {
+      t.join();
+    }
+    assertEquals(startingRequestCount + 1,FakeGroupMapping.getRequestCount());
+  }
+  @Test public void testThreadNotBlockedWhenExpiredEntryExistsWithBackgroundRefresh() throws Exception {
+    conf.setLong(CommonConfigurationKeys.HADOOP_SECURITY_GROUPS_CACHE_SECS,1);
+    conf.setBoolean(CommonConfigurationKeys.HADOOP_SECURITY_GROUPS_CACHE_BACKGROUND_RELOAD,true);
+    FakeTimer timer=new FakeTimer();
+    final Groups groups=new Groups(conf,timer);
+    groups.cacheGroupsAdd(Arrays.asList(myGroups));
+    groups.refresh();
+    FakeGroupMapping.clearBlackList();
+    groups.getGroups("me");
+    FakeGroupMapping.setGetGroupsDelayMs(100);
+    groups.cacheGroupsAdd(Arrays.asList("grp3"));
+    int startingRequestCount=FakeGroupMapping.getRequestCount();
+    timer.advance(4 * 1000);
+    assertEquals(groups.getGroups("me").size(),2);
+    assertEquals(startingRequestCount,FakeGroupMapping.getRequestCount());
+    Thread.sleep(110);
+    assertEquals(startingRequestCount + 1,FakeGroupMapping.getRequestCount());
+    assertEquals(groups.getGroups("me").size(),3);
+  }
+  @Test public void testThreadBlockedWhenExpiredEntryExistsWithoutBackgroundRefresh() throws Exception {
+    conf.setLong(CommonConfigurationKeys.HADOOP_SECURITY_GROUPS_CACHE_SECS,1);
+    conf.setBoolean(CommonConfigurationKeys.HADOOP_SECURITY_GROUPS_CACHE_BACKGROUND_RELOAD,false);
+    FakeTimer timer=new FakeTimer();
+    final Groups groups=new Groups(conf,timer);
+    groups.cacheGroupsAdd(Arrays.asList(myGroups));
+    groups.refresh();
+    FakeGroupMapping.clearBlackList();
+    groups.getGroups("me");
+    FakeGroupMapping.setGetGroupsDelayMs(100);
+    groups.cacheGroupsAdd(Arrays.asList("grp3"));
+    int startingRequestCount=FakeGroupMapping.getRequestCount();
+    timer.advance(4 * 1000);
+    assertEquals(groups.getGroups("me").size(),3);
+    assertEquals(startingRequestCount + 1,FakeGroupMapping.getRequestCount());
+  }
+  @Test public void testExceptionOnBackgroundRefreshHandled() throws Exception {
+    conf.setLong(CommonConfigurationKeys.HADOOP_SECURITY_GROUPS_CACHE_SECS,1);
+    conf.setBoolean(CommonConfigurationKeys.HADOOP_SECURITY_GROUPS_CACHE_BACKGROUND_RELOAD,true);
+    FakeTimer timer=new FakeTimer();
+    final Groups groups=new Groups(conf,timer);
+    groups.cacheGroupsAdd(Arrays.asList(myGroups));
+    groups.refresh();
+    FakeGroupMapping.clearBlackList();
+    groups.getGroups("me");
+    groups.cacheGroupsAdd(Arrays.asList("grp3"));
+    int startingRequestCount=FakeGroupMapping.getRequestCount();
+    FakeGroupMapping.setThrowException(true);
+    timer.advance(4 * 1000);
+    FakeGroupMapping.pause();
+    assertEquals(groups.getGroups("me").size(),2);
+    assertEquals(startingRequestCount,FakeGroupMapping.getRequestCount());
+    FakeGroupMapping.resume();
+    waitForGroupCounters(groups,0,0,0,1);
+    FakeGroupMapping.setThrowException(false);
+    assertEquals(startingRequestCount + 1,FakeGroupMapping.getRequestCount());
+    assertEquals(groups.getGroups("me").size(),2);
+    waitForGroupCounters(groups,0,0,1,1);
+    assertEquals(startingRequestCount + 2,FakeGroupMapping.getRequestCount());
+    assertEquals(groups.getGroups("me").size(),3);
+  }
+  @Test public void testEntriesExpireIfBackgroundRefreshFails() throws Exception {
+    conf.setLong(CommonConfigurationKeys.HADOOP_SECURITY_GROUPS_CACHE_SECS,1);
+    conf.setBoolean(CommonConfigurationKeys.HADOOP_SECURITY_GROUPS_CACHE_BACKGROUND_RELOAD,true);
+    FakeTimer timer=new FakeTimer();
+    final Groups groups=new Groups(conf,timer);
+    groups.cacheGroupsAdd(Arrays.asList(myGroups));
+    groups.refresh();
+    FakeGroupMapping.clearBlackList();
+    groups.getGroups("me");
+    FakeGroupMapping.setThrowException(true);
+    for (int i=0; i < 9; i++) {
+      assertEquals(groups.getGroups("me").size(),2);
+      timer.advance(1 * 1000);
+    }
+    timer.advance(2 * 1000);
+    try {
+      groups.getGroups("me");
+      fail("Should have thrown an exception here");
+    }
+ catch (    Exception e) {
+    }
+    FakeGroupMapping.setThrowException(false);
+    assertEquals(groups.getGroups("me").size(),2);
+  }
+  @Test public void testBackgroundRefreshCounters() throws IOException, InterruptedException {
+    conf.setLong(CommonConfigurationKeys.HADOOP_SECURITY_GROUPS_CACHE_SECS,1);
+    conf.setBoolean(CommonConfigurationKeys.HADOOP_SECURITY_GROUPS_CACHE_BACKGROUND_RELOAD,true);
+    conf.setInt(CommonConfigurationKeys.HADOOP_SECURITY_GROUPS_CACHE_BACKGROUND_RELOAD_THREADS,2);
+    FakeTimer timer=new FakeTimer();
+    final Groups groups=new Groups(conf,timer);
+    groups.cacheGroupsAdd(Arrays.asList(myGroups));
+    groups.refresh();
+    FakeGroupMapping.clearBlackList();
+    String[] grps={"one","two","three","four","five"};
+    for (    String g : grps) {
+      groups.getGroups(g);
+    }
+    timer.advance(2 * 1000);
+    FakeGroupMapping.pause();
+    for (    String g : grps) {
+      groups.getGroups(g);
+    }
+    waitForGroupCounters(groups,3,2,0,0);
+    FakeGroupMapping.resume();
+    waitForGroupCounters(groups,0,0,5,0);
+    timer.advance(2 * 1000);
+    FakeGroupMapping.setGetGroupsDelayMs(0);
+    FakeGroupMapping.setThrowException(true);
+    for (    String g : grps) {
+      groups.getGroups(g);
+    }
+    waitForGroupCounters(groups,0,0,5,5);
+  }
+  private void waitForGroupCounters(  Groups groups,  long expectedQueued,  long expectedRunning,  long expectedSuccess,  long expectedExpection) throws InterruptedException {
+    long[] expected={expectedQueued,expectedRunning,expectedSuccess,expectedExpection};
+    long[] actual=new long[expected.length];
+    try {
+      GenericTestUtils.waitFor(new Supplier<Boolean>(){
+        @Override public Boolean get(){
+          actual[0]=groups.getBackgroundRefreshQueued();
+          actual[1]=groups.getBackgroundRefreshRunning();
+          actual[2]=groups.getBackgroundRefreshSuccess();
+          actual[3]=groups.getBackgroundRefreshException();
+          return Arrays.equals(actual,expected);
+        }
+      }
+,20,1000);
+    }
+ catch (    TimeoutException e) {
+      fail("Excepted group counter values are not reached in given time," + " expecting (Queued, Running, Success, Exception) : " + Arrays.toString(expected) + " but actual : "+ Arrays.toString(actual));
+    }
+  }
+  @Test public void testExceptionCallingLoadWithoutBackgroundRefreshReturnsOldValue() throws Exception {
+    conf.setLong(CommonConfigurationKeys.HADOOP_SECURITY_GROUPS_CACHE_SECS,1);
+    conf.setBoolean(CommonConfigurationKeys.HADOOP_SECURITY_GROUPS_CACHE_BACKGROUND_RELOAD,false);
+    FakeTimer timer=new FakeTimer();
+    final Groups groups=new Groups(conf,timer);
+    groups.cacheGroupsAdd(Arrays.asList(myGroups));
+    groups.refresh();
+    FakeGroupMapping.clearBlackList();
+    assertEquals(groups.getGroups("me").size(),2);
+    timer.advance(2 * 1000);
+    FakeGroupMapping.setThrowException(true);
+    assertEquals(groups.getGroups("me").size(),2);
+  }
+  @Test public void testCacheEntriesExpire() throws Exception {
+    conf.setLong(CommonConfigurationKeys.HADOOP_SECURITY_GROUPS_CACHE_SECS,1);
+    FakeTimer timer=new FakeTimer();
+    final Groups groups=new Groups(conf,timer);
+    groups.cacheGroupsAdd(Arrays.asList(myGroups));
+    groups.refresh();
+    FakeGroupMapping.clearBlackList();
+    groups.getGroups("me");
+    int startingRequestCount=FakeGroupMapping.getRequestCount();
+    timer.advance(20 * 1000);
+    groups.getGroups("me");
+    assertEquals(startingRequestCount + 1,FakeGroupMapping.getRequestCount());
+  }
+  @Test public void testNegativeCacheClearedOnRefresh() throws Exception {
+    conf.setLong(CommonConfigurationKeys.HADOOP_SECURITY_GROUPS_NEGATIVE_CACHE_SECS,100);
+    final Groups groups=new Groups(conf);
+    groups.cacheGroupsAdd(Arrays.asList(myGroups));
+    groups.refresh();
+    FakeGroupMapping.clearBlackList();
+    FakeGroupMapping.addToBlackList("dne");
+    try {
+      groups.getGroups("dne");
+      fail("Should have failed to find this group");
+    }
+ catch (    IOException e) {
+    }
+    int startingRequestCount=FakeGroupMapping.getRequestCount();
+    groups.refresh();
+    FakeGroupMapping.addToBlackList("dne");
+    try {
+      List<String> g=groups.getGroups("dne");
+      fail("Should have failed to find this group");
+    }
+ catch (    IOException e) {
+    }
+    assertEquals(startingRequestCount + 1,FakeGroupMapping.getRequestCount());
+  }
+  @Test public void testNegativeCacheEntriesExpire() throws Exception {
+    conf.setLong(CommonConfigurationKeys.HADOOP_SECURITY_GROUPS_NEGATIVE_CACHE_SECS,2);
+    FakeTimer timer=new FakeTimer();
+    Groups groups=new Groups(conf,timer);
+    groups.cacheGroupsAdd(Arrays.asList(myGroups));
+    groups.refresh();
+    FakeGroupMapping.addToBlackList("user1");
+    FakeGroupMapping.addToBlackList("user2");
+    try {
+      groups.getGroups("user1");
+      fail("Did not throw IOException : Failed to obtain groups" + " from FakeGroupMapping.");
+    }
+ catch (    IOException e) {
+      GenericTestUtils.assertExceptionContains("No groups found for user",e);
+    }
+    assertTrue(groups.getNegativeCache().contains("user1"));
+    timer.advance(1000);
+    try {
+      groups.getGroups("user2");
+      fail("Did not throw IOException : Failed to obtain groups" + " from FakeGroupMapping.");
+    }
+ catch (    IOException e) {
+      GenericTestUtils.assertExceptionContains("No groups found for user",e);
+    }
+    assertTrue(groups.getNegativeCache().contains("user2"));
+    timer.advance(1100);
+    assertFalse(groups.getNegativeCache().contains("user1"));
+    assertTrue(groups.getNegativeCache().contains("user2"));
+    timer.advance(1000);
+    assertFalse(groups.getNegativeCache().contains("user2"));
+  }
+}

@@ -1,0 +1,53 @@
+/** 
+ * Tests that maxBlockLocations default value is sufficient for RS-10-4.
+ */
+public class TestJobSplitWriterWithEC {
+  private ErasureCodingPolicy ecPolicy=SystemErasureCodingPolicies.getByID(SystemErasureCodingPolicies.RS_10_4_POLICY_ID);
+  private static final int BLOCKSIZE=1024 * 1024 * 10;
+  private MiniDFSCluster cluster;
+  private DistributedFileSystem fs;
+  private Configuration conf;
+  private Path submitDir;
+  private Path testFile;
+  @Before public void setup() throws Exception {
+    Configuration hdfsConf=new HdfsConfiguration();
+    hdfsConf.setLong(DFSConfigKeys.DFS_NAMENODE_MIN_BLOCK_SIZE_KEY,0);
+    String namenodeDir=new File(MiniDFSCluster.getBaseDirectory(),"name").getAbsolutePath();
+    hdfsConf.set(DFSConfigKeys.DFS_NAMENODE_NAME_DIR_KEY,namenodeDir);
+    hdfsConf.set(DFSConfigKeys.DFS_NAMENODE_EDITS_DIR_KEY,namenodeDir);
+    hdfsConf.setLong(DFSConfigKeys.DFS_BLOCK_SIZE_KEY,BLOCKSIZE);
+    cluster=new MiniDFSCluster.Builder(hdfsConf).numDataNodes(15).build();
+    fs=cluster.getFileSystem();
+    fs.enableErasureCodingPolicy(ecPolicy.getName());
+    fs.setErasureCodingPolicy(new Path("/"),ecPolicy.getName());
+    cluster.waitActive();
+    conf=new Configuration();
+    submitDir=new Path("/");
+    testFile=new Path("/testfile");
+    DFSTestUtil.writeFile(fs,testFile,StripedFileTestUtil.generateBytes(BLOCKSIZE));
+    conf.set(FileInputFormat.INPUT_DIR,fs.getUri().toString() + testFile.toString());
+  }
+  @After public void after(){
+    cluster.close();
+  }
+  @Test public void testMaxBlockLocationsNewSplitsWithErasureCoding() throws Exception {
+    Job job=Job.getInstance(conf);
+    final FileInputFormat<?,?> fileInputFormat=new TextInputFormat();
+    final List<InputSplit> splits=fileInputFormat.getSplits(job);
+    JobSplitWriter.createSplitFiles(submitDir,conf,fs,splits);
+    validateSplitMetaInfo();
+  }
+  @Test public void testMaxBlockLocationsOldSplitsWithErasureCoding() throws Exception {
+    JobConf jobConf=new JobConf(conf);
+    org.apache.hadoop.mapred.TextInputFormat fileInputFormat=new org.apache.hadoop.mapred.TextInputFormat();
+    fileInputFormat.configure(jobConf);
+    final org.apache.hadoop.mapred.InputSplit[] splits=fileInputFormat.getSplits(jobConf,1);
+    JobSplitWriter.createSplitFiles(submitDir,conf,fs,splits);
+    validateSplitMetaInfo();
+  }
+  private void validateSplitMetaInfo() throws IOException {
+    JobSplit.TaskSplitMetaInfo[] splitInfo=SplitMetaInfoReader.readSplitMetaInfo(new JobID(),fs,conf,submitDir);
+    assertEquals("Number of splits",1,splitInfo.length);
+    assertEquals("Number of block locations",14,splitInfo[0].getLocations().length);
+  }
+}

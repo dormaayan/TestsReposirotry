@@ -1,0 +1,54 @@
+/** 
+ * This looks at what happens with concurrent commits. However, the failure condition it looks for (subdir under subdir) is the kind of failure you see on a rename-based commit. What it will not detect is the fact that both tasks will each commit to the destination directory. That is: whichever commits last wins. There's no way to stop this. Instead it is a requirement that the task commit operation is only executed when the committer is happy to commit only those tasks which it knows have succeeded, and abort those which have not.
+ * @throws Exception failure
+ */
+@Test public void testConcurrentCommitTaskWithSubDir() throws Exception {
+  Job job=newJob();
+  FileOutputFormat.setOutputPath(job,outDir);
+  final Configuration conf=job.getConfiguration();
+  final JobContext jContext=new JobContextImpl(conf,taskAttempt0.getJobID());
+  AbstractS3ACommitter amCommitter=createCommitter(new TaskAttemptContextImpl(conf,taskAttempt0));
+  amCommitter.setupJob(jContext);
+  final TaskAttemptContext[] taCtx=new TaskAttemptContextImpl[2];
+  taCtx[0]=new TaskAttemptContextImpl(conf,taskAttempt0);
+  taCtx[1]=new TaskAttemptContextImpl(conf,taskAttempt1);
+  final TextOutputFormat[] tof=new LoggingTextOutputFormat[2];
+  for (int i=0; i < tof.length; i++) {
+    tof[i]=new LoggingTextOutputFormat(){
+      @Override public Path getDefaultWorkFile(      TaskAttemptContext context,      String extension) throws IOException {
+        final AbstractS3ACommitter foc=(AbstractS3ACommitter)getOutputCommitter(context);
+        return new Path(new Path(foc.getWorkPath(),SUB_DIR),getUniqueFile(context,getOutputName(context),extension));
+      }
+    }
+;
+  }
+  final ExecutorService executor=HadoopExecutors.newFixedThreadPool(2);
+  try {
+    for (int i=0; i < taCtx.length; i++) {
+      final int taskIdx=i;
+      executor.submit(() -> {
+        final OutputCommitter outputCommitter=tof[taskIdx].getOutputCommitter(taCtx[taskIdx]);
+        outputCommitter.setupTask(taCtx[taskIdx]);
+        final RecordWriter rw=tof[taskIdx].getRecordWriter(taCtx[taskIdx]);
+        writeOutput(rw,taCtx[taskIdx]);
+        describe("Committing Task %d",taskIdx);
+        outputCommitter.commitTask(taCtx[taskIdx]);
+        return null;
+      }
+);
+    }
+  }
+  finally {
+    executor.shutdown();
+    while (!executor.awaitTermination(1,TimeUnit.SECONDS)) {
+      log().info("Awaiting thread termination!");
+    }
+  }
+  describe("\nCommitting Job");
+  amCommitter.commitJob(jContext);
+  assertPathExists("base output directory",outDir);
+  assertPart0000DoesNotExist(outDir);
+  Path outSubDir=new Path(outDir,SUB_DIR);
+  assertPathDoesNotExist("Must not end up with sub_dir/sub_dir",new Path(outSubDir,SUB_DIR));
+  validateContent(outSubDir,false);
+}

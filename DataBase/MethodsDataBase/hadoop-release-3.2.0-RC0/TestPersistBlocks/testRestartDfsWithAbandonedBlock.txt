@@ -1,0 +1,44 @@
+@Test public void testRestartDfsWithAbandonedBlock() throws Exception {
+  final Configuration conf=new HdfsConfiguration();
+  conf.setInt(CommonConfigurationKeysPublic.IPC_CLIENT_CONNECTION_MAXIDLETIME_KEY,0);
+  MiniDFSCluster cluster=null;
+  long len=0;
+  FSDataOutputStream stream;
+  try {
+    cluster=new MiniDFSCluster.Builder(conf).numDataNodes(3).build();
+    FileSystem fs=cluster.getFileSystem();
+    stream=fs.create(FILE_PATH,true,BLOCK_SIZE,(short)1,BLOCK_SIZE);
+    stream.write(DATA_BEFORE_RESTART);
+    stream.hflush();
+    while (len < BLOCK_SIZE * (NUM_BLOCKS - 1)) {
+      FileStatus status=fs.getFileStatus(FILE_PATH);
+      len=status.getLen();
+      Thread.sleep(100);
+    }
+    DFSClient dfsclient=DFSClientAdapter.getDFSClient((DistributedFileSystem)fs);
+    HdfsFileStatus fileStatus=dfsclient.getNamenode().getFileInfo(FILE_NAME);
+    LocatedBlocks blocks=dfsclient.getNamenode().getBlockLocations(FILE_NAME,0,BLOCK_SIZE * NUM_BLOCKS);
+    assertEquals(NUM_BLOCKS,blocks.getLocatedBlocks().size());
+    LocatedBlock b=blocks.getLastLocatedBlock();
+    dfsclient.getNamenode().abandonBlock(b.getBlock(),fileStatus.getFileId(),FILE_NAME,dfsclient.clientName);
+    cluster.restartNameNode();
+    FileStatus status=fs.getFileStatus(FILE_PATH);
+    assertTrue("Length incorrect: " + status.getLen(),status.getLen() == len - BLOCK_SIZE);
+    FSDataInputStream readStream=fs.open(FILE_PATH);
+    try {
+      byte[] verifyBuf=new byte[DATA_BEFORE_RESTART.length - BLOCK_SIZE];
+      IOUtils.readFully(readStream,verifyBuf,0,verifyBuf.length);
+      byte[] expectedBuf=new byte[DATA_BEFORE_RESTART.length - BLOCK_SIZE];
+      System.arraycopy(DATA_BEFORE_RESTART,0,expectedBuf,0,expectedBuf.length);
+      assertArrayEquals(expectedBuf,verifyBuf);
+    }
+  finally {
+      IOUtils.closeStream(readStream);
+    }
+  }
+  finally {
+    if (cluster != null) {
+      cluster.shutdown();
+    }
+  }
+}

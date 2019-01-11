@@ -1,0 +1,131 @@
+@Test public void testDelegationToken() throws IOException, InterruptedException {
+  final YarnConfiguration conf=new YarnConfiguration();
+  conf.set(YarnConfiguration.RM_PRINCIPAL,"testuser/localhost@apache.org");
+  conf.set(CommonConfigurationKeysPublic.HADOOP_SECURITY_AUTHENTICATION,"kerberos");
+  UserGroupInformation.setConfiguration(conf);
+  ResourceScheduler scheduler=createMockScheduler(conf);
+  long initialInterval=10000l;
+  long maxLifetime=20000l;
+  long renewInterval=10000l;
+  RMDelegationTokenSecretManager rmDtSecretManager=createRMDelegationTokenSecretManager(initialInterval,maxLifetime,renewInterval);
+  rmDtSecretManager.startThreads();
+  LOG.info("Creating DelegationTokenSecretManager with initialInterval: " + initialInterval + ", maxLifetime: "+ maxLifetime+ ", renewInterval: "+ renewInterval);
+  final ClientRMService clientRMService=new ClientRMServiceForTest(conf,scheduler,rmDtSecretManager);
+  clientRMService.init(conf);
+  clientRMService.start();
+  ApplicationClientProtocol clientRMWithDT=null;
+  try {
+    UserGroupInformation loggedInUser=UserGroupInformation.createRemoteUser("testrenewer@APACHE.ORG");
+    Assert.assertEquals("testrenewer",loggedInUser.getShortUserName());
+    loggedInUser.setAuthenticationMethod(AuthenticationMethod.KERBEROS);
+    org.apache.hadoop.yarn.api.records.Token token=getDelegationToken(loggedInUser,clientRMService,loggedInUser.getShortUserName());
+    long tokenFetchTime=System.currentTimeMillis();
+    LOG.info("Got delegation token at: " + tokenFetchTime);
+    clientRMWithDT=getClientRMProtocolWithDT(token,clientRMService.getBindAddress(),"loginuser1",conf);
+    GetNewApplicationRequest request=Records.newRecord(GetNewApplicationRequest.class);
+    try {
+      clientRMWithDT.getNewApplication(request);
+    }
+ catch (    IOException e) {
+      fail("Unexpected exception" + e);
+    }
+catch (    YarnException e) {
+      fail("Unexpected exception" + e);
+    }
+    while (System.currentTimeMillis() < tokenFetchTime + initialInterval / 2) {
+      Thread.sleep(500l);
+    }
+    long nextExpTime=renewDelegationToken(loggedInUser,clientRMService,token);
+    long renewalTime=System.currentTimeMillis();
+    LOG.info("Renewed token at: " + renewalTime + ", NextExpiryTime: "+ nextExpTime);
+    while (System.currentTimeMillis() > tokenFetchTime + initialInterval && System.currentTimeMillis() < nextExpTime) {
+      Thread.sleep(500l);
+    }
+    Thread.sleep(50l);
+    try {
+      clientRMWithDT.getNewApplication(request);
+    }
+ catch (    IOException e) {
+      fail("Unexpected exception" + e);
+    }
+catch (    YarnException e) {
+      fail("Unexpected exception" + e);
+    }
+    while (System.currentTimeMillis() < renewalTime + renewInterval) {
+      Thread.sleep(500l);
+    }
+    Thread.sleep(50l);
+    LOG.info("At time: " + System.currentTimeMillis() + ", token should be invalid");
+    try {
+      clientRMWithDT.getNewApplication(request);
+      fail("Should not have succeeded with an expired token");
+    }
+ catch (    Exception e) {
+      assertEquals(InvalidToken.class.getName(),e.getClass().getName());
+      assertTrue(e.getMessage().contains("is expired"));
+    }
+    if (clientRMWithDT != null) {
+      RPC.stopProxy(clientRMWithDT);
+      clientRMWithDT=null;
+    }
+    token=getDelegationToken(loggedInUser,clientRMService,loggedInUser.getShortUserName());
+    tokenFetchTime=System.currentTimeMillis();
+    LOG.info("Got delegation token at: " + tokenFetchTime);
+    clientRMWithDT=getClientRMProtocolWithDT(token,clientRMService.getBindAddress(),"loginuser2",conf);
+    request=Records.newRecord(GetNewApplicationRequest.class);
+    try {
+      clientRMWithDT.getNewApplication(request);
+    }
+ catch (    IOException e) {
+      fail("Unexpected exception" + e);
+    }
+catch (    YarnException e) {
+      fail("Unexpected exception" + e);
+    }
+    cancelDelegationToken(loggedInUser,clientRMService,token);
+    if (clientRMWithDT != null) {
+      RPC.stopProxy(clientRMWithDT);
+      clientRMWithDT=null;
+    }
+    clientRMWithDT=getClientRMProtocolWithDT(token,clientRMService.getBindAddress(),"loginuser2",conf);
+    LOG.info("Cancelled delegation token at: " + System.currentTimeMillis());
+    try {
+      clientRMWithDT.getNewApplication(request);
+      fail("Should not have succeeded with a cancelled delegation token");
+    }
+ catch (    IOException e) {
+    }
+catch (    YarnException e) {
+    }
+    if (clientRMWithDT != null) {
+      RPC.stopProxy(clientRMWithDT);
+      clientRMWithDT=null;
+    }
+    token=getDelegationToken(loggedInUser,clientRMService,loggedInUser.getShortUserName());
+    byte[] tokenIdentifierContent=token.getIdentifier().array();
+    RMDelegationTokenIdentifier tokenIdentifier=new RMDelegationTokenIdentifier();
+    DataInputBuffer dib=new DataInputBuffer();
+    dib.reset(tokenIdentifierContent,tokenIdentifierContent.length);
+    tokenIdentifier.readFields(dib);
+    RMDelegationTokenIdentifierForTest newVersionTokenIdentifier=new RMDelegationTokenIdentifierForTest(tokenIdentifier,"message");
+    Token<RMDelegationTokenIdentifier> newRMDTtoken=new Token<RMDelegationTokenIdentifier>(newVersionTokenIdentifier,rmDtSecretManager);
+    org.apache.hadoop.yarn.api.records.Token newToken=BuilderUtils.newDelegationToken(newRMDTtoken.getIdentifier(),newRMDTtoken.getKind().toString(),newRMDTtoken.getPassword(),newRMDTtoken.getService().toString());
+    clientRMWithDT=getClientRMProtocolWithDT(newToken,clientRMService.getBindAddress(),"loginuser3",conf);
+    request=Records.newRecord(GetNewApplicationRequest.class);
+    try {
+      clientRMWithDT.getNewApplication(request);
+    }
+ catch (    IOException e) {
+      fail("Unexpected exception" + e);
+    }
+catch (    YarnException e) {
+      fail("Unexpected exception" + e);
+    }
+  }
+  finally {
+    rmDtSecretManager.stopThreads();
+    if (clientRMWithDT != null) {
+      RPC.stopProxy(clientRMWithDT);
+    }
+  }
+}

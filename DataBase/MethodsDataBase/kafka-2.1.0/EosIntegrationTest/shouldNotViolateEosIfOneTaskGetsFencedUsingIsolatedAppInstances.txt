@@ -1,0 +1,59 @@
+@Test public void shouldNotViolateEosIfOneTaskGetsFencedUsingIsolatedAppInstances() throws Exception {
+  final KafkaStreams streams1=getKafkaStreams(false,"appDir1",1);
+  final KafkaStreams streams2=getKafkaStreams(false,"appDir2",1);
+  try {
+    streams1.start();
+    streams2.start();
+    final List<KeyValue<Long,Long>> committedDataBeforeGC=prepareData(0L,10L,0L,1L);
+    final List<KeyValue<Long,Long>> uncommittedDataBeforeGC=prepareData(10L,15L,0L,1L);
+    final List<KeyValue<Long,Long>> dataBeforeGC=new ArrayList<>();
+    dataBeforeGC.addAll(committedDataBeforeGC);
+    dataBeforeGC.addAll(uncommittedDataBeforeGC);
+    final List<KeyValue<Long,Long>> dataToTriggerFirstRebalance=prepareData(15L,20L,0L,1L);
+    final List<KeyValue<Long,Long>> dataAfterSecondRebalance=prepareData(20L,30L,0L,1L);
+    writeInputData(committedDataBeforeGC);
+    TestUtils.waitForCondition(new TestCondition(){
+      @Override public boolean conditionMet(){
+        return commitRequested.get() == 2;
+      }
+    }
+,MAX_WAIT_TIME_MS,"SteamsTasks did not request commit.");
+    writeInputData(uncommittedDataBeforeGC);
+    final List<KeyValue<Long,Long>> uncommittedRecords=readResult(dataBeforeGC.size(),null);
+    final List<KeyValue<Long,Long>> committedRecords=readResult(committedDataBeforeGC.size(),CONSUMER_GROUP_ID);
+    checkResultPerKey(committedRecords,committedDataBeforeGC);
+    checkResultPerKey(uncommittedRecords,dataBeforeGC);
+    gcInjected.set(true);
+    writeInputData(dataToTriggerFirstRebalance);
+    TestUtils.waitForCondition(new TestCondition(){
+      @Override public boolean conditionMet(){
+        return streams1.allMetadata().size() == 1 && streams2.allMetadata().size() == 1 && (streams1.allMetadata().iterator().next().topicPartitions().size() == 2 || streams2.allMetadata().iterator().next().topicPartitions().size() == 2);
+      }
+    }
+,MAX_WAIT_TIME_MS,"Should have rebalanced.");
+    final List<KeyValue<Long,Long>> committedRecordsAfterRebalance=readResult(uncommittedDataBeforeGC.size() + dataToTriggerFirstRebalance.size(),CONSUMER_GROUP_ID);
+    final List<KeyValue<Long,Long>> expectedCommittedRecordsAfterRebalance=new ArrayList<>();
+    expectedCommittedRecordsAfterRebalance.addAll(uncommittedDataBeforeGC);
+    expectedCommittedRecordsAfterRebalance.addAll(dataToTriggerFirstRebalance);
+    checkResultPerKey(committedRecordsAfterRebalance,expectedCommittedRecordsAfterRebalance);
+    doGC=false;
+    TestUtils.waitForCondition(new TestCondition(){
+      @Override public boolean conditionMet(){
+        return streams1.allMetadata().size() == 1 && streams2.allMetadata().size() == 1 && streams1.allMetadata().iterator().next().topicPartitions().size() == 1 && streams2.allMetadata().iterator().next().topicPartitions().size() == 1;
+      }
+    }
+,MAX_WAIT_TIME_MS,"Should have rebalanced.");
+    writeInputData(dataAfterSecondRebalance);
+    final List<KeyValue<Long,Long>> allCommittedRecords=readResult(committedDataBeforeGC.size() + uncommittedDataBeforeGC.size() + dataToTriggerFirstRebalance.size()+ dataAfterSecondRebalance.size(),CONSUMER_GROUP_ID + "_ALL");
+    final List<KeyValue<Long,Long>> allExpectedCommittedRecordsAfterRecovery=new ArrayList<>();
+    allExpectedCommittedRecordsAfterRecovery.addAll(committedDataBeforeGC);
+    allExpectedCommittedRecordsAfterRecovery.addAll(uncommittedDataBeforeGC);
+    allExpectedCommittedRecordsAfterRecovery.addAll(dataToTriggerFirstRebalance);
+    allExpectedCommittedRecordsAfterRecovery.addAll(dataAfterSecondRebalance);
+    checkResultPerKey(allCommittedRecords,allExpectedCommittedRecordsAfterRecovery);
+  }
+  finally {
+    streams1.close();
+    streams2.close();
+  }
+}

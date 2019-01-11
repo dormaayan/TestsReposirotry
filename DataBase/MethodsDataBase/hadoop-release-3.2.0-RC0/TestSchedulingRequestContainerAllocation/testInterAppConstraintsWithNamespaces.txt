@@ -1,0 +1,73 @@
+@Test(timeout=30000L) public void testInterAppConstraintsWithNamespaces() throws Exception {
+  YarnConfiguration config=new YarnConfiguration();
+  config.set(YarnConfiguration.RM_PLACEMENT_CONSTRAINTS_HANDLER,YarnConfiguration.SCHEDULER_RM_PLACEMENT_CONSTRAINTS_HANDLER);
+  config.setClass(YarnConfiguration.RM_SCHEDULER,CapacityScheduler.class,ResourceScheduler.class);
+  MockRM rm=new MockRM(config);
+  try {
+    rm.start();
+    MockNM nm1=rm.registerNode("192.168.0.1:1234:",100 * GB,100);
+    MockNM nm2=rm.registerNode("192.168.0.2:1234",100 * GB,100);
+    MockNM nm3=rm.registerNode("192.168.0.3:1234",100 * GB,100);
+    MockNM nm4=rm.registerNode("192.168.0.4:1234",100 * GB,100);
+    MockNM nm5=rm.registerNode("192.168.0.5:1234",100 * GB,100);
+    ApplicationId app5Id=null;
+    Map<ApplicationId,List<Container>> allocMap=new HashMap<>();
+    for (int i=0; i < 10; i++) {
+      String applicationTag=i < 5 ? "former5" : "latter5";
+      RMApp app=rm.submitApp(1 * GB,ImmutableSet.of(applicationTag));
+      doNodeHeartbeat(nm1,nm2,nm3,nm4,nm5);
+      RMAppAttempt attempt=app.getCurrentAppAttempt();
+      MockAM am=rm.sendAMLaunched(attempt.getAppAttemptId());
+      am.registerAppAttempt();
+      PlacementConstraint pc=targetNotIn("node",allocationTag("foo")).build();
+      am.addSchedulingRequest(ImmutableList.of(schedulingRequest(1,3,1,1024,pc,"foo")));
+      List<Container> allocated=waitForAllocation(3,3000,am,nm1,nm2,nm3,nm4,nm5);
+      if (i == 5) {
+        app5Id=am.getApplicationAttemptId().getApplicationId();
+      }
+      allocMap.put(am.getApplicationAttemptId().getApplicationId(),allocated);
+    }
+    Assert.assertNotNull(app5Id);
+    Assert.assertEquals(3,getContainerNodesNum(allocMap.get(app5Id)));
+    RMApp app1=rm.submitApp(1 * GB,ImmutableSet.of("xyz"));
+    doNodeHeartbeat(nm1);
+    RMAppAttempt attempt1=app1.getCurrentAppAttempt();
+    MockAM am1=rm.sendAMLaunched(attempt1.getAppAttemptId());
+    am1.registerAppAttempt();
+    PlacementConstraint pc=targetIn("node",allocationTagWithNamespace(new TargetApplicationsNamespace.AppID(app5Id).toString(),"foo")).build();
+    am1.addSchedulingRequest(ImmutableList.of(schedulingRequest(1,3,1,1024,pc,"foo")));
+    List<Container> allocated=waitForAllocation(3,3000,am1,nm1,nm2,nm3,nm4,nm5);
+    ConcurrentMap<NodeId,RMNode> rmNodes=rm.getRMContext().getRMNodes();
+    List<Container> app5Alloc=allocMap.get(app5Id);
+    for (    Container c : allocated) {
+      RMNode rmNode=rmNodes.get(c.getNodeId());
+      Assert.assertNotNull(rmNode);
+      Assert.assertTrue("This app is affinity with app-id/app5/foo " + "containers",app5Alloc.stream().anyMatch(c5 -> c5.getNodeId() == c.getNodeId()));
+    }
+    RMApp app2=rm.submitApp(1 * GB);
+    doNodeHeartbeat(nm2);
+    RMAppAttempt app2attempt1=app2.getCurrentAppAttempt();
+    MockAM am2=rm.sendAMLaunched(app2attempt1.getAppAttemptId());
+    am2.registerAppAttempt();
+    pc=targetNotIn("node",allocationTagWithNamespace(new TargetApplicationsNamespace.AppTag("xyz").toString(),"foo")).build();
+    am2.addSchedulingRequest(ImmutableList.of(schedulingRequest(1,2,1,1024,pc,"foo")));
+    allocated=waitForAllocation(2,3000,am2,nm1,nm2,nm3,nm4,nm5);
+    Assert.assertEquals(2,allocated.size());
+    for (    Container c : app5Alloc) {
+      Assert.assertNotEquals(c.getNodeId(),allocated.iterator().next().getNodeId());
+    }
+    RMApp app3=rm.submitApp(1 * GB);
+    doNodeHeartbeat(nm3);
+    RMAppAttempt app3attempt1=app3.getCurrentAppAttempt();
+    MockAM am3=rm.sendAMLaunched(app3attempt1.getAppAttemptId());
+    am3.registerAppAttempt();
+    pc=cardinality("node",new TargetApplicationsNamespace.NotSelf().toString(),1,1,"foo").build();
+    am3.addSchedulingRequest(ImmutableList.of(schedulingRequest(1,1,1,1024,pc,"foo")));
+    allocated=waitForAllocation(1,3000,am3,nm1,nm2,nm3,nm4,nm5);
+    Assert.assertEquals(1,allocated.size());
+    Assert.assertTrue(rmNodes.get(allocated.iterator().next().getNodeId()).getAllocationTagsWithCount().get("foo") == 2);
+  }
+  finally {
+    rm.stop();
+  }
+}

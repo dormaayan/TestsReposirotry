@@ -1,0 +1,95 @@
+/** 
+ * Tests the sequential block ID generation mechanism and block ID collision handling.
+ */
+public class TestSequentialBlockId {
+  private static final Logger LOG=LoggerFactory.getLogger("TestSequentialBlockId");
+  final int BLOCK_SIZE=1024;
+  final int IO_SIZE=BLOCK_SIZE;
+  final short REPLICATION=1;
+  final long SEED=0;
+  /** 
+ * Test that block IDs are generated sequentially.
+ * @throws IOException
+ */
+  @Test public void testBlockIdGeneration() throws IOException {
+    Configuration conf=new HdfsConfiguration();
+    conf.setInt(DFSConfigKeys.DFS_REPLICATION_KEY,1);
+    MiniDFSCluster cluster=new MiniDFSCluster.Builder(conf).numDataNodes(1).build();
+    try {
+      cluster.waitActive();
+      FileSystem fs=cluster.getFileSystem();
+      Path path=new Path("testBlockIdGeneration.dat");
+      DFSTestUtil.createFile(fs,path,IO_SIZE,BLOCK_SIZE * 10,BLOCK_SIZE,REPLICATION,SEED);
+      List<LocatedBlock> blocks=DFSTestUtil.getAllBlocks(fs,path);
+      LOG.info("Block0 id is " + blocks.get(0).getBlock().getBlockId());
+      long nextBlockExpectedId=blocks.get(0).getBlock().getBlockId() + 1;
+      for (int i=1; i < blocks.size(); ++i) {
+        long nextBlockId=blocks.get(i).getBlock().getBlockId();
+        LOG.info("Block" + i + " id is "+ nextBlockId);
+        assertThat(nextBlockId,is(nextBlockExpectedId));
+        ++nextBlockExpectedId;
+      }
+    }
+  finally {
+      cluster.shutdown();
+    }
+  }
+  /** 
+ * Test that collisions in the block ID space are handled gracefully.
+ * @throws IOException
+ */
+  @Test public void testTriggerBlockIdCollision() throws IOException {
+    Configuration conf=new HdfsConfiguration();
+    conf.setInt(DFSConfigKeys.DFS_REPLICATION_KEY,1);
+    MiniDFSCluster cluster=new MiniDFSCluster.Builder(conf).numDataNodes(1).build();
+    try {
+      cluster.waitActive();
+      FileSystem fs=cluster.getFileSystem();
+      FSNamesystem fsn=cluster.getNamesystem();
+      final int blockCount=10;
+      Path path1=new Path("testBlockIdCollisionDetection_file1.dat");
+      DFSTestUtil.createFile(fs,path1,IO_SIZE,BLOCK_SIZE * blockCount,BLOCK_SIZE,REPLICATION,SEED);
+      List<LocatedBlock> blocks1=DFSTestUtil.getAllBlocks(fs,path1);
+      SequentialBlockIdGenerator blockIdGenerator=fsn.getBlockManager().getBlockIdManager().getBlockIdGenerator();
+      blockIdGenerator.setCurrentValue(blockIdGenerator.getCurrentValue() - 5);
+      Path path2=new Path("testBlockIdCollisionDetection_file2.dat");
+      DFSTestUtil.createFile(fs,path2,IO_SIZE,BLOCK_SIZE * blockCount,BLOCK_SIZE,REPLICATION,SEED);
+      List<LocatedBlock> blocks2=DFSTestUtil.getAllBlocks(fs,path2);
+      assertThat(blocks2.size(),is(blockCount));
+      assertThat(blocks2.get(0).getBlock().getBlockId(),is(blocks1.get(9).getBlock().getBlockId() + 1));
+    }
+  finally {
+      cluster.shutdown();
+    }
+  }
+  /** 
+ * Test that the block type (legacy or not) can be correctly detected based on its generation stamp.
+ * @throws IOException
+ */
+  @Test public void testBlockTypeDetection() throws IOException {
+    BlockIdManager bid=mock(BlockIdManager.class);
+    final long maxGenStampForLegacyBlocks=10000;
+    when(bid.getLegacyGenerationStampLimit()).thenReturn(maxGenStampForLegacyBlocks);
+    Block legacyBlock=spy(new Block());
+    when(legacyBlock.getGenerationStamp()).thenReturn(maxGenStampForLegacyBlocks / 2);
+    Block newBlock=spy(new Block());
+    when(newBlock.getGenerationStamp()).thenReturn(maxGenStampForLegacyBlocks + 1);
+    when(bid.isLegacyBlock(any(Block.class))).thenCallRealMethod();
+    assertThat(bid.isLegacyBlock(legacyBlock),is(true));
+    assertThat(bid.isLegacyBlock(newBlock),is(false));
+  }
+  /** 
+ * Test that the generation stamp for legacy and new blocks is updated as expected.
+ * @throws IOException
+ */
+  @Test public void testGenerationStampUpdate() throws IOException {
+    BlockIdManager bid=mock(BlockIdManager.class);
+    final long nextLegacyGenerationStamp=5000;
+    final long nextGenerationStamp=20000;
+    when(bid.getNextLegacyGenerationStamp()).thenReturn(nextLegacyGenerationStamp);
+    when(bid.getNextGenerationStamp()).thenReturn(nextGenerationStamp);
+    when(bid.nextGenerationStamp(anyBoolean())).thenCallRealMethod();
+    assertThat(bid.nextGenerationStamp(true),is(nextLegacyGenerationStamp));
+    assertThat(bid.nextGenerationStamp(false),is(nextGenerationStamp));
+  }
+}

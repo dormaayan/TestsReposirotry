@@ -1,0 +1,109 @@
+/** 
+ * End-to-End test cases for the AMRMProxy Service.
+ */
+public class TestAMRMProxy extends BaseAMRMProxyE2ETest {
+  private static final Logger LOG=LoggerFactory.getLogger(TestAMRMProxy.class);
+  @Test(timeout=120000) public void testAMRMProxyE2E() throws Exception {
+    ApplicationMasterProtocol client;
+    try (MiniYARNCluster cluster=new MiniYARNCluster("testAMRMProxyE2E",1,1,1);YarnClient rmClient=YarnClient.createYarnClient()){
+      Configuration conf=new YarnConfiguration();
+      conf.setBoolean(YarnConfiguration.AMRM_PROXY_ENABLED,true);
+      conf.setBoolean(FairSchedulerConfiguration.ASSIGN_MULTIPLE,true);
+      cluster.init(conf);
+      cluster.start();
+      final Configuration yarnConf=cluster.getConfig();
+      yarnConf.set(YarnConfiguration.RM_SCHEDULER_ADDRESS,YarnConfiguration.DEFAULT_AMRM_PROXY_ADDRESS);
+      rmClient.init(yarnConf);
+      rmClient.start();
+      ApplicationAttemptId appAttmptId=createApp(rmClient,cluster,conf);
+      ApplicationId appId=appAttmptId.getApplicationId();
+      client=createAMRMProtocol(rmClient,appId,cluster,yarnConf);
+      LOG.info("testAMRMProxyE2E - Register Application Master");
+      RegisterApplicationMasterResponse responseRegister=client.registerApplicationMaster(RegisterApplicationMasterRequest.newInstance(NetUtils.getHostname(),1024,""));
+      Assert.assertNotNull(responseRegister);
+      Assert.assertNotNull(responseRegister.getQueue());
+      Assert.assertNotNull(responseRegister.getApplicationACLs());
+      Assert.assertNotNull(responseRegister.getClientToAMTokenMasterKey());
+      Assert.assertNotNull(responseRegister.getContainersFromPreviousAttempts());
+      Assert.assertNotNull(responseRegister.getSchedulerResourceTypes());
+      Assert.assertNotNull(responseRegister.getMaximumResourceCapability());
+      RMApp rmApp=cluster.getResourceManager().getRMContext().getRMApps().get(appId);
+      Assert.assertEquals(RMAppState.RUNNING,rmApp.getState());
+      LOG.info("testAMRMProxyE2E - Allocate Resources Application Master");
+      AllocateRequest request=createAllocateRequest(rmClient.getNodeReports(NodeState.RUNNING));
+      AllocateResponse allocResponse=client.allocate(request);
+      Assert.assertNotNull(allocResponse);
+      Assert.assertEquals(0,allocResponse.getAllocatedContainers().size());
+      request.setAskList(new ArrayList<ResourceRequest>());
+      request.setResponseId(request.getResponseId() + 1);
+      Thread.sleep(1000);
+      allocResponse=client.allocate(request);
+      Assert.assertNotNull(allocResponse);
+      Assert.assertEquals(2,allocResponse.getAllocatedContainers().size());
+      LOG.info("testAMRMPRoxy - Finish Application Master");
+      FinishApplicationMasterResponse responseFinish=client.finishApplicationMaster(FinishApplicationMasterRequest.newInstance(FinalApplicationStatus.SUCCEEDED,"success",null));
+      Assert.assertNotNull(responseFinish);
+      Thread.sleep(500);
+      Assert.assertNotEquals(RMAppState.FINISHED,rmApp.getState());
+    }
+   }
+  @Test(timeout=120000) public void testAMRMProxyTokenRenewal() throws Exception {
+    ApplicationMasterProtocol client;
+    try (MiniYARNCluster cluster=new MiniYARNCluster("testE2ETokenRenewal",1,1,1);YarnClient rmClient=YarnClient.createYarnClient()){
+      Configuration conf=new YarnConfiguration();
+      conf.setBoolean(YarnConfiguration.AMRM_PROXY_ENABLED,true);
+      conf.setInt(YarnConfiguration.RM_NM_EXPIRY_INTERVAL_MS,4500);
+      conf.setInt(YarnConfiguration.RM_NM_HEARTBEAT_INTERVAL_MS,4500);
+      conf.setInt(YarnConfiguration.RM_AM_EXPIRY_INTERVAL_MS,4500);
+      conf.setInt(YarnConfiguration.RM_AMRM_TOKEN_MASTER_KEY_ROLLING_INTERVAL_SECS,20);
+      cluster.init(conf);
+      cluster.start();
+      final Configuration yarnConf=cluster.getConfig();
+      yarnConf.set(YarnConfiguration.RM_SCHEDULER_ADDRESS,YarnConfiguration.DEFAULT_AMRM_PROXY_ADDRESS);
+      rmClient.init(yarnConf);
+      rmClient.start();
+      ApplicationAttemptId appAttmptId=createApp(rmClient,cluster,conf);
+      ApplicationId appId=appAttmptId.getApplicationId();
+      client=createAMRMProtocol(rmClient,appId,cluster,yarnConf);
+      client.registerApplicationMaster(RegisterApplicationMasterRequest.newInstance(NetUtils.getHostname(),1024,""));
+      LOG.info("testAMRMProxyTokenRenewal - Allocate Resources Application Master");
+      AllocateRequest request=createAllocateRequest(rmClient.getNodeReports(NodeState.RUNNING));
+      Token lastToken=null;
+      AllocateResponse response=null;
+      for (int i=0; i < 5; i++) {
+        response=client.allocate(request);
+        request.setResponseId(request.getResponseId() + 1);
+        if (response.getAMRMToken() != null && !response.getAMRMToken().equals(lastToken)) {
+          break;
+        }
+        lastToken=response.getAMRMToken();
+        Thread.sleep(4500);
+      }
+      Assert.assertFalse(response.getAMRMToken().equals(lastToken));
+      LOG.info("testAMRMPRoxy - Finish Application Master");
+      client.finishApplicationMaster(FinishApplicationMasterRequest.newInstance(FinalApplicationStatus.SUCCEEDED,"success",null));
+    }
+   }
+  @Test(timeout=120000) public void testE2ETokenSwap() throws Exception {
+    ApplicationMasterProtocol client;
+    try (MiniYARNCluster cluster=new MiniYARNCluster("testE2ETokenSwap",1,1,1);YarnClient rmClient=YarnClient.createYarnClient()){
+      Configuration conf=new YarnConfiguration();
+      conf.setBoolean(YarnConfiguration.AMRM_PROXY_ENABLED,true);
+      cluster.init(conf);
+      cluster.start();
+      final Configuration yarnConf=cluster.getConfig();
+      rmClient.init(yarnConf);
+      rmClient.start();
+      ApplicationAttemptId appAttmptId=createApp(rmClient,cluster,conf);
+      ApplicationId appId=appAttmptId.getApplicationId();
+      client=createAMRMProtocol(rmClient,appId,cluster,yarnConf);
+      try {
+        client.registerApplicationMaster(RegisterApplicationMasterRequest.newInstance(NetUtils.getHostname(),1024,""));
+        Assert.fail();
+      }
+ catch (      IOException e) {
+        Assert.assertTrue(e.getMessage().startsWith("Invalid AMRMToken from appattempt_"));
+      }
+    }
+   }
+}

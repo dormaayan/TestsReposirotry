@@ -1,0 +1,68 @@
+@Test(timeout=100000) @SuppressWarnings("unchecked") public void testParallelDownloadAttemptsForPrivateResource() throws Exception {
+  DrainDispatcher dispatcher1=null;
+  try {
+    dispatcher1=new DrainDispatcher();
+    String user="testuser";
+    ApplicationId appId=BuilderUtils.newApplicationId(1,1);
+    List<Path> localDirs=new ArrayList<Path>();
+    String[] sDirs=new String[1];
+    for (int i=0; i < 1; ++i) {
+      localDirs.add(lfs.makeQualified(new Path(basedir,i + "")));
+      sDirs[i]=localDirs.get(i).toString();
+    }
+    conf.setStrings(YarnConfiguration.NM_LOCAL_DIRS,sDirs);
+    LocalDirsHandlerService localDirHandler=new LocalDirsHandlerService();
+    localDirHandler.init(conf);
+    EventHandler<ApplicationEvent> applicationBus=mock(EventHandler.class);
+    dispatcher1.register(ApplicationEventType.class,applicationBus);
+    EventHandler<ContainerEvent> containerBus=mock(EventHandler.class);
+    dispatcher1.register(ContainerEventType.class,containerBus);
+    ContainerExecutor exec=mock(ContainerExecutor.class);
+    DeletionService delService=mock(DeletionService.class);
+    LocalDirsHandlerService dirsHandler=new LocalDirsHandlerService();
+    dirsHandler.init(conf);
+    dispatcher1.init(conf);
+    dispatcher1.start();
+    ResourceLocalizationService rls=new ResourceLocalizationService(dispatcher1,exec,delService,localDirHandler,nmContext,metrics);
+    dispatcher1.register(LocalizationEventType.class,rls);
+    rls.init(conf);
+    rls.handle(createApplicationLocalizationEvent(user,appId));
+    LocalResourceRequest req=new LocalResourceRequest(new Path("file:///tmp"),123L,LocalResourceType.FILE,LocalResourceVisibility.PRIVATE,"");
+    Container container1=createMockContainer(user,1);
+    String localizerId1=container1.getContainerId().toString();
+    rls.getPrivateLocalizers().put(localizerId1,rls.new LocalizerRunner(new LocalizerContext(user,container1.getContainerId(),null),localizerId1));
+    LocalizerRunner localizerRunner1=rls.getLocalizerRunner(localizerId1);
+    dispatcher1.getEventHandler().handle(createContainerLocalizationEvent(container1,LocalResourceVisibility.PRIVATE,req));
+    Assert.assertTrue(waitForPrivateDownloadToStart(rls,localizerId1,1,5000));
+    ContainerImpl container2=createMockContainer(user,2);
+    String localizerId2=container2.getContainerId().toString();
+    rls.getPrivateLocalizers().put(localizerId2,rls.new LocalizerRunner(new LocalizerContext(user,container2.getContainerId(),null),localizerId2));
+    LocalizerRunner localizerRunner2=rls.getLocalizerRunner(localizerId2);
+    dispatcher1.getEventHandler().handle(createContainerLocalizationEvent(container2,LocalResourceVisibility.PRIVATE,req));
+    Assert.assertTrue(waitForPrivateDownloadToStart(rls,localizerId2,1,5000));
+    LocalResourcesTracker tracker=rls.getLocalResourcesTracker(LocalResourceVisibility.PRIVATE,user,appId);
+    LocalizedResource lr=tracker.getLocalizedResource(req);
+    Assert.assertEquals(ResourceState.DOWNLOADING,lr.getState());
+    Assert.assertEquals(1,lr.sem.availablePermits());
+    LocalizerHeartbeatResponse response1=rls.heartbeat(createLocalizerStatus(localizerId1));
+    Assert.assertEquals(1,localizerRunner1.scheduled.size());
+    Assert.assertEquals(req.getResource(),response1.getResourceSpecs().get(0).getResource().getResource());
+    Assert.assertEquals(0,lr.sem.availablePermits());
+    LocalizerHeartbeatResponse response2=rls.heartbeat(createLocalizerStatus(localizerId2));
+    Assert.assertEquals(0,localizerRunner2.scheduled.size());
+    Assert.assertEquals(0,response2.getResourceSpecs().size());
+    rls.heartbeat(createLocalizerStatusForFailedResource(localizerId1,req));
+    Assert.assertTrue(waitForResourceState(lr,rls,req,LocalResourceVisibility.PRIVATE,user,appId,ResourceState.FAILED,5000));
+    Assert.assertTrue(lr.getState().equals(ResourceState.FAILED));
+    Assert.assertEquals(0,localizerRunner1.scheduled.size());
+    response2=rls.heartbeat(createLocalizerStatus(localizerId2));
+    Assert.assertEquals(0,localizerRunner2.scheduled.size());
+    Assert.assertEquals(0,localizerRunner2.pending.size());
+    Assert.assertEquals(0,response2.getResourceSpecs().size());
+  }
+  finally {
+    if (dispatcher1 != null) {
+      dispatcher1.stop();
+    }
+  }
+}

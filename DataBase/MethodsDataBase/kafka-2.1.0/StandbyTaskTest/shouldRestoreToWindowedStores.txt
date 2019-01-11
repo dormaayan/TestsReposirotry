@@ -1,0 +1,22 @@
+@Test public void shouldRestoreToWindowedStores() throws IOException {
+  final String storeName="windowed-store";
+  final String changelogName=applicationId + "-" + storeName+ "-changelog";
+  final TopicPartition topicPartition=new TopicPartition(changelogName,1);
+  final List<TopicPartition> partitions=mkList(topicPartition);
+  consumer.assign(partitions);
+  final InternalTopologyBuilder internalTopologyBuilder=new InternalTopologyBuilder().setApplicationId(applicationId);
+  final InternalStreamsBuilder builder=new InternalStreamsBuilder(internalTopologyBuilder);
+  builder.stream(Collections.singleton("topic"),new ConsumedInternal<>()).groupByKey().windowedBy(TimeWindows.of(ofMillis(60_000)).grace(ofMillis(0L))).count(Materialized.<Object,Long,WindowStore<Bytes,byte[]>>as(storeName).withRetention(ofMillis(120_000L)));
+  builder.buildAndOptimizeTopology();
+  final StandbyTask task=new StandbyTask(taskId,partitions,internalTopologyBuilder.build(0),consumer,new StoreChangelogReader(restoreStateConsumer,Duration.ZERO,stateRestoreListener,new LogContext("standby-task-test ")),createConfig(baseDir),new MockStreamsMetrics(new Metrics()),stateDirectory);
+  task.initializeStateStores();
+  consumer.commitSync(mkMap(mkEntry(topicPartition,new OffsetAndMetadata(35L))));
+  task.commit();
+  final List<ConsumerRecord<byte[],byte[]>> remaining1=task.update(topicPartition,Arrays.asList(makeWindowedConsumerRecord(changelogName,10,1,0L,60_000L),makeWindowedConsumerRecord(changelogName,20,2,60_000L,120_000),makeWindowedConsumerRecord(changelogName,30,3,120_000L,180_000),makeWindowedConsumerRecord(changelogName,40,4,180_000L,240_000)));
+  assertEquals(Arrays.asList(new KeyValue<>(new Windowed<>(1,new TimeWindow(0,60_000)),100L),new KeyValue<>(new Windowed<>(2,new TimeWindow(60_000,120_000)),100L),new KeyValue<>(new Windowed<>(3,new TimeWindow(120_000,180_000)),100L)),getWindowedStoreContents(storeName,task));
+  consumer.commitSync(mkMap(mkEntry(topicPartition,new OffsetAndMetadata(45L))));
+  task.commit();
+  final List<ConsumerRecord<byte[],byte[]>> remaining2=task.update(topicPartition,remaining1);
+  assertEquals(emptyList(),remaining2);
+  assertEquals(Arrays.asList(new KeyValue<>(new Windowed<>(2,new TimeWindow(60_000,120_000)),100L),new KeyValue<>(new Windowed<>(3,new TimeWindow(120_000,180_000)),100L),new KeyValue<>(new Windowed<>(4,new TimeWindow(180_000,240_000)),100L)),getWindowedStoreContents(storeName,task));
+}

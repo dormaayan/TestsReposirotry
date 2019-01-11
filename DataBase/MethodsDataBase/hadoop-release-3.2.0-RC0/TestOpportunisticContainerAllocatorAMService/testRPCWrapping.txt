@@ -1,0 +1,59 @@
+@Test public void testRPCWrapping() throws Exception {
+  Configuration conf=new Configuration();
+  conf.set(YarnConfiguration.IPC_RPC_IMPL,HadoopYarnProtoRPC.class.getName());
+  YarnRPC rpc=YarnRPC.create(conf);
+  String bindAddr="localhost:0";
+  InetSocketAddress addr=NetUtils.createSocketAddr(bindAddr);
+  conf.setSocketAddr(YarnConfiguration.RM_SCHEDULER_ADDRESS,addr);
+  final RecordFactory factory=RecordFactoryProvider.getRecordFactory(null);
+  final RMContext rmContext=new RMContextImpl(){
+    @Override public AMLivelinessMonitor getAMLivelinessMonitor(){
+      return null;
+    }
+    @Override public Configuration getYarnConfiguration(){
+      return new YarnConfiguration();
+    }
+    @Override public RMContainerTokenSecretManager getContainerTokenSecretManager(){
+      return new RMContainerTokenSecretManager(conf);
+    }
+    @Override public ResourceScheduler getScheduler(){
+      return new FifoScheduler();
+    }
+  }
+;
+  Container c=factory.newRecordInstance(Container.class);
+  c.setExecutionType(ExecutionType.OPPORTUNISTIC);
+  c.setId(ContainerId.newContainerId(ApplicationAttemptId.newInstance(ApplicationId.newInstance(12345,1),2),3));
+  AllocateRequest allReq=(AllocateRequestPBImpl)factory.newRecordInstance(AllocateRequest.class);
+  allReq.setAskList(Arrays.asList(ResourceRequest.newInstance(Priority.UNDEFINED,"a",Resource.newInstance(1,2),1,true,"exp",ExecutionTypeRequest.newInstance(ExecutionType.OPPORTUNISTIC,true))));
+  OpportunisticContainerAllocatorAMService service=createService(factory,rmContext,c);
+  conf.setBoolean(YarnConfiguration.DIST_SCHEDULING_ENABLED,true);
+  Server server=service.getServer(rpc,conf,addr,null);
+  server.start();
+  RPC.setProtocolEngine(conf,ApplicationMasterProtocolPB.class,ProtobufRpcEngine.class);
+  ApplicationMasterProtocolPB ampProxy=RPC.getProxy(ApplicationMasterProtocolPB.class,1,NetUtils.getConnectAddress(server),conf);
+  RegisterApplicationMasterResponse regResp=new RegisterApplicationMasterResponsePBImpl(ampProxy.registerApplicationMaster(null,((RegisterApplicationMasterRequestPBImpl)factory.newRecordInstance(RegisterApplicationMasterRequest.class)).getProto()));
+  Assert.assertEquals("dummyQueue",regResp.getQueue());
+  FinishApplicationMasterResponse finishResp=new FinishApplicationMasterResponsePBImpl(ampProxy.finishApplicationMaster(null,((FinishApplicationMasterRequestPBImpl)factory.newRecordInstance(FinishApplicationMasterRequest.class)).getProto()));
+  Assert.assertEquals(false,finishResp.getIsUnregistered());
+  AllocateResponse allocResp=new AllocateResponsePBImpl(ampProxy.allocate(null,((AllocateRequestPBImpl)factory.newRecordInstance(AllocateRequest.class)).getProto()));
+  List<Container> allocatedContainers=allocResp.getAllocatedContainers();
+  Assert.assertEquals(1,allocatedContainers.size());
+  Assert.assertEquals(ExecutionType.OPPORTUNISTIC,allocatedContainers.get(0).getExecutionType());
+  Assert.assertEquals(12345,allocResp.getNumClusterNodes());
+  RPC.setProtocolEngine(conf,DistributedSchedulingAMProtocolPB.class,ProtobufRpcEngine.class);
+  DistributedSchedulingAMProtocolPB dsProxy=RPC.getProxy(DistributedSchedulingAMProtocolPB.class,1,NetUtils.getConnectAddress(server),conf);
+  RegisterDistributedSchedulingAMResponse dsRegResp=new RegisterDistributedSchedulingAMResponsePBImpl(dsProxy.registerApplicationMasterForDistributedScheduling(null,((RegisterApplicationMasterRequestPBImpl)factory.newRecordInstance(RegisterApplicationMasterRequest.class)).getProto()));
+  Assert.assertEquals(54321l,dsRegResp.getContainerIdStart());
+  Assert.assertEquals(4,dsRegResp.getMaxContainerResource().getVirtualCores());
+  Assert.assertEquals(1024,dsRegResp.getMinContainerResource().getMemorySize());
+  Assert.assertEquals(2,dsRegResp.getIncrContainerResource().getVirtualCores());
+  DistributedSchedulingAllocateRequestPBImpl distAllReq=(DistributedSchedulingAllocateRequestPBImpl)factory.newRecordInstance(DistributedSchedulingAllocateRequest.class);
+  distAllReq.setAllocateRequest(allReq);
+  distAllReq.setAllocatedContainers(Arrays.asList(c));
+  DistributedSchedulingAllocateResponse dsAllocResp=new DistributedSchedulingAllocateResponsePBImpl(dsProxy.allocateForDistributedScheduling(null,distAllReq.getProto()));
+  Assert.assertEquals("h1",dsAllocResp.getNodesForScheduling().get(0).getNodeId().getHost());
+  Assert.assertEquals("l1",dsAllocResp.getNodesForScheduling().get(1).getNodePartition());
+  FinishApplicationMasterResponse dsfinishResp=new FinishApplicationMasterResponsePBImpl(dsProxy.finishApplicationMaster(null,((FinishApplicationMasterRequestPBImpl)factory.newRecordInstance(FinishApplicationMasterRequest.class)).getProto()));
+  Assert.assertEquals(false,dsfinishResp.getIsUnregistered());
+}

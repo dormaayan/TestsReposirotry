@@ -1,0 +1,55 @@
+/** 
+ * CAUTION: If this test starts failing, please make sure that the {@link org.apache.hadoop.fs.s3a.Constants#MAX_THREADS} configuration is notset too low. Alternatively, consider reducing the <code>scale.test.operation.count</code> parameter in <code>getOperationCount()</code>.
+ * @see #getOperationCount()
+ */
+@Test public void testBulkRenameAndDelete() throws Throwable {
+  final Path scaleTestDir=path("testBulkRenameAndDelete");
+  final Path srcDir=new Path(scaleTestDir,"src");
+  final Path finalDir=new Path(scaleTestDir,"final");
+  final long count=getOperationCount();
+  final S3AFileSystem fs=getFileSystem();
+  ContractTestUtils.rm(fs,scaleTestDir,true,false);
+  fs.mkdirs(srcDir);
+  fs.mkdirs(finalDir);
+  int testBufferSize=fs.getConf().getInt(ContractTestUtils.IO_CHUNK_BUFFER_SIZE,ContractTestUtils.DEFAULT_IO_CHUNK_BUFFER_SIZE);
+  ExecutorService exec=Executors.newFixedThreadPool(16);
+  final ExecutorCompletionService<Boolean> completionService=new ExecutorCompletionService<>(exec);
+  try {
+    final byte[] data=ContractTestUtils.dataset(testBufferSize,'a','z');
+    for (int i=0; i < count; ++i) {
+      final String fileName="foo-" + i;
+      completionService.submit(new Callable<Boolean>(){
+        @Override public Boolean call() throws IOException {
+          ContractTestUtils.createFile(fs,new Path(srcDir,fileName),false,data);
+          return fs.exists(new Path(srcDir,fileName));
+        }
+      }
+);
+    }
+    for (int i=0; i < count; ++i) {
+      final Future<Boolean> future=completionService.take();
+      try {
+        if (!future.get()) {
+          LOG.warn("cannot create file");
+        }
+      }
+ catch (      ExecutionException e) {
+        LOG.warn("Error while uploading file",e.getCause());
+        throw e;
+      }
+    }
+  }
+  finally {
+    exec.shutdown();
+  }
+  int nSrcFiles=fs.listStatus(srcDir).length;
+  fs.rename(srcDir,finalDir);
+  assertEquals(nSrcFiles,fs.listStatus(finalDir).length);
+  ContractTestUtils.assertPathDoesNotExist(fs,"not deleted after rename",new Path(srcDir,"foo-" + 0));
+  ContractTestUtils.assertPathDoesNotExist(fs,"not deleted after rename",new Path(srcDir,"foo-" + count / 2));
+  ContractTestUtils.assertPathDoesNotExist(fs,"not deleted after rename",new Path(srcDir,"foo-" + (count - 1)));
+  ContractTestUtils.assertPathExists(fs,"not renamed to dest dir",new Path(finalDir,"foo-" + 0));
+  ContractTestUtils.assertPathExists(fs,"not renamed to dest dir",new Path(finalDir,"foo-" + count / 2));
+  ContractTestUtils.assertPathExists(fs,"not renamed to dest dir",new Path(finalDir,"foo-" + (count - 1)));
+  ContractTestUtils.assertDeleted(fs,finalDir,true,false);
+}

@@ -1,0 +1,68 @@
+@Test(timeout=20000) @SuppressWarnings("unchecked") public void testFailedPublicResource() throws Exception {
+  List<Path> localDirs=new ArrayList<Path>();
+  String[] sDirs=new String[4];
+  for (int i=0; i < 4; ++i) {
+    localDirs.add(lfs.makeQualified(new Path(basedir,i + "")));
+    sDirs[i]=localDirs.get(i).toString();
+  }
+  conf.setStrings(YarnConfiguration.NM_LOCAL_DIRS,sDirs);
+  DrainDispatcher dispatcher=new DrainDispatcher();
+  EventHandler<ApplicationEvent> applicationBus=mock(EventHandler.class);
+  dispatcher.register(ApplicationEventType.class,applicationBus);
+  EventHandler<ContainerEvent> containerBus=mock(EventHandler.class);
+  dispatcher.register(ContainerEventType.class,containerBus);
+  ContainerExecutor exec=mock(ContainerExecutor.class);
+  DeletionService delService=mock(DeletionService.class);
+  LocalDirsHandlerService dirsHandler=new LocalDirsHandlerService();
+  dirsHandler.init(conf);
+  dispatcher.init(conf);
+  dispatcher.start();
+  try {
+    ResourceLocalizationService rawService=new ResourceLocalizationService(dispatcher,exec,delService,dirsHandler,nmContext,metrics);
+    ResourceLocalizationService spyService=spy(rawService);
+    doReturn(mockServer).when(spyService).createServer();
+    doReturn(lfs).when(spyService).getLocalFileContext(isA(Configuration.class));
+    spyService.init(conf);
+    spyService.start();
+    final String user="user0";
+    final Application app=mock(Application.class);
+    final ApplicationId appId=BuilderUtils.newApplicationId(314159265358979L,3);
+    when(app.getUser()).thenReturn(user);
+    when(app.getAppId()).thenReturn(appId);
+    spyService.handle(new ApplicationLocalizationEvent(LocalizationEventType.INIT_APPLICATION_RESOURCES,app));
+    dispatcher.await();
+    final Container c=getMockContainer(appId,42,user);
+    Random r=new Random();
+    long seed=r.nextLong();
+    System.out.println("SEED: " + seed);
+    r.setSeed(seed);
+    final CyclicBarrier barrier=new CyclicBarrier(2);
+    doAnswer(new Answer<Void>(){
+      public Void answer(      InvocationOnMock invocation) throws IOException {
+        try {
+          barrier.await();
+        }
+ catch (        InterruptedException e) {
+        }
+catch (        BrokenBarrierException e) {
+        }
+        throw new IOException("forced failure");
+      }
+    }
+).when(spylfs).setPermission(isA(Path.class),isA(FsPermission.class));
+    final LocalResource pubResource=getPublicMockedResource(r);
+    final LocalResourceRequest pubReq=new LocalResourceRequest(pubResource);
+    Map<LocalResourceVisibility,Collection<LocalResourceRequest>> req=new HashMap<LocalResourceVisibility,Collection<LocalResourceRequest>>();
+    req.put(LocalResourceVisibility.PUBLIC,Collections.singletonList(pubReq));
+    Set<LocalResourceRequest> pubRsrcs=new HashSet<LocalResourceRequest>();
+    pubRsrcs.add(pubReq);
+    spyService.handle(new ContainerLocalizationRequestEvent(c,req));
+    spyService.handle(new ContainerLocalizationRequestEvent(c,req));
+    dispatcher.await();
+    barrier.await();
+    verify(containerBus,timeout(5000).times(2)).handle(isA(ContainerResourceFailedEvent.class));
+  }
+  finally {
+    dispatcher.stop();
+  }
+}

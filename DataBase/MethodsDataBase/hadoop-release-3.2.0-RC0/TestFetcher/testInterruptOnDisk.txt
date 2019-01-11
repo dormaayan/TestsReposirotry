@@ -1,0 +1,36 @@
+@Test(timeout=10000) public void testInterruptOnDisk() throws Exception {
+  final int FETCHER=7;
+  Path p=new Path("file:///tmp/foo");
+  Path pTmp=OnDiskMapOutput.getTempPath(p,FETCHER);
+  FileSystem mFs=mock(FileSystem.class,RETURNS_DEEP_STUBS);
+  IFileWrappedMapOutput<Text,Text> odmo=spy(new OnDiskMapOutput<Text,Text>(map1ID,mm,100L,job,FETCHER,true,mFs,p));
+  when(mm.reserve(any(TaskAttemptID.class),anyLong(),anyInt())).thenReturn(odmo);
+  doNothing().when(mm).waitForResource();
+  when(ss.getHost()).thenReturn(host);
+  String replyHash=SecureShuffleUtils.generateHash(encHash.getBytes(),key);
+  when(connection.getResponseCode()).thenReturn(200);
+  when(connection.getHeaderField(SecureShuffleUtils.HTTP_HEADER_REPLY_URL_HASH)).thenReturn(replyHash);
+  ShuffleHeader header=new ShuffleHeader(map1ID.toString(),10,10,1);
+  ByteArrayOutputStream bout=new ByteArrayOutputStream();
+  header.write(new DataOutputStream(bout));
+  final StuckInputStream in=new StuckInputStream(new ByteArrayInputStream(bout.toByteArray()));
+  when(connection.getInputStream()).thenReturn(in);
+  when(connection.getHeaderField(ShuffleHeader.HTTP_HEADER_NAME)).thenReturn(ShuffleHeader.DEFAULT_HTTP_HEADER_NAME);
+  when(connection.getHeaderField(ShuffleHeader.HTTP_HEADER_VERSION)).thenReturn(ShuffleHeader.DEFAULT_HTTP_HEADER_VERSION);
+  doAnswer(new Answer<Void>(){
+    public Void answer(    InvocationOnMock ignore) throws IOException {
+      in.close();
+      return null;
+    }
+  }
+).when(connection).disconnect();
+  Fetcher<Text,Text> underTest=new FakeFetcher<Text,Text>(job,id,ss,mm,r,metrics,except,key,connection,FETCHER);
+  underTest.start();
+  in.waitForFetcher();
+  underTest.shutDown();
+  underTest.join();
+  assertTrue(in.wasClosedProperly());
+  verify(mFs).create(eq(pTmp));
+  verify(mFs).delete(eq(pTmp),eq(false));
+  verify(odmo).abort();
+}

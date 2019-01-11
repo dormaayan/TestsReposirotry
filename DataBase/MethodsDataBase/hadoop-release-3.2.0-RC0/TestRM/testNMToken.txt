@@ -1,0 +1,77 @@
+@Test(timeout=40000) public void testNMToken() throws Exception {
+  MockRM rm=new MockRM(conf);
+  try {
+    rm.start();
+    MockNM nm1=rm.registerNode("h1:1234",10000);
+    NMTokenSecretManagerInRM nmTokenSecretManager=rm.getRMContext().getNMTokenSecretManager();
+    RMApp app=rm.submitApp(1000);
+    nm1.nodeHeartbeat(true);
+    RMAppAttempt attempt=app.getCurrentAppAttempt();
+    MockAM am=rm.sendAMLaunched(attempt.getAppAttemptId());
+    Assert.assertTrue(nmTokenSecretManager.isApplicationAttemptRegistered(attempt.getAppAttemptId()));
+    am.registerAppAttempt();
+    ArrayList<Container> containersReceivedForNM1=new ArrayList<Container>();
+    List<ContainerId> releaseContainerList=new ArrayList<ContainerId>();
+    HashMap<String,Token> nmTokens=new HashMap<String,Token>();
+    AllocateResponse response=am.allocate("h1",1000,2,releaseContainerList);
+    Assert.assertEquals(0,response.getAllocatedContainers().size());
+    allocateContainersAndValidateNMTokens(am,containersReceivedForNM1,2,nmTokens,nm1);
+    Assert.assertEquals(1,nmTokens.size());
+    response=am.allocate("h1",1000,2,releaseContainerList);
+    Assert.assertEquals(0,response.getAllocatedContainers().size());
+    allocateContainersAndValidateNMTokens(am,containersReceivedForNM1,4,nmTokens,nm1);
+    Assert.assertEquals(1,nmTokens.size());
+    MockNM nm2=rm.registerNode("h2:1234",10000);
+    nm2.nodeHeartbeat(true);
+    ArrayList<Container> containersReceivedForNM2=new ArrayList<Container>();
+    response=am.allocate("h2",1000,2,releaseContainerList);
+    Assert.assertEquals(0,response.getAllocatedContainers().size());
+    allocateContainersAndValidateNMTokens(am,containersReceivedForNM2,2,nmTokens,nm2);
+    Assert.assertEquals(2,nmTokens.size());
+    nm2=rm.registerNode("h2:1234",10000);
+    Map<NodeId,RMNode> nodes=rm.getRMContext().getRMNodes();
+    while (nodes.get(nm2.getNodeId()).getLastNodeHeartBeatResponse().getResponseId() > 0) {
+      Thread.sleep(WAIT_SLEEP_MS);
+    }
+    int interval=40;
+    while (nmTokenSecretManager.isApplicationAttemptNMTokenPresent(attempt.getAppAttemptId(),nm2.getNodeId()) && interval-- > 0) {
+      LOG.info("waiting for nmToken to be cleared for : " + nm2.getNodeId());
+      Thread.sleep(WAIT_SLEEP_MS);
+    }
+    Assert.assertTrue(nmTokenSecretManager.isApplicationAttemptRegistered(attempt.getAppAttemptId()));
+    nmTokens.remove(nm2.getNodeId().toString());
+    Assert.assertEquals(1,nmTokens.size());
+    response=am.allocate("h2",1000,2,releaseContainerList);
+    Assert.assertEquals(0,response.getAllocatedContainers().size());
+    allocateContainersAndValidateNMTokens(am,containersReceivedForNM2,4,nmTokens,nm2);
+    Assert.assertEquals(2,nmTokens.size());
+    Assert.assertTrue(nmTokenSecretManager.isApplicationAttemptNMTokenPresent(attempt.getAppAttemptId(),nm1.getNodeId()));
+    Assert.assertTrue(nmTokenSecretManager.isApplicationAttemptNMTokenPresent(attempt.getAppAttemptId(),nm2.getNodeId()));
+    nmTokenSecretManager.rollMasterKey();
+    nmTokenSecretManager.activateNextMasterKey();
+    Assert.assertFalse(nmTokenSecretManager.isApplicationAttemptNMTokenPresent(attempt.getAppAttemptId(),nm1.getNodeId()));
+    Assert.assertFalse(nmTokenSecretManager.isApplicationAttemptNMTokenPresent(attempt.getAppAttemptId(),nm2.getNodeId()));
+    Assert.assertTrue(nmTokenSecretManager.isApplicationAttemptRegistered(attempt.getAppAttemptId()));
+    nmTokens.clear();
+    Assert.assertEquals(0,nmTokens.size());
+    response=am.allocate("h2",1000,1,releaseContainerList);
+    Assert.assertEquals(0,response.getAllocatedContainers().size());
+    allocateContainersAndValidateNMTokens(am,containersReceivedForNM2,5,nmTokens,nm2);
+    Assert.assertEquals(1,nmTokens.size());
+    Assert.assertTrue(nmTokenSecretManager.isApplicationAttemptNMTokenPresent(attempt.getAppAttemptId(),nm2.getNodeId()));
+    Assert.assertTrue(nmTokenSecretManager.isApplicationAttemptRegistered(attempt.getAppAttemptId()));
+    am.unregisterAppAttempt();
+    for (    Container container : containersReceivedForNM1) {
+      nm1.nodeHeartbeat(attempt.getAppAttemptId(),container.getId().getContainerId(),ContainerState.COMPLETE);
+    }
+    for (    Container container : containersReceivedForNM2) {
+      nm2.nodeHeartbeat(attempt.getAppAttemptId(),container.getId().getContainerId(),ContainerState.COMPLETE);
+    }
+    nm1.nodeHeartbeat(am.getApplicationAttemptId(),1,ContainerState.COMPLETE);
+    rm.waitForState(am.getApplicationAttemptId(),RMAppAttemptState.FINISHED);
+    Assert.assertFalse(nmTokenSecretManager.isApplicationAttemptRegistered(attempt.getAppAttemptId()));
+  }
+  finally {
+    rm.stop();
+  }
+}

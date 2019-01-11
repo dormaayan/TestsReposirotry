@@ -1,0 +1,33 @@
+@Test(timeout=60000) public void testAppAttemptTokensRestoredOnRMRestart() throws Exception {
+  conf.setInt(YarnConfiguration.RM_AM_MAX_ATTEMPTS,2);
+  conf.set(CommonConfigurationKeysPublic.HADOOP_SECURITY_AUTHENTICATION,"kerberos");
+  UserGroupInformation.setConfiguration(conf);
+  MockRM rm1=new TestSecurityMockRM(conf);
+  MemoryRMStateStore memStore=(MemoryRMStateStore)rm1.getRMStateStore();
+  Map<ApplicationId,ApplicationStateData> rmAppState=memStore.getState().getApplicationState();
+  rm1.start();
+  MockNM nm1=new MockNM("0.0.0.0:4321",15120,rm1.getResourceTrackerService());
+  nm1.registerNode();
+  RMApp app1=rm1.submitApp(200,"name","user",new HashMap<ApplicationAccessType,String>(),"default");
+  ApplicationStateData appState=rmAppState.get(app1.getApplicationId());
+  Assert.assertNotNull(appState);
+  nm1.nodeHeartbeat(true);
+  RMAppAttempt attempt1=app1.getCurrentAppAttempt();
+  ApplicationAttemptId attemptId1=attempt1.getAppAttemptId();
+  rm1.waitForState(attemptId1,RMAppAttemptState.ALLOCATED);
+  ApplicationAttemptStateData attemptState=appState.getAttempt(attemptId1);
+  Assert.assertNotNull(attemptState);
+  Assert.assertEquals(BuilderUtils.newContainerId(attemptId1,1),attemptState.getMasterContainer().getId());
+  byte[] clientTokenMasterKey=attempt1.getClientTokenMasterKey().getEncoded();
+  Credentials savedCredentials=attemptState.getAppAttemptTokens();
+  Assert.assertArrayEquals("client token master key not saved",clientTokenMasterKey,savedCredentials.getSecretKey(RMStateStore.AM_CLIENT_TOKEN_MASTER_KEY_NAME));
+  MockRM rm2=new TestSecurityMockRM(conf,memStore);
+  rm2.start();
+  RMApp loadedApp1=rm2.getRMContext().getRMApps().get(app1.getApplicationId());
+  RMAppAttempt loadedAttempt1=loadedApp1.getRMAppAttempt(attemptId1);
+  Assert.assertNotNull(loadedAttempt1);
+  Assert.assertEquals("client token master key not restored",attempt1.getClientTokenMasterKey(),loadedAttempt1.getClientTokenMasterKey());
+  Assert.assertArrayEquals(clientTokenMasterKey,rm2.getClientToAMTokenSecretManager().getMasterKey(attemptId1).getEncoded());
+  Token<AMRMTokenIdentifier> amrmToken=loadedAttempt1.getAMRMToken();
+  Assert.assertArrayEquals(amrmToken.getPassword(),rm2.getRMContext().getAMRMTokenSecretManager().retrievePassword(amrmToken.decodeIdentifier()));
+}

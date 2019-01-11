@@ -1,0 +1,41 @@
+@Test public void flowControlProperlyChunksLargeMessage() throws Exception {
+  final Http2Headers headers=dummyHeaders();
+  final int length=10485760;
+  final ByteBuf data=randomBytes(length);
+  final ByteArrayOutputStream out=new ByteArrayOutputStream(length);
+  doAnswer(new Answer<Integer>(){
+    @Override public Integer answer(    InvocationOnMock in) throws Throwable {
+      ByteBuf buf=(ByteBuf)in.getArguments()[2];
+      int padding=(Integer)in.getArguments()[3];
+      int processedBytes=buf.readableBytes() + padding;
+      buf.readBytes(out,buf.readableBytes());
+      return processedBytes;
+    }
+  }
+).when(serverListener).onDataRead(any(ChannelHandlerContext.class),eq(3),any(ByteBuf.class),eq(0),anyBoolean());
+  try {
+    bootstrapEnv(length,1,2,1);
+    runInChannel(clientChannel,new Http2Runnable(){
+      @Override public void run() throws Http2Exception {
+        http2Client.encoder().writeHeaders(ctx(),3,headers,0,(short)16,false,0,false,newPromise());
+        http2Client.encoder().writeData(ctx(),3,data.retainedDuplicate(),0,false,newPromise());
+        http2Client.encoder().writeHeaders(ctx(),3,headers,0,(short)16,false,0,true,newPromise());
+        http2Client.flush(ctx());
+      }
+    }
+);
+    assertTrue(serverSettingsAckLatch.await(DEFAULT_AWAIT_TIMEOUT_SECONDS,SECONDS));
+    assertTrue(trailersLatch.await(DEFAULT_AWAIT_TIMEOUT_SECONDS,SECONDS));
+    verify(serverListener).onHeadersRead(any(ChannelHandlerContext.class),eq(3),eq(headers),eq(0),eq((short)16),eq(false),eq(0),eq(false));
+    verify(serverListener).onHeadersRead(any(ChannelHandlerContext.class),eq(3),eq(headers),eq(0),eq((short)16),eq(false),eq(0),eq(true));
+    assertEquals(0,dataLatch.getCount());
+    out.flush();
+    byte[] received=out.toByteArray();
+    assertArrayEquals(data.array(),received);
+  }
+  finally {
+    setClientGracefulShutdownTime(0);
+    data.release();
+    out.close();
+  }
+}

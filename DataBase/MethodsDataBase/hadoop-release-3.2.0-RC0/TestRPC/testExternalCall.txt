@@ -1,0 +1,50 @@
+@Test(timeout=30000) public void testExternalCall() throws Exception {
+  final UserGroupInformation ugi=UserGroupInformation.createUserForTesting("user123",new String[0]);
+  final IOException expectedIOE=new IOException("boom");
+  final Server server=setupTestServer(conf,1);
+  try {
+    final AtomicBoolean result=new AtomicBoolean();
+    ExternalCall<String> remoteUserCall=newExtCall(ugi,new PrivilegedExceptionAction<String>(){
+      @Override public String run() throws Exception {
+        return UserGroupInformation.getCurrentUser().getUserName();
+      }
+    }
+);
+    ExternalCall<String> exceptionCall=newExtCall(ugi,new PrivilegedExceptionAction<String>(){
+      @Override public String run() throws Exception {
+        throw expectedIOE;
+      }
+    }
+);
+    final CountDownLatch latch=new CountDownLatch(1);
+    final CyclicBarrier barrier=new CyclicBarrier(2);
+    ExternalCall<Void> barrierCall=newExtCall(ugi,new PrivilegedExceptionAction<Void>(){
+      @Override public Void run() throws Exception {
+        latch.countDown();
+        barrier.await();
+        return null;
+      }
+    }
+);
+    server.queueCall(barrierCall);
+    server.queueCall(exceptionCall);
+    server.queueCall(remoteUserCall);
+    latch.await();
+    assertEquals(2,server.getCallQueueLen());
+    barrier.await();
+    barrierCall.get();
+    String answer=remoteUserCall.get();
+    assertEquals(ugi.getUserName(),answer);
+    try {
+      exceptionCall.get();
+      fail("didn't throw");
+    }
+ catch (    ExecutionException ee) {
+      assertTrue((ee.getCause()) instanceof IOException);
+      assertEquals(expectedIOE.getMessage(),ee.getCause().getMessage());
+    }
+  }
+  finally {
+    server.stop();
+  }
+}

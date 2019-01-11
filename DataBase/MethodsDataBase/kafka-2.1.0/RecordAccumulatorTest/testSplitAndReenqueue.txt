@@ -1,0 +1,43 @@
+@Test public void testSplitAndReenqueue() throws ExecutionException, InterruptedException {
+  long now=time.milliseconds();
+  RecordAccumulator accum=createTestRecordAccumulator(1024,10 * 1024,CompressionType.GZIP,10);
+  ByteBuffer buffer=ByteBuffer.allocate(4096);
+  MemoryRecordsBuilder builder=MemoryRecords.builder(buffer,CompressionType.NONE,TimestampType.CREATE_TIME,0L);
+  ProducerBatch batch=new ProducerBatch(tp1,builder,now,true);
+  byte[] value=new byte[1024];
+  final AtomicInteger acked=new AtomicInteger(0);
+  Callback cb=new Callback(){
+    @Override public void onCompletion(    RecordMetadata metadata,    Exception exception){
+      acked.incrementAndGet();
+    }
+  }
+;
+  Future<RecordMetadata> future1=batch.tryAppend(now,null,value,Record.EMPTY_HEADERS,cb,now);
+  Future<RecordMetadata> future2=batch.tryAppend(now,null,value,Record.EMPTY_HEADERS,cb,now);
+  assertNotNull(future1);
+  assertNotNull(future2);
+  batch.close();
+  accum.reenqueue(batch,now);
+  time.sleep(101L);
+  RecordAccumulator.ReadyCheckResult result=accum.ready(cluster,time.milliseconds());
+  assertTrue("The batch should be ready",result.readyNodes.size() > 0);
+  Map<Integer,List<ProducerBatch>> drained=accum.drain(cluster,result.readyNodes,Integer.MAX_VALUE,time.milliseconds());
+  assertEquals("Only node1 should be drained",1,drained.size());
+  assertEquals("Only one batch should be drained",1,drained.get(node1.id()).size());
+  accum.splitAndReenqueue(drained.get(node1.id()).get(0));
+  time.sleep(101L);
+  drained=accum.drain(cluster,result.readyNodes,Integer.MAX_VALUE,time.milliseconds());
+  assertFalse(drained.isEmpty());
+  assertFalse(drained.get(node1.id()).isEmpty());
+  drained.get(node1.id()).get(0).done(acked.get(),100L,null);
+  assertEquals("The first message should have been acked.",1,acked.get());
+  assertTrue(future1.isDone());
+  assertEquals(0,future1.get().offset());
+  drained=accum.drain(cluster,result.readyNodes,Integer.MAX_VALUE,time.milliseconds());
+  assertFalse(drained.isEmpty());
+  assertFalse(drained.get(node1.id()).isEmpty());
+  drained.get(node1.id()).get(0).done(acked.get(),100L,null);
+  assertEquals("Both message should have been acked.",2,acked.get());
+  assertTrue(future2.isDone());
+  assertEquals(1,future2.get().offset());
+}

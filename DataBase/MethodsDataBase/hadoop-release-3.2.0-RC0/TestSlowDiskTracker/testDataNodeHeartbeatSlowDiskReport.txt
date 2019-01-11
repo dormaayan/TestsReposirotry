@@ -1,0 +1,41 @@
+@Test public void testDataNodeHeartbeatSlowDiskReport() throws Exception {
+  MiniDFSCluster cluster=new MiniDFSCluster.Builder(conf).numDataNodes(2).build();
+  try {
+    DataNode dn1=cluster.getDataNodes().get(0);
+    DataNode dn2=cluster.getDataNodes().get(1);
+    NameNode nn=cluster.getNameNode(0);
+    DatanodeManager datanodeManager=nn.getNamesystem().getBlockManager().getDatanodeManager();
+    SlowDiskTracker slowDiskTracker=datanodeManager.getSlowDiskTracker();
+    slowDiskTracker.setReportValidityMs(OUTLIERS_REPORT_INTERVAL * 100);
+    dn1.getDiskMetrics().addSlowDiskForTesting("disk1",ImmutableMap.of(DiskOp.WRITE,1.3));
+    dn1.getDiskMetrics().addSlowDiskForTesting("disk2",ImmutableMap.of(DiskOp.READ,1.6,DiskOp.WRITE,1.1));
+    dn2.getDiskMetrics().addSlowDiskForTesting("disk1",ImmutableMap.of(DiskOp.METADATA,0.8));
+    dn2.getDiskMetrics().addSlowDiskForTesting("disk2",ImmutableMap.of(DiskOp.WRITE,1.3));
+    String dn1ID=dn1.getDatanodeId().getIpcAddr(false);
+    String dn2ID=dn2.getDatanodeId().getIpcAddr(false);
+    Thread.sleep(OUTLIERS_REPORT_INTERVAL);
+    GenericTestUtils.waitFor(new Supplier<Boolean>(){
+      @Override public Boolean get(){
+        return (slowDiskTracker.getSlowDisksReport().size() == 4);
+      }
+    }
+,1000,100000);
+    Map<String,DiskLatency> slowDisksReport=getSlowDisksReportForTesting(slowDiskTracker);
+    assertThat(slowDisksReport.size(),is(4));
+    assertTrue(Math.abs(slowDisksReport.get(dn1ID + ":disk1").getLatency(DiskOp.WRITE) - 1.3) < 0.0000001);
+    assertTrue(Math.abs(slowDisksReport.get(dn1ID + ":disk2").getLatency(DiskOp.READ) - 1.6) < 0.0000001);
+    assertTrue(Math.abs(slowDisksReport.get(dn1ID + ":disk2").getLatency(DiskOp.WRITE) - 1.1) < 0.0000001);
+    assertTrue(Math.abs(slowDisksReport.get(dn2ID + ":disk1").getLatency(DiskOp.METADATA) - 0.8) < 0.0000001);
+    assertTrue(Math.abs(slowDisksReport.get(dn2ID + ":disk2").getLatency(DiskOp.WRITE) - 1.3) < 0.0000001);
+    ArrayList<DiskLatency> jsonReport=getAndDeserializeJson(slowDiskTracker.getSlowDiskReportAsJsonString());
+    assertThat(jsonReport.size(),is(4));
+    assertTrue(isDiskInReports(jsonReport,dn1ID,"disk1",DiskOp.WRITE,1.3));
+    assertTrue(isDiskInReports(jsonReport,dn1ID,"disk2",DiskOp.READ,1.6));
+    assertTrue(isDiskInReports(jsonReport,dn1ID,"disk2",DiskOp.WRITE,1.1));
+    assertTrue(isDiskInReports(jsonReport,dn2ID,"disk1",DiskOp.METADATA,0.8));
+    assertTrue(isDiskInReports(jsonReport,dn2ID,"disk2",DiskOp.WRITE,1.3));
+  }
+  finally {
+    cluster.shutdown();
+  }
+}

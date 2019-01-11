@@ -1,0 +1,57 @@
+@Test(timeout=60000) public void testDownloadPublicWithStatCache() throws IOException, URISyntaxException, InterruptedException, ExecutionException {
+  FileContext files=FileContext.getLocalFSFileContext(conf);
+  Path basedir=files.makeQualified(new Path("target",TestFSDownload.class.getSimpleName()));
+  FileSystem f=basedir.getFileSystem(conf);
+  assumeTrue(FSDownload.ancestorsHaveExecutePermissions(f,basedir,null));
+  files.mkdir(basedir,null,true);
+  conf.setStrings(TestFSDownload.class.getName(),basedir.toString());
+  int size=512;
+  final ConcurrentMap<Path,AtomicInteger> counts=new ConcurrentHashMap<Path,AtomicInteger>();
+  final CacheLoader<Path,Future<FileStatus>> loader=FSDownload.createStatusCacheLoader(conf);
+  final LoadingCache<Path,Future<FileStatus>> statCache=CacheBuilder.newBuilder().build(new CacheLoader<Path,Future<FileStatus>>(){
+    public Future<FileStatus> load(    Path path) throws Exception {
+      AtomicInteger count=counts.get(path);
+      if (count == null) {
+        count=new AtomicInteger(0);
+        AtomicInteger existing=counts.putIfAbsent(path,count);
+        if (existing != null) {
+          count=existing;
+        }
+      }
+      count.incrementAndGet();
+      return loader.load(path);
+    }
+  }
+);
+  final int fileCount=3;
+  List<Callable<Boolean>> tasks=new ArrayList<Callable<Boolean>>();
+  for (int i=0; i < fileCount; i++) {
+    Random rand=new Random();
+    long sharedSeed=rand.nextLong();
+    rand.setSeed(sharedSeed);
+    System.out.println("SEED: " + sharedSeed);
+    final Path path=new Path(basedir,"test-file-" + i);
+    createFile(files,path,size,rand);
+    final FileSystem fs=path.getFileSystem(conf);
+    final FileStatus sStat=fs.getFileStatus(path);
+    tasks.add(new Callable<Boolean>(){
+      public Boolean call() throws IOException {
+        return FSDownload.isPublic(fs,path,sStat,statCache);
+      }
+    }
+);
+  }
+  ExecutorService exec=HadoopExecutors.newFixedThreadPool(fileCount);
+  try {
+    List<Future<Boolean>> futures=exec.invokeAll(tasks);
+    for (    Future<Boolean> future : futures) {
+      assertTrue(future.get());
+    }
+    for (    AtomicInteger count : counts.values()) {
+      assertSame(count.get(),1);
+    }
+  }
+  finally {
+    exec.shutdown();
+  }
+}

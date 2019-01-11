@@ -1,0 +1,46 @@
+@Test public void shouldRestoreStateFromSourceTopic() throws Exception {
+  final AtomicInteger numReceived=new AtomicInteger(0);
+  final StreamsBuilder builder=new StreamsBuilder();
+  final Properties props=props(APPID);
+  props.put(StreamsConfig.TOPOLOGY_OPTIMIZATION,StreamsConfig.OPTIMIZE);
+  final int offsetLimitDelta=1000;
+  final int offsetCheckpointed=1000;
+  createStateForRestoration(INPUT_STREAM);
+  setCommittedOffset(INPUT_STREAM,offsetLimitDelta);
+  final StateDirectory stateDirectory=new StateDirectory(new StreamsConfig(props),new MockTime());
+  new OffsetCheckpoint(new File(stateDirectory.directoryForTask(new TaskId(0,0)),".checkpoint")).write(Collections.singletonMap(new TopicPartition(INPUT_STREAM,0),(long)offsetCheckpointed));
+  new OffsetCheckpoint(new File(stateDirectory.directoryForTask(new TaskId(0,1)),".checkpoint")).write(Collections.singletonMap(new TopicPartition(INPUT_STREAM,1),(long)offsetCheckpointed));
+  final CountDownLatch startupLatch=new CountDownLatch(1);
+  final CountDownLatch shutdownLatch=new CountDownLatch(1);
+  builder.table(INPUT_STREAM,Consumed.with(Serdes.Integer(),Serdes.Integer())).toStream().foreach(new ForeachAction<Integer,Integer>(){
+    @Override public void apply(    final Integer key,    final Integer value){
+      if (numReceived.incrementAndGet() == 2 * offsetLimitDelta)       shutdownLatch.countDown();
+    }
+  }
+);
+  kafkaStreams=new KafkaStreams(builder.build(),props);
+  kafkaStreams.setStateListener(new KafkaStreams.StateListener(){
+    @Override public void onChange(    final KafkaStreams.State newState,    final KafkaStreams.State oldState){
+      if (newState == KafkaStreams.State.RUNNING && oldState == KafkaStreams.State.REBALANCING) {
+        startupLatch.countDown();
+      }
+    }
+  }
+);
+  final AtomicLong restored=new AtomicLong(0);
+  kafkaStreams.setGlobalStateRestoreListener(new StateRestoreListener(){
+    @Override public void onRestoreStart(    final TopicPartition topicPartition,    final String storeName,    final long startingOffset,    final long endingOffset){
+    }
+    @Override public void onBatchRestored(    final TopicPartition topicPartition,    final String storeName,    final long batchEndOffset,    final long numRestored){
+    }
+    @Override public void onRestoreEnd(    final TopicPartition topicPartition,    final String storeName,    final long totalRestored){
+      restored.addAndGet(totalRestored);
+    }
+  }
+);
+  kafkaStreams.start();
+  assertTrue(startupLatch.await(30,TimeUnit.SECONDS));
+  assertThat(restored.get(),equalTo((long)numberOfKeys - offsetLimitDelta * 2 - offsetCheckpointed * 2));
+  assertTrue(shutdownLatch.await(30,TimeUnit.SECONDS));
+  assertThat(numReceived.get(),equalTo(offsetLimitDelta * 2));
+}

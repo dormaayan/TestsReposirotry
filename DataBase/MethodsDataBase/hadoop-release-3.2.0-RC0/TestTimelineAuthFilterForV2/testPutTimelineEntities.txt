@@ -1,0 +1,63 @@
+@Test public void testPutTimelineEntities() throws Exception {
+  final String entityType="dummy_type";
+  ApplicationId appId=ApplicationId.newInstance(0,1);
+  File entityTypeDir=new File(TEST_ROOT_DIR.getAbsolutePath() + File.separator + "entities"+ File.separator+ YarnConfiguration.DEFAULT_RM_CLUSTER_ID+ File.separator+ UserGroupInformation.getCurrentUser().getUserName()+ File.separator+ "test_flow_name"+ File.separator+ "test_flow_version"+ File.separator+ "1"+ File.separator+ appId.toString()+ File.separator+ entityType);
+  try {
+    if (withKerberosLogin) {
+      KerberosTestUtils.doAs(HTTP_USER + "/localhost",new Callable<Void>(){
+        @Override public Void call() throws Exception {
+          publishAndVerifyEntity(appId,entityTypeDir,entityType,1);
+          return null;
+        }
+      }
+);
+    }
+ else {
+      assertTrue("Entities should have been published successfully.",publishWithRetries(appId,entityTypeDir,entityType,1));
+      AppLevelTimelineCollector collector=(AppLevelTimelineCollector)collectorManager.get(appId);
+      Token<TimelineDelegationTokenIdentifier> token=collector.getDelegationTokenForApp();
+      assertNotNull(token);
+      Thread.sleep(1000);
+      assertTrue("Entities should have been published successfully.",publishWithRetries(appId,entityTypeDir,entityType,2));
+      assertNotNull(collector);
+      verify(collectorManager.getTokenManagerService(),atLeastOnce()).renewToken(eq(collector.getDelegationTokenForApp()),any(String.class));
+      Thread.sleep(3000);
+      for (int i=0; i < 40; i++) {
+        if (!token.equals(collector.getDelegationTokenForApp())) {
+          break;
+        }
+        Thread.sleep(50);
+      }
+      assertNotEquals("Token should have been regenerated.",token,collector.getDelegationTokenForApp());
+      Thread.sleep(1000);
+      try {
+        publishAndVerifyEntity(appId,entityTypeDir,entityType,2);
+        fail("Exception should have been thrown due to Invalid Token.");
+      }
+ catch (      YarnException e) {
+        assertTrue("Exception thrown should have been due to Invalid Token.",e.getCause().getMessage().contains("InvalidToken"));
+      }
+      Token<TimelineDelegationTokenIdentifier> regeneratedToken=collector.getDelegationTokenForApp();
+      regeneratedToken.setService(new Text("localhost" + regeneratedToken.getService().toString().substring(regeneratedToken.getService().toString().indexOf(":"))));
+      UserGroupInformation.getCurrentUser().addToken(regeneratedToken);
+      assertTrue("Entities should have been published successfully.",publishWithRetries(appId,entityTypeDir,entityType,2));
+      verify(collectorManager.getTokenManagerService(),times(2)).generateToken(any(UserGroupInformation.class),any(String.class));
+      assertEquals(1,((DummyNodeTimelineCollectorManager)collectorManager).getTokenExpiredCnt());
+    }
+    for (int i=0; i < 50; i++) {
+      if (entityTypeDir.listFiles().length == 2) {
+        break;
+      }
+      Thread.sleep(50);
+    }
+    assertEquals(2,entityTypeDir.listFiles().length);
+    verifyEntity(entityTypeDir,"entity2",entityType);
+    AppLevelTimelineCollector collector=(AppLevelTimelineCollector)collectorManager.get(appId);
+    assertNotNull(collector);
+    auxService.removeApplication(appId);
+    verify(collectorManager.getTokenManagerService()).cancelToken(eq(collector.getDelegationTokenForApp()),any(String.class));
+  }
+  finally {
+    FileUtils.deleteQuietly(entityTypeDir);
+  }
+}

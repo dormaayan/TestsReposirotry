@@ -1,0 +1,56 @@
+@Test(timeout=20000) public void testUnusableNodeTransition() throws Exception {
+  Configuration conf=new Configuration();
+  conf.set(MRJobConfig.MR_AM_STAGING_DIR,stagingDir);
+  conf.setInt(MRJobConfig.NUM_REDUCES,1);
+  DrainDispatcher dispatcher=new DrainDispatcher();
+  dispatcher.init(conf);
+  dispatcher.start();
+  CyclicBarrier syncBarrier=new CyclicBarrier(2);
+  OutputCommitter committer=new TestingOutputCommitter(syncBarrier,true);
+  CommitterEventHandler commitHandler=createCommitterEventHandler(dispatcher,committer);
+  commitHandler.init(conf);
+  commitHandler.start();
+  final JobImpl job=createRunningStubbedJob(conf,dispatcher,2,null);
+  EventHandler<TaskAttemptEvent> taskAttemptEventHandler=new EventHandler<TaskAttemptEvent>(){
+    @Override public void handle(    TaskAttemptEvent event){
+      if (event.getType() == TaskAttemptEventType.TA_KILL) {
+        job.decrementSucceededMapperCount();
+      }
+    }
+  }
+;
+  dispatcher.register(TaskAttemptEventType.class,taskAttemptEventHandler);
+  Map<TaskId,Task> spiedTasks=new HashMap<>();
+  List<NodeReport> nodeReports=new ArrayList<>();
+  Map<NodeReport,TaskId> nodeReportsToTaskIds=new HashMap<>();
+  createSpiedMapTasks(nodeReportsToTaskIds,spiedTasks,job,NodeState.UNHEALTHY,nodeReports);
+  job.tasks.putAll(spiedTasks);
+  for (  TaskId taskId : job.tasks.keySet()) {
+    if (taskId.getTaskType() == TaskType.MAP) {
+      TaskAttemptCompletionEvent tce=Records.newRecord(TaskAttemptCompletionEvent.class);
+      TaskAttemptId attemptId=MRBuilderUtils.newTaskAttemptId(taskId,0);
+      tce.setAttemptId(attemptId);
+      tce.setStatus(TaskAttemptCompletionEventStatus.SUCCEEDED);
+      job.handle(new JobTaskAttemptCompletedEvent(tce));
+      job.handle(new JobTaskEvent(taskId,TaskState.SUCCEEDED));
+      Assert.assertEquals(JobState.RUNNING,job.getState());
+    }
+  }
+  NodeReport firstMapperNodeReport=nodeReports.get(0);
+  NodeReport secondMapperNodeReport=nodeReports.get(1);
+  job.handle(new JobUpdatedNodesEvent(job.getID(),Collections.singletonList(firstMapperNodeReport)));
+  dispatcher.await();
+  for (  TaskId taskId : job.tasks.keySet()) {
+    if (taskId.getTaskType() == TaskType.REDUCE) {
+      job.handle(new JobTaskEvent(taskId,TaskState.SUCCEEDED));
+    }
+  }
+  job.handle(new JobUpdatedNodesEvent(job.getID(),Collections.singletonList(secondMapperNodeReport)));
+  TaskId firstMapper=nodeReportsToTaskIds.get(firstMapperNodeReport);
+  job.handle(new JobTaskEvent(firstMapper,TaskState.SUCCEEDED));
+  assertJobState(job,JobStateInternal.COMMITTING);
+  syncBarrier.await();
+  assertJobState(job,JobStateInternal.SUCCEEDED);
+  dispatcher.stop();
+  commitHandler.stop();
+}

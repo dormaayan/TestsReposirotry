@@ -1,0 +1,77 @@
+@Test public void testOpWrite() throws IOException {
+  int numDataNodes=1;
+  final long BLOCK_ID_FUDGE=128;
+  Configuration conf=new HdfsConfiguration();
+  MiniDFSCluster cluster=new MiniDFSCluster.Builder(conf).numDataNodes(numDataNodes).build();
+  try {
+    cluster.waitActive();
+    String poolId=cluster.getNamesystem().getBlockPoolId();
+    datanode=InternalDataNodeTestUtils.getDNRegistrationForBP(cluster.getDataNodes().get(0),poolId);
+    dnAddr=NetUtils.createSocketAddr(datanode.getXferAddr());
+    FileSystem fileSys=cluster.getFileSystem();
+    Path file=new Path("dataprotocol.dat");
+    DFSTestUtil.createFile(fileSys,file,1L,(short)numDataNodes,0L);
+    ExtendedBlock firstBlock=DFSTestUtil.getFirstBlock(fileSys,file);
+    testWrite(firstBlock,BlockConstructionStage.PIPELINE_SETUP_CREATE,0L,"Cannot create an existing block",true);
+    testWrite(firstBlock,BlockConstructionStage.DATA_STREAMING,0L,"Unexpected stage",true);
+    long newGS=firstBlock.getGenerationStamp() + 1;
+    testWrite(firstBlock,BlockConstructionStage.PIPELINE_SETUP_STREAMING_RECOVERY,newGS,"Cannot recover data streaming to a finalized replica",true);
+    newGS=firstBlock.getGenerationStamp() + 1;
+    testWrite(firstBlock,BlockConstructionStage.PIPELINE_SETUP_APPEND,newGS,"Append to a finalized replica",false);
+    firstBlock.setGenerationStamp(newGS);
+    file=new Path("dataprotocol1.dat");
+    DFSTestUtil.createFile(fileSys,file,1L,(short)numDataNodes,0L);
+    firstBlock=DFSTestUtil.getFirstBlock(fileSys,file);
+    newGS=firstBlock.getGenerationStamp() + 1;
+    testWrite(firstBlock,BlockConstructionStage.PIPELINE_SETUP_APPEND_RECOVERY,newGS,"Recover appending to a finalized replica",false);
+    file=new Path("dataprotocol2.dat");
+    DFSTestUtil.createFile(fileSys,file,1L,(short)numDataNodes,0L);
+    firstBlock=DFSTestUtil.getFirstBlock(fileSys,file);
+    newGS=firstBlock.getGenerationStamp() + 1;
+    testWrite(firstBlock,BlockConstructionStage.PIPELINE_CLOSE_RECOVERY,newGS,"Recover failed close to a finalized replica",false);
+    firstBlock.setGenerationStamp(newGS);
+    long newBlockId=firstBlock.getBlockId() + BLOCK_ID_FUDGE;
+    ExtendedBlock newBlock=new ExtendedBlock(firstBlock.getBlockPoolId(),newBlockId,0,firstBlock.getGenerationStamp());
+    testWrite(newBlock,BlockConstructionStage.PIPELINE_SETUP_CREATE,0L,"Create a new block",false);
+    newGS=newBlock.getGenerationStamp() + 1;
+    newBlock.setBlockId(newBlock.getBlockId() + 1);
+    testWrite(newBlock,BlockConstructionStage.PIPELINE_SETUP_STREAMING_RECOVERY,newGS,"Recover a new block",true);
+    newGS=newBlock.getGenerationStamp() + 1;
+    testWrite(newBlock,BlockConstructionStage.PIPELINE_SETUP_APPEND,newGS,"Cannot append to a new block",true);
+    newBlock.setBlockId(newBlock.getBlockId() + 1);
+    newGS=newBlock.getGenerationStamp() + 1;
+    testWrite(newBlock,BlockConstructionStage.PIPELINE_SETUP_APPEND_RECOVERY,newGS,"Cannot append to a new block",true);
+    Path file1=new Path("dataprotocol1.dat");
+    DFSTestUtil.createFile(fileSys,file1,1L,(short)numDataNodes,0L);
+    DFSOutputStream out=(DFSOutputStream)(fileSys.append(file1).getWrappedStream());
+    out.write(1);
+    out.hflush();
+    FSDataInputStream in=fileSys.open(file1);
+    firstBlock=DFSTestUtil.getAllBlocks(in).get(0).getBlock();
+    firstBlock.setNumBytes(2L);
+    try {
+      testWrite(firstBlock,BlockConstructionStage.PIPELINE_SETUP_CREATE,0L,"Cannot create a RBW block",true);
+      newGS=firstBlock.getGenerationStamp() + 1;
+      testWrite(firstBlock,BlockConstructionStage.PIPELINE_SETUP_APPEND,newGS,"Cannot append to a RBW replica",true);
+      testWrite(firstBlock,BlockConstructionStage.PIPELINE_SETUP_APPEND_RECOVERY,newGS,"Recover append to a RBW replica",false);
+      firstBlock.setGenerationStamp(newGS);
+      file=new Path("dataprotocol2.dat");
+      DFSTestUtil.createFile(fileSys,file,1L,(short)numDataNodes,0L);
+      out=(DFSOutputStream)(fileSys.append(file).getWrappedStream());
+      out.write(1);
+      out.hflush();
+      in=fileSys.open(file);
+      firstBlock=DFSTestUtil.getAllBlocks(in).get(0).getBlock();
+      firstBlock.setNumBytes(2L);
+      newGS=firstBlock.getGenerationStamp() + 1;
+      testWrite(firstBlock,BlockConstructionStage.PIPELINE_SETUP_STREAMING_RECOVERY,newGS,"Recover a RBW replica",false);
+    }
+  finally {
+      IOUtils.closeStream(in);
+      IOUtils.closeStream(out);
+    }
+  }
+  finally {
+    cluster.shutdown();
+  }
+}

@@ -1,0 +1,72 @@
+@Test(timeout=180000) public void testDecommissionWithOpenfileReporting() throws Exception {
+  LOG.info("Starting test testDecommissionWithOpenfileReporting");
+  getConf().setInt(DFSConfigKeys.DFS_NAMENODE_REDUNDANCY_INTERVAL_SECONDS_KEY,1000);
+  getConf().setLong(DFSConfigKeys.DFS_NAMENODE_LIST_OPENFILES_NUM_RESPONSES,1);
+  startSimpleCluster(1,4);
+  FileSystem fileSys=getCluster().getFileSystem(0);
+  FSNamesystem ns=getCluster().getNamesystem(0);
+  final String[] closedFiles=new String[3];
+  final String[] openFiles=new String[3];
+  HashSet<Path> closedFileSet=new HashSet<>();
+  HashMap<Path,FSDataOutputStream> openFilesMap=new HashMap<>();
+  for (int i=0; i < 3; i++) {
+    closedFiles[i]="/testDecommissionWithOpenfileReporting.closed." + i;
+    openFiles[i]="/testDecommissionWithOpenfileReporting.open." + i;
+    writeFile(fileSys,new Path(closedFiles[i]),(short)3,10);
+    closedFileSet.add(new Path(closedFiles[i]));
+    writeFile(fileSys,new Path(openFiles[i]),(short)3,10);
+    FSDataOutputStream fdos=fileSys.append(new Path(openFiles[i]));
+    openFilesMap.put(new Path(openFiles[i]),fdos);
+  }
+  HashMap<DatanodeInfo,Integer> dnInfoMap=new HashMap<>();
+  for (int i=0; i < 3; i++) {
+    LocatedBlocks lbs=NameNodeAdapter.getBlockLocations(getCluster().getNameNode(0),openFiles[i],0,blockSize * 10);
+    for (    DatanodeInfo dn : lbs.getLastLocatedBlock().getLocations()) {
+      if (dnInfoMap.containsKey(dn)) {
+        dnInfoMap.put(dn,dnInfoMap.get(dn) + 1);
+      }
+ else {
+        dnInfoMap.put(dn,1);
+      }
+    }
+  }
+  DatanodeInfo dnToDecommission=null;
+  int maxDnOccurance=0;
+  for (  Map.Entry<DatanodeInfo,Integer> entry : dnInfoMap.entrySet()) {
+    if (entry.getValue() > maxDnOccurance) {
+      maxDnOccurance=entry.getValue();
+      dnToDecommission=entry.getKey();
+    }
+  }
+  LOG.info("XXX Dn to decommission: " + dnToDecommission + ", max: "+ maxDnOccurance);
+  DatanodeManager dm=ns.getBlockManager().getDatanodeManager();
+  ArrayList<String> nodes=new ArrayList<>();
+  dnToDecommission=dm.getDatanode(dnToDecommission.getDatanodeUuid());
+  nodes.add(dnToDecommission.getXferAddr());
+  initExcludeHosts(nodes);
+  refreshNodes(0);
+  waitNodeState(dnToDecommission,AdminStates.DECOMMISSION_INPROGRESS);
+  verifyOpenFilesBlockingDecommission(closedFileSet,openFilesMap,maxDnOccurance);
+  final AtomicBoolean stopRedundancyMonitor=new AtomicBoolean(false);
+  Thread monitorThread=new Thread(new Runnable(){
+    @Override public void run(){
+      while (!stopRedundancyMonitor.get()) {
+        try {
+          BlockManagerTestUtil.checkRedundancy(getCluster().getNamesystem().getBlockManager());
+          BlockManagerTestUtil.updateState(getCluster().getNamesystem().getBlockManager());
+          Thread.sleep(1000);
+        }
+ catch (        Exception e) {
+          LOG.warn("Encountered exception during redundancy monitor: " + e);
+        }
+      }
+    }
+  }
+);
+  monitorThread.start();
+  waitNodeState(dnToDecommission,AdminStates.DECOMMISSIONED);
+  stopRedundancyMonitor.set(true);
+  monitorThread.join();
+  openFilesMap.clear();
+  verifyOpenFilesBlockingDecommission(closedFileSet,openFilesMap,0);
+}

@@ -1,0 +1,166 @@
+public class TestFSAppAttempt extends FairSchedulerTestBase {
+  @Before public void setup(){
+    Configuration conf=createConfiguration();
+    resourceManager=new MockRM(conf);
+    resourceManager.start();
+    scheduler=(FairScheduler)resourceManager.getResourceScheduler();
+  }
+  @Test public void testDelayScheduling(){
+    FSLeafQueue queue=Mockito.mock(FSLeafQueue.class);
+    Priority pri=Mockito.mock(Priority.class);
+    SchedulerRequestKey prio=TestUtils.toSchedulerKey(pri);
+    Mockito.when(pri.getPriority()).thenReturn(1);
+    double nodeLocalityThreshold=.5;
+    double rackLocalityThreshold=.6;
+    ApplicationAttemptId applicationAttemptId=createAppAttemptId(1,1);
+    RMContext rmContext=resourceManager.getRMContext();
+    FSAppAttempt schedulerApp=new FSAppAttempt(scheduler,applicationAttemptId,"user1",queue,null,rmContext);
+    assertEquals(NodeType.NODE_LOCAL,schedulerApp.getAllowedLocalityLevel(prio,10,nodeLocalityThreshold,rackLocalityThreshold));
+    for (int i=0; i < 5; i++) {
+      schedulerApp.addSchedulingOpportunity(prio);
+      assertEquals(NodeType.NODE_LOCAL,schedulerApp.getAllowedLocalityLevel(prio,10,nodeLocalityThreshold,rackLocalityThreshold));
+    }
+    schedulerApp.addSchedulingOpportunity(prio);
+    assertEquals(NodeType.RACK_LOCAL,schedulerApp.getAllowedLocalityLevel(prio,10,nodeLocalityThreshold,rackLocalityThreshold));
+    schedulerApp.resetAllowedLocalityLevel(prio,NodeType.NODE_LOCAL);
+    schedulerApp.resetSchedulingOpportunities(prio);
+    assertEquals(NodeType.NODE_LOCAL,schedulerApp.getAllowedLocalityLevel(prio,10,nodeLocalityThreshold,rackLocalityThreshold));
+    for (int i=0; i < 5; i++) {
+      schedulerApp.addSchedulingOpportunity(prio);
+      assertEquals(NodeType.NODE_LOCAL,schedulerApp.getAllowedLocalityLevel(prio,10,nodeLocalityThreshold,rackLocalityThreshold));
+    }
+    schedulerApp.addSchedulingOpportunity(prio);
+    assertEquals(NodeType.RACK_LOCAL,schedulerApp.getAllowedLocalityLevel(prio,10,nodeLocalityThreshold,rackLocalityThreshold));
+    for (int i=0; i < 6; i++) {
+      schedulerApp.addSchedulingOpportunity(prio);
+      assertEquals(NodeType.RACK_LOCAL,schedulerApp.getAllowedLocalityLevel(prio,10,nodeLocalityThreshold,rackLocalityThreshold));
+    }
+    schedulerApp.addSchedulingOpportunity(prio);
+    assertEquals(NodeType.OFF_SWITCH,schedulerApp.getAllowedLocalityLevel(prio,10,nodeLocalityThreshold,rackLocalityThreshold));
+  }
+  @Test public void testDelaySchedulingForContinuousScheduling() throws InterruptedException {
+    FSLeafQueue queue=scheduler.getQueueManager().getLeafQueue("queue",true);
+    Priority pri=Mockito.mock(Priority.class);
+    SchedulerRequestKey prio=TestUtils.toSchedulerKey(pri);
+    Mockito.when(pri.getPriority()).thenReturn(1);
+    ControlledClock clock=new ControlledClock();
+    scheduler.setClock(clock);
+    long nodeLocalityDelayMs=5 * 1000L;
+    long rackLocalityDelayMs=6 * 1000L;
+    RMContext rmContext=resourceManager.getRMContext();
+    ApplicationAttemptId applicationAttemptId=createAppAttemptId(1,1);
+    FSAppAttempt schedulerApp=new FSAppAttempt(scheduler,applicationAttemptId,"user1",queue,null,rmContext);
+    assertEquals(NodeType.NODE_LOCAL,schedulerApp.getAllowedLocalityLevelByTime(prio,nodeLocalityDelayMs,rackLocalityDelayMs,clock.getTime()));
+    clock.tickSec(4);
+    assertEquals(NodeType.NODE_LOCAL,schedulerApp.getAllowedLocalityLevelByTime(prio,nodeLocalityDelayMs,rackLocalityDelayMs,clock.getTime()));
+    clock.tickSec(2);
+    assertEquals(NodeType.RACK_LOCAL,schedulerApp.getAllowedLocalityLevelByTime(prio,nodeLocalityDelayMs,rackLocalityDelayMs,clock.getTime()));
+    schedulerApp.resetAllowedLocalityLevel(prio,NodeType.NODE_LOCAL);
+    schedulerApp.resetSchedulingOpportunities(prio,clock.getTime());
+    assertEquals(NodeType.NODE_LOCAL,schedulerApp.getAllowedLocalityLevelByTime(prio,nodeLocalityDelayMs,rackLocalityDelayMs,clock.getTime()));
+    clock.tickSec(6);
+    assertEquals(NodeType.RACK_LOCAL,schedulerApp.getAllowedLocalityLevelByTime(prio,nodeLocalityDelayMs,rackLocalityDelayMs,clock.getTime()));
+    clock.tickSec(7);
+    assertEquals(NodeType.OFF_SWITCH,schedulerApp.getAllowedLocalityLevelByTime(prio,nodeLocalityDelayMs,rackLocalityDelayMs,clock.getTime()));
+  }
+  @Test public void testLocalityLevelWithoutDelays(){
+    FSLeafQueue queue=Mockito.mock(FSLeafQueue.class);
+    Priority pri=Mockito.mock(Priority.class);
+    SchedulerRequestKey prio=TestUtils.toSchedulerKey(pri);
+    Mockito.when(pri.getPriority()).thenReturn(1);
+    RMContext rmContext=resourceManager.getRMContext();
+    ApplicationAttemptId applicationAttemptId=createAppAttemptId(1,1);
+    FSAppAttempt schedulerApp=new FSAppAttempt(scheduler,applicationAttemptId,"user1",queue,null,rmContext);
+    assertEquals(NodeType.OFF_SWITCH,schedulerApp.getAllowedLocalityLevel(prio,10,-1.0,-1.0));
+  }
+  @Test public void testHeadroom(){
+    final FairScheduler mockScheduler=Mockito.mock(FairScheduler.class);
+    Mockito.when(mockScheduler.getClock()).thenReturn(scheduler.getClock());
+    final FSLeafQueue mockQueue=Mockito.mock(FSLeafQueue.class);
+    final Resource queueMaxResources=Resource.newInstance(5 * 1024,3);
+    final Resource queueFairShare=Resources.createResource(4096,2);
+    final Resource queueUsage=Resource.newInstance(2048,2);
+    final Resource queueStarvation=Resources.subtract(queueFairShare,queueUsage);
+    final Resource queueMaxResourcesAvailable=Resources.subtract(queueMaxResources,queueUsage);
+    final Resource clusterResource=Resources.createResource(8192,8);
+    final Resource clusterUsage=Resources.createResource(2048,2);
+    final Resource clusterAvailable=Resources.subtract(clusterResource,clusterUsage);
+    final QueueMetrics fakeRootQueueMetrics=Mockito.mock(QueueMetrics.class);
+    Mockito.when(mockQueue.getMaxShare()).thenReturn(queueMaxResources);
+    Mockito.when(mockQueue.getFairShare()).thenReturn(queueFairShare);
+    Mockito.when(mockQueue.getResourceUsage()).thenReturn(queueUsage);
+    Mockito.when(mockScheduler.getClusterResource()).thenReturn(clusterResource);
+    Mockito.when(fakeRootQueueMetrics.getAllocatedResources()).thenReturn(clusterUsage);
+    Mockito.when(mockScheduler.getRootQueueMetrics()).thenReturn(fakeRootQueueMetrics);
+    ApplicationAttemptId applicationAttemptId=createAppAttemptId(1,1);
+    RMContext rmContext=resourceManager.getRMContext();
+    FSAppAttempt schedulerApp=new FSAppAttempt(mockScheduler,applicationAttemptId,"user1",mockQueue,null,rmContext);
+    Mockito.when(mockQueue.getPolicy()).thenReturn(SchedulingPolicy.getInstance(DominantResourceFairnessPolicy.class));
+    verifyHeadroom(schedulerApp,min(queueStarvation.getMemorySize(),clusterAvailable.getMemorySize(),queueMaxResourcesAvailable.getMemorySize()),min(queueStarvation.getVirtualCores(),clusterAvailable.getVirtualCores(),queueMaxResourcesAvailable.getVirtualCores()));
+    Mockito.when(mockQueue.getPolicy()).thenReturn(SchedulingPolicy.getInstance(FairSharePolicy.class));
+    verifyHeadroom(schedulerApp,min(queueStarvation.getMemorySize(),clusterAvailable.getMemorySize(),queueMaxResourcesAvailable.getMemorySize()),Math.min(clusterAvailable.getVirtualCores(),queueMaxResourcesAvailable.getVirtualCores()));
+    Mockito.when(mockQueue.getPolicy()).thenReturn(SchedulingPolicy.getInstance(FifoPolicy.class));
+    verifyHeadroom(schedulerApp,min(queueStarvation.getMemorySize(),clusterAvailable.getMemorySize(),queueMaxResourcesAvailable.getMemorySize()),Math.min(clusterAvailable.getVirtualCores(),queueMaxResourcesAvailable.getVirtualCores()));
+  }
+  @Test public void testHeadroomWithBlackListedNodes(){
+    RMNode node1=MockNodes.newNodeInfo(1,Resources.createResource(8 * 1024,8),1,"127.0.0.1");
+    NodeAddedSchedulerEvent nodeEvent1=new NodeAddedSchedulerEvent(node1);
+    scheduler.handle(nodeEvent1);
+    RMNode node2=MockNodes.newNodeInfo(1,Resources.createResource(4 * 1024,4),2,"127.0.0.2");
+    NodeAddedSchedulerEvent nodeEvent2=new NodeAddedSchedulerEvent(node2);
+    scheduler.handle(nodeEvent2);
+    assertEquals("We should have two alive nodes.",2,scheduler.getNumClusterNodes());
+    Resource clusterResource=scheduler.getClusterResource();
+    Resource clusterUsage=scheduler.getRootQueueMetrics().getAllocatedResources();
+    assertEquals(12 * 1024,clusterResource.getMemorySize());
+    assertEquals(12,clusterResource.getVirtualCores());
+    assertEquals(0,clusterUsage.getMemorySize());
+    assertEquals(0,clusterUsage.getVirtualCores());
+    ApplicationAttemptId id11=createAppAttemptId(1,1);
+    createMockRMApp(id11);
+    scheduler.addApplication(id11.getApplicationId(),"default","user1",false);
+    scheduler.addApplicationAttempt(id11,false,false);
+    assertNotNull(scheduler.getSchedulerApplications().get(id11.getApplicationId()));
+    FSAppAttempt app=scheduler.getSchedulerApp(id11);
+    assertNotNull(app);
+    Resource queueUsage=app.getQueue().getResourceUsage();
+    assertEquals(0,queueUsage.getMemorySize());
+    assertEquals(0,queueUsage.getVirtualCores());
+    SchedulerNode n1=scheduler.getSchedulerNode(node1.getNodeID());
+    SchedulerNode n2=scheduler.getSchedulerNode(node2.getNodeID());
+    assertNotNull(n1);
+    assertNotNull(n2);
+    List<String> blacklistAdditions=new ArrayList<String>(1);
+    List<String> blacklistRemovals=new ArrayList<String>(1);
+    blacklistAdditions.add(n1.getNodeName());
+    FSAppAttempt spyApp=spy(app);
+    doReturn(false).when(spyApp).isWaitingForAMContainer();
+    spyApp.updateBlacklist(blacklistAdditions,blacklistRemovals);
+    spyApp.getQueue().setFairShare(clusterResource);
+    assertTrue(spyApp.isPlaceBlacklisted(n1.getNodeName()));
+    assertFalse(spyApp.isPlaceBlacklisted(n2.getNodeName()));
+    assertEquals(n2.getUnallocatedResource(),spyApp.getHeadroom());
+    blacklistAdditions.clear();
+    blacklistAdditions.add(n2.getNodeName());
+    blacklistRemovals.add(n1.getNodeName());
+    spyApp.updateBlacklist(blacklistAdditions,blacklistRemovals);
+    assertFalse(spyApp.isPlaceBlacklisted(n1.getNodeName()));
+    assertTrue(spyApp.isPlaceBlacklisted(n2.getNodeName()));
+    assertEquals(n1.getUnallocatedResource(),spyApp.getHeadroom());
+    blacklistAdditions.clear();
+    blacklistRemovals.clear();
+    blacklistRemovals.add(n2.getNodeName());
+    spyApp.updateBlacklist(blacklistAdditions,blacklistRemovals);
+    assertFalse(spyApp.isPlaceBlacklisted(n1.getNodeName()));
+    assertFalse(spyApp.isPlaceBlacklisted(n2.getNodeName()));
+    assertEquals(clusterResource,spyApp.getHeadroom());
+  }
+  private static long min(  long value1,  long value2,  long value3){
+    return Math.min(Math.min(value1,value2),value3);
+  }
+  protected void verifyHeadroom(  FSAppAttempt schedulerApp,  long expectedMemory,  long expectedCPU){
+    Resource headroom=schedulerApp.getHeadroom();
+    assertEquals(expectedMemory,headroom.getMemorySize());
+    assertEquals(expectedCPU,headroom.getVirtualCores());
+  }
+}

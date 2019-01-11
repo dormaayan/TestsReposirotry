@@ -1,0 +1,72 @@
+/** 
+ * Test UAM handling in RM.
+ */
+public class TestWorkPreservingUnmanagedAM extends ParameterizedSchedulerTestBase {
+  private YarnConfiguration conf;
+  public TestWorkPreservingUnmanagedAM(  SchedulerType type) throws IOException {
+    super(type);
+  }
+  @Before public void setup(){
+    Logger rootLogger=LogManager.getRootLogger();
+    rootLogger.setLevel(Level.DEBUG);
+    conf=getConf();
+    UserGroupInformation.setConfiguration(conf);
+    DefaultMetricsSystem.setMiniClusterMode(true);
+  }
+  /** 
+ * Test UAM work preserving restart. When the keepContainersAcrossAttempt flag is on, we allow UAM to directly register again and move on without getting the applicationAlreadyRegistered exception.
+ */
+  protected void testUAMRestart(  boolean keepContainers) throws Exception {
+    MockRM rm=new MockRM();
+    rm.start();
+    MockNM nm=new MockNM("127.0.0.1:1234",15120,rm.getResourceTrackerService());
+    nm.registerNode();
+    boolean unamanged=true;
+    int maxAttempts=1;
+    boolean waitForAccepted=true;
+    RMApp app=rm.submitApp(200,"",UserGroupInformation.getCurrentUser().getShortUserName(),null,unamanged,null,maxAttempts,null,null,waitForAccepted,keepContainers);
+    MockAM am=MockRM.launchUAM(app,rm,nm);
+    am.registerAppAttempt();
+    int numContainers=3;
+    List<Container> conts=am.allocate("127.0.0.1",1000,numContainers,new ArrayList<ContainerId>()).getAllocatedContainers();
+    while (conts.size() < numContainers) {
+      nm.nodeHeartbeat(true);
+      conts.addAll(am.allocate(new ArrayList<ResourceRequest>(),new ArrayList<ContainerId>()).getAllocatedContainers());
+      Thread.sleep(100);
+    }
+    List<ContainerId> releaseList=Collections.singletonList(conts.get(0).getId());
+    List<ContainerStatus> finishedConts=am.allocate(new ArrayList<ResourceRequest>(),releaseList).getCompletedContainersStatuses();
+    while (finishedConts.size() < releaseList.size()) {
+      nm.nodeHeartbeat(true);
+      finishedConts.addAll(am.allocate(new ArrayList<ResourceRequest>(),new ArrayList<ContainerId>()).getCompletedContainersStatuses());
+      Thread.sleep(100);
+    }
+    RegisterApplicationMasterResponse response=null;
+    try {
+      response=am.registerAppAttempt(false);
+    }
+ catch (    InvalidApplicationMasterRequestException e) {
+      Assert.assertEquals(false,keepContainers);
+      return;
+    }
+    Assert.assertEquals("RM should not allow second register" + " for UAM without keep container flag ",true,keepContainers);
+    Assert.assertEquals(2,response.getContainersFromPreviousAttempts().size());
+    Assert.assertEquals(1,response.getNMTokensFromPreviousAttempts().size());
+    numContainers=1;
+    am.allocate("127.0.0.1",1000,numContainers,new ArrayList<ContainerId>());
+    nm.nodeHeartbeat(true);
+    conts=am.allocate(new ArrayList<ResourceRequest>(),new ArrayList<ContainerId>()).getAllocatedContainers();
+    while (conts.size() < numContainers) {
+      nm.nodeHeartbeat(true);
+      conts.addAll(am.allocate(new ArrayList<ResourceRequest>(),new ArrayList<ContainerId>()).getAllocatedContainers());
+      Thread.sleep(100);
+    }
+    rm.stop();
+  }
+  @Test(timeout=600000) public void testUAMRestartKeepContainers() throws Exception {
+    testUAMRestart(true);
+  }
+  @Test(timeout=600000) public void testUAMRestartNoKeepContainers() throws Exception {
+    testUAMRestart(false);
+  }
+}

@@ -1,0 +1,67 @@
+@Test(timeout=300000) public void testFsckMoveAfterCorruption() throws Exception {
+  final int dfsBlockSize=512 * 1024;
+  final int numDatanodes=1;
+  final int replication=1;
+  conf.setLong(DFSConfigKeys.DFS_BLOCK_SIZE_KEY,dfsBlockSize);
+  conf.setLong(DFSConfigKeys.DFS_BLOCKREPORT_INTERVAL_MSEC_KEY,1000L);
+  conf.setInt(DFSConfigKeys.DFS_DATANODE_DIRECTORYSCAN_INTERVAL_KEY,1);
+  conf.setInt(DFSConfigKeys.DFS_REPLICATION_KEY,replication);
+  File builderBaseDir=new File(GenericTestUtils.getRandomizedTempPath());
+  cluster=new MiniDFSCluster.Builder(conf,builderBaseDir).build();
+  DistributedFileSystem dfs=cluster.getFileSystem();
+  cluster.waitActive();
+  final String srcDir="/srcdat";
+  final DFSTestUtil util=new DFSTestUtil.Builder().setName("TestFsck").setMinSize(dfsBlockSize * 2).setMaxSize(dfsBlockSize * 3).setNumFiles(1).build();
+  util.createFiles(dfs,srcDir,(short)replication);
+  final String[] fileNames=util.getFileNames(srcDir);
+  LOG.info("Created files: " + Arrays.toString(fileNames));
+  String outStr=runFsck(conf,0,true,"/","-files","-blocks");
+  assertTrue(outStr.contains(NamenodeFsck.HEALTHY_STATUS));
+  final DFSClient dfsClient=new DFSClient(new InetSocketAddress("localhost",cluster.getNameNodePort()),conf);
+  final String blockFileToCorrupt=fileNames[0];
+  final CorruptedTestFile ctf=new CorruptedTestFile(blockFileToCorrupt,Sets.newHashSet(0),dfsClient,numDatanodes,dfsBlockSize);
+  ctf.corruptBlocks(cluster);
+  GenericTestUtils.waitFor(new Supplier<Boolean>(){
+    @Override public Boolean get(){
+      try {
+        final String str=runFsck(conf,1,false,"/");
+        String numCorrupt=null;
+        for (        String line : str.split(LINE_SEPARATOR)) {
+          Matcher m=NUM_CORRUPT_BLOCKS_PATTERN.matcher(line);
+          if (m.matches()) {
+            numCorrupt=m.group(1);
+            break;
+          }
+        }
+        if (numCorrupt == null) {
+          Assert.fail("Cannot find corrupt blocks count in fsck output.");
+        }
+        if (Integer.parseInt(numCorrupt) == ctf.getTotalMissingBlocks()) {
+          assertTrue(str.contains(NamenodeFsck.CORRUPT_STATUS));
+          return true;
+        }
+      }
+ catch (      Exception e) {
+        LOG.error("Exception caught",e);
+        Assert.fail("Caught unexpected exception.");
+      }
+      return false;
+    }
+  }
+,1000,60000);
+  runFsck(conf,1,true,"/","-files","-blocks","-racks");
+  LOG.info("Moving blocks to lost+found");
+  runFsck(conf,1,false,"/","-move");
+  final List<LocatedFileStatus> retVal=new ArrayList<>();
+  final RemoteIterator<LocatedFileStatus> iter=dfs.listFiles(new Path("/lost+found"),true);
+  while (iter.hasNext()) {
+    retVal.add(iter.next());
+  }
+  LOG.info("Items in lost+found: " + retVal);
+  long totalLength=0;
+  for (  LocatedFileStatus lfs : retVal) {
+    totalLength+=lfs.getLen();
+  }
+  Assert.assertTrue("Nothing is moved to lost+found!",totalLength > 0);
+  util.cleanup(dfs,srcDir);
+}

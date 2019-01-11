@@ -1,0 +1,67 @@
+/** 
+ * Test Placement Constraints and Scheduling Requests.
+ */
+public class TestAMRMClientPlacementConstraints extends BaseAMRMClientTest {
+  @Test(timeout=60000) public void testAMRMClientWithPlacementConstraints() throws Exception {
+    teardown();
+    conf=new YarnConfiguration();
+    conf.set(YarnConfiguration.RM_PLACEMENT_CONSTRAINTS_HANDLER,YarnConfiguration.PROCESSOR_RM_PLACEMENT_CONSTRAINTS_HANDLER);
+    createClusterAndStartApplication(conf);
+    AMRMClient<AMRMClient.ContainerRequest> amClient=AMRMClient.<AMRMClient.ContainerRequest>createAMRMClient();
+    amClient.setNMTokenCache(new NMTokenCache());
+    Assert.assertNotSame(NMTokenCache.getSingleton(),amClient.getNMTokenCache());
+    final List<Container> allocatedContainers=new ArrayList<>();
+    final List<RejectedSchedulingRequest> rejectedSchedulingRequests=new ArrayList<>();
+    AMRMClientAsync asyncClient=new AMRMClientAsyncImpl<>(amClient,1000,new AMRMClientAsync.AbstractCallbackHandler(){
+      @Override public void onContainersAllocated(      List<Container> containers){
+        allocatedContainers.addAll(containers);
+      }
+      @Override public void onRequestsRejected(      List<RejectedSchedulingRequest> rejReqs){
+        rejectedSchedulingRequests.addAll(rejReqs);
+      }
+      @Override public void onContainersCompleted(      List<ContainerStatus> statuses){
+      }
+      @Override public void onContainersUpdated(      List<UpdatedContainer> containers){
+      }
+      @Override public void onShutdownRequest(){
+      }
+      @Override public void onNodesUpdated(      List<NodeReport> updatedNodes){
+      }
+      @Override public void onError(      Throwable e){
+      }
+      @Override public float getProgress(){
+        return 0.1f;
+      }
+    }
+);
+    asyncClient.init(conf);
+    asyncClient.start();
+    Map<Set<String>,PlacementConstraint> pcMapping=new HashMap<>();
+    pcMapping.put(Collections.singleton("foo"),PlacementConstraints.build(PlacementConstraints.targetNotIn(NODE,allocationTag("foo"))));
+    pcMapping.put(Collections.singleton("bar"),PlacementConstraints.build(PlacementConstraints.targetNotIn(NODE,allocationTag("bar"))));
+    asyncClient.registerApplicationMaster("Host",10000,"",pcMapping);
+    asyncClient.addSchedulingRequests(Arrays.asList(schedulingRequest(1,1,1,1,512,"foo"),schedulingRequest(1,1,2,1,512,"foo"),schedulingRequest(1,1,3,1,512,"foo"),schedulingRequest(1,1,4,1,512,"foo"),schedulingRequest(4,1,5,1,512,"bar")));
+    waitForContainerAllocation(allocatedContainers,rejectedSchedulingRequests,6,2);
+    Assert.assertEquals(6,allocatedContainers.size());
+    Map<NodeId,List<Container>> containersPerNode=allocatedContainers.stream().collect(Collectors.groupingBy(Container::getNodeId));
+    Assert.assertEquals(3,containersPerNode.entrySet().size());
+    HashSet<String> srcTags=new HashSet<>(Arrays.asList("foo","bar"));
+    containersPerNode.entrySet().forEach(x -> Assert.assertEquals(srcTags,x.getValue().stream().map(y -> y.getAllocationTags().iterator().next()).collect(Collectors.toSet())));
+    Assert.assertEquals(2,rejectedSchedulingRequests.size());
+    Assert.assertEquals(srcTags,rejectedSchedulingRequests.stream().map(x -> x.getRequest().getAllocationTags().iterator().next()).collect(Collectors.toSet()));
+    asyncClient.stop();
+  }
+  private static void waitForContainerAllocation(  List<Container> allocatedContainers,  List<RejectedSchedulingRequest> rejectedRequests,  int containerNum,  int rejNum) throws Exception {
+    int maxCount=10;
+    while (maxCount >= 0 && (allocatedContainers.size() < containerNum || rejectedRequests.size() < rejNum)) {
+      maxCount--;
+      sleep(1000);
+    }
+  }
+  private static SchedulingRequest schedulingRequest(  int numAllocations,  int priority,  long allocReqId,  int cores,  int mem,  String... tags){
+    return schedulingRequest(numAllocations,priority,allocReqId,cores,mem,ExecutionType.GUARANTEED,tags);
+  }
+  private static SchedulingRequest schedulingRequest(  int numAllocations,  int priority,  long allocReqId,  int cores,  int mem,  ExecutionType execType,  String... tags){
+    return SchedulingRequest.newBuilder().priority(Priority.newInstance(priority)).allocationRequestId(allocReqId).allocationTags(new HashSet<>(Arrays.asList(tags))).executionType(ExecutionTypeRequest.newInstance(execType,true)).resourceSizing(ResourceSizing.newInstance(numAllocations,Resource.newInstance(mem,cores))).build();
+  }
+}

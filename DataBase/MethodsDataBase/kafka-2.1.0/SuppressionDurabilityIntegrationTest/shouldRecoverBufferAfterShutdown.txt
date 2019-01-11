@@ -1,0 +1,37 @@
+@Test public void shouldRecoverBufferAfterShutdown(){
+  final String testId="-shouldRecoverBufferAfterShutdown";
+  final String appId=getClass().getSimpleName().toLowerCase(Locale.getDefault()) + testId;
+  final String input="input" + testId;
+  final String outputSuppressed="output-suppressed" + testId;
+  final String outputRaw="output-raw" + testId;
+  cleanStateBeforeTest(CLUSTER,input,outputRaw,outputSuppressed);
+  final StreamsBuilder builder=new StreamsBuilder();
+  final KTable<String,Long> valueCounts=buildCountsTable(input,builder);
+  final KStream<String,Long> suppressedCounts=valueCounts.suppress(untilTimeLimit(ofMillis(MAX_VALUE),maxRecords(3L).emitEarlyWhenFull())).toStream();
+  final AtomicInteger eventCount=new AtomicInteger(0);
+  suppressedCounts.foreach((key,value) -> eventCount.incrementAndGet());
+  suppressedCounts.to(outputSuppressed,Produced.with(STRING_SERDE,Serdes.Long()));
+  valueCounts.toStream().to(outputRaw,Produced.with(STRING_SERDE,Serdes.Long()));
+  final Properties streamsConfig=mkProperties(mkMap(mkEntry(StreamsConfig.APPLICATION_ID_CONFIG,appId),mkEntry(StreamsConfig.BOOTSTRAP_SERVERS_CONFIG,CLUSTER.bootstrapServers()),mkEntry(StreamsConfig.POLL_MS_CONFIG,Integer.toString(COMMIT_INTERVAL)),mkEntry(StreamsConfig.COMMIT_INTERVAL_MS_CONFIG,Integer.toString(COMMIT_INTERVAL)),mkEntry(StreamsConfig.PROCESSING_GUARANTEE_CONFIG,eosEnabled ? EXACTLY_ONCE : AT_LEAST_ONCE)));
+  KafkaStreams driver=getStartedStreams(streamsConfig,builder,true);
+  try {
+    produceSynchronously(input,asList(new KeyValueTimestamp<>("k1","v1",scaledTime(1L)),new KeyValueTimestamp<>("k2","v2",scaledTime(2L)),new KeyValueTimestamp<>("k3","v3",scaledTime(3L))));
+    verifyOutput(outputRaw,asList(new KeyValueTimestamp<>("v1",1L,scaledTime(1L)),new KeyValueTimestamp<>("v2",1L,scaledTime(2L)),new KeyValueTimestamp<>("v3",1L,scaledTime(3L))));
+    assertThat(eventCount.get(),is(0));
+    produceSynchronously(input,asList(new KeyValueTimestamp<>("k4","v4",scaledTime(4L)),new KeyValueTimestamp<>("k5","v5",scaledTime(5L))));
+    verifyOutput(outputRaw,asList(new KeyValueTimestamp<>("v4",1L,scaledTime(4L)),new KeyValueTimestamp<>("v5",1L,scaledTime(5L))));
+    assertThat(eventCount.get(),is(2));
+    verifyOutput(outputSuppressed,asList(new KeyValueTimestamp<>("v1",1L,scaledTime(1L)),new KeyValueTimestamp<>("v2",1L,scaledTime(2L))));
+    driver.close();
+    assertThat(driver.state(),is(KafkaStreams.State.NOT_RUNNING));
+    driver=getStartedStreams(streamsConfig,builder,false);
+    produceSynchronously(input,asList(new KeyValueTimestamp<>("k6","v6",scaledTime(6L)),new KeyValueTimestamp<>("k7","v7",scaledTime(7L)),new KeyValueTimestamp<>("k8","v8",scaledTime(8L))));
+    verifyOutput(outputRaw,asList(new KeyValueTimestamp<>("v6",1L,scaledTime(6L)),new KeyValueTimestamp<>("v7",1L,scaledTime(7L)),new KeyValueTimestamp<>("v8",1L,scaledTime(8L))));
+    assertThat(eventCount.get(),is(5));
+    verifyOutput(outputSuppressed,asList(new KeyValueTimestamp<>("v3",1L,scaledTime(3L)),new KeyValueTimestamp<>("v4",1L,scaledTime(4L)),new KeyValueTimestamp<>("v5",1L,scaledTime(5L))));
+  }
+  finally {
+    driver.close();
+    cleanStateAfterTest(CLUSTER,driver);
+  }
+}

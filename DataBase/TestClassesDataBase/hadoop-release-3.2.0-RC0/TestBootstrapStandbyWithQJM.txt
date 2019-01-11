@@ -1,0 +1,98 @@
+/** 
+ * Test BootstrapStandby when QJM is used for shared edits. 
+ */
+public class TestBootstrapStandbyWithQJM {
+  enum UpgradeState {  NORMAL,   RECOVER,   FORMAT}
+  private MiniDFSCluster cluster;
+  private MiniJournalCluster jCluster;
+  private int nnCount=3;
+  @Before public void setup() throws Exception {
+    Configuration conf=new Configuration();
+    conf.setInt(CommonConfigurationKeysPublic.IPC_CLIENT_CONNECTION_MAXIDLETIME_KEY,0);
+    MiniQJMHACluster miniQjmHaCluster=new MiniQJMHACluster.Builder(conf).setNumNameNodes(nnCount).build();
+    cluster=miniQjmHaCluster.getDfsCluster();
+    jCluster=miniQjmHaCluster.getJournalCluster();
+    cluster.transitionToActive(0);
+    DistributedFileSystem dfs=(DistributedFileSystem)HATestUtil.configureFailoverFs(cluster,conf);
+    dfs.mkdirs(new Path("/test2"));
+    dfs.close();
+  }
+  @After public void cleanup() throws IOException {
+    if (cluster != null) {
+      cluster.shutdown();
+      cluster=null;
+    }
+    if (jCluster != null) {
+      jCluster.shutdown();
+      jCluster=null;
+    }
+  }
+  /** 
+ * BootstrapStandby when the existing NN is standby 
+ */
+  @Test public void testBootstrapStandbyWithStandbyNN() throws Exception {
+    cluster.transitionToStandby(0);
+    bootstrapStandbys();
+  }
+  /** 
+ * BootstrapStandby when the existing NN is active 
+ */
+  @Test public void testBootstrapStandbyWithActiveNN() throws Exception {
+    cluster.transitionToActive(0);
+    bootstrapStandbys();
+  }
+  private void bootstrapStandbys() throws Exception {
+    for (int i=1; i < nnCount; i++) {
+      Configuration otherNNConf=cluster.getConfiguration(i);
+      cluster.shutdownNameNode(i);
+      int rc=BootstrapStandby.run(new String[]{"-force"},otherNNConf);
+      assertEquals(0,rc);
+      FSImageTestUtil.assertNNHasCheckpoints(cluster,i,ImmutableList.of(0));
+    }
+    FSImageTestUtil.assertNNFilesMatch(cluster);
+  }
+  /** 
+ * Test the bootstrapstandby while the other namenode is in upgrade state. Make sure a previous directory can be created.
+ */
+  @Test public void testUpgrade() throws Exception {
+    testUpgrade(UpgradeState.NORMAL);
+  }
+  /** 
+ * Similar with testUpgrade, but rename nn1's current directory to previous.tmp before bootstrapStandby, and make sure the nn1 is recovered first then converted into upgrade state.
+ */
+  @Test public void testUpgradeWithRecover() throws Exception {
+    testUpgrade(UpgradeState.RECOVER);
+  }
+  /** 
+ * Similar with testUpgrade, but rename nn1's current directory to a random name so that it's not formatted. Make sure the nn1 is formatted and then converted into upgrade state.
+ */
+  @Test public void testUpgradeWithFormat() throws Exception {
+    testUpgrade(UpgradeState.FORMAT);
+  }
+  private void testUpgrade(  UpgradeState state) throws Exception {
+    cluster.transitionToActive(0);
+    final Configuration confNN1=cluster.getConfiguration(1);
+    final File current=cluster.getNameNode(1).getFSImage().getStorage().getStorageDir(0).getCurrentDir();
+    final File tmp=cluster.getNameNode(1).getFSImage().getStorage().getStorageDir(0).getPreviousTmp();
+    cluster.shutdownNameNode(1);
+    FSImage fsImage0=cluster.getNameNode(0).getNamesystem().getFSImage();
+    Whitebox.setInternalState(fsImage0,"isUpgradeFinalized",false);
+switch (state) {
+case RECOVER:
+      NNStorage.rename(current,tmp);
+    break;
+case FORMAT:
+  final File wrongPath=new File(current.getParentFile(),"wrong");
+NNStorage.rename(current,wrongPath);
+break;
+default :
+break;
+}
+int rc=BootstrapStandby.run(new String[]{"-force"},confNN1);
+assertEquals(0,rc);
+FSImageTestUtil.assertNNHasCheckpoints(cluster,1,ImmutableList.of(0));
+FSImageTestUtil.assertNNFilesMatch(cluster);
+cluster.restartNameNode(1);
+assertFalse(cluster.getNameNode(1).getNamesystem().isUpgradeFinalized());
+}
+}

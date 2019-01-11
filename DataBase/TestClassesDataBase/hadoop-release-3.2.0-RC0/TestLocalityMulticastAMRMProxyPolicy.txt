@@ -1,0 +1,399 @@
+/** 
+ * Simple test class for the  {@link LocalityMulticastAMRMProxyPolicy}.
+ */
+public class TestLocalityMulticastAMRMProxyPolicy extends BaseFederationPoliciesTest {
+  public static final Logger LOG=LoggerFactory.getLogger(TestLocalityMulticastAMRMProxyPolicy.class);
+  @Before public void setUp() throws Exception {
+    setPolicy(new TestableLocalityMulticastAMRMProxyPolicy());
+    setPolicyInfo(new WeightedPolicyInfo());
+    Map<SubClusterIdInfo,Float> routerWeights=new HashMap<>();
+    Map<SubClusterIdInfo,Float> amrmWeights=new HashMap<>();
+    for (int i=0; i < 6; i++) {
+      SubClusterIdInfo sc=new SubClusterIdInfo("subcluster" + i);
+      if (i != 3) {
+        SubClusterInfo sci=mock(SubClusterInfo.class);
+        when(sci.getState()).thenReturn(SubClusterState.SC_RUNNING);
+        when(sci.getSubClusterId()).thenReturn(sc.toId());
+        getActiveSubclusters().put(sc.toId(),sci);
+      }
+      float weight=1 / 10f;
+      routerWeights.put(sc,weight);
+      amrmWeights.put(sc,weight);
+      if (i == 4) {
+        routerWeights.put(sc,0f);
+        amrmWeights.put(sc,0f);
+      }
+    }
+    getPolicyInfo().setRouterPolicyWeights(routerWeights);
+    getPolicyInfo().setAMRMPolicyWeights(amrmWeights);
+    getPolicyInfo().setHeadroomAlpha(0.5f);
+    setHomeSubCluster(SubClusterId.newInstance("homesubcluster"));
+  }
+  @Test public void testReinitilialize() throws YarnException {
+    initializePolicy();
+  }
+  private void initializePolicy() throws YarnException {
+    initializePolicy(new YarnConfiguration());
+  }
+  private void initializePolicy(  Configuration conf) throws YarnException {
+    setFederationPolicyContext(new FederationPolicyInitializationContext());
+    SubClusterResolver resolver=FederationPoliciesTestUtil.initResolver();
+    getFederationPolicyContext().setFederationSubclusterResolver(resolver);
+    ByteBuffer buf=getPolicyInfo().toByteBuffer();
+    getFederationPolicyContext().setSubClusterPolicyConfiguration(SubClusterPolicyConfiguration.newInstance("queue1",getPolicy().getClass().getCanonicalName(),buf));
+    getFederationPolicyContext().setHomeSubcluster(getHomeSubCluster());
+    FederationPoliciesTestUtil.initializePolicyContext(getFederationPolicyContext(),getPolicy(),getPolicyInfo(),getActiveSubclusters(),conf);
+  }
+  @Test(expected=FederationPolicyInitializationException.class) public void testNullWeights() throws Exception {
+    getPolicyInfo().setAMRMPolicyWeights(null);
+    initializePolicy();
+    fail();
+  }
+  @Test(expected=FederationPolicyInitializationException.class) public void testEmptyWeights() throws Exception {
+    getPolicyInfo().setAMRMPolicyWeights(new HashMap<SubClusterIdInfo,Float>());
+    initializePolicy();
+    fail();
+  }
+  @Test public void testSplitBasedOnHeadroom() throws Exception {
+    getPolicyInfo().setHeadroomAlpha(1.0f);
+    initializePolicy();
+    List<ResourceRequest> resourceRequests=createSimpleRequest();
+    prepPolicyWithHeadroom(true);
+    Map<SubClusterId,List<ResourceRequest>> response=((FederationAMRMProxyPolicy)getPolicy()).splitResourceRequests(resourceRequests);
+    LOG.info("Initial headroom");
+    prettyPrintRequests(response);
+    validateSplit(response,resourceRequests);
+    checkExpectedAllocation(response,"subcluster0",1,60);
+    checkExpectedAllocation(response,"subcluster1",1,-1);
+    checkExpectedAllocation(response,"subcluster2",1,15);
+    checkExpectedAllocation(response,"subcluster5",1,25);
+    checkTotalContainerAllocation(response,100);
+    AllocateResponse ar=getAllocateResponseWithTargetHeadroom(40);
+    ((FederationAMRMProxyPolicy)getPolicy()).notifyOfResponse(SubClusterId.newInstance("subcluster2"),ar);
+    response=((FederationAMRMProxyPolicy)getPolicy()).splitResourceRequests(resourceRequests);
+    LOG.info("After headroom update");
+    prettyPrintRequests(response);
+    validateSplit(response,resourceRequests);
+    checkExpectedAllocation(response,"subcluster0",1,37);
+    checkExpectedAllocation(response,"subcluster1",1,-1);
+    checkExpectedAllocation(response,"subcluster2",1,37);
+    checkExpectedAllocation(response,"subcluster5",1,25);
+    checkTotalContainerAllocation(response,100);
+  }
+  @Test(timeout=5000) public void testStressPolicy() throws Exception {
+    getPolicyInfo().setHeadroomAlpha(1.0f);
+    initializePolicy();
+    addHomeSubClusterAsActive();
+    int numRR=1000;
+    List<ResourceRequest> resourceRequests=createLargeRandomList(numRR);
+    prepPolicyWithHeadroom(true);
+    int numIterations=1000;
+    long tstart=System.currentTimeMillis();
+    for (int i=0; i < numIterations; i++) {
+      Map<SubClusterId,List<ResourceRequest>> response=((FederationAMRMProxyPolicy)getPolicy()).splitResourceRequests(resourceRequests);
+      validateSplit(response,resourceRequests);
+    }
+    long tend=System.currentTimeMillis();
+    LOG.info("Performed " + numIterations + " policy invocations (and "+ "validations) in "+ (tend - tstart)+ "ms");
+  }
+  @Test public void testFWDAllZeroANY() throws Exception {
+    getPolicyInfo().setHeadroomAlpha(0.5f);
+    initializePolicy();
+    List<ResourceRequest> resourceRequests=createZeroSizedANYRequest();
+    prepPolicyWithHeadroom(true);
+    Map<SubClusterId,List<ResourceRequest>> response=((FederationAMRMProxyPolicy)getPolicy()).splitResourceRequests(resourceRequests);
+    prettyPrintRequests(response);
+    validateSplit(response,resourceRequests);
+    checkExpectedAllocation(response,"subcluster0",1,0);
+    checkExpectedAllocation(response,"subcluster1",1,0);
+    checkExpectedAllocation(response,"subcluster2",1,0);
+    checkExpectedAllocation(response,"subcluster3",-1,-1);
+    checkExpectedAllocation(response,"subcluster4",-1,-1);
+    checkExpectedAllocation(response,"subcluster5",-1,-1);
+    checkTotalContainerAllocation(response,0);
+  }
+  @Test public void testSplitBasedOnHeadroomAndWeights() throws Exception {
+    getPolicyInfo().setHeadroomAlpha(0.5f);
+    initializePolicy();
+    List<ResourceRequest> resourceRequests=createSimpleRequest();
+    prepPolicyWithHeadroom(true);
+    Map<SubClusterId,List<ResourceRequest>> response=((FederationAMRMProxyPolicy)getPolicy()).splitResourceRequests(resourceRequests);
+    prettyPrintRequests(response);
+    validateSplit(response,resourceRequests);
+    checkExpectedAllocation(response,"subcluster0",1,42);
+    checkExpectedAllocation(response,"subcluster1",1,12);
+    checkExpectedAllocation(response,"subcluster2",1,20);
+    checkExpectedAllocation(response,"subcluster3",-1,-1);
+    checkExpectedAllocation(response,"subcluster4",-1,-1);
+    checkExpectedAllocation(response,"subcluster5",1,25);
+    checkTotalContainerAllocation(response,100);
+  }
+  private void prepPolicyWithHeadroom(  boolean setSubCluster0) throws YarnException {
+    AllocateResponse ar=getAllocateResponseWithTargetHeadroom(40);
+    if (setSubCluster0) {
+      ((FederationAMRMProxyPolicy)getPolicy()).notifyOfResponse(SubClusterId.newInstance("subcluster0"),ar);
+    }
+    ar=getAllocateResponseWithTargetHeadroom(0);
+    ((FederationAMRMProxyPolicy)getPolicy()).notifyOfResponse(SubClusterId.newInstance("subcluster1"),ar);
+    ar=getAllocateResponseWithTargetHeadroom(10);
+    ((FederationAMRMProxyPolicy)getPolicy()).notifyOfResponse(SubClusterId.newInstance("subcluster2"),ar);
+  }
+  private AllocateResponse getAllocateResponseWithTargetHeadroom(  int numContainers){
+    return AllocateResponse.newInstance(0,null,null,Collections.<NodeReport>emptyList(),Resource.newInstance(numContainers * 1024,numContainers),null,10,null,Collections.<NMToken>emptyList());
+  }
+  /** 
+ * modify default initialization to include a "homesubcluster" which we will use as the default for when nodes or racks are unknown.
+ */
+  private void addHomeSubClusterAsActive(){
+    SubClusterInfo sci=mock(SubClusterInfo.class);
+    when(sci.getState()).thenReturn(SubClusterState.SC_RUNNING);
+    when(sci.getSubClusterId()).thenReturn(getHomeSubCluster());
+    getActiveSubclusters().put(getHomeSubCluster(),sci);
+    SubClusterIdInfo sc=new SubClusterIdInfo(getHomeSubCluster().getId());
+    getPolicyInfo().getRouterPolicyWeights().put(sc,0.1f);
+    getPolicyInfo().getAMRMPolicyWeights().put(sc,0.1f);
+  }
+  @Test public void testSplitAllocateRequest() throws Exception {
+    initializePolicy();
+    addHomeSubClusterAsActive();
+    FederationPoliciesTestUtil.initializePolicyContext(getFederationPolicyContext(),getPolicy(),getPolicyInfo(),getActiveSubclusters(),new Configuration());
+    List<ResourceRequest> resourceRequests=createComplexRequest();
+    Map<SubClusterId,List<ResourceRequest>> response=((FederationAMRMProxyPolicy)getPolicy()).splitResourceRequests(resourceRequests);
+    validateSplit(response,resourceRequests);
+    prettyPrintRequests(response);
+    checkExpectedAllocation(response,getHomeSubCluster().getId(),7,29);
+    checkExpectedAllocation(response,"subcluster0",10,32);
+    checkExpectedAllocation(response,"subcluster1",5,26);
+    checkExpectedAllocation(response,"subcluster2",4,23);
+    checkExpectedAllocation(response,"subcluster3",-1,-1);
+    checkExpectedAllocation(response,"subcluster4",-1,-1);
+    checkExpectedAllocation(response,"subcluster5",1,20);
+    checkTotalContainerAllocation(response,130);
+    for (    ResourceRequest rr : response.get(getHomeSubCluster())) {
+      Assert.assertTrue(rr.getAllocationRequestId() == 2L || rr.getAllocationRequestId() == 4L || rr.getAllocationRequestId() == 5L);
+    }
+    List<ResourceRequest> rrs=response.get(SubClusterId.newInstance("subcluster0"));
+    for (    ResourceRequest rr : rrs) {
+      Assert.assertTrue(rr.getAllocationRequestId() != 1L);
+      Assert.assertTrue(rr.getAllocationRequestId() != 4L);
+    }
+    for (    ResourceRequest rr : response.get(SubClusterId.newInstance("subcluster1"))) {
+      Assert.assertTrue(rr.getAllocationRequestId() == 1L || rr.getAllocationRequestId() == 2L);
+    }
+    for (    ResourceRequest rr : response.get(SubClusterId.newInstance("subcluster2"))) {
+      Assert.assertTrue(rr.getAllocationRequestId() == 1L || rr.getAllocationRequestId() == 2L);
+    }
+    for (    ResourceRequest rr : response.get(SubClusterId.newInstance("subcluster5"))) {
+      Assert.assertTrue(rr.getAllocationRequestId() == 2);
+      Assert.assertTrue(rr.getRelaxLocality());
+    }
+  }
+  private void checkExpectedAllocation(  Map<SubClusterId,List<ResourceRequest>> response,  String subCluster,  long totResourceRequests,  long minimumTotalContainers){
+    if (minimumTotalContainers == -1) {
+      Assert.assertNull(response.get(SubClusterId.newInstance(subCluster)));
+    }
+ else {
+      SubClusterId sc=SubClusterId.newInstance(subCluster);
+      Assert.assertEquals(totResourceRequests,response.get(sc).size());
+      long actualContCount=0;
+      for (      ResourceRequest rr : response.get(sc)) {
+        actualContCount+=rr.getNumContainers();
+      }
+      Assert.assertTrue("Actual count " + actualContCount + " should be at least "+ minimumTotalContainers,minimumTotalContainers <= actualContCount);
+    }
+  }
+  private void checkTotalContainerAllocation(  Map<SubClusterId,List<ResourceRequest>> response,  long totalContainers){
+    long actualContCount=0;
+    for (    Map.Entry<SubClusterId,List<ResourceRequest>> entry : response.entrySet()) {
+      for (      ResourceRequest rr : entry.getValue()) {
+        actualContCount+=rr.getNumContainers();
+      }
+    }
+    Assert.assertEquals(totalContainers,actualContCount);
+  }
+  private void validateSplit(  Map<SubClusterId,List<ResourceRequest>> split,  List<ResourceRequest> original) throws YarnException {
+    SubClusterResolver resolver=getFederationPolicyContext().getFederationSubclusterResolver();
+    int numUsedSubclusters=split.size();
+    Set<Long> originalIds=new HashSet<>();
+    Set<Long> splitIds=new HashSet<>();
+    int originalContainers=0;
+    for (    ResourceRequest rr : original) {
+      originalContainers+=rr.getNumContainers();
+      originalIds.add(rr.getAllocationRequestId());
+    }
+    int splitContainers=0;
+    for (    Map.Entry<SubClusterId,List<ResourceRequest>> rrs : split.entrySet()) {
+      for (      ResourceRequest rr : rrs.getValue()) {
+        splitContainers+=rr.getNumContainers();
+        splitIds.add(rr.getAllocationRequestId());
+        SubClusterId fid=null;
+        try {
+          fid=resolver.getSubClusterForNode(rr.getResourceName());
+        }
+ catch (        YarnException e) {
+        }
+        if (!rrs.getKey().equals(getHomeSubCluster()) && fid != null && !fid.equals(rrs.getKey())) {
+          Assert.fail("A node-local (or resolvable rack-local) RR should not " + "be send to an RM other than what it resolves to.");
+        }
+      }
+    }
+    Assert.assertEquals(originalIds,splitIds);
+    Assert.assertTrue(" Containers requested (" + splitContainers + ") should "+ "not exceed the original count of containers ("+ originalContainers+ ") by more than the number of subclusters ("+ numUsedSubclusters+ ")",originalContainers + numUsedSubclusters >= splitContainers);
+    for (    SubClusterId targetId : split.keySet()) {
+      Assert.assertTrue("Target subcluster " + targetId + " should be in the active set",getActiveSubclusters().containsKey(targetId));
+      Assert.assertTrue("Target subclusters (" + targetId + ") should have weight >0 in "+ "the policy ",getPolicyInfo().getRouterPolicyWeights().get(new SubClusterIdInfo(targetId)) > 0);
+    }
+  }
+  private void prettyPrintRequests(  Map<SubClusterId,List<ResourceRequest>> response){
+    for (    Map.Entry<SubClusterId,List<ResourceRequest>> entry : response.entrySet()) {
+      String str="";
+      for (      ResourceRequest rr : entry.getValue()) {
+        str+=" [id:" + rr.getAllocationRequestId() + " loc:"+ rr.getResourceName()+ " numCont:"+ rr.getNumContainers()+ "], ";
+      }
+      LOG.info(entry.getKey() + " --> " + str);
+    }
+  }
+  private List<ResourceRequest> createLargeRandomList(  int numRR) throws Exception {
+    List<ResourceRequest> out=new ArrayList<>();
+    Random rand=new Random(1);
+    DefaultSubClusterResolverImpl resolver=(DefaultSubClusterResolverImpl)getFederationPolicyContext().getFederationSubclusterResolver();
+    List<String> nodes=new ArrayList<>(resolver.getNodeToSubCluster().keySet());
+    for (int i=0; i < numRR; i++) {
+      String nodeName=nodes.get(rand.nextInt(nodes.size()));
+      long allocationId=(long)rand.nextInt(20);
+      out.add(FederationPoliciesTestUtil.createResourceRequest(allocationId,nodeName,1024,1,1,rand.nextInt(100),null,rand.nextBoolean()));
+    }
+    return out;
+  }
+  private List<ResourceRequest> createSimpleRequest() throws Exception {
+    List<ResourceRequest> out=new ArrayList<>();
+    out.add(FederationPoliciesTestUtil.createResourceRequest(0L,ResourceRequest.ANY,1024,1,1,100,null,true));
+    return out;
+  }
+  private List<ResourceRequest> createZeroSizedANYRequest() throws Exception {
+    List<ResourceRequest> out=new ArrayList<>();
+    out.add(FederationPoliciesTestUtil.createResourceRequest(0L,ResourceRequest.ANY,1024,1,1,0,null,true));
+    return out;
+  }
+  private List<ResourceRequest> createComplexRequest() throws Exception {
+    List<ResourceRequest> out=new ArrayList<>();
+    out.add(FederationPoliciesTestUtil.createResourceRequest(0L,"subcluster0-rack0-host0",1024,1,1,1,null,false));
+    out.add(FederationPoliciesTestUtil.createResourceRequest(0L,"subcluster0-rack0",1024,1,1,1,null,false));
+    out.add(FederationPoliciesTestUtil.createResourceRequest(0L,ResourceRequest.ANY,1024,1,1,1,null,false));
+    out.add(FederationPoliciesTestUtil.createResourceRequest(1L,"subcluster1-rack1-host1",1024,1,1,1,null,false));
+    out.add(FederationPoliciesTestUtil.createResourceRequest(1L,"subcluster1-rack1-host2",1024,1,1,1,null,false));
+    out.add(FederationPoliciesTestUtil.createResourceRequest(1L,"subcluster2-rack3-host3",1024,1,1,1,null,false));
+    out.add(FederationPoliciesTestUtil.createResourceRequest(1L,"subcluster1-rack1",1024,1,1,2,null,false));
+    out.add(FederationPoliciesTestUtil.createResourceRequest(1L,"subcluster2-rack3",1024,1,1,1,null,false));
+    out.add(FederationPoliciesTestUtil.createResourceRequest(1L,ResourceRequest.ANY,1024,1,1,3,null,false));
+    out.add(FederationPoliciesTestUtil.createResourceRequest(2L,ResourceRequest.ANY,1024,1,1,100,null,true));
+    out.add(FederationPoliciesTestUtil.createResourceRequest(3L,"subcluster0-rack0-host0",1024,1,1,1,null,true));
+    out.add(FederationPoliciesTestUtil.createResourceRequest(3L,"subcluster0-rack0",1024,1,1,1,null,true));
+    out.add(FederationPoliciesTestUtil.createResourceRequest(3L,ResourceRequest.ANY,1024,1,1,1,null,true));
+    out.add(FederationPoliciesTestUtil.createResourceRequest(4L,"unknownNode",1024,1,1,1,null,false));
+    out.add(FederationPoliciesTestUtil.createResourceRequest(4L,"unknownRack",1024,1,1,1,null,false));
+    out.add(FederationPoliciesTestUtil.createResourceRequest(4L,ResourceRequest.ANY,1024,1,1,1,null,false));
+    out.add(FederationPoliciesTestUtil.createResourceRequest(5L,"subcluster0-rack0-host0",1024,1,1,2,null,false));
+    out.add(FederationPoliciesTestUtil.createResourceRequest(5L,"subcluster0-rack0",1024,1,1,2,null,false));
+    out.add(FederationPoliciesTestUtil.createResourceRequest(5L,"node4",1024,1,1,2,null,false));
+    out.add(FederationPoliciesTestUtil.createResourceRequest(5L,"rack2",1024,1,1,2,null,false));
+    out.add(FederationPoliciesTestUtil.createResourceRequest(5L,ResourceRequest.ANY,1024,1,1,4,null,false));
+    return out;
+  }
+  public String printList(  ArrayList<Integer> list){
+    StringBuilder sb=new StringBuilder();
+    for (    Integer entry : list) {
+      sb.append(entry + ", ");
+    }
+    return sb.toString();
+  }
+  @Test public void testIntegerAssignment() throws YarnException {
+    float[] weights=new float[]{0,0.1f,0.2f,0.2f,-0.1f,0.1f,0.2f,0.1f,0.1f};
+    int[] expectedMin=new int[]{0,1,3,3,0,1,3,1,1};
+    ArrayList<Float> weightsList=new ArrayList<>();
+    for (    float weight : weights) {
+      weightsList.add(weight);
+    }
+    LocalityMulticastAMRMProxyPolicy policy=(LocalityMulticastAMRMProxyPolicy)getPolicy();
+    for (int i=0; i < 500000; i++) {
+      ArrayList<Integer> allocations=policy.computeIntegerAssignment(19,weightsList);
+      int sum=0;
+      for (int j=0; j < weights.length; j++) {
+        sum+=allocations.get(j);
+        if (allocations.get(j) < expectedMin[j]) {
+          Assert.fail(allocations.get(j) + " at index " + j+ " should be at least "+ expectedMin[j]+ ". Allocation array: "+ printList(allocations));
+        }
+      }
+      Assert.assertEquals("Expect sum to be 19 in array: " + printList(allocations),19,sum);
+    }
+  }
+  @Test public void testCancelWithLocalizedResource() throws YarnException {
+    getPolicyInfo().setHeadroomAlpha(1.0f);
+    initializePolicy();
+    List<ResourceRequest> resourceRequests=new ArrayList<>();
+    prepPolicyWithHeadroom(true);
+    resourceRequests.add(FederationPoliciesTestUtil.createResourceRequest(0L,"subcluster0-rack0-host0",1024,1,1,1,null,false));
+    resourceRequests.add(FederationPoliciesTestUtil.createResourceRequest(0L,"subcluster0-rack0",1024,1,1,1,null,false));
+    resourceRequests.add(FederationPoliciesTestUtil.createResourceRequest(0L,ResourceRequest.ANY,1024,1,1,0,null,false));
+    Map<SubClusterId,List<ResourceRequest>> response=((FederationAMRMProxyPolicy)getPolicy()).splitResourceRequests(resourceRequests);
+    checkExpectedAllocation(response,"subcluster0",3,1);
+    checkExpectedAllocation(response,"subcluster1",1,0);
+    checkExpectedAllocation(response,"subcluster2",1,0);
+    checkExpectedAllocation(response,"subcluster3",-1,-1);
+    checkExpectedAllocation(response,"subcluster4",-1,-1);
+    checkExpectedAllocation(response,"subcluster5",-1,-1);
+    resourceRequests.clear();
+    resourceRequests.add(FederationPoliciesTestUtil.createResourceRequest(0L,"subcluster0-rack0-host0",1024,1,1,0,null,false));
+    resourceRequests.add(FederationPoliciesTestUtil.createResourceRequest(0L,"subcluster0-rack0",1024,1,1,0,null,false));
+    resourceRequests.add(FederationPoliciesTestUtil.createResourceRequest(0L,ResourceRequest.ANY,1024,1,1,100,null,false));
+    response=((FederationAMRMProxyPolicy)getPolicy()).splitResourceRequests(resourceRequests);
+    checkExpectedAllocation(response,"subcluster0",3,60);
+    checkExpectedAllocation(response,"subcluster1",1,-1);
+    checkExpectedAllocation(response,"subcluster2",1,15);
+    checkExpectedAllocation(response,"subcluster5",1,25);
+    checkTotalContainerAllocation(response,100);
+  }
+  @Test public void testSubClusterExpiry() throws Exception {
+    getPolicyInfo().setHeadroomAlpha(1.0f);
+    YarnConfiguration conf=new YarnConfiguration();
+    conf.setLong(YarnConfiguration.FEDERATION_AMRMPROXY_SUBCLUSTER_TIMEOUT,500);
+    initializePolicy(conf);
+    List<ResourceRequest> resourceRequests=createSimpleRequest();
+    prepPolicyWithHeadroom(true);
+    Map<SubClusterId,List<ResourceRequest>> response=((FederationAMRMProxyPolicy)getPolicy()).splitResourceRequests(resourceRequests);
+    prettyPrintRequests(response);
+    validateSplit(response,resourceRequests);
+    checkExpectedAllocation(response,"subcluster0",1,60);
+    checkExpectedAllocation(response,"subcluster1",1,-1);
+    checkExpectedAllocation(response,"subcluster2",1,15);
+    checkExpectedAllocation(response,"subcluster5",1,25);
+    checkTotalContainerAllocation(response,100);
+    Thread.sleep(800);
+    prepPolicyWithHeadroom(false);
+    response=((FederationAMRMProxyPolicy)getPolicy()).splitResourceRequests(resourceRequests);
+    prettyPrintRequests(response);
+    validateSplit(response,resourceRequests);
+    checkExpectedAllocation(response,"subcluster0",1,-1);
+    checkExpectedAllocation(response,"subcluster1",1,-1);
+    checkExpectedAllocation(response,"subcluster2",1,100);
+    checkExpectedAllocation(response,"subcluster5",1,-1);
+    checkTotalContainerAllocation(response,100);
+  }
+  /** 
+ * A testable version of LocalityMulticastAMRMProxyPolicy that deterministically falls back to home sub-cluster for unresolved requests.
+ */
+private class TestableLocalityMulticastAMRMProxyPolicy extends LocalityMulticastAMRMProxyPolicy {
+    @Override protected SubClusterId getSubClusterForUnResolvedRequest(    AllocationBookkeeper bookkeeper,    long allocationId){
+      SubClusterId originalResult=super.getSubClusterForUnResolvedRequest(bookkeeper,allocationId);
+      Map<SubClusterId,SubClusterInfo> activeClusters=null;
+      try {
+        activeClusters=getActiveSubclusters();
+      }
+ catch (      YarnException e) {
+        throw new RuntimeException(e);
+      }
+      Assert.assertTrue(activeClusters.containsKey(originalResult));
+      return getHomeSubCluster();
+    }
+  }
+}

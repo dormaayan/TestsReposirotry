@@ -1,0 +1,102 @@
+private class MyResourceTracker implements ResourceTracker {
+  private final Context context;
+  private boolean signalContainer;
+  public MyResourceTracker(  Context context,  boolean signalContainer){
+    this.context=context;
+    this.signalContainer=signalContainer;
+  }
+  @Override public RegisterNodeManagerResponse registerNodeManager(  RegisterNodeManagerRequest request) throws YarnException, IOException {
+    NodeId nodeId=request.getNodeId();
+    Resource resource=request.getResource();
+    LOG.info("Registering " + nodeId.toString());
+    InetSocketAddress expected=NetUtils.getConnectAddress(conf.getSocketAddr(YarnConfiguration.NM_ADDRESS,null,-1));
+    Assert.assertEquals(NetUtils.getHostPortString(expected),nodeId.toString());
+    Assert.assertEquals(5 * 1024,resource.getMemorySize());
+    registeredNodes.add(nodeId);
+    RegisterNodeManagerResponse response=recordFactory.newRecordInstance(RegisterNodeManagerResponse.class);
+    response.setContainerTokenMasterKey(createMasterKey());
+    response.setNMTokenMasterKey(createMasterKey());
+    return response;
+  }
+  private Map<ApplicationId,List<ContainerStatus>> getAppToContainerStatusMap(  List<ContainerStatus> containers){
+    Map<ApplicationId,List<ContainerStatus>> map=new HashMap<ApplicationId,List<ContainerStatus>>();
+    for (    ContainerStatus cs : containers) {
+      ApplicationId applicationId=cs.getContainerId().getApplicationAttemptId().getApplicationId();
+      List<ContainerStatus> appContainers=map.get(applicationId);
+      if (appContainers == null) {
+        appContainers=new ArrayList<ContainerStatus>();
+        map.put(applicationId,appContainers);
+      }
+      appContainers.add(cs);
+    }
+    return map;
+  }
+  @Override public NodeHeartbeatResponse nodeHeartbeat(  NodeHeartbeatRequest request) throws YarnException, IOException {
+    NodeStatus nodeStatus=request.getNodeStatus();
+    LOG.info("Got heartbeat number " + heartBeatID);
+    NodeManagerMetrics mockMetrics=mock(NodeManagerMetrics.class);
+    Dispatcher mockDispatcher=mock(Dispatcher.class);
+    @SuppressWarnings("unchecked") EventHandler<Event> mockEventHandler=mock(EventHandler.class);
+    when(mockDispatcher.getEventHandler()).thenReturn(mockEventHandler);
+    NMStateStoreService stateStore=new NMNullStateStoreService();
+    nodeStatus.setResponseId(heartBeatID++);
+    Map<ApplicationId,List<ContainerStatus>> appToContainers=getAppToContainerStatusMap(nodeStatus.getContainersStatuses());
+    List<SignalContainerRequest> containersToSignal=null;
+    ApplicationId appId1=ApplicationId.newInstance(0,1);
+    ApplicationId appId2=ApplicationId.newInstance(0,2);
+    ContainerId firstContainerID=null;
+    if (heartBeatID == 1) {
+      Assert.assertEquals(0,nodeStatus.getContainersStatuses().size());
+      ApplicationAttemptId appAttemptID=ApplicationAttemptId.newInstance(appId1,0);
+      firstContainerID=ContainerId.newContainerId(appAttemptID,heartBeatID);
+      ContainerLaunchContext launchContext=recordFactory.newRecordInstance(ContainerLaunchContext.class);
+      Resource resource=BuilderUtils.newResource(2,1);
+      long currentTime=System.currentTimeMillis();
+      String user="testUser";
+      ContainerTokenIdentifier containerToken=BuilderUtils.newContainerTokenIdentifier(BuilderUtils.newContainerToken(firstContainerID,0,InetAddress.getByName("localhost").getCanonicalHostName(),1234,user,resource,currentTime + 10000,123,"password".getBytes(),currentTime));
+      Context context=mock(Context.class);
+      when(context.getNMStateStore()).thenReturn(stateStore);
+      Container container=new ContainerImpl(conf,mockDispatcher,launchContext,null,mockMetrics,containerToken,context);
+      this.context.getContainers().put(firstContainerID,container);
+    }
+ else     if (heartBeatID == 2) {
+      Assert.assertEquals("Number of applications should only be one!",1,nodeStatus.getContainersStatuses().size());
+      Assert.assertEquals("Number of container for the app should be one!",1,appToContainers.get(appId1).size());
+      ConcurrentMap<ContainerId,Container> activeContainers=this.context.getContainers();
+      Assert.assertEquals(1,activeContainers.size());
+      if (this.signalContainer) {
+        containersToSignal=new ArrayList<SignalContainerRequest>();
+        SignalContainerRequest signalReq=recordFactory.newRecordInstance(SignalContainerRequest.class);
+        signalReq.setContainerId(firstContainerID);
+        signalReq.setCommand(SignalContainerCommand.OUTPUT_THREAD_DUMP);
+        containersToSignal.add(signalReq);
+      }
+      ApplicationAttemptId appAttemptID=ApplicationAttemptId.newInstance(appId2,0);
+      ContainerId secondContainerID=ContainerId.newContainerId(appAttemptID,heartBeatID);
+      ContainerLaunchContext launchContext=recordFactory.newRecordInstance(ContainerLaunchContext.class);
+      long currentTime=System.currentTimeMillis();
+      String user="testUser";
+      Resource resource=BuilderUtils.newResource(3,1);
+      ContainerTokenIdentifier containerToken=BuilderUtils.newContainerTokenIdentifier(BuilderUtils.newContainerToken(secondContainerID,0,InetAddress.getByName("localhost").getCanonicalHostName(),1234,user,resource,currentTime + 10000,123,"password".getBytes(),currentTime));
+      Context context=mock(Context.class);
+      when(context.getNMStateStore()).thenReturn(stateStore);
+      Container container=new ContainerImpl(conf,mockDispatcher,launchContext,null,mockMetrics,containerToken,context);
+      this.context.getContainers().put(secondContainerID,container);
+    }
+ else     if (heartBeatID == 3) {
+      Assert.assertEquals("Number of applications should have two!",2,appToContainers.size());
+      Assert.assertEquals("Number of container for the app-1 should be only one!",1,appToContainers.get(appId1).size());
+      Assert.assertEquals("Number of container for the app-2 should be only one!",1,appToContainers.get(appId2).size());
+      ConcurrentMap<ContainerId,Container> activeContainers=this.context.getContainers();
+      Assert.assertEquals(2,activeContainers.size());
+    }
+    NodeHeartbeatResponse nhResponse=YarnServerBuilderUtils.newNodeHeartbeatResponse(heartBeatID,null,null,null,null,null,1000L);
+    if (containersToSignal != null) {
+      nhResponse.addAllContainersToSignal(containersToSignal);
+    }
+    return nhResponse;
+  }
+  @Override public UnRegisterNodeManagerResponse unRegisterNodeManager(  UnRegisterNodeManagerRequest request) throws YarnException, IOException {
+    return recordFactory.newRecordInstance(UnRegisterNodeManagerResponse.class);
+  }
+}

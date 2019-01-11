@@ -1,0 +1,49 @@
+@Test(timeout=30000) public void testProvidedReporting() throws Exception {
+  conf.setClass(ImageWriter.Options.UGI_CLASS,SingleUGIResolver.class,UGIResolver.class);
+  createImage(new FSTreeWalk(providedPath,conf),nnDirPath,FixedBlockResolver.class);
+  int numDatanodes=10;
+  startCluster(nnDirPath,numDatanodes,new StorageType[]{StorageType.PROVIDED,StorageType.DISK},null,false);
+  long diskCapacity=1000;
+  for (  DataNode dn : cluster.getDataNodes()) {
+    for (    FsVolumeSpi ref : dn.getFSDataset().getFsVolumeReferences()) {
+      if (ref.getStorageType() == StorageType.DISK) {
+        ((FsVolumeImpl)ref).setCapacityForTesting(diskCapacity);
+      }
+    }
+  }
+  cluster.triggerHeartbeats();
+  Thread.sleep(10000);
+  FSNamesystem namesystem=cluster.getNameNode().getNamesystem();
+  DatanodeStatistics dnStats=namesystem.getBlockManager().getDatanodeManager().getDatanodeStatistics();
+  assertEquals(diskCapacity * numDatanodes,namesystem.getTotal());
+  assertEquals(providedDataSize,dnStats.getProvidedCapacity());
+  assertEquals(providedDataSize,namesystem.getProvidedCapacityTotal());
+  assertEquals(providedDataSize,dnStats.getStorageTypeStats().get(StorageType.PROVIDED).getCapacityTotal());
+  assertEquals(providedDataSize,dnStats.getStorageTypeStats().get(StorageType.PROVIDED).getCapacityUsed());
+  for (  DataNode dn : cluster.getDataNodes()) {
+    for (    StorageReport report : dn.getFSDataset().getStorageReports(namesystem.getBlockPoolId())) {
+      if (report.getStorage().getStorageType() == StorageType.PROVIDED) {
+        assertEquals(providedDataSize,report.getCapacity());
+        assertEquals(providedDataSize,report.getDfsUsed());
+        assertEquals(providedDataSize,report.getBlockPoolUsed());
+        assertEquals(0,report.getNonDfsUsed());
+        assertEquals(0,report.getRemaining());
+      }
+    }
+  }
+  DFSClient client=new DFSClient(new InetSocketAddress("localhost",cluster.getNameNodePort()),cluster.getConfiguration(0));
+  BlockManager bm=namesystem.getBlockManager();
+  for (int fileId=0; fileId < numFiles; fileId++) {
+    String filename="/" + filePrefix + fileId+ fileSuffix;
+    LocatedBlocks locatedBlocks=client.getLocatedBlocks(filename,0,baseFileLen);
+    for (    LocatedBlock locatedBlock : locatedBlocks.getLocatedBlocks()) {
+      BlockInfo blockInfo=bm.getStoredBlock(locatedBlock.getBlock().getLocalBlock());
+      Iterator<DatanodeStorageInfo> storagesItr=blockInfo.getStorageInfos();
+      DatanodeStorageInfo info=storagesItr.next();
+      assertEquals(StorageType.PROVIDED,info.getStorageType());
+      DatanodeDescriptor dnDesc=info.getDatanodeDescriptor();
+      assertEquals(ProvidedStorageMap.ProvidedDescriptor.NETWORK_LOCATION + PATH_SEPARATOR_STR + ProvidedStorageMap.ProvidedDescriptor.NAME,NodeBase.getPath(dnDesc));
+      assertFalse(storagesItr.hasNext());
+    }
+  }
+}

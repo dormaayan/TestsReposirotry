@@ -1,0 +1,44 @@
+@Test(timeout=600000) public void testFilesExceedMaxLockedMemory() throws Exception {
+  LOG.info("beginning testFilesExceedMaxLockedMemory");
+  final int numFiles=5;
+  final long fileSize=CACHE_CAPACITY / (numFiles - 1);
+  final Path[] testFiles=new Path[numFiles];
+  final HdfsBlockLocation[][] fileLocs=new HdfsBlockLocation[numFiles][];
+  final long[] fileSizes=new long[numFiles];
+  for (int i=0; i < numFiles; i++) {
+    testFiles[i]=new Path("/testFilesExceedMaxLockedMemory-" + i);
+    DFSTestUtil.createFile(fs,testFiles[i],fileSize,(short)1,0xDFAl);
+    fileLocs[i]=(HdfsBlockLocation[])fs.getFileBlockLocations(testFiles[i],0,fileSize);
+    long[] sizes=getBlockSizes(fileLocs[i]);
+    for (int j=0; j < sizes.length; j++) {
+      fileSizes[i]+=sizes[j];
+    }
+  }
+  long total=0;
+  DFSTestUtil.verifyExpectedCacheUsage(0,0,fsd);
+  for (int i=0; i < numFiles - 1; i++) {
+    setHeartbeatResponse(cacheBlocks(fileLocs[i]));
+    total=DFSTestUtil.verifyExpectedCacheUsage(rounder.roundUp(total + fileSizes[i]),4 * (i + 1),fsd);
+  }
+  final LogVerificationAppender appender=new LogVerificationAppender();
+  final Logger logger=Logger.getRootLogger();
+  logger.addAppender(appender);
+  setHeartbeatResponse(cacheBlocks(fileLocs[numFiles - 1]));
+  GenericTestUtils.waitFor(new Supplier<Boolean>(){
+    @Override public Boolean get(){
+      int lines=appender.countLinesWithMessage("more bytes in the cache: " + DFSConfigKeys.DFS_DATANODE_MAX_LOCKED_MEMORY_KEY);
+      return lines > 0;
+    }
+  }
+,500,30000);
+  assertTrue("Expected more than 0 failed cache attempts",fsd.getNumBlocksFailedToCache() > 0);
+  int curCachedBlocks=16;
+  for (int i=0; i < numFiles - 1; i++) {
+    setHeartbeatResponse(uncacheBlocks(fileLocs[i]));
+    long uncachedBytes=rounder.roundUp(fileSizes[i]);
+    total-=uncachedBytes;
+    curCachedBlocks-=uncachedBytes / BLOCK_SIZE;
+    DFSTestUtil.verifyExpectedCacheUsage(total,curCachedBlocks,fsd);
+  }
+  LOG.info("finishing testFilesExceedMaxLockedMemory");
+}

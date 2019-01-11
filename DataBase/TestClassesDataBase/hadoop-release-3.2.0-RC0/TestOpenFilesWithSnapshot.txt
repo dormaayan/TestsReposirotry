@@ -1,0 +1,565 @@
+public class TestOpenFilesWithSnapshot {
+  private static final Logger LOG=LoggerFactory.getLogger(TestOpenFilesWithSnapshot.class.getName());
+  private final Configuration conf=new Configuration();
+  MiniDFSCluster cluster=null;
+  DistributedFileSystem fs=null;
+  private static final long SEED=0;
+  private static final short REPLICATION=3;
+  private static final long BLOCKSIZE=1024;
+  private static final long BUFFERLEN=BLOCKSIZE / 2;
+  private static final long FILELEN=BLOCKSIZE * 2;
+  @Before public void setup() throws IOException {
+    conf.setBoolean(DFSConfigKeys.DFS_NAMENODE_SNAPSHOT_CAPTURE_OPENFILES,true);
+    cluster=new MiniDFSCluster.Builder(conf).numDataNodes(REPLICATION).build();
+    conf.set("dfs.blocksize","1048576");
+    fs=cluster.getFileSystem();
+  }
+  @After public void teardown() throws IOException {
+    if (fs != null) {
+      fs.close();
+      fs=null;
+    }
+    if (cluster != null) {
+      cluster.shutdown();
+      cluster=null;
+    }
+  }
+  @Test public void testUCFileDeleteWithSnapShot() throws Exception {
+    Path path=new Path("/test");
+    doWriteAndAbort(fs,path);
+    fs.delete(new Path("/test/test/test2"),true);
+    fs.delete(new Path("/test/test/test3"),true);
+    restartNameNode();
+  }
+  @Test public void testParentDirWithUCFileDeleteWithSnapShot() throws Exception {
+    Path path=new Path("/test");
+    doWriteAndAbort(fs,path);
+    fs.delete(new Path("/test/test"),true);
+    restartNameNode();
+  }
+  @Test public void testWithCheckpoint() throws Exception {
+    Path path=new Path("/test");
+    doWriteAndAbort(fs,path);
+    fs.delete(new Path("/test/test"),true);
+    restartNameNode();
+    String test2snapshotPath=Snapshot.getSnapshotPath(path.toString(),"s1/test/test2");
+    DFSTestUtil.readFile(fs,new Path(test2snapshotPath));
+    String test3snapshotPath=Snapshot.getSnapshotPath(path.toString(),"s1/test/test3");
+    DFSTestUtil.readFile(fs,new Path(test3snapshotPath));
+  }
+  @Test public void testFilesDeletionWithCheckpoint() throws Exception {
+    Path path=new Path("/test");
+    doWriteAndAbort(fs,path);
+    fs.delete(new Path("/test/test/test2"),true);
+    fs.delete(new Path("/test/test/test3"),true);
+    restartNameNode();
+    String test2snapshotPath=Snapshot.getSnapshotPath(path.toString(),"s1/test/test2");
+    DFSTestUtil.readFile(fs,new Path(test2snapshotPath));
+    String test3snapshotPath=Snapshot.getSnapshotPath(path.toString(),"s1/test/test3");
+    DFSTestUtil.readFile(fs,new Path(test3snapshotPath));
+  }
+  private void doWriteAndAbort(  DistributedFileSystem fs,  Path path) throws IOException {
+    fs.mkdirs(path);
+    fs.allowSnapshot(path);
+    DFSTestUtil.createFile(fs,new Path("/test/test1"),100,(short)2,100024L);
+    DFSTestUtil.createFile(fs,new Path("/test/test2"),100,(short)2,100024L);
+    Path file=new Path("/test/test/test2");
+    FSDataOutputStream out=fs.create(file);
+    for (int i=0; i < 2; i++) {
+      long count=0;
+      while (count < 1048576) {
+        out.writeBytes("hell");
+        count+=4;
+      }
+    }
+    ((DFSOutputStream)out.getWrappedStream()).hsync(EnumSet.of(SyncFlag.UPDATE_LENGTH));
+    DFSTestUtil.abortStream((DFSOutputStream)out.getWrappedStream());
+    Path file2=new Path("/test/test/test3");
+    FSDataOutputStream out2=fs.create(file2);
+    for (int i=0; i < 2; i++) {
+      long count=0;
+      while (count < 1048576) {
+        out2.writeBytes("hell");
+        count+=4;
+      }
+    }
+    ((DFSOutputStream)out2.getWrappedStream()).hsync(EnumSet.of(SyncFlag.UPDATE_LENGTH));
+    DFSTestUtil.abortStream((DFSOutputStream)out2.getWrappedStream());
+    fs.createSnapshot(path,"s1");
+  }
+  @Test public void testOpenFilesWithMultipleSnapshots() throws Exception {
+    doTestMultipleSnapshots(true);
+  }
+  @Test public void testOpenFilesWithMultipleSnapshotsWithoutCheckpoint() throws Exception {
+    doTestMultipleSnapshots(false);
+  }
+  private void doTestMultipleSnapshots(  boolean saveNamespace) throws IOException {
+    Path path=new Path("/test");
+    doWriteAndAbort(fs,path);
+    fs.createSnapshot(path,"s2");
+    fs.delete(new Path("/test/test"),true);
+    fs.deleteSnapshot(path,"s2");
+    cluster.triggerBlockReports();
+    if (saveNamespace) {
+      NameNode nameNode=cluster.getNameNode();
+      NameNodeAdapter.enterSafeMode(nameNode,false);
+      NameNodeAdapter.saveNamespace(nameNode);
+      NameNodeAdapter.leaveSafeMode(nameNode);
+    }
+    cluster.restartNameNode(true);
+  }
+  @Test public void testOpenFilesWithRename() throws Exception {
+    Path path=new Path("/test");
+    doWriteAndAbort(fs,path);
+    Path fileWithEmptyBlock=new Path("/test/test/test4");
+    fs.create(fileWithEmptyBlock);
+    NamenodeProtocols nameNodeRpc=cluster.getNameNodeRpc();
+    String clientName=fs.getClient().getClientName();
+    nameNodeRpc.addBlock(fileWithEmptyBlock.toString(),clientName,null,null,HdfsConstants.GRANDFATHER_INODE_ID,null,null);
+    fs.createSnapshot(path,"s2");
+    fs.rename(new Path("/test/test"),new Path("/test/test-renamed"));
+    fs.delete(new Path("/test/test-renamed"),true);
+    restartNameNode();
+  }
+  private void createFile(  final Path filePath) throws IOException {
+    DFSTestUtil.createFile(fs,filePath,(int)BUFFERLEN,FILELEN,BLOCKSIZE,REPLICATION,SEED);
+  }
+  private int writeToStream(  final FSDataOutputStream outputStream,  byte[] buf) throws IOException {
+    outputStream.write(buf);
+    ((HdfsDataOutputStream)outputStream).hsync(EnumSet.of(SyncFlag.UPDATE_LENGTH));
+    return buf.length;
+  }
+  /** 
+ * Test open files under snapshot directories are getting captured in snapshots as a truly immutable copy. Verify open files outside of snapshot directory not getting affected. \- level_0_A \- level_1_C +- appA.log         (open file, not under snap root) \- level_2_E        (Snapshottable Dir) \- level_3_G +- flume.log    (open file, under snap root) \- level_0_B +- appB.log         (open file, not under snap root) \- level_2_D        (Snapshottable Dir) +- hbase.log      (open file, under snap root)
+ */
+  @Test(timeout=120000) public void testPointInTimeSnapshotCopiesForOpenFiles() throws Exception {
+    final Path level0A=new Path("/level_0_A");
+    final Path level0B=new Path("/level_0_B");
+    final Path level1C=new Path(level0A,"level_1_C");
+    final Path level1D=new Path(level0B,"level_1_D");
+    final Path level2E=new Path(level1C,"level_2_E");
+    final Path level3G=new Path(level2E,"level_3_G");
+    Set<Path> dirPaths=new HashSet<>(Arrays.asList(level0A,level0B,level1C,level1D,level2E,level3G));
+    for (    Path dirPath : dirPaths) {
+      fs.mkdirs(dirPath);
+    }
+    final Path flumeSnapRootDir=level2E;
+    final Path hbaseSnapRootDir=level1D;
+    final String flumeFileName="flume.log";
+    final String hbaseFileName="hbase.log";
+    final String appAFileName="appA.log";
+    final String appBFileName="appB.log";
+    final String flumeSnap1Name="flume_snap_s1";
+    final String flumeSnap2Name="flume_snap_s2";
+    final String flumeSnap3Name="flume_snap_s3";
+    final String hbaseSnap1Name="hbase_snap_s1";
+    final String hbaseSnap2Name="hbase_snap_s2";
+    final String hbaseSnap3Name="hbase_snap_s3";
+    final String flumeRelPathFromSnapDir="level_3_G/" + flumeFileName;
+    final Path flumeFile=new Path(level3G,flumeFileName);
+    createFile(flumeFile);
+    FSDataOutputStream flumeOutputStream=fs.append(flumeFile);
+    final Path hbaseFile=new Path(level1D,hbaseFileName);
+    createFile(hbaseFile);
+    FSDataOutputStream hbaseOutputStream=fs.append(hbaseFile);
+    final Path appAFile=new Path(level1C,appAFileName);
+    createFile(appAFile);
+    FSDataOutputStream appAOutputStream=fs.append(appAFile);
+    final Path appBFile=new Path(level0B,appBFileName);
+    createFile(appBFile);
+    FSDataOutputStream appBOutputStream=fs.append(appBFile);
+    final long appAFileInitialLength=fs.getFileStatus(appAFile).getLen();
+    final long appBFileInitialLength=fs.getFileStatus(appBFile).getLen();
+    final Path flumeS1Dir=SnapshotTestHelper.createSnapshot(fs,flumeSnapRootDir,flumeSnap1Name);
+    final Path flumeS1Path=new Path(flumeS1Dir,flumeRelPathFromSnapDir);
+    final Path hbaseS1Dir=SnapshotTestHelper.createSnapshot(fs,hbaseSnapRootDir,hbaseSnap1Name);
+    final Path hbaseS1Path=new Path(hbaseS1Dir,hbaseFileName);
+    final long flumeFileLengthAfterS1=fs.getFileStatus(flumeFile).getLen();
+    final long hbaseFileLengthAfterS1=fs.getFileStatus(hbaseFile).getLen();
+    Assert.assertEquals(flumeFileLengthAfterS1,fs.getFileStatus(flumeS1Path).getLen());
+    Assert.assertEquals(hbaseFileLengthAfterS1,fs.getFileStatus(hbaseS1Path).getLen());
+    Assert.assertEquals(appAFileInitialLength,fs.getFileStatus(appAFile).getLen());
+    Assert.assertEquals(appBFileInitialLength,fs.getFileStatus(appBFile).getLen());
+    long flumeFileWrittenDataLength=flumeFileLengthAfterS1;
+    long hbaseFileWrittenDataLength=hbaseFileLengthAfterS1;
+    long appAFileWrittenDataLength=appAFileInitialLength;
+    int newWriteLength=(int)(BLOCKSIZE * 1.5);
+    byte[] buf=new byte[newWriteLength];
+    Random random=new Random();
+    random.nextBytes(buf);
+    flumeFileWrittenDataLength+=writeToStream(flumeOutputStream,buf);
+    hbaseFileWrittenDataLength+=writeToStream(hbaseOutputStream,buf);
+    final Path flumeS2Dir=SnapshotTestHelper.createSnapshot(fs,flumeSnapRootDir,flumeSnap2Name);
+    final Path flumeS2Path=new Path(flumeS2Dir,flumeRelPathFromSnapDir);
+    final Path hbaseS2Dir=SnapshotTestHelper.createSnapshot(fs,hbaseSnapRootDir,hbaseSnap2Name);
+    final Path hbaseS2Path=new Path(hbaseS2Dir,hbaseFileName);
+    final long flumeFileLengthAfterS2=fs.getFileStatus(flumeFile).getLen();
+    final long hbaseFileLengthAfterS2=fs.getFileStatus(hbaseFile).getLen();
+    Assert.assertEquals(flumeFileWrittenDataLength,flumeFileLengthAfterS2);
+    Assert.assertEquals(hbaseFileWrittenDataLength,hbaseFileLengthAfterS2);
+    Assert.assertEquals(flumeFileLengthAfterS2,fs.getFileStatus(flumeS2Path).getLen());
+    Assert.assertEquals(hbaseFileLengthAfterS2,fs.getFileStatus(hbaseS2Path).getLen());
+    Assert.assertEquals(appAFileInitialLength,fs.getFileStatus(appAFile).getLen());
+    Assert.assertEquals(appBFileInitialLength,fs.getFileStatus(appBFile).getLen());
+    newWriteLength=(int)(BLOCKSIZE * 2.5);
+    buf=new byte[newWriteLength];
+    random.nextBytes(buf);
+    appAFileWrittenDataLength+=writeToStream(appAOutputStream,buf);
+    Assert.assertEquals(flumeFileLengthAfterS2,fs.getFileStatus(flumeS2Path).getLen());
+    Assert.assertEquals(appAFileWrittenDataLength,fs.getFileStatus(appAFile).getLen());
+    newWriteLength=(int)(BLOCKSIZE * 2.5);
+    buf=new byte[newWriteLength];
+    random.nextBytes(buf);
+    flumeFileWrittenDataLength+=writeToStream(flumeOutputStream,buf);
+    final Path flumeS3Dir=SnapshotTestHelper.createSnapshot(fs,flumeSnapRootDir,flumeSnap3Name);
+    final Path flumeS3Path=new Path(flumeS3Dir,flumeRelPathFromSnapDir);
+    final Path hbaseS3Dir=SnapshotTestHelper.createSnapshot(fs,hbaseSnapRootDir,hbaseSnap3Name);
+    final Path hbaseS3Path=new Path(hbaseS3Dir,hbaseFileName);
+    final long flumeFileLengthAfterS3=fs.getFileStatus(flumeFile).getLen();
+    final long hbaseFileLengthAfterS3=fs.getFileStatus(hbaseFile).getLen();
+    Assert.assertEquals(flumeFileWrittenDataLength,flumeFileLengthAfterS3);
+    Assert.assertEquals(hbaseFileWrittenDataLength,hbaseFileLengthAfterS3);
+    Assert.assertEquals(flumeFileLengthAfterS3,fs.getFileStatus(flumeS3Path).getLen());
+    Assert.assertEquals(hbaseFileLengthAfterS3,fs.getFileStatus(hbaseS3Path).getLen());
+    Assert.assertEquals(appAFileWrittenDataLength,fs.getFileStatus(appAFile).getLen());
+    Assert.assertEquals(appBFileInitialLength,fs.getFileStatus(appBFile).getLen());
+    Assert.assertEquals(flumeFileLengthAfterS1,fs.getFileStatus(flumeS1Path).getLen());
+    Assert.assertEquals(flumeFileLengthAfterS2,fs.getFileStatus(flumeS2Path).getLen());
+    Assert.assertEquals(flumeFileLengthAfterS3,fs.getFileStatus(flumeS3Path).getLen());
+    Assert.assertEquals(hbaseFileLengthAfterS1,fs.getFileStatus(hbaseS1Path).getLen());
+    Assert.assertEquals(hbaseFileLengthAfterS2,fs.getFileStatus(hbaseS2Path).getLen());
+    Assert.assertEquals(hbaseFileLengthAfterS3,fs.getFileStatus(hbaseS3Path).getLen());
+    flumeOutputStream.close();
+    hbaseOutputStream.close();
+    appAOutputStream.close();
+    appBOutputStream.close();
+  }
+  /** 
+ * Test snapshot capturing open files and verify the same across NameNode restarts.
+ */
+  @Test(timeout=120000) public void testSnapshotsForOpenFilesWithNNRestart() throws Exception {
+    final Path level0A=new Path("/level_0_A");
+    final Path flumeSnapRootDir=level0A;
+    final String flumeFileName="flume.log";
+    final String flumeSnap1Name="flume_snap_1";
+    final String flumeSnap2Name="flume_snap_2";
+    final Path flumeFile=new Path(level0A,flumeFileName);
+    createFile(flumeFile);
+    FSDataOutputStream flumeOutputStream=fs.append(flumeFile);
+    final Path flumeS1Dir=SnapshotTestHelper.createSnapshot(fs,flumeSnapRootDir,flumeSnap1Name);
+    final Path flumeS1Path=new Path(flumeS1Dir,flumeFileName);
+    final long flumeFileLengthAfterS1=fs.getFileStatus(flumeFile).getLen();
+    Assert.assertEquals(flumeFileLengthAfterS1,fs.getFileStatus(flumeS1Path).getLen());
+    long flumeFileWrittenDataLength=flumeFileLengthAfterS1;
+    int newWriteLength=(int)(BLOCKSIZE * 1.5);
+    byte[] buf=new byte[newWriteLength];
+    Random random=new Random();
+    random.nextBytes(buf);
+    flumeFileWrittenDataLength+=writeToStream(flumeOutputStream,buf);
+    final Path flumeS2Dir=SnapshotTestHelper.createSnapshot(fs,flumeSnapRootDir,flumeSnap2Name);
+    final Path flumeS2Path=new Path(flumeS2Dir,flumeFileName);
+    final long flumeFileLengthAfterS2=fs.getFileStatus(flumeFile).getLen();
+    Assert.assertEquals(flumeFileWrittenDataLength,flumeFileLengthAfterS2);
+    Assert.assertEquals(flumeFileLengthAfterS2,fs.getFileStatus(flumeS2Path).getLen());
+    flumeFileWrittenDataLength+=writeToStream(flumeOutputStream,buf);
+    Assert.assertEquals(flumeFileLengthAfterS1,fs.getFileStatus(flumeS1Path).getLen());
+    Assert.assertEquals(flumeFileLengthAfterS2,fs.getFileStatus(flumeS2Path).getLen());
+    restartNameNode();
+    cluster.waitActive();
+    Assert.assertEquals(flumeFileWrittenDataLength,fs.getFileStatus(flumeFile).getLen());
+    Assert.assertEquals(flumeFileLengthAfterS1,fs.getFileStatus(flumeS1Path).getLen());
+    Assert.assertEquals(flumeFileLengthAfterS2,fs.getFileStatus(flumeS2Path).getLen());
+    flumeOutputStream.close();
+  }
+  /** 
+ * Test snapshot capturing open files when an open file with active lease is deleted by the client.
+ */
+  @Test(timeout=120000) public void testSnapshotsForOpenFilesAndDeletion() throws Exception {
+    final Path snapRootDir=new Path("/level_0_A");
+    final String flumeFileName="flume.log";
+    final String hbaseFileName="hbase.log";
+    final String snap1Name="snap_1";
+    final String snap2Name="snap_2";
+    final String snap3Name="snap_3";
+    final Path flumeFile=new Path(snapRootDir,flumeFileName);
+    createFile(flumeFile);
+    final Path hbaseFile=new Path(snapRootDir,hbaseFileName);
+    createFile(hbaseFile);
+    FSDataOutputStream flumeOutputStream=fs.append(flumeFile);
+    FSDataOutputStream hbaseOutputStream=fs.append(hbaseFile);
+    final Path snap1Dir=SnapshotTestHelper.createSnapshot(fs,snapRootDir,snap1Name);
+    final Path flumeS1Path=new Path(snap1Dir,flumeFileName);
+    final long flumeFileLengthAfterS1=fs.getFileStatus(flumeFile).getLen();
+    final Path hbaseS1Path=new Path(snap1Dir,hbaseFileName);
+    final long hbaseFileLengthAfterS1=fs.getFileStatus(hbaseFile).getLen();
+    Assert.assertEquals(flumeFileLengthAfterS1,fs.getFileStatus(flumeS1Path).getLen());
+    Assert.assertEquals(hbaseFileLengthAfterS1,fs.getFileStatus(hbaseS1Path).getLen());
+    long flumeFileWrittenDataLength=flumeFileLengthAfterS1;
+    long hbaseFileWrittenDataLength=hbaseFileLengthAfterS1;
+    int newWriteLength=(int)(BLOCKSIZE * 1.5);
+    byte[] buf=new byte[newWriteLength];
+    Random random=new Random();
+    random.nextBytes(buf);
+    flumeFileWrittenDataLength+=writeToStream(flumeOutputStream,buf);
+    hbaseFileWrittenDataLength+=writeToStream(hbaseOutputStream,buf);
+    final Path snap2Dir=SnapshotTestHelper.createSnapshot(fs,snapRootDir,snap2Name);
+    final Path flumeS2Path=new Path(snap2Dir,flumeFileName);
+    final Path hbaseS2Path=new Path(snap2Dir,hbaseFileName);
+    final long flumeFileLengthAfterS2=fs.getFileStatus(flumeFile).getLen();
+    Assert.assertEquals(flumeFileWrittenDataLength,flumeFileLengthAfterS2);
+    final long hbaseFileLengthAfterS2=fs.getFileStatus(hbaseFile).getLen();
+    Assert.assertEquals(hbaseFileWrittenDataLength,hbaseFileLengthAfterS2);
+    Assert.assertEquals(flumeFileLengthAfterS2,fs.getFileStatus(flumeS2Path).getLen());
+    Assert.assertEquals(hbaseFileLengthAfterS2,fs.getFileStatus(hbaseS2Path).getLen());
+    writeToStream(flumeOutputStream,buf);
+    hbaseFileWrittenDataLength+=writeToStream(hbaseOutputStream,buf);
+    Assert.assertEquals(flumeFileLengthAfterS1,fs.getFileStatus(flumeS1Path).getLen());
+    Assert.assertEquals(flumeFileLengthAfterS2,fs.getFileStatus(flumeS2Path).getLen());
+    Assert.assertEquals(hbaseFileLengthAfterS1,fs.getFileStatus(hbaseS1Path).getLen());
+    Assert.assertEquals(hbaseFileLengthAfterS2,fs.getFileStatus(hbaseS2Path).getLen());
+    boolean flumeFileDeleted=fs.delete(flumeFile,true);
+    Assert.assertTrue(flumeFileDeleted);
+    Assert.assertFalse(fs.exists(flumeFile));
+    Assert.assertTrue(fs.exists(flumeS1Path));
+    Assert.assertTrue(fs.exists(flumeS2Path));
+    SnapshotTestHelper.createSnapshot(fs,snapRootDir,"tmp_snap");
+    fs.deleteSnapshot(snapRootDir,"tmp_snap");
+    fs.deleteSnapshot(snapRootDir,snap2Name);
+    Assert.assertFalse(fs.exists(flumeS2Path));
+    Assert.assertTrue(fs.exists(flumeS1Path));
+    fs.deleteSnapshot(snapRootDir,snap1Name);
+    Assert.assertFalse(fs.exists(flumeS2Path));
+    Assert.assertFalse(fs.exists(flumeS1Path));
+    final Path snap3Dir=SnapshotTestHelper.createSnapshot(fs,snapRootDir,snap3Name);
+    final Path hbaseS3Path=new Path(snap3Dir,hbaseFileName);
+    final long hbaseFileLengthAfterS3=fs.getFileStatus(hbaseFile).getLen();
+    Assert.assertEquals(hbaseFileWrittenDataLength,hbaseFileLengthAfterS3);
+    hbaseFileWrittenDataLength+=writeToStream(hbaseOutputStream,buf);
+    Assert.assertEquals(hbaseFileLengthAfterS3,fs.getFileStatus(hbaseS3Path).getLen());
+    Assert.assertEquals(hbaseFileWrittenDataLength,fs.getFileStatus(hbaseFile).getLen());
+    hbaseOutputStream.close();
+  }
+  /** 
+ * Verify if the NameNode can restart properly after an OpenForWrite file and the only snapshot it was present in were deleted.
+ * @throws Exception
+ */
+  @Test(timeout=600000) public void testOpenFileDeletionAndNNRestart() throws Exception {
+    final Path snapRootDir=new Path("/level_0_A/test");
+    final String hbaseFileName="hbase.log";
+    final String snap1Name="snap_1";
+    final Path hbaseFile=new Path(snapRootDir,hbaseFileName);
+    createFile(hbaseFile);
+    FSDataOutputStream hbaseOutputStream=fs.append(hbaseFile);
+    int newWriteLength=(int)(BLOCKSIZE * 1.5);
+    byte[] buf=new byte[newWriteLength];
+    Random random=new Random();
+    random.nextBytes(buf);
+    writeToStream(hbaseOutputStream,buf);
+    final Path snap1Dir=SnapshotTestHelper.createSnapshot(fs,snapRootDir,snap1Name);
+    LOG.info("Open file status in snap: " + fs.getFileStatus(new Path(snap1Dir,hbaseFileName)));
+    fs.delete(hbaseFile,true);
+    fs.deleteSnapshot(snapRootDir,snap1Name);
+    Assert.assertFalse(fs.exists(hbaseFile));
+    cluster.restartNameNode();
+    cluster.waitActive();
+    Assert.assertFalse(fs.exists(hbaseFile));
+  }
+  /** 
+ * Test client writing to open files are not interrupted when snapshots that captured open files get deleted.
+ */
+  @Test(timeout=240000) public void testOpenFileWritingAcrossSnapDeletion() throws Exception {
+    final Path snapRootDir=new Path("/level_0_A");
+    final String flumeFileName="flume.log";
+    final String hbaseFileName="hbase.log";
+    final String snap1Name="snap_1";
+    final String snap2Name="snap_2";
+    final String snap3Name="snap_3";
+    final Path flumeFile=new Path(snapRootDir,flumeFileName);
+    FSDataOutputStream flumeOut=fs.create(flumeFile,false,8000,(short)3,1048576);
+    flumeOut.close();
+    final Path hbaseFile=new Path(snapRootDir,hbaseFileName);
+    FSDataOutputStream hbaseOut=fs.create(hbaseFile,false,8000,(short)3,1048576);
+    hbaseOut.close();
+    final AtomicBoolean writerError=new AtomicBoolean(false);
+    final CountDownLatch startLatch=new CountDownLatch(1);
+    final CountDownLatch deleteLatch=new CountDownLatch(1);
+    Thread t=new Thread(new Runnable(){
+      @Override public void run(){
+        try {
+          FSDataOutputStream flumeOutputStream=fs.append(flumeFile,8000);
+          FSDataOutputStream hbaseOutputStream=fs.append(hbaseFile,8000);
+          byte[] bytes=new byte[(int)(1024 * 0.2)];
+          Random r=new Random(Time.now());
+          for (int i=0; i < 200000; i++) {
+            r.nextBytes(bytes);
+            flumeOutputStream.write(bytes);
+            if (hbaseOutputStream != null) {
+              hbaseOutputStream.write(bytes);
+            }
+            if (i == 50000) {
+              startLatch.countDown();
+            }
+ else             if (i == 100000) {
+              deleteLatch.countDown();
+            }
+ else             if (i == 150000) {
+              hbaseOutputStream.hsync();
+              fs.delete(hbaseFile,true);
+              try {
+                hbaseOutputStream.close();
+              }
+ catch (              Exception e) {
+              }
+              hbaseOutputStream=null;
+            }
+ else             if (i % 5000 == 0) {
+              LOG.info("Write pos: " + flumeOutputStream.getPos() + ", size: "+ fs.getFileStatus(flumeFile).getLen()+ ", loop: "+ (i + 1));
+            }
+          }
+        }
+ catch (        Exception e) {
+          LOG.warn("Writer error: " + e);
+          writerError.set(true);
+        }
+      }
+    }
+);
+    t.start();
+    startLatch.await();
+    final Path snap1Dir=SnapshotTestHelper.createSnapshot(fs,snapRootDir,snap1Name);
+    final Path flumeS1Path=new Path(snap1Dir,flumeFileName);
+    LOG.info("Snap1 file status: " + fs.getFileStatus(flumeS1Path));
+    LOG.info("Current file status: " + fs.getFileStatus(flumeFile));
+    deleteLatch.await();
+    LOG.info("Snap1 file status: " + fs.getFileStatus(flumeS1Path));
+    LOG.info("Current file status: " + fs.getFileStatus(flumeFile));
+    LOG.info("Deleting " + snap1Name);
+    fs.deleteSnapshot(snapRootDir,snap1Name);
+    SnapshotTestHelper.createSnapshot(fs,snapRootDir,snap2Name);
+    SnapshotTestHelper.createSnapshot(fs,snapRootDir,snap3Name);
+    fs.deleteSnapshot(snapRootDir,snap3Name);
+    fs.deleteSnapshot(snapRootDir,snap2Name);
+    SnapshotTestHelper.createSnapshot(fs,snapRootDir,"test");
+    t.join();
+    Assert.assertFalse("Client encountered writing error!",writerError.get());
+    restartNameNode();
+    cluster.waitActive();
+  }
+  /** 
+ * Verify snapshots with open files captured are safe even when the 'current' version of the file is truncated and appended later.
+ */
+  @Test(timeout=120000) public void testOpenFilesSnapChecksumWithTrunkAndAppend() throws Exception {
+    final Path dir=new Path("/A/B/C");
+    fs.mkdirs(dir);
+    final Path hbaseSnapRootDir=dir;
+    final String hbaseFileName="hbase.wal";
+    final String hbaseSnap1Name="hbase_snap_s1";
+    final String hbaseSnap2Name="hbase_snap_s2";
+    final String hbaseSnap3Name="hbase_snap_s3";
+    final String hbaseSnap4Name="hbase_snap_s4";
+    final Path hbaseFile=new Path(dir,hbaseFileName);
+    createFile(hbaseFile);
+    final FileChecksum hbaseWALFileCksum0=fs.getFileChecksum(hbaseFile);
+    FSDataOutputStream hbaseOutputStream=fs.append(hbaseFile);
+    final Path hbaseS1Dir=SnapshotTestHelper.createSnapshot(fs,hbaseSnapRootDir,hbaseSnap1Name);
+    final Path hbaseS1Path=new Path(hbaseS1Dir,hbaseFileName);
+    final FileChecksum hbaseFileCksumS1=fs.getFileChecksum(hbaseS1Path);
+    Assert.assertEquals("Live and snap1 file checksum doesn't match!",hbaseWALFileCksum0,fs.getFileChecksum(hbaseS1Path));
+    int newWriteLength=(int)(BLOCKSIZE * 1.5);
+    byte[] buf=new byte[newWriteLength];
+    Random random=new Random();
+    random.nextBytes(buf);
+    writeToStream(hbaseOutputStream,buf);
+    final Path hbaseS2Dir=SnapshotTestHelper.createSnapshot(fs,hbaseSnapRootDir,hbaseSnap2Name);
+    final Path hbaseS2Path=new Path(hbaseS2Dir,hbaseFileName);
+    final FileChecksum hbaseFileCksumS2=fs.getFileChecksum(hbaseS2Path);
+    Assert.assertEquals("Snap file checksum has changed!",hbaseFileCksumS1,fs.getFileChecksum(hbaseS1Path));
+    Assert.assertNotEquals("Snap1 and snap2 file checksum should differ!",hbaseFileCksumS1,hbaseFileCksumS2);
+    newWriteLength=(int)(BLOCKSIZE * 2.5);
+    buf=new byte[newWriteLength];
+    random.nextBytes(buf);
+    writeToStream(hbaseOutputStream,buf);
+    final Path hbaseS3Dir=SnapshotTestHelper.createSnapshot(fs,hbaseSnapRootDir,hbaseSnap3Name);
+    final Path hbaseS3Path=new Path(hbaseS3Dir,hbaseFileName);
+    FileChecksum hbaseFileCksumS3=fs.getFileChecksum(hbaseS3Path);
+    hbaseOutputStream.close();
+    final FileChecksum hbaseFileCksumBeforeTruncate=fs.getFileChecksum(hbaseFile);
+    Assert.assertEquals("Snap3 and before truncate file checksum should match!",hbaseFileCksumBeforeTruncate,hbaseFileCksumS3);
+    long currentFileLen=fs.getFileStatus(hbaseFile).getLen();
+    boolean fileTruncated=fs.truncate(hbaseFile,currentFileLen / 2);
+    Assert.assertTrue("File truncation failed!",fileTruncated);
+    final FileChecksum hbaseFileCksumAfterTruncate=fs.getFileChecksum(hbaseFile);
+    Assert.assertNotEquals("Snap3 and after truncate checksum shouldn't match!",hbaseFileCksumS3,hbaseFileCksumAfterTruncate);
+    hbaseOutputStream=fs.append(hbaseFile);
+    newWriteLength=(int)(BLOCKSIZE * 5.5);
+    buf=new byte[newWriteLength];
+    random.nextBytes(buf);
+    writeToStream(hbaseOutputStream,buf);
+    final Path hbaseS4Dir=SnapshotTestHelper.createSnapshot(fs,hbaseSnapRootDir,hbaseSnap4Name);
+    final Path hbaseS4Path=new Path(hbaseS4Dir,hbaseFileName);
+    final FileChecksum hbaseFileCksumS4=fs.getFileChecksum(hbaseS4Path);
+    hbaseOutputStream.close();
+    final FileChecksum hbaseFileCksumAfterAppend=fs.getFileChecksum(hbaseFile);
+    Assert.assertEquals("Snap4 and after append file checksum should match!",hbaseFileCksumAfterAppend,hbaseFileCksumS4);
+    hbaseFileCksumS3=fs.getFileChecksum(hbaseS3Path);
+    Assert.assertEquals("Snap3 and before truncate file checksum should match!",hbaseFileCksumBeforeTruncate,hbaseFileCksumS3);
+  }
+  private Path createSnapshot(  Path snapRootDir,  String snapName,  String fileName) throws Exception {
+    final Path snap1Dir=SnapshotTestHelper.createSnapshot(fs,snapRootDir,snapName);
+    return new Path(snap1Dir,fileName);
+  }
+  private void verifyFileSize(  long fileSize,  Path... filePaths) throws IOException {
+    for (    Path filePath : filePaths) {
+      Assert.assertEquals(fileSize,fs.getFileStatus(filePath).getLen());
+    }
+  }
+  /** 
+ * Verify open files captured in the snapshots across config disable and enable.
+ */
+  @Test public void testOpenFilesWithMixedConfig() throws Exception {
+    final Path snapRootDir=new Path("/level_0_A");
+    final String flumeFileName="flume.log";
+    final String snap1Name="s1";
+    final String snap2Name="s2";
+    final String snap3Name="s3";
+    final String snap4Name="s4";
+    final String snap5Name="s5";
+    final Path flumeFile=new Path(snapRootDir,flumeFileName);
+    createFile(flumeFile);
+    FSDataOutputStream flumeOutputStream=fs.append(flumeFile);
+    cluster.getNameNode().getNamesystem().getSnapshotManager().setCaptureOpenFiles(false);
+    final Path flumeS1Path=createSnapshot(snapRootDir,snap1Name,flumeFileName);
+    verifyFileSize(FILELEN,flumeS1Path);
+    long flumeFileWrittenDataLength=FILELEN;
+    int newWriteLength=(int)(BLOCKSIZE * 1.5);
+    byte[] buf=new byte[newWriteLength];
+    Random random=new Random();
+    random.nextBytes(buf);
+    flumeFileWrittenDataLength+=writeToStream(flumeOutputStream,buf);
+    final Path flumeS2Path=createSnapshot(snapRootDir,snap2Name,flumeFileName);
+    verifyFileSize(flumeFileWrittenDataLength,flumeFile,flumeS2Path,flumeS1Path);
+    cluster.getNameNode().getNamesystem().getSnapshotManager().setCaptureOpenFiles(true);
+    flumeFileWrittenDataLength+=writeToStream(flumeOutputStream,buf);
+    long flumeFileLengthAfterS3=flumeFileWrittenDataLength;
+    final Path flumeS3Path=createSnapshot(snapRootDir,snap3Name,flumeFileName);
+    verifyFileSize(flumeFileWrittenDataLength,flumeFile,flumeS3Path,flumeS2Path,flumeS1Path);
+    flumeFileWrittenDataLength+=writeToStream(flumeOutputStream,buf);
+    final Path flumeS4Path=createSnapshot(snapRootDir,snap4Name,flumeFileName);
+    verifyFileSize(flumeFileWrittenDataLength,flumeFile,flumeS4Path);
+    verifyFileSize(flumeFileLengthAfterS3,flumeS3Path,flumeS2Path,flumeS1Path);
+    long flumeFileLengthAfterS4=flumeFileWrittenDataLength;
+    cluster.getNameNode().getNamesystem().getSnapshotManager().setCaptureOpenFiles(false);
+    final Path flumeS5Path=createSnapshot(snapRootDir,snap5Name,flumeFileName);
+    flumeFileWrittenDataLength+=writeToStream(flumeOutputStream,buf);
+    verifyFileSize(flumeFileWrittenDataLength,flumeFile,flumeS5Path);
+    verifyFileSize(flumeFileLengthAfterS4,flumeS4Path);
+  }
+  private void restartNameNode() throws Exception {
+    cluster.triggerBlockReports();
+    NameNode nameNode=cluster.getNameNode();
+    NameNodeAdapter.enterSafeMode(nameNode,false);
+    NameNodeAdapter.saveNamespace(nameNode);
+    NameNodeAdapter.leaveSafeMode(nameNode);
+    cluster.restartNameNode(true);
+  }
+}

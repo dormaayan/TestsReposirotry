@@ -1,0 +1,103 @@
+public class TestTrafficControlBandwidthHandlerImpl {
+  private static final Logger LOG=LoggerFactory.getLogger(TestTrafficControlBandwidthHandlerImpl.class);
+  private static final int ROOT_BANDWIDTH_MBIT=100;
+  private static final int YARN_BANDWIDTH_MBIT=70;
+  private static final int TEST_CLASSID=100;
+  private static final String TEST_CLASSID_STR="42:100";
+  private static final String TEST_CONTAINER_ID_STR="container_01";
+  private static final String TEST_TASKS_FILE="testTasksFile";
+  private PrivilegedOperationExecutor privilegedOperationExecutorMock;
+  private CGroupsHandler cGroupsHandlerMock;
+  private TrafficController trafficControllerMock;
+  private Configuration conf;
+  private String tmpPath;
+  private String device;
+  ContainerId containerIdMock;
+  Container containerMock;
+  @Before public void setup(){
+    privilegedOperationExecutorMock=mock(PrivilegedOperationExecutor.class);
+    cGroupsHandlerMock=mock(CGroupsHandler.class);
+    trafficControllerMock=mock(TrafficController.class);
+    conf=new YarnConfiguration();
+    tmpPath=new StringBuffer(System.getProperty("test.build.data")).append('/').append("hadoop.tmp.dir").toString();
+    device=YarnConfiguration.DEFAULT_NM_NETWORK_RESOURCE_INTERFACE;
+    containerIdMock=mock(ContainerId.class);
+    containerMock=mock(Container.class);
+    when(containerIdMock.toString()).thenReturn(TEST_CONTAINER_ID_STR);
+    when(containerMock.getContainerId()).thenReturn(containerIdMock);
+    conf.setInt(YarnConfiguration.NM_NETWORK_RESOURCE_OUTBOUND_BANDWIDTH_MBIT,ROOT_BANDWIDTH_MBIT);
+    conf.setInt(YarnConfiguration.NM_NETWORK_RESOURCE_OUTBOUND_BANDWIDTH_YARN_MBIT,YARN_BANDWIDTH_MBIT);
+    conf.set("hadoop.tmp.dir",tmpPath);
+    conf.setBoolean(YarnConfiguration.NM_RECOVERY_ENABLED,false);
+  }
+  @Test public void testBootstrap(){
+    TrafficControlBandwidthHandlerImpl handlerImpl=new TrafficControlBandwidthHandlerImpl(privilegedOperationExecutorMock,cGroupsHandlerMock,trafficControllerMock);
+    try {
+      handlerImpl.bootstrap(conf);
+      verify(cGroupsHandlerMock).initializeCGroupController(eq(CGroupsHandler.CGroupController.NET_CLS));
+      verifyNoMoreInteractions(cGroupsHandlerMock);
+      verify(trafficControllerMock).bootstrap(eq(device),eq(ROOT_BANDWIDTH_MBIT),eq(YARN_BANDWIDTH_MBIT));
+      verifyNoMoreInteractions(trafficControllerMock);
+    }
+ catch (    ResourceHandlerException e) {
+      LOG.error("Unexpected exception: " + e);
+      Assert.fail("Caught unexpected ResourceHandlerException!");
+    }
+  }
+  @Test public void testLifeCycle(){
+    TrafficController trafficControllerSpy=spy(new TrafficController(conf,privilegedOperationExecutorMock));
+    TrafficControlBandwidthHandlerImpl handlerImpl=new TrafficControlBandwidthHandlerImpl(privilegedOperationExecutorMock,cGroupsHandlerMock,trafficControllerSpy);
+    try {
+      handlerImpl.bootstrap(conf);
+      testPreStart(trafficControllerSpy,handlerImpl);
+      testPostComplete(trafficControllerSpy,handlerImpl);
+    }
+ catch (    ResourceHandlerException e) {
+      LOG.error("Unexpected exception: " + e);
+      Assert.fail("Caught unexpected ResourceHandlerException!");
+    }
+  }
+  private void testPreStart(  TrafficController trafficControllerSpy,  TrafficControlBandwidthHandlerImpl handlerImpl) throws ResourceHandlerException {
+    reset(privilegedOperationExecutorMock);
+    doReturn(TEST_CLASSID).when(trafficControllerSpy).getNextClassId();
+    doReturn(TEST_CLASSID_STR).when(trafficControllerSpy).getStringForNetClsClassId(TEST_CLASSID);
+    when(cGroupsHandlerMock.getPathForCGroupTasks(CGroupsHandler.CGroupController.NET_CLS,TEST_CONTAINER_ID_STR)).thenReturn(TEST_TASKS_FILE);
+    List<PrivilegedOperation> ops=handlerImpl.preStart(containerMock);
+    verify(cGroupsHandlerMock).createCGroup(eq(CGroupsHandler.CGroupController.NET_CLS),eq(TEST_CONTAINER_ID_STR));
+    verify(cGroupsHandlerMock).updateCGroupParam(eq(CGroupsHandler.CGroupController.NET_CLS),eq(TEST_CONTAINER_ID_STR),eq(CGroupsHandler.CGROUP_PARAM_CLASSID),eq(TEST_CLASSID_STR));
+    Assert.assertEquals(2,ops.size());
+    PrivilegedOperation addPidOp=ops.get(0);
+    String expectedAddPidOpArg=PrivilegedOperation.CGROUP_ARG_PREFIX + TEST_TASKS_FILE;
+    List<String> addPidOpArgs=addPidOp.getArguments();
+    Assert.assertEquals(PrivilegedOperation.OperationType.ADD_PID_TO_CGROUP,addPidOp.getOperationType());
+    Assert.assertEquals(1,addPidOpArgs.size());
+    Assert.assertEquals(expectedAddPidOpArg,addPidOpArgs.get(0));
+    PrivilegedOperation tcModifyOp=ops.get(1);
+    List<String> tcModifyOpArgs=tcModifyOp.getArguments();
+    Assert.assertEquals(PrivilegedOperation.OperationType.TC_MODIFY_STATE,tcModifyOp.getOperationType());
+    Assert.assertEquals(1,tcModifyOpArgs.size());
+    Assert.assertTrue(new File(tcModifyOpArgs.get(0)).exists());
+  }
+  private void testPostComplete(  TrafficController trafficControllerSpy,  TrafficControlBandwidthHandlerImpl handlerImpl) throws ResourceHandlerException {
+    reset(privilegedOperationExecutorMock);
+    List<PrivilegedOperation> ops=handlerImpl.postComplete(containerIdMock);
+    verify(cGroupsHandlerMock).deleteCGroup(eq(CGroupsHandler.CGroupController.NET_CLS),eq(TEST_CONTAINER_ID_STR));
+    try {
+      ArgumentCaptor<PrivilegedOperation> opCaptor=ArgumentCaptor.forClass(PrivilegedOperation.class);
+      verify(privilegedOperationExecutorMock).executePrivilegedOperation(opCaptor.capture(),eq(false));
+      List<String> args=opCaptor.getValue().getArguments();
+      Assert.assertEquals(PrivilegedOperation.OperationType.TC_MODIFY_STATE,opCaptor.getValue().getOperationType());
+      Assert.assertEquals(1,args.size());
+      Assert.assertTrue(new File(args.get(0)).exists());
+      verify(trafficControllerSpy).releaseClassId(TEST_CLASSID);
+    }
+ catch (    PrivilegedOperationException e) {
+      LOG.error("Caught exception: " + e);
+      Assert.fail("Unexpected PrivilegedOperationException from mock!");
+    }
+    Assert.assertNull(ops);
+  }
+  @After public void teardown(){
+    FileUtil.fullyDelete(new File(tmpPath));
+  }
+}

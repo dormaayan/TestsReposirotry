@@ -1,0 +1,46 @@
+@Test public void testMetadataRefreshDuringRebalance(){
+  final String consumerId="leader";
+  subscriptions.subscribe(Pattern.compile(".*"),rebalanceListener);
+  metadata.needMetadataForAllTopics(true);
+  metadata.update(TestUtils.singletonCluster(topic1,1),Collections.<String>emptySet(),time.milliseconds());
+  assertEquals(singleton(topic1),subscriptions.subscription());
+  client.prepareResponse(groupCoordinatorResponse(node,Errors.NONE));
+  coordinator.ensureCoordinatorReady(time.timer(Long.MAX_VALUE));
+  Map<String,List<String>> initialSubscription=singletonMap(consumerId,singletonList(topic1));
+  partitionAssignor.prepare(singletonMap(consumerId,singletonList(t1p)));
+  final List<String> updatedSubscription=Arrays.asList(topic1,topic2);
+  final Set<String> updatedSubscriptionSet=new HashSet<>(updatedSubscription);
+  client.prepareResponse(joinGroupLeaderResponse(1,consumerId,initialSubscription,Errors.NONE));
+  client.prepareResponse(new MockClient.RequestMatcher(){
+    @Override public boolean matches(    AbstractRequest body){
+      final Map<String,Integer> updatedPartitions=new HashMap<>();
+      for (      String topic : updatedSubscription)       updatedPartitions.put(topic,1);
+      metadata.update(TestUtils.clusterWith(1,updatedPartitions),Collections.<String>emptySet(),time.milliseconds());
+      return true;
+    }
+  }
+,syncGroupResponse(singletonList(t1p),Errors.NONE));
+  List<TopicPartition> newAssignment=Arrays.asList(t1p,t2p);
+  Set<TopicPartition> newAssignmentSet=new HashSet<>(newAssignment);
+  Map<String,List<String>> updatedSubscriptions=singletonMap(consumerId,Arrays.asList(topic1,topic2));
+  partitionAssignor.prepare(singletonMap(consumerId,newAssignment));
+  client.prepareResponse(new MockClient.RequestMatcher(){
+    @Override public boolean matches(    AbstractRequest body){
+      JoinGroupRequest join=(JoinGroupRequest)body;
+      ProtocolMetadata protocolMetadata=join.groupProtocols().iterator().next();
+      PartitionAssignor.Subscription subscription=ConsumerProtocol.deserializeSubscription(protocolMetadata.metadata());
+      protocolMetadata.metadata().rewind();
+      return subscription.topics().containsAll(updatedSubscriptionSet);
+    }
+  }
+,joinGroupLeaderResponse(2,consumerId,updatedSubscriptions,Errors.NONE));
+  client.prepareResponse(syncGroupResponse(newAssignment,Errors.NONE));
+  coordinator.poll(time.timer(Long.MAX_VALUE));
+  assertFalse(coordinator.rejoinNeededOrPending());
+  assertEquals(updatedSubscriptionSet,subscriptions.subscription());
+  assertEquals(newAssignmentSet,subscriptions.assignedPartitions());
+  assertEquals(2,rebalanceListener.revokedCount);
+  assertEquals(singleton(t1p),rebalanceListener.revoked);
+  assertEquals(2,rebalanceListener.assignedCount);
+  assertEquals(newAssignmentSet,rebalanceListener.assigned);
+}

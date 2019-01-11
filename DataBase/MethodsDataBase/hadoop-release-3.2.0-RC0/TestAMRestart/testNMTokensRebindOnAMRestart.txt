@@ -1,0 +1,66 @@
+@Test(timeout=30000) public void testNMTokensRebindOnAMRestart() throws Exception {
+  getConf().setInt(YarnConfiguration.RM_AM_MAX_ATTEMPTS,3);
+  getConf().setFloat(YarnConfiguration.AM_SCHEDULING_NODE_BLACKLISTING_DISABLE_THRESHOLD,0.5f);
+  MockRM rm1=new MockRM(getConf());
+  rm1.start();
+  RMApp app1=rm1.submitApp(200,"myname","myuser",new HashMap<ApplicationAccessType,String>(),false,"default",-1,null,"MAPREDUCE",false,true);
+  MockNM nm1=new MockNM("127.0.0.1:1234",8000,rm1.getResourceTrackerService());
+  nm1.registerNode();
+  MockNM nm2=new MockNM("127.1.1.1:4321",8000,rm1.getResourceTrackerService());
+  nm2.registerNode();
+  MockAM am1=MockRM.launchAndRegisterAM(app1,rm1,nm1);
+  List<Container> containers=new ArrayList<Container>();
+  List<NMToken> expectedNMTokens=new ArrayList<NMToken>();
+  while (true) {
+    AllocateResponse response=am1.allocate("127.0.0.1",2000,2,new ArrayList<ContainerId>());
+    nm1.nodeHeartbeat(true);
+    containers.addAll(response.getAllocatedContainers());
+    expectedNMTokens.addAll(response.getNMTokens());
+    if (containers.size() == 2) {
+      break;
+    }
+    Thread.sleep(200);
+    System.out.println("Waiting for container to be allocated.");
+  }
+  nm1.nodeHeartbeat(am1.getApplicationAttemptId(),2,ContainerState.RUNNING);
+  ContainerId containerId2=ContainerId.newContainerId(am1.getApplicationAttemptId(),2);
+  rm1.waitForState(nm1,containerId2,RMContainerState.RUNNING);
+  nm1.nodeHeartbeat(am1.getApplicationAttemptId(),3,ContainerState.RUNNING);
+  ContainerId containerId3=ContainerId.newContainerId(am1.getApplicationAttemptId(),3);
+  rm1.waitForState(nm1,containerId3,RMContainerState.RUNNING);
+  nm1.nodeHeartbeat(am1.getApplicationAttemptId(),1,ContainerState.COMPLETE);
+  rm1.waitForState(am1.getApplicationAttemptId(),RMAppAttemptState.FAILED);
+  rm1.waitForState(app1.getApplicationId(),RMAppState.ACCEPTED);
+  MockAM am2=MockRM.launchAM(app1,rm1,nm1);
+  RegisterApplicationMasterResponse registerResponse=am2.registerAppAttempt();
+  rm1.waitForState(am2.getApplicationAttemptId(),RMAppAttemptState.RUNNING);
+  Assert.assertEquals(expectedNMTokens.size(),registerResponse.getNMTokensFromPreviousAttempts().size());
+  for (int i=0; i < expectedNMTokens.size(); i++) {
+    Assert.assertTrue(expectedNMTokens.get(i).equals(registerResponse.getNMTokensFromPreviousAttempts().get(i)));
+  }
+  containers=new ArrayList<Container>();
+  while (true) {
+    AllocateResponse allocateResponse=am2.allocate("127.1.1.1",4000,1,new ArrayList<ContainerId>());
+    nm2.nodeHeartbeat(true);
+    containers.addAll(allocateResponse.getAllocatedContainers());
+    expectedNMTokens.addAll(allocateResponse.getNMTokens());
+    if (containers.size() == 1) {
+      break;
+    }
+    Thread.sleep(200);
+    System.out.println("Waiting for container to be allocated.");
+  }
+  nm1.nodeHeartbeat(am2.getApplicationAttemptId(),2,ContainerState.RUNNING);
+  ContainerId am2ContainerId2=ContainerId.newContainerId(am2.getApplicationAttemptId(),2);
+  rm1.waitForState(nm1,am2ContainerId2,RMContainerState.RUNNING);
+  nm1.nodeHeartbeat(am2.getApplicationAttemptId(),1,ContainerState.COMPLETE);
+  rm1.waitForState(am2.getApplicationAttemptId(),RMAppAttemptState.FAILED);
+  rm1.waitForState(app1.getApplicationId(),RMAppState.ACCEPTED);
+  MockAM am3=MockRM.launchAM(app1,rm1,nm1);
+  registerResponse=am3.registerAppAttempt();
+  rm1.waitForState(am3.getApplicationAttemptId(),RMAppAttemptState.RUNNING);
+  List<NMToken> transferredTokens=registerResponse.getNMTokensFromPreviousAttempts();
+  Assert.assertEquals(2,transferredTokens.size());
+  Assert.assertTrue(transferredTokens.containsAll(expectedNMTokens));
+  rm1.stop();
+}

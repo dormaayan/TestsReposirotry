@@ -1,0 +1,43 @@
+@Test public void testLogAggregationCreateDirsFailsWithoutKillingNM() throws Exception {
+  this.conf.set(YarnConfiguration.NM_LOG_DIRS,localLogDir.getAbsolutePath());
+  this.conf.set(YarnConfiguration.NM_REMOTE_APP_LOG_DIR,this.remoteRootLogDir.getAbsolutePath());
+  DeletionService spyDelSrvc=spy(this.delSrvc);
+  LogAggregationFileControllerFactory factory=new LogAggregationFileControllerFactory(conf);
+  LogAggregationFileController logAggregationFileFormat=factory.getFileControllerForWrite();
+  LogAggregationFileController spyLogAggregationFileFormat=spy(logAggregationFileFormat);
+  Exception e=new YarnRuntimeException(new SecretManager.InvalidToken("KABOOM!"));
+  doThrow(e).when(spyLogAggregationFileFormat).createAppDir(any(String.class),any(ApplicationId.class),any(UserGroupInformation.class));
+  LogAggregationService logAggregationService=spy(new LogAggregationService(dispatcher,this.context,spyDelSrvc,super.dirsHandler){
+    @Override public LogAggregationFileController getLogAggregationFileController(    Configuration conf){
+      return spyLogAggregationFileFormat;
+    }
+  }
+);
+  logAggregationService.init(this.conf);
+  logAggregationService.start();
+  ApplicationId appId=BuilderUtils.newApplicationId(System.currentTimeMillis(),(int)(Math.random() * 1000));
+  File appLogDir=new File(localLogDir,appId.toString());
+  appLogDir.mkdir();
+  LogAggregationContext contextWithAMAndFailed=Records.newRecord(LogAggregationContext.class);
+  contextWithAMAndFailed.setLogAggregationPolicyClassName(AMOrFailedContainerLogAggregationPolicy.class.getName());
+  logAggregationService.handle(new LogHandlerAppStartedEvent(appId,this.user,null,this.acls,contextWithAMAndFailed));
+  dispatcher.await();
+  ApplicationEvent expectedEvents[]=new ApplicationEvent[]{new ApplicationEvent(appId,ApplicationEventType.APPLICATION_LOG_HANDLING_FAILED)};
+  checkEvents(appEventHandler,expectedEvents,false,"getType","getApplicationID","getDiagnostic");
+  Assert.assertEquals(logAggregationService.getInvalidTokenApps().size(),1);
+  logAggregationService.handle(new LogHandlerContainerFinishedEvent(BuilderUtils.newContainerId(4,1,1,1),ContainerType.APPLICATION_MASTER,0));
+  dispatcher.await();
+  AppLogAggregator appAgg=logAggregationService.getAppLogAggregators().get(appId);
+  Assert.assertFalse("Aggregation should be disabled",appAgg.isAggregationEnabled());
+  logAggregationService.handle(new LogHandlerTokenUpdatedEvent());
+  dispatcher.await();
+  appAgg=logAggregationService.getAppLogAggregators().get(appId);
+  Assert.assertFalse("Aggregation should be enabled",appAgg.isAggregationEnabled());
+  Assert.assertEquals(0,logAggregationService.getInvalidTokenApps().size());
+  logAggregationService.handle(new LogHandlerAppFinishedEvent(BuilderUtils.newApplicationId(1,5)));
+  dispatcher.await();
+  logAggregationService.stop();
+  assertEquals(0,logAggregationService.getNumAggregators());
+  verify(spyDelSrvc).delete(any(FileDeletionTask.class));
+  verify(logAggregationService).closeFileSystems(any(UserGroupInformation.class));
+}

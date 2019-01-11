@@ -1,0 +1,36 @@
+@Test(timeout=60000) public void testDataXceiverHandlesRequestShortCircuitShmFailure() throws Exception {
+  BlockReaderTestUtil.enableShortCircuitShmTracing();
+  TemporarySocketDirectory sockDir=new TemporarySocketDirectory();
+  Configuration conf=createShortCircuitConf("testDataXceiverHandlesRequestShortCircuitShmFailure",sockDir);
+  conf.setLong(HdfsClientConfigKeys.Read.ShortCircuit.STREAMS_CACHE_EXPIRY_MS_KEY,1000000000L);
+  MiniDFSCluster cluster=new MiniDFSCluster.Builder(conf).numDataNodes(1).build();
+  cluster.waitActive();
+  DistributedFileSystem fs=cluster.getFileSystem();
+  final Path TEST_PATH1=new Path("/test_file1");
+  DFSTestUtil.createFile(fs,TEST_PATH1,4096,(short)1,0xFADE1);
+  LOG.info("Setting failure injector and performing a read which " + "should fail...");
+  DataNodeFaultInjector failureInjector=Mockito.mock(DataNodeFaultInjector.class);
+  Mockito.doAnswer(new Answer<Void>(){
+    @Override public Void answer(    InvocationOnMock invocation) throws Throwable {
+      throw new IOException("injected error into sendShmResponse");
+    }
+  }
+).when(failureInjector).sendShortCircuitShmResponse();
+  DataNodeFaultInjector prevInjector=DataNodeFaultInjector.get();
+  DataNodeFaultInjector.set(failureInjector);
+  try {
+    DFSTestUtil.readFileBuffer(fs,TEST_PATH1);
+    Assert.fail("expected readFileBuffer to fail, but it succeeded.");
+  }
+ catch (  Throwable t) {
+    GenericTestUtils.assertExceptionContains("TCP reads were disabled for " + "testing, but we failed to do a non-TCP read.",t);
+  }
+  checkNumberOfSegmentsAndSlots(0,0,cluster.getDataNodes().get(0).getShortCircuitRegistry());
+  LOG.info("Clearing failure injector and performing another read...");
+  DataNodeFaultInjector.set(prevInjector);
+  fs.getClient().getClientContext().getDomainSocketFactory().clearPathMap();
+  DFSTestUtil.readFileBuffer(fs,TEST_PATH1);
+  checkNumberOfSegmentsAndSlots(1,1,cluster.getDataNodes().get(0).getShortCircuitRegistry());
+  cluster.shutdown();
+  sockDir.close();
+}

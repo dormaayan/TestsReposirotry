@@ -1,0 +1,84 @@
+@Test public void testAMRMClientMatchStorage() throws YarnException, IOException {
+  AMRMClientImpl<ContainerRequest> amClient=null;
+  try {
+    amClient=(AMRMClientImpl<ContainerRequest>)AMRMClient.<ContainerRequest>createAMRMClient();
+    amClient.init(conf);
+    amClient.start();
+    amClient.registerApplicationMaster("Host",10000,"");
+    Priority priority1=Records.newRecord(Priority.class);
+    priority1.setPriority(2);
+    ContainerRequest storedContainer1=new ContainerRequest(capability,nodes,racks,priority);
+    ContainerRequest storedContainer2=new ContainerRequest(capability,nodes,racks,priority);
+    ContainerRequest storedContainer3=new ContainerRequest(capability,null,null,priority1);
+    amClient.addContainerRequest(storedContainer1);
+    amClient.addContainerRequest(storedContainer2);
+    amClient.addContainerRequest(storedContainer3);
+    RemoteRequestsTable<ContainerRequest> remoteRequestsTable=amClient.getTable(0);
+    int containersRequestedAny=remoteRequestsTable.get(priority,ResourceRequest.ANY,ExecutionType.GUARANTEED,capability).remoteRequest.getNumContainers();
+    assertEquals(2,containersRequestedAny);
+    containersRequestedAny=remoteRequestsTable.get(priority1,ResourceRequest.ANY,ExecutionType.GUARANTEED,capability).remoteRequest.getNumContainers();
+    assertEquals(1,containersRequestedAny);
+    List<? extends Collection<ContainerRequest>> matches=amClient.getMatchingRequests(priority,node,capability);
+    verifyMatches(matches,2);
+    matches=amClient.getMatchingRequests(priority,rack,capability);
+    verifyMatches(matches,2);
+    matches=amClient.getMatchingRequests(priority,ResourceRequest.ANY,capability);
+    verifyMatches(matches,2);
+    matches=amClient.getMatchingRequests(priority1,rack,capability);
+    assertTrue(matches.isEmpty());
+    matches=amClient.getMatchingRequests(priority1,ResourceRequest.ANY,capability);
+    verifyMatches(matches,1);
+    amClient.removeContainerRequest(storedContainer3);
+    matches=amClient.getMatchingRequests(priority,node,capability);
+    verifyMatches(matches,2);
+    amClient.removeContainerRequest(storedContainer2);
+    matches=amClient.getMatchingRequests(priority,node,capability);
+    verifyMatches(matches,1);
+    matches=amClient.getMatchingRequests(priority,rack,capability);
+    verifyMatches(matches,1);
+    ContainerRequest storedRequest=matches.get(0).iterator().next();
+    assertEquals(storedContainer1,storedRequest);
+    amClient.removeContainerRequest(storedContainer1);
+    matches=amClient.getMatchingRequests(priority,ResourceRequest.ANY,capability);
+    assertTrue(matches.isEmpty());
+    matches=amClient.getMatchingRequests(priority1,ResourceRequest.ANY,capability);
+    assertTrue(matches.isEmpty());
+    assertTrue(amClient.getTable(0).isEmpty());
+    amClient.addContainerRequest(storedContainer1);
+    amClient.addContainerRequest(storedContainer3);
+    int allocatedContainerCount=0;
+    int iterationsLeft=3;
+    while (allocatedContainerCount < 2 && iterationsLeft-- > 0) {
+      Log.getLog().info("Allocated " + allocatedContainerCount + " containers"+ " with "+ iterationsLeft+ " iterations left");
+      AllocateResponse allocResponse=amClient.allocate(0.1f);
+      assertEquals(0,amClient.ask.size());
+      assertEquals(0,amClient.release.size());
+      assertEquals(nodeCount,amClient.getClusterNodeCount());
+      allocatedContainerCount+=allocResponse.getAllocatedContainers().size();
+      for (      Container container : allocResponse.getAllocatedContainers()) {
+        ContainerRequest expectedRequest=container.getPriority().equals(storedContainer1.getPriority()) ? storedContainer1 : storedContainer3;
+        matches=amClient.getMatchingRequests(container.getPriority(),ResourceRequest.ANY,container.getResource());
+        verifyMatches(matches,1);
+        ContainerRequest matchedRequest=matches.get(0).iterator().next();
+        assertEquals(matchedRequest,expectedRequest);
+        amClient.removeContainerRequest(matchedRequest);
+        amClient.releaseAssignedContainer(container.getId());
+      }
+      if (allocatedContainerCount < containersRequestedAny) {
+        triggerSchedulingWithNMHeartBeat();
+      }
+    }
+    assertEquals(2,allocatedContainerCount);
+    AllocateResponse allocResponse=amClient.allocate(0.1f);
+    assertEquals(0,amClient.release.size());
+    assertEquals(0,amClient.ask.size());
+    assertEquals(0,allocResponse.getAllocatedContainers().size());
+    assertTrue(remoteRequestsTable.isEmpty());
+    amClient.unregisterApplicationMaster(FinalApplicationStatus.SUCCEEDED,null,null);
+  }
+  finally {
+    if (amClient != null && amClient.getServiceState() == STATE.STARTED) {
+      amClient.stop();
+    }
+  }
+}

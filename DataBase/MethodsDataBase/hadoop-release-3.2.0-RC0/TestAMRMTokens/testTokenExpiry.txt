@@ -1,0 +1,66 @@
+/** 
+ * Validate that application tokens are unusable after the application-finishes.
+ * @throws Exception
+ */
+@SuppressWarnings("unchecked") @Test public void testTokenExpiry() throws Exception {
+  conf.setLong(YarnConfiguration.RM_AMRM_TOKEN_MASTER_KEY_ROLLING_INTERVAL_SECS,YarnConfiguration.DEFAULT_RM_AMRM_TOKEN_MASTER_KEY_ROLLING_INTERVAL_SECS);
+  conf.setLong(YarnConfiguration.RM_AM_EXPIRY_INTERVAL_MS,YarnConfiguration.DEFAULT_RM_AM_EXPIRY_INTERVAL_MS);
+  conf.set(YarnConfiguration.RM_SCHEDULER_ADDRESS,"0.0.0.0:0");
+  MyContainerManager containerManager=new MyContainerManager();
+  final MockRMWithAMS rm=new MockRMWithAMS(conf,containerManager);
+  rm.start();
+  final Configuration conf=rm.getConfig();
+  final YarnRPC rpc=YarnRPC.create(conf);
+  ApplicationMasterProtocol rmClient=null;
+  try {
+    MockNM nm1=rm.registerNode("localhost:1234",5120);
+    RMApp app=rm.submitApp(1024);
+    nm1.nodeHeartbeat(true);
+    int waitCount=0;
+    while (containerManager.containerTokens == null && waitCount++ < 20) {
+      LOG.info("Waiting for AM Launch to happen..");
+      Thread.sleep(1000);
+    }
+    Assert.assertNotNull(containerManager.containerTokens);
+    RMAppAttempt attempt=app.getCurrentAppAttempt();
+    ApplicationAttemptId applicationAttemptId=attempt.getAppAttemptId();
+    UserGroupInformation currentUser=UserGroupInformation.createRemoteUser(applicationAttemptId.toString());
+    Credentials credentials=containerManager.getContainerCredentials();
+    final InetSocketAddress rmBindAddress=rm.getApplicationMasterService().getBindAddress();
+    Token<? extends TokenIdentifier> amRMToken=MockRMWithAMS.setupAndReturnAMRMToken(rmBindAddress,credentials.getAllTokens());
+    currentUser.addToken(amRMToken);
+    rmClient=createRMClient(rm,conf,rpc,currentUser);
+    RegisterApplicationMasterRequest request=Records.newRecord(RegisterApplicationMasterRequest.class);
+    rmClient.registerApplicationMaster(request);
+    FinishApplicationMasterRequest finishAMRequest=Records.newRecord(FinishApplicationMasterRequest.class);
+    finishAMRequest.setFinalApplicationStatus(FinalApplicationStatus.SUCCEEDED);
+    finishAMRequest.setDiagnostics("diagnostics");
+    finishAMRequest.setTrackingUrl("url");
+    rmClient.finishApplicationMaster(finishAMRequest);
+    ContainerStatus containerStatus=BuilderUtils.newContainerStatus(attempt.getMasterContainer().getId(),ContainerState.COMPLETE,"AM Container Finished",0,attempt.getMasterContainer().getResource());
+    rm.getRMContext().getDispatcher().getEventHandler().handle(new RMAppAttemptContainerFinishedEvent(applicationAttemptId,containerStatus,nm1.getNodeId()));
+    int count=0;
+    while (attempt.getState() != RMAppAttemptState.FINISHED && count < maxWaitAttempts) {
+      Thread.sleep(100);
+      count++;
+    }
+    Assert.assertTrue(attempt.getState() == RMAppAttemptState.FINISHED);
+    rpc.stopProxy(rmClient,conf);
+    rmClient=createRMClient(rm,conf,rpc,currentUser);
+    AllocateRequest allocateRequest=Records.newRecord(AllocateRequest.class);
+    try {
+      rmClient.allocate(allocateRequest);
+      Assert.fail("You got to be kidding me! " + "Using App tokens after app-finish should fail!");
+    }
+ catch (    Throwable t) {
+      LOG.info("Exception found is ",t);
+      Assert.assertTrue(t.getCause().getMessage().contains(applicationAttemptId.toString() + " not found in AMRMTokenSecretManager."));
+    }
+  }
+  finally {
+    rm.stop();
+    if (rmClient != null) {
+      rpc.stopProxy(rmClient,conf);
+    }
+  }
+}

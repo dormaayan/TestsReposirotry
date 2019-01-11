@@ -1,0 +1,55 @@
+/** 
+ * Tests for  {@link WebMvcMetricsFilter} in the presence of a custom exception handler.
+ * @author Jon Schneider
+ */
+@RunWith(SpringRunner.class) @WebAppConfiguration @TestPropertySource(properties="security.ignored=/**") public class WebMvcMetricsIntegrationTests {
+  @Autowired private WebApplicationContext context;
+  @Autowired private SimpleMeterRegistry registry;
+  @Autowired private WebMvcMetricsFilter filter;
+  private MockMvc mvc;
+  @Before public void setupMockMvc(){
+    this.mvc=MockMvcBuilders.webAppContextSetup(this.context).addFilters(this.filter).build();
+  }
+  @Test public void handledExceptionIsRecordedInMetricTag() throws Exception {
+    this.mvc.perform(get("/api/handledError")).andExpect(status().is5xxServerError());
+    assertThat(this.registry.get("http.server.requests").tags("exception","Exception1","status","500").timer().count()).isEqualTo(1L);
+  }
+  @Test public void rethrownExceptionIsRecordedInMetricTag(){
+    assertThatCode(() -> this.mvc.perform(get("/api/rethrownError")).andExpect(status().is5xxServerError()));
+    assertThat(this.registry.get("http.server.requests").tags("exception","Exception2","status","500").timer().count()).isEqualTo(1L);
+  }
+@Configuration @EnableWebMvc static class TestConfiguration {
+    @Bean MockClock clock(){
+      return new MockClock();
+    }
+    @Bean MeterRegistry meterRegistry(    Clock clock){
+      return new SimpleMeterRegistry(SimpleConfig.DEFAULT,clock);
+    }
+    @Bean public WebMvcMetricsFilter webMetricsFilter(    MeterRegistry registry,    WebApplicationContext ctx){
+      return new WebMvcMetricsFilter(registry,new DefaultWebMvcTagsProvider(),"http.server.requests",true);
+    }
+@RestController @RequestMapping("/api") @Timed static class Controller1 {
+      @Bean public CustomExceptionHandler controllerAdvice(){
+        return new CustomExceptionHandler();
+      }
+      @GetMapping("/handledError") public String handledError(){
+        throw new Exception1();
+      }
+      @GetMapping("/rethrownError") public String rethrownError(){
+        throw new Exception2();
+      }
+    }
+  }
+static class Exception1 extends RuntimeException {
+  }
+static class Exception2 extends RuntimeException {
+  }
+@ControllerAdvice static class CustomExceptionHandler {
+    @ExceptionHandler ResponseEntity<String> handleError(    Exception1 ex){
+      return new ResponseEntity<>("this is a custom exception body",HttpStatus.INTERNAL_SERVER_ERROR);
+    }
+    @ExceptionHandler ResponseEntity<String> rethrowError(    Exception2 ex){
+      throw ex;
+    }
+  }
+}

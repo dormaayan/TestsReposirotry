@@ -1,0 +1,36 @@
+/** 
+ * Tests that Xattrs should be cleaned if satisfy storage policy called on EC file with unsuitable storage policy set.
+ * @throws Exception
+ */
+@Test(timeout=300000) public void testSPSShouldNotLeakXattrIfSatisfyStoragePolicyCallOnECFiles() throws Exception {
+  StorageType[][] diskTypes=new StorageType[][]{{StorageType.SSD,StorageType.DISK},{StorageType.SSD,StorageType.DISK},{StorageType.SSD,StorageType.DISK},{StorageType.SSD,StorageType.DISK},{StorageType.SSD,StorageType.DISK},{StorageType.DISK,StorageType.SSD},{StorageType.DISK,StorageType.SSD},{StorageType.DISK,StorageType.SSD},{StorageType.DISK,StorageType.SSD},{StorageType.DISK,StorageType.SSD}};
+  int defaultStripedBlockSize=StripedFileTestUtil.getDefaultECPolicy().getCellSize() * 4;
+  config.setLong(DFSConfigKeys.DFS_BLOCK_SIZE_KEY,defaultStripedBlockSize);
+  config.setLong(DFSConfigKeys.DFS_HEARTBEAT_INTERVAL_KEY,1L);
+  config.setLong(DFSConfigKeys.DFS_NAMENODE_REDUNDANCY_INTERVAL_SECONDS_KEY,1L);
+  config.setBoolean(DFSConfigKeys.DFS_NAMENODE_REDUNDANCY_CONSIDERLOAD_KEY,false);
+  try {
+    hdfsCluster=startCluster(config,diskTypes,diskTypes.length,STORAGES_PER_DATANODE,CAPACITY);
+    dfs=hdfsCluster.getFileSystem();
+    dfs.enableErasureCodingPolicy(StripedFileTestUtil.getDefaultECPolicy().getName());
+    ClientProtocol client=NameNodeProxies.createProxy(config,hdfsCluster.getFileSystem(0).getUri(),ClientProtocol.class).getProxy();
+    String fooDir="/foo";
+    client.mkdirs(fooDir,new FsPermission((short)777),true);
+    client.setErasureCodingPolicy(fooDir,StripedFileTestUtil.getDefaultECPolicy().getName());
+    final String testFile="/foo/bar";
+    long fileLen=20 * defaultStripedBlockSize;
+    DFSTestUtil.createFile(dfs,new Path(testFile),fileLen,(short)3,0);
+    client.setStoragePolicy(fooDir,HdfsConstants.ONESSD_STORAGE_POLICY_NAME);
+    dfs.satisfyStoragePolicy(new Path(testFile));
+    LocatedBlocks locatedBlocks=client.getBlockLocations(testFile,0,fileLen);
+    for (    LocatedBlock lb : locatedBlocks.getLocatedBlocks()) {
+      for (      StorageType type : lb.getStorageTypes()) {
+        Assert.assertEquals(StorageType.DISK,type);
+      }
+    }
+    DFSTestUtil.waitForXattrRemoved(testFile,XATTR_SATISFY_STORAGE_POLICY,hdfsCluster.getNamesystem(),30000);
+  }
+  finally {
+    shutdownCluster();
+  }
+}

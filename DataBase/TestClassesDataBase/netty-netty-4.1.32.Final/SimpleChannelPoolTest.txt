@@ -1,0 +1,187 @@
+public class SimpleChannelPoolTest {
+  private static final String LOCAL_ADDR_ID="test.id";
+  @Test public void testAcquire() throws Exception {
+    EventLoopGroup group=new LocalEventLoopGroup();
+    LocalAddress addr=new LocalAddress(LOCAL_ADDR_ID);
+    Bootstrap cb=new Bootstrap();
+    cb.remoteAddress(addr);
+    cb.group(group).channel(LocalChannel.class);
+    ServerBootstrap sb=new ServerBootstrap();
+    sb.group(group).channel(LocalServerChannel.class).childHandler(new ChannelInitializer<LocalChannel>(){
+      @Override public void initChannel(      LocalChannel ch) throws Exception {
+        ch.pipeline().addLast(new ChannelInboundHandlerAdapter());
+      }
+    }
+);
+    Channel sc=sb.bind(addr).sync().channel();
+    CountingChannelPoolHandler handler=new CountingChannelPoolHandler();
+    ChannelPool pool=new SimpleChannelPool(cb,handler);
+    Channel channel=pool.acquire().sync().getNow();
+    pool.release(channel).syncUninterruptibly();
+    Channel channel2=pool.acquire().sync().getNow();
+    assertSame(channel,channel2);
+    assertEquals(1,handler.channelCount());
+    pool.release(channel2).syncUninterruptibly();
+    try {
+      pool.release(channel2).syncUninterruptibly();
+      fail();
+    }
+ catch (    IllegalArgumentException e) {
+      assertFalse(channel.isActive());
+    }
+    assertEquals(1,handler.acquiredCount());
+    assertEquals(2,handler.releasedCount());
+    sc.close().sync();
+    group.shutdownGracefully();
+  }
+  @Test public void testBoundedChannelPoolSegment() throws Exception {
+    EventLoopGroup group=new LocalEventLoopGroup();
+    LocalAddress addr=new LocalAddress(LOCAL_ADDR_ID);
+    Bootstrap cb=new Bootstrap();
+    cb.remoteAddress(addr);
+    cb.group(group).channel(LocalChannel.class);
+    ServerBootstrap sb=new ServerBootstrap();
+    sb.group(group).channel(LocalServerChannel.class).childHandler(new ChannelInitializer<LocalChannel>(){
+      @Override public void initChannel(      LocalChannel ch) throws Exception {
+        ch.pipeline().addLast(new ChannelInboundHandlerAdapter());
+      }
+    }
+);
+    Channel sc=sb.bind(addr).sync().channel();
+    CountingChannelPoolHandler handler=new CountingChannelPoolHandler();
+    ChannelPool pool=new SimpleChannelPool(cb,handler,ChannelHealthChecker.ACTIVE){
+      private final Queue<Channel> queue=new LinkedBlockingQueue<Channel>(1);
+      @Override protected Channel pollChannel(){
+        return queue.poll();
+      }
+      @Override protected boolean offerChannel(      Channel ch){
+        return queue.offer(ch);
+      }
+    }
+;
+    Channel channel=pool.acquire().sync().getNow();
+    Channel channel2=pool.acquire().sync().getNow();
+    pool.release(channel).syncUninterruptibly().getNow();
+    try {
+      pool.release(channel2).syncUninterruptibly();
+      fail();
+    }
+ catch (    IllegalStateException e) {
+    }
+    channel2.close().sync();
+    assertEquals(2,handler.channelCount());
+    assertEquals(0,handler.acquiredCount());
+    assertEquals(1,handler.releasedCount());
+    sc.close().sync();
+    channel.close().sync();
+    channel2.close().sync();
+    group.shutdownGracefully();
+  }
+  /** 
+ * Tests that if channel was unhealthy it is not offered back to the pool.
+ * @throws Exception
+ */
+  @Test public void testUnhealthyChannelIsNotOffered() throws Exception {
+    EventLoopGroup group=new LocalEventLoopGroup();
+    LocalAddress addr=new LocalAddress(LOCAL_ADDR_ID);
+    Bootstrap cb=new Bootstrap();
+    cb.remoteAddress(addr);
+    cb.group(group).channel(LocalChannel.class);
+    ServerBootstrap sb=new ServerBootstrap();
+    sb.group(group).channel(LocalServerChannel.class).childHandler(new ChannelInitializer<LocalChannel>(){
+      @Override public void initChannel(      LocalChannel ch) throws Exception {
+        ch.pipeline().addLast(new ChannelInboundHandlerAdapter());
+      }
+    }
+);
+    Channel sc=sb.bind(addr).syncUninterruptibly().channel();
+    ChannelPoolHandler handler=new CountingChannelPoolHandler();
+    ChannelPool pool=new SimpleChannelPool(cb,handler);
+    Channel channel1=pool.acquire().syncUninterruptibly().getNow();
+    pool.release(channel1).syncUninterruptibly();
+    Channel channel2=pool.acquire().syncUninterruptibly().getNow();
+    assertSame(channel1,channel2);
+    channel1.close().syncUninterruptibly();
+    pool.release(channel1).syncUninterruptibly();
+    Channel channel3=pool.acquire().syncUninterruptibly().getNow();
+    assertNotSame(channel1,channel3);
+    sc.close().syncUninterruptibly();
+    channel3.close().syncUninterruptibly();
+    group.shutdownGracefully();
+  }
+  /** 
+ * Tests that if channel was unhealthy it is was offered back to the pool because it was requested not to validate channel health on release.
+ * @throws Exception
+ */
+  @Test public void testUnhealthyChannelIsOfferedWhenNoHealthCheckRequested() throws Exception {
+    EventLoopGroup group=new LocalEventLoopGroup();
+    LocalAddress addr=new LocalAddress(LOCAL_ADDR_ID);
+    Bootstrap cb=new Bootstrap();
+    cb.remoteAddress(addr);
+    cb.group(group).channel(LocalChannel.class);
+    ServerBootstrap sb=new ServerBootstrap();
+    sb.group(group).channel(LocalServerChannel.class).childHandler(new ChannelInitializer<LocalChannel>(){
+      @Override public void initChannel(      LocalChannel ch) throws Exception {
+        ch.pipeline().addLast(new ChannelInboundHandlerAdapter());
+      }
+    }
+);
+    Channel sc=sb.bind(addr).syncUninterruptibly().channel();
+    ChannelPoolHandler handler=new CountingChannelPoolHandler();
+    ChannelPool pool=new SimpleChannelPool(cb,handler,ChannelHealthChecker.ACTIVE,false);
+    Channel channel1=pool.acquire().syncUninterruptibly().getNow();
+    channel1.close().syncUninterruptibly();
+    Future<Void> releaseFuture=pool.release(channel1,channel1.eventLoop().<Void>newPromise()).syncUninterruptibly();
+    assertThat(releaseFuture.isSuccess(),CoreMatchers.is(true));
+    Channel channel2=pool.acquire().syncUninterruptibly().getNow();
+    assertNotSame(channel1,channel2);
+    sc.close().syncUninterruptibly();
+    channel2.close().syncUninterruptibly();
+    group.shutdownGracefully();
+  }
+  @Test public void testBootstrap(){
+    final SimpleChannelPool pool=new SimpleChannelPool(new Bootstrap(),new CountingChannelPoolHandler());
+    try {
+      assertNotNull(pool.bootstrap());
+    }
+  finally {
+      pool.close();
+    }
+  }
+  @Test public void testHandler(){
+    final ChannelPoolHandler handler=new CountingChannelPoolHandler();
+    final SimpleChannelPool pool=new SimpleChannelPool(new Bootstrap(),handler);
+    try {
+      assertSame(handler,pool.handler());
+    }
+  finally {
+      pool.close();
+    }
+  }
+  @Test public void testHealthChecker(){
+    final ChannelHealthChecker healthChecker=ChannelHealthChecker.ACTIVE;
+    final SimpleChannelPool pool=new SimpleChannelPool(new Bootstrap(),new CountingChannelPoolHandler(),healthChecker);
+    try {
+      assertSame(healthChecker,pool.healthChecker());
+    }
+  finally {
+      pool.close();
+    }
+  }
+  @Test public void testReleaseHealthCheck(){
+    final SimpleChannelPool healthCheckOnReleasePool=new SimpleChannelPool(new Bootstrap(),new CountingChannelPoolHandler(),ChannelHealthChecker.ACTIVE,true);
+    try {
+      assertTrue(healthCheckOnReleasePool.releaseHealthCheck());
+    }
+  finally {
+      healthCheckOnReleasePool.close();
+    }
+    final SimpleChannelPool noHealthCheckOnReleasePool=new SimpleChannelPool(new Bootstrap(),new CountingChannelPoolHandler(),ChannelHealthChecker.ACTIVE,false);
+    try {
+      assertFalse(noHealthCheckOnReleasePool.releaseHealthCheck());
+    }
+  finally {
+      noHealthCheckOnReleasePool.close();
+    }
+  }
+}

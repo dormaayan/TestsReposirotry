@@ -1,0 +1,37 @@
+@Test public void shouldCountSessionWindows() throws Exception {
+  final long sessionGap=5 * 60 * 1000L;
+  final long t1=mockTime.milliseconds() - TimeUnit.MILLISECONDS.convert(1,TimeUnit.HOURS);
+  final List<KeyValue<String,String>> t1Messages=Arrays.asList(new KeyValue<>("bob","start"),new KeyValue<>("penny","start"),new KeyValue<>("jo","pause"),new KeyValue<>("emily","pause"));
+  IntegrationTestUtils.produceKeyValuesSynchronouslyWithTimestamp(userSessionsStream,t1Messages,TestUtils.producerConfig(CLUSTER.bootstrapServers(),StringSerializer.class,StringSerializer.class,new Properties()),t1);
+  final long t2=t1 + (sessionGap / 2);
+  IntegrationTestUtils.produceKeyValuesSynchronouslyWithTimestamp(userSessionsStream,Collections.singletonList(new KeyValue<>("emily","resume")),TestUtils.producerConfig(CLUSTER.bootstrapServers(),StringSerializer.class,StringSerializer.class,new Properties()),t2);
+  final long t3=t1 + sessionGap + 1;
+  IntegrationTestUtils.produceKeyValuesSynchronouslyWithTimestamp(userSessionsStream,Arrays.asList(new KeyValue<>("bob","pause"),new KeyValue<>("penny","stop")),TestUtils.producerConfig(CLUSTER.bootstrapServers(),StringSerializer.class,StringSerializer.class,new Properties()),t3);
+  final long t4=t3 + (sessionGap / 2);
+  IntegrationTestUtils.produceKeyValuesSynchronouslyWithTimestamp(userSessionsStream,Arrays.asList(new KeyValue<>("bob","resume"),new KeyValue<>("jo","resume")),TestUtils.producerConfig(CLUSTER.bootstrapServers(),StringSerializer.class,StringSerializer.class,new Properties()),t4);
+  final Map<Windowed<String>,KeyValue<Long,Long>> results=new HashMap<>();
+  final CountDownLatch latch=new CountDownLatch(11);
+  builder.stream(userSessionsStream,Consumed.with(Serdes.String(),Serdes.String())).groupByKey(Serialized.with(Serdes.String(),Serdes.String())).windowedBy(SessionWindows.with(ofMillis(sessionGap))).count().toStream().transform(() -> new Transformer<Windowed<String>,Long,KeyValue<Object,Object>>(){
+    private ProcessorContext context;
+    @Override public void init(    final ProcessorContext context){
+      this.context=context;
+    }
+    @Override public KeyValue<Object,Object> transform(    final Windowed<String> key,    final Long value){
+      results.put(key,KeyValue.pair(value,context.timestamp()));
+      latch.countDown();
+      return null;
+    }
+    @Override public void close(){
+    }
+  }
+);
+  startStreams();
+  latch.await(30,TimeUnit.SECONDS);
+  assertThat(results.get(new Windowed<>("bob",new SessionWindow(t1,t1))),equalTo(KeyValue.pair(1L,t1)));
+  assertThat(results.get(new Windowed<>("penny",new SessionWindow(t1,t1))),equalTo(KeyValue.pair(1L,t1)));
+  assertThat(results.get(new Windowed<>("jo",new SessionWindow(t1,t1))),equalTo(KeyValue.pair(1L,t1)));
+  assertThat(results.get(new Windowed<>("jo",new SessionWindow(t4,t4))),equalTo(KeyValue.pair(1L,t4)));
+  assertThat(results.get(new Windowed<>("emily",new SessionWindow(t1,t2))),equalTo(KeyValue.pair(2L,t2)));
+  assertThat(results.get(new Windowed<>("bob",new SessionWindow(t3,t4))),equalTo(KeyValue.pair(2L,t4)));
+  assertThat(results.get(new Windowed<>("penny",new SessionWindow(t3,t3))),equalTo(KeyValue.pair(1L,t3)));
+}

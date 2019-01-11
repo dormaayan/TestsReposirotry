@@ -1,0 +1,85 @@
+@Test public void testReencryptionBasic() throws Exception {
+  final int len=8196;
+  final Path zoneParent=new Path("/zones");
+  final Path zone=new Path(zoneParent,"zone");
+  fsWrapper.mkdir(zone,FsPermission.getDirDefault(),true);
+  dfsAdmin.createEncryptionZone(zone,TEST_KEY,NO_TRASH);
+  for (int i=0; i < 10; ++i) {
+    DFSTestUtil.createFile(fs,new Path(zone,Integer.toString(i)),len,(short)1,0xFEED);
+  }
+  final Path subdir=new Path("/dir");
+  fsWrapper.mkdir(subdir,FsPermission.getDirDefault(),true);
+  DFSTestUtil.createFile(fs,new Path(subdir,"f"),len,(short)1,0xFEED);
+  final Path encFile1=new Path(zone,"0");
+  final FileEncryptionInfo fei0=getFileEncryptionInfo(encFile1);
+  dfsAdmin.reencryptEncryptionZone(zone,ReencryptAction.START);
+  waitForReencryptedZones(1);
+  assertKeyVersionEquals(encFile1,fei0);
+  verifyZoneStatus(zone,null,0);
+  rollKey(TEST_KEY);
+  dfsAdmin.reencryptEncryptionZone(zone,ReencryptAction.START);
+  waitForReencryptedZones(2);
+  FileEncryptionInfo fei1=getFileEncryptionInfo(encFile1);
+  assertKeyVersionChanged(encFile1,fei0);
+  RemoteIterator<ZoneReencryptionStatus> it=dfsAdmin.listReencryptionStatus();
+  assertTrue(it.hasNext());
+  ZoneReencryptionStatus zs=it.next();
+  assertEquals(zone.toString(),zs.getZoneName());
+  assertEquals(ZoneReencryptionStatus.State.Completed,zs.getState());
+  verifyZoneCompletionTime(zs);
+  assertNotEquals(fei0.getEzKeyVersionName(),zs.getEzKeyVersionName());
+  assertEquals(fei1.getEzKeyVersionName(),zs.getEzKeyVersionName());
+  assertEquals(10,zs.getFilesReencrypted());
+  dfsAdmin.reencryptEncryptionZone(zone,ReencryptAction.START);
+  waitForReencryptedZones(3);
+  assertKeyVersionEquals(encFile1,fei1);
+  try {
+    dfsAdmin.reencryptEncryptionZone(subdir,ReencryptAction.START);
+    fail("Re-encrypting non-EZ should fail");
+  }
+ catch (  RemoteException expected) {
+    LOG.info("Expected exception caught.",expected);
+    assertExceptionContains("not the root of an encryption zone",expected);
+  }
+  try {
+    dfsAdmin.reencryptEncryptionZone(new Path(zone,"notexist"),ReencryptAction.START);
+    fail("Re-encrypting non-existing dir should fail");
+  }
+ catch (  RemoteException expected) {
+    LOG.info("Expected exception caught.",expected);
+    assertTrue(expected.unwrapRemoteException() instanceof FileNotFoundException);
+  }
+  try {
+    dfsAdmin.reencryptEncryptionZone(encFile1,ReencryptAction.START);
+    fail("Re-encrypting on a file should fail");
+  }
+ catch (  RemoteException expected) {
+    LOG.info("Expected exception caught.",expected);
+    assertExceptionContains("not the root of an encryption zone",expected);
+  }
+  getEzManager().pauseReencryptForTesting();
+  dfsAdmin.reencryptEncryptionZone(zone,ReencryptAction.START);
+  waitForQueuedZones(1);
+  try {
+    dfsAdmin.reencryptEncryptionZone(zone,ReencryptAction.START);
+  }
+ catch (  RemoteException expected) {
+    LOG.info("Expected exception caught.",expected);
+    assertExceptionContains("already submitted",expected);
+  }
+  getEzManager().resumeReencryptForTesting();
+  waitForReencryptedZones(4);
+  final Path emptyZone=new Path("/emptyZone");
+  fsWrapper.mkdir(emptyZone,FsPermission.getDirDefault(),true);
+  dfsAdmin.createEncryptionZone(emptyZone,TEST_KEY,NO_TRASH);
+  dfsAdmin.reencryptEncryptionZone(emptyZone,ReencryptAction.START);
+  waitForReencryptedZones(5);
+  dfsAdmin.reencryptEncryptionZone(emptyZone,ReencryptAction.START);
+  waitForReencryptedZones(6);
+  final Path renamedZone=new Path("/renamedZone");
+  fsWrapper.rename(zone,renamedZone);
+  it=dfsAdmin.listReencryptionStatus();
+  assertTrue(it.hasNext());
+  zs=it.next();
+  assertEquals(renamedZone.toString(),zs.getZoneName());
+}

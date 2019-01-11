@@ -1,0 +1,51 @@
+/** 
+ * Test if correct exception (StandbyException or RetriableException) can be thrown during the NN failover. 
+ */
+@Test(timeout=300000) public void testDelegationTokenDuringNNFailover() throws Exception {
+  EditLogTailer editLogTailer=nn1.getNamesystem().getEditLogTailer();
+  editLogTailer.stop();
+  Configuration conf=(Configuration)Whitebox.getInternalState(editLogTailer,"conf");
+  nn1.getNamesystem().setEditLogTailerForTests(new EditLogTailerForTest(nn1.getNamesystem(),conf));
+  final Token<DelegationTokenIdentifier> token=getDelegationToken(fs,"JobTracker");
+  DelegationTokenIdentifier identifier=new DelegationTokenIdentifier();
+  byte[] tokenId=token.getIdentifier();
+  identifier.readFields(new DataInputStream(new ByteArrayInputStream(tokenId)));
+  LOG.info("A valid token should have non-null password, " + "and should be renewed successfully");
+  assertTrue(null != dtSecretManager.retrievePassword(identifier));
+  dtSecretManager.renewToken(token,"JobTracker");
+  cluster.transitionToStandby(0);
+  try {
+    cluster.getNameNodeRpc(0).renewDelegationToken(token);
+    fail("StandbyException is expected since nn0 is in standby state");
+  }
+ catch (  StandbyException e) {
+    GenericTestUtils.assertExceptionContains(HAServiceState.STANDBY.toString(),e);
+  }
+  new Thread(){
+    @Override public void run(){
+      try {
+        cluster.transitionToActive(1);
+      }
+ catch (      Exception e) {
+        LOG.error("Transition nn1 to active failed",e);
+      }
+    }
+  }
+.start();
+  Thread.sleep(1000);
+  try {
+    nn1.getNamesystem().verifyToken(token.decodeIdentifier(),token.getPassword());
+    fail("RetriableException/StandbyException is expected since nn1 is in transition");
+  }
+ catch (  IOException e) {
+    assertTrue(e instanceof StandbyException || e instanceof RetriableException);
+    LOG.info("Got expected exception",e);
+  }
+  catchup=true;
+synchronized (this) {
+    this.notifyAll();
+  }
+  Configuration clientConf=dfs.getConf();
+  doRenewOrCancel(token,clientConf,TokenTestAction.RENEW);
+  doRenewOrCancel(token,clientConf,TokenTestAction.CANCEL);
+}

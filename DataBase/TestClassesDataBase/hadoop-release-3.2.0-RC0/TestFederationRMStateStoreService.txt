@@ -1,0 +1,80 @@
+/** 
+ * Unit tests for FederationStateStoreService.
+ */
+public class TestFederationRMStateStoreService {
+  private final HAServiceProtocol.StateChangeRequestInfo requestInfo=new HAServiceProtocol.StateChangeRequestInfo(HAServiceProtocol.RequestSource.REQUEST_BY_USER);
+  private final SubClusterId subClusterId=SubClusterId.newInstance("SC-1");
+  private final GetSubClusterInfoRequest request=GetSubClusterInfoRequest.newInstance(subClusterId);
+  private Configuration conf;
+  private FederationStateStore stateStore;
+  private long lastHearbeatTS=0;
+  private JSONJAXBContext jc;
+  private JSONUnmarshaller unmarshaller;
+  @Before public void setUp() throws IOException, YarnException, JAXBException {
+    conf=new YarnConfiguration();
+    jc=new JSONJAXBContext(JSONConfiguration.mapped().rootUnwrapping(false).build(),ClusterMetricsInfo.class);
+    unmarshaller=jc.createJSONUnmarshaller();
+  }
+  @After public void tearDown() throws Exception {
+    unmarshaller=null;
+    jc=null;
+  }
+  @Test public void testFederationStateStoreService() throws Exception {
+    conf.setBoolean(YarnConfiguration.FEDERATION_ENABLED,true);
+    conf.set(YarnConfiguration.RM_CLUSTER_ID,subClusterId.getId());
+    final MockRM rm=new MockRM(conf);
+    rm.init(conf);
+    stateStore=rm.getFederationStateStoreService().getStateStoreClient();
+    GetSubClusterInfoResponse response=stateStore.getSubCluster(request);
+    Assert.assertNull(response);
+    rm.start();
+    String capability=checkSubClusterInfo(SubClusterState.SC_NEW);
+    Assert.assertTrue(capability.isEmpty());
+    FederationStateStoreHeartbeat storeHeartbeat=rm.getFederationStateStoreService().getStateStoreHeartbeatThread();
+    storeHeartbeat.run();
+    capability=checkSubClusterInfo(SubClusterState.SC_RUNNING);
+    checkClusterMetricsInfo(capability,0);
+    rm.registerNode("127.0.0.1:1234",4 * 1024);
+    storeHeartbeat.run();
+    capability=checkSubClusterInfo(SubClusterState.SC_RUNNING);
+    checkClusterMetricsInfo(capability,1);
+    rm.getFederationStateStoreService().deregisterSubCluster(SubClusterDeregisterRequest.newInstance(subClusterId,SubClusterState.SC_UNREGISTERED));
+    checkSubClusterInfo(SubClusterState.SC_UNREGISTERED);
+    explicitFailover(rm);
+    capability=checkSubClusterInfo(SubClusterState.SC_NEW);
+    Assert.assertTrue(capability.isEmpty());
+    storeHeartbeat=rm.getFederationStateStoreService().getStateStoreHeartbeatThread();
+    storeHeartbeat.run();
+    capability=checkSubClusterInfo(SubClusterState.SC_RUNNING);
+    checkClusterMetricsInfo(capability,0);
+    rm.registerNode("127.0.0.1:1234",4 * 1024);
+    storeHeartbeat.run();
+    capability=checkSubClusterInfo(SubClusterState.SC_RUNNING);
+    checkClusterMetricsInfo(capability,1);
+    rm.stop();
+  }
+  private void explicitFailover(  MockRM rm) throws IOException {
+    rm.getAdminService().transitionToStandby(requestInfo);
+    Assert.assertTrue(rm.getRMContext().getHAServiceState() == HAServiceProtocol.HAServiceState.STANDBY);
+    rm.getAdminService().transitionToActive(requestInfo);
+    Assert.assertTrue(rm.getRMContext().getHAServiceState() == HAServiceProtocol.HAServiceState.ACTIVE);
+    lastHearbeatTS=0;
+    stateStore=rm.getFederationStateStoreService().getStateStoreClient();
+  }
+  private void checkClusterMetricsInfo(  String capability,  int numNodes) throws JAXBException {
+    ClusterMetricsInfo clusterMetricsInfo=unmarshaller.unmarshalFromJSON(new StringReader(capability),ClusterMetricsInfo.class);
+    Assert.assertEquals(numNodes,clusterMetricsInfo.getTotalNodes());
+  }
+  private String checkSubClusterInfo(  SubClusterState state) throws YarnException, UnknownHostException {
+    Assert.assertNotNull(stateStore.getSubCluster(request));
+    SubClusterInfo response=stateStore.getSubCluster(request).getSubClusterInfo();
+    Assert.assertEquals(state,response.getState());
+    Assert.assertTrue(response.getLastHeartBeat() >= lastHearbeatTS);
+    String expectedAddress=(response.getClientRMServiceAddress().split(":"))[0];
+    Assert.assertEquals(expectedAddress,(response.getAMRMServiceAddress().split(":"))[0]);
+    Assert.assertEquals(expectedAddress,(response.getRMAdminServiceAddress().split(":"))[0]);
+    Assert.assertEquals(expectedAddress,(response.getRMWebServiceAddress().split(":"))[0]);
+    lastHearbeatTS=response.getLastHeartBeat();
+    return response.getCapability();
+  }
+}

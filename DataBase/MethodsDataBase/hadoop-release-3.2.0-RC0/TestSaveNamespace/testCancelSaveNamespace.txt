@@ -1,0 +1,56 @@
+@Test(timeout=20000) public void testCancelSaveNamespace() throws Exception {
+  Configuration conf=getConf();
+  NameNode.initMetrics(conf,NamenodeRole.NAMENODE);
+  DFSTestUtil.formatNameNode(conf);
+  FSNamesystem fsn=FSNamesystem.loadFromDisk(conf);
+  final FSImage image=fsn.getFSImage();
+  NNStorage storage=image.getStorage();
+  storage.close();
+  storage.setStorageDirectories(FSNamesystem.getNamespaceDirs(conf),FSNamesystem.getNamespaceEditsDirs(conf));
+  FSNamesystem spyFsn=spy(fsn);
+  final FSNamesystem finalFsn=spyFsn;
+  DelayAnswer delayer=new GenericTestUtils.DelayAnswer(LOG);
+  BlockIdManager bid=spy(spyFsn.getBlockManager().getBlockIdManager());
+  Whitebox.setInternalState(finalFsn.getBlockManager(),"blockIdManager",bid);
+  doAnswer(delayer).when(bid).getGenerationStamp();
+  ExecutorService pool=Executors.newFixedThreadPool(2);
+  try {
+    doAnEdit(fsn,1);
+    final Canceler canceler=new Canceler();
+    fsn.setSafeMode(SafeModeAction.SAFEMODE_ENTER);
+    try {
+      Future<Void> saverFuture=pool.submit(new Callable<Void>(){
+        @Override public Void call() throws Exception {
+          image.saveNamespace(finalFsn,NameNodeFile.IMAGE,canceler);
+          return null;
+        }
+      }
+);
+      delayer.waitForCall();
+      Future<Void> cancelFuture=pool.submit(new Callable<Void>(){
+        @Override public Void call() throws Exception {
+          canceler.cancel("cancelled");
+          return null;
+        }
+      }
+);
+      Thread.sleep(500);
+      delayer.proceed();
+      cancelFuture.get();
+      saverFuture.get();
+      fail("saveNamespace did not fail even though cancelled!");
+    }
+ catch (    Throwable t) {
+      GenericTestUtils.assertExceptionContains("SaveNamespaceCancelledException",t);
+    }
+    LOG.info("Successfully cancelled a saveNamespace");
+    FSImageTestUtil.logStorageContents(LOG,storage);
+    for (    StorageDirectory sd : storage.dirIterable(null)) {
+      File curDir=sd.getCurrentDir();
+      GenericTestUtils.assertGlobEquals(curDir,"fsimage_.*",NNStorage.getImageFileName(0),NNStorage.getImageFileName(0) + MD5FileUtils.MD5_SUFFIX);
+    }
+  }
+  finally {
+    fsn.close();
+  }
+}

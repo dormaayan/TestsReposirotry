@@ -1,0 +1,52 @@
+@Test public void shouldCloseTaskAsZombieAndRemoveFromActiveTasksIfProducerWasFencedWhileProcessing() throws Exception {
+  internalTopologyBuilder.addSource(null,"source",null,null,null,topic1);
+  internalTopologyBuilder.addSink("sink","dummyTopic",null,null,null,"source");
+  final StreamThread thread=createStreamThread(clientId,new StreamsConfig(configProps(true)),true);
+  final MockConsumer<byte[],byte[]> consumer=clientSupplier.consumer;
+  consumer.updatePartitions(topic1,singletonList(new PartitionInfo(topic1,1,null,null,null)));
+  thread.setState(StreamThread.State.RUNNING);
+  thread.rebalanceListener.onPartitionsRevoked(null);
+  final Map<TaskId,Set<TopicPartition>> activeTasks=new HashMap<>();
+  final List<TopicPartition> assignedPartitions=new ArrayList<>();
+  assignedPartitions.add(t1p1);
+  activeTasks.put(task1,Collections.singleton(t1p1));
+  thread.taskManager().setAssignmentMetadata(activeTasks,Collections.<TaskId,Set<TopicPartition>>emptyMap());
+  final MockConsumer<byte[],byte[]> mockConsumer=(MockConsumer<byte[],byte[]>)thread.consumer;
+  mockConsumer.assign(assignedPartitions);
+  mockConsumer.updateBeginningOffsets(Collections.singletonMap(t1p1,0L));
+  thread.rebalanceListener.onPartitionsAssigned(assignedPartitions);
+  thread.runOnce();
+  assertThat(thread.tasks().size(),equalTo(1));
+  final MockProducer producer=clientSupplier.producers.get(0);
+  consumer.updateBeginningOffsets(Collections.singletonMap(assignedPartitions.iterator().next(),0L));
+  consumer.unsubscribe();
+  consumer.assign(new HashSet<>(assignedPartitions));
+  consumer.addRecord(new ConsumerRecord<>(topic1,1,0,new byte[0],new byte[0]));
+  mockTime.sleep(config.getLong(StreamsConfig.COMMIT_INTERVAL_MS_CONFIG) + 1);
+  thread.runOnce();
+  assertThat(producer.history().size(),equalTo(1));
+  assertFalse(producer.transactionCommitted());
+  mockTime.sleep(config.getLong(StreamsConfig.COMMIT_INTERVAL_MS_CONFIG) + 1L);
+  TestUtils.waitForCondition(new TestCondition(){
+    @Override public boolean conditionMet(){
+      return producer.commitCount() == 1;
+    }
+  }
+,"StreamsThread did not commit transaction.");
+  producer.fenceProducer();
+  mockTime.sleep(config.getLong(StreamsConfig.COMMIT_INTERVAL_MS_CONFIG) + 1L);
+  consumer.addRecord(new ConsumerRecord<>(topic1,1,1,new byte[0],new byte[0]));
+  try {
+    thread.runOnce();
+    fail("Should have thrown TaskMigratedException");
+  }
+ catch (  final TaskMigratedException expected) {
+  }
+  TestUtils.waitForCondition(new TestCondition(){
+    @Override public boolean conditionMet(){
+      return thread.tasks().isEmpty();
+    }
+  }
+,"StreamsThread did not remove fenced zombie task.");
+  assertThat(producer.commitCount(),equalTo(1L));
+}

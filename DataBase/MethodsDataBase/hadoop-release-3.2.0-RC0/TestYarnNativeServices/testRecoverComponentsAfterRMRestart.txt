@@ -1,0 +1,37 @@
+@Test(timeout=200000) public void testRecoverComponentsAfterRMRestart() throws Exception {
+  YarnConfiguration conf=new YarnConfiguration();
+  conf.setBoolean(YarnConfiguration.RECOVERY_ENABLED,true);
+  conf.setBoolean(YarnConfiguration.RM_WORK_PRESERVING_RECOVERY_ENABLED,true);
+  conf.setLong(YarnConfiguration.NM_RESOURCEMANAGER_CONNECT_RETRY_INTERVAL_MS,500L);
+  conf.setBoolean(YarnConfiguration.YARN_MINICLUSTER_FIXED_PORTS,true);
+  conf.setBoolean(YarnConfiguration.YARN_MINICLUSTER_USE_RPC,true);
+  setConf(conf);
+  setupInternal(NUM_NMS);
+  ServiceClient client=createClient(getConf());
+  Service exampleApp=createExampleApplication();
+  client.actionCreate(exampleApp);
+  Multimap<String,String> containersBeforeFailure=waitForAllCompToBeReady(client,exampleApp);
+  LOG.info("Restart the resource manager");
+  getYarnCluster().restartResourceManager(getYarnCluster().getActiveRMIndex());
+  GenericTestUtils.waitFor(() -> getYarnCluster().getResourceManager().getServiceState() == org.apache.hadoop.service.Service.STATE.STARTED,2000,200000);
+  Assert.assertTrue("node managers connected",getYarnCluster().waitForNodeManagersToConnect(5000));
+  ApplicationId exampleAppId=ApplicationId.fromString(exampleApp.getId());
+  ApplicationAttemptId applicationAttemptId=client.getYarnClient().getApplicationReport(exampleAppId).getCurrentApplicationAttemptId();
+  LOG.info("Fail the application attempt {}",applicationAttemptId);
+  client.getYarnClient().failApplicationAttempt(applicationAttemptId);
+  GenericTestUtils.waitFor(() -> {
+    try {
+      ApplicationReport ar=client.getYarnClient().getApplicationReport(exampleAppId);
+      return ar.getCurrentApplicationAttemptId().getAttemptId() == 2 && ar.getYarnApplicationState() == YarnApplicationState.RUNNING;
+    }
+ catch (    YarnException|IOException e) {
+      throw new RuntimeException("while waiting",e);
+    }
+  }
+,2000,200000);
+  Multimap<String,String> containersAfterFailure=waitForAllCompToBeReady(client,exampleApp);
+  Assert.assertEquals("component container affected by restart",containersBeforeFailure,containersAfterFailure);
+  LOG.info("Stop/destroy service {}",exampleApp);
+  client.actionStop(exampleApp.getName(),true);
+  client.actionDestroy(exampleApp.getName());
+}

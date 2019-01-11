@@ -1,0 +1,87 @@
+/** 
+ * Race between two threads simultaneously calling FSNamesystem.getAdditionalBlock().
+ */
+public class TestAddBlockRetry {
+  public static final Logger LOG=LoggerFactory.getLogger(TestAddBlockRetry.class);
+  private static final short REPLICATION=3;
+  private Configuration conf;
+  private MiniDFSCluster cluster;
+  @Before public void setUp() throws Exception {
+    conf=new Configuration();
+    cluster=new MiniDFSCluster.Builder(conf).numDataNodes(REPLICATION).build();
+    cluster.waitActive();
+  }
+  @After public void tearDown() throws Exception {
+    if (cluster != null) {
+      cluster.shutdown();
+      cluster=null;
+    }
+  }
+  /** 
+ * Retry addBlock() while another thread is in chooseTarget(). See HDFS-4452.
+ */
+  @Test public void testRetryAddBlockWhileInChooseTarget() throws Exception {
+    final String src="/testRetryAddBlockWhileInChooseTarget";
+    final FSNamesystem ns=cluster.getNamesystem();
+    final NamenodeProtocols nn=cluster.getNameNodeRpc();
+    nn.create(src,FsPermission.getFileDefault(),"clientName",new EnumSetWritable<CreateFlag>(EnumSet.of(CreateFlag.CREATE)),true,(short)3,1024,null,null);
+    LOG.info("Starting first addBlock for " + src);
+    LocatedBlock[] onRetryBlock=new LocatedBlock[1];
+    ns.readLock();
+    FSDirWriteFileOp.ValidateAddBlockResult r;
+    FSPermissionChecker pc=Mockito.mock(FSPermissionChecker.class);
+    try {
+      r=FSDirWriteFileOp.validateAddBlock(ns,pc,src,HdfsConstants.GRANDFATHER_INODE_ID,"clientName",null,onRetryBlock);
+    }
+  finally {
+      ns.readUnlock();
+      ;
+    }
+    DatanodeStorageInfo targets[]=FSDirWriteFileOp.chooseTargetForNewBlock(ns.getBlockManager(),src,null,null,null,r);
+    assertNotNull("Targets must be generated",targets);
+    LOG.info("Starting second addBlock for " + src);
+    nn.addBlock(src,"clientName",null,null,HdfsConstants.GRANDFATHER_INODE_ID,null,null);
+    assertTrue("Penultimate block must be complete",checkFileProgress(src,false));
+    LocatedBlocks lbs=nn.getBlockLocations(src,0,Long.MAX_VALUE);
+    assertEquals("Must be one block",1,lbs.getLocatedBlocks().size());
+    LocatedBlock lb2=lbs.get(0);
+    assertEquals("Wrong replication",REPLICATION,lb2.getLocations().length);
+    ns.writeLock();
+    LocatedBlock newBlock;
+    try {
+      newBlock=FSDirWriteFileOp.storeAllocatedBlock(ns,src,HdfsConstants.GRANDFATHER_INODE_ID,"clientName",null,targets);
+    }
+  finally {
+      ns.writeUnlock();
+    }
+    assertEquals("Blocks are not equal",lb2.getBlock(),newBlock.getBlock());
+    lbs=nn.getBlockLocations(src,0,Long.MAX_VALUE);
+    assertEquals("Must be one block",1,lbs.getLocatedBlocks().size());
+    LocatedBlock lb1=lbs.get(0);
+    assertEquals("Wrong replication",REPLICATION,lb1.getLocations().length);
+    assertEquals("Blocks are not equal",lb1.getBlock(),lb2.getBlock());
+  }
+  boolean checkFileProgress(  String src,  boolean checkall) throws IOException {
+    final FSNamesystem ns=cluster.getNamesystem();
+    ns.readLock();
+    try {
+      return ns.checkFileProgress(src,ns.dir.getINode(src).asFile(),checkall);
+    }
+  finally {
+      ns.readUnlock();
+    }
+  }
+  @Test public void testAddBlockRetryShouldReturnBlockWithLocations() throws Exception {
+    final String src="/testAddBlockRetryShouldReturnBlockWithLocations";
+    NamenodeProtocols nameNodeRpc=cluster.getNameNodeRpc();
+    nameNodeRpc.create(src,FsPermission.getFileDefault(),"clientName",new EnumSetWritable<CreateFlag>(EnumSet.of(CreateFlag.CREATE)),true,(short)3,1024,null,null);
+    LOG.info("Starting first addBlock for " + src);
+    LocatedBlock lb1=nameNodeRpc.addBlock(src,"clientName",null,null,HdfsConstants.GRANDFATHER_INODE_ID,null,null);
+    assertTrue("Block locations should be present",lb1.getLocations().length > 0);
+    cluster.restartNameNode();
+    nameNodeRpc=cluster.getNameNodeRpc();
+    LocatedBlock lb2=nameNodeRpc.addBlock(src,"clientName",null,null,HdfsConstants.GRANDFATHER_INODE_ID,null,null);
+    assertEquals("Blocks are not equal",lb1.getBlock(),lb2.getBlock());
+    assertTrue("Wrong locations with retry",lb2.getLocations().length > 0);
+  }
+}

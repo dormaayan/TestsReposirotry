@@ -1,0 +1,59 @@
+@Test public void testGroupByEvictionCancellationOfSource5933(){
+  PublishProcessor<Integer> source=PublishProcessor.create();
+  final TestTicker testTicker=new TestTicker();
+  Function<Consumer<Object>,Map<Integer,Object>> mapFactory=new Function<Consumer<Object>,Map<Integer,Object>>(){
+    @Override public Map<Integer,Object> apply(    final Consumer<Object> action) throws Exception {
+      return CacheBuilder.newBuilder().expireAfterAccess(5,TimeUnit.SECONDS).removalListener(new RemovalListener<Object,Object>(){
+        @Override public void onRemoval(        RemovalNotification<Object,Object> notification){
+          try {
+            action.accept(notification.getValue());
+          }
+ catch (          Exception ex) {
+            throw new RuntimeException(ex);
+          }
+        }
+      }
+).ticker(testTicker).<Integer,Object>build().asMap();
+    }
+  }
+;
+  final List<String> list=new CopyOnWriteArrayList<String>();
+  Flowable<Integer> stream=source.doOnCancel(new Action(){
+    @Override public void run() throws Exception {
+      list.add("Source canceled");
+    }
+  }
+).<Integer,Integer>groupBy(Functions.<Integer>identity(),Functions.<Integer>identity(),false,Flowable.bufferSize(),mapFactory).flatMap(new Function<GroupedFlowable<Integer,Integer>,Publisher<? extends Integer>>(){
+    @Override public Publisher<? extends Integer> apply(    GroupedFlowable<Integer,Integer> group) throws Exception {
+      return group.doOnComplete(new Action(){
+        @Override public void run() throws Exception {
+          list.add("Group completed");
+        }
+      }
+).doOnCancel(new Action(){
+        @Override public void run() throws Exception {
+          list.add("Group canceled");
+        }
+      }
+);
+    }
+  }
+);
+  TestSubscriber<Integer> ts=stream.doOnCancel(new Action(){
+    @Override public void run() throws Exception {
+      list.add("Outer group by canceled");
+    }
+  }
+).test();
+  source.onNext(1);
+  source.onNext(1);
+  source.onNext(1);
+  ts.awaitCount(3);
+  testTicker.tick=TimeUnit.SECONDS.toNanos(6);
+  source.onNext(1);
+  ts.awaitCount(4);
+  ts.cancel();
+  System.out.println(list);
+  assertTrue(list.contains("Source canceled"));
+  assertEquals(Arrays.asList("Group completed","Outer group by canceled","Group canceled","Source canceled"),list);
+}

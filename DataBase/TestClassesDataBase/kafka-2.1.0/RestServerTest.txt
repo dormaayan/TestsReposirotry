@@ -1,0 +1,135 @@
+@RunWith(PowerMockRunner.class) public class RestServerTest {
+  @MockStrict private Herder herder;
+  @MockStrict private Plugins plugins;
+  private RestServer server;
+  @After public void tearDown(){
+    server.stop();
+  }
+  private Map<String,String> baseWorkerProps(){
+    Map<String,String> workerProps=new HashMap<>();
+    workerProps.put(DistributedConfig.STATUS_STORAGE_TOPIC_CONFIG,"status-topic");
+    workerProps.put(DistributedConfig.CONFIG_TOPIC_CONFIG,"config-topic");
+    workerProps.put(CommonClientConfigs.BOOTSTRAP_SERVERS_CONFIG,"localhost:9092");
+    workerProps.put(DistributedConfig.GROUP_ID_CONFIG,"connect-test-group");
+    workerProps.put(WorkerConfig.KEY_CONVERTER_CLASS_CONFIG,"org.apache.kafka.connect.json.JsonConverter");
+    workerProps.put(WorkerConfig.VALUE_CONVERTER_CLASS_CONFIG,"org.apache.kafka.connect.json.JsonConverter");
+    workerProps.put(WorkerConfig.INTERNAL_KEY_CONVERTER_CLASS_CONFIG,"org.apache.kafka.connect.json.JsonConverter");
+    workerProps.put(WorkerConfig.INTERNAL_VALUE_CONVERTER_CLASS_CONFIG,"org.apache.kafka.connect.json.JsonConverter");
+    workerProps.put(DistributedConfig.OFFSET_STORAGE_TOPIC_CONFIG,"connect-offsets");
+    return workerProps;
+  }
+  @Test public void testCORSEnabled(){
+    checkCORSRequest("*","http://bar.com","http://bar.com","PUT");
+  }
+  @Test public void testCORSDisabled(){
+    checkCORSRequest("","http://bar.com",null,null);
+  }
+  @Test public void testParseListeners(){
+    Map<String,String> configMap=new HashMap<>(baseWorkerProps());
+    configMap.put(WorkerConfig.LISTENERS_CONFIG,"http://localhost:8080,https://localhost:8443");
+    DistributedConfig config=new DistributedConfig(configMap);
+    server=new RestServer(config);
+    Assert.assertArrayEquals(new String[]{"http://localhost:8080","https://localhost:8443"},server.parseListeners().toArray());
+    configMap=new HashMap<>(baseWorkerProps());
+    configMap.put(WorkerConfig.REST_HOST_NAME_CONFIG,"my-hostname");
+    configMap.put(WorkerConfig.REST_PORT_CONFIG,"8080");
+    config=new DistributedConfig(configMap);
+    server=new RestServer(config);
+    Assert.assertArrayEquals(new String[]{"http://my-hostname:8080"},server.parseListeners().toArray());
+  }
+  @Test public void testAdvertisedUri(){
+    Map<String,String> configMap=new HashMap<>(baseWorkerProps());
+    configMap.put(WorkerConfig.LISTENERS_CONFIG,"http://localhost:8080,https://localhost:8443");
+    DistributedConfig config=new DistributedConfig(configMap);
+    server=new RestServer(config);
+    Assert.assertEquals("http://localhost:8080/",server.advertisedUrl().toString());
+    configMap=new HashMap<>(baseWorkerProps());
+    configMap.put(WorkerConfig.LISTENERS_CONFIG,"http://localhost:8080,https://localhost:8443");
+    configMap.put(WorkerConfig.REST_ADVERTISED_LISTENER_CONFIG,"https");
+    config=new DistributedConfig(configMap);
+    server=new RestServer(config);
+    Assert.assertEquals("https://localhost:8443/",server.advertisedUrl().toString());
+    configMap=new HashMap<>(baseWorkerProps());
+    configMap.put(WorkerConfig.LISTENERS_CONFIG,"https://localhost:8443");
+    config=new DistributedConfig(configMap);
+    server=new RestServer(config);
+    Assert.assertEquals("https://localhost:8443/",server.advertisedUrl().toString());
+    configMap=new HashMap<>(baseWorkerProps());
+    configMap.put(WorkerConfig.LISTENERS_CONFIG,"https://localhost:8443");
+    configMap.put(WorkerConfig.REST_ADVERTISED_LISTENER_CONFIG,"http");
+    configMap.put(WorkerConfig.REST_ADVERTISED_HOST_NAME_CONFIG,"somehost");
+    configMap.put(WorkerConfig.REST_ADVERTISED_PORT_CONFIG,"10000");
+    config=new DistributedConfig(configMap);
+    server=new RestServer(config);
+    Assert.assertEquals("http://somehost:10000/",server.advertisedUrl().toString());
+    configMap=new HashMap<>(baseWorkerProps());
+    configMap.put(WorkerConfig.REST_HOST_NAME_CONFIG,"my-hostname");
+    configMap.put(WorkerConfig.REST_PORT_CONFIG,"8080");
+    config=new DistributedConfig(configMap);
+    server=new RestServer(config);
+    Assert.assertEquals("http://my-hostname:8080/",server.advertisedUrl().toString());
+  }
+  public void checkCORSRequest(  String corsDomain,  String origin,  String expectedHeader,  String method){
+    Map<String,String> workerProps=baseWorkerProps();
+    workerProps.put(WorkerConfig.ACCESS_CONTROL_ALLOW_ORIGIN_CONFIG,corsDomain);
+    workerProps.put(WorkerConfig.ACCESS_CONTROL_ALLOW_METHODS_CONFIG,method);
+    WorkerConfig workerConfig=new DistributedConfig(workerProps);
+    System.setProperty("sun.net.http.allowRestrictedHeaders","true");
+    EasyMock.expect(herder.plugins()).andStubReturn(plugins);
+    EasyMock.expect(plugins.newPlugins(Collections.EMPTY_LIST,workerConfig,ConnectRestExtension.class)).andStubReturn(Collections.EMPTY_LIST);
+    final Capture<Callback<Collection<String>>> connectorsCallback=EasyMock.newCapture();
+    herder.connectors(EasyMock.capture(connectorsCallback));
+    PowerMock.expectLastCall().andAnswer(new IAnswer<Object>(){
+      @Override public Object answer() throws Throwable {
+        connectorsCallback.getValue().onCompletion(null,Arrays.asList("a","b"));
+        return null;
+      }
+    }
+);
+    PowerMock.replayAll();
+    server=new RestServer(workerConfig);
+    server.start(herder);
+    Response response=request("/connectors").header("Referer",origin + "/page").header("Origin",origin).get();
+    assertEquals(200,response.getStatus());
+    assertEquals(expectedHeader,response.getHeaderString("Access-Control-Allow-Origin"));
+    response=request("/connector-plugins/FileStreamSource/validate").header("Referer",origin + "/page").header("Origin",origin).header("Access-Control-Request-Method",method).options();
+    assertEquals(404,response.getStatus());
+    assertEquals(expectedHeader,response.getHeaderString("Access-Control-Allow-Origin"));
+    assertEquals(method,response.getHeaderString("Access-Control-Allow-Methods"));
+    PowerMock.verifyAll();
+  }
+  protected Invocation.Builder request(  String path){
+    return request(path,null,null,null);
+  }
+  protected Invocation.Builder request(  String path,  Map<String,String> queryParams){
+    return request(path,null,null,queryParams);
+  }
+  protected Invocation.Builder request(  String path,  String templateName,  Object templateValue){
+    return request(path,templateName,templateValue,null);
+  }
+  protected Invocation.Builder request(  String path,  String templateName,  Object templateValue,  Map<String,String> queryParams){
+    Client client=ClientBuilder.newClient();
+    WebTarget target;
+    URI pathUri=null;
+    try {
+      pathUri=new URI(path);
+    }
+ catch (    URISyntaxException e) {
+    }
+    if (pathUri != null && pathUri.isAbsolute()) {
+      target=client.target(path);
+    }
+ else {
+      target=client.target(server.advertisedUrl()).path(path);
+    }
+    if (templateName != null && templateValue != null) {
+      target=target.resolveTemplate(templateName,templateValue);
+    }
+    if (queryParams != null) {
+      for (      Map.Entry<String,String> queryParam : queryParams.entrySet()) {
+        target=target.queryParam(queryParam.getKey(),queryParam.getValue());
+      }
+    }
+    return target.request();
+  }
+}

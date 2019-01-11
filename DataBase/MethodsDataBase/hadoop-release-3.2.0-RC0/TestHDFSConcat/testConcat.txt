@@ -1,0 +1,89 @@
+/** 
+ * Concatenates 10 files into one Verifies the final size, deletion of the file, number of blocks
+ * @throws IOException
+ */
+@Test public void testConcat() throws IOException, InterruptedException {
+  final int numFiles=10;
+  long fileLen=blockSize * 3;
+  HdfsFileStatus fStatus;
+  FSDataInputStream stm;
+  String trg="/trg";
+  Path trgPath=new Path(trg);
+  DFSTestUtil.createFile(dfs,trgPath,fileLen,REPL_FACTOR,1);
+  fStatus=nn.getFileInfo(trg);
+  long trgLen=fStatus.getLen();
+  long trgBlocks=nn.getBlockLocations(trg,0,trgLen).locatedBlockCount();
+  Path[] files=new Path[numFiles];
+  byte[][] bytes=new byte[numFiles + 1][(int)fileLen];
+  LocatedBlocks[] lblocks=new LocatedBlocks[numFiles];
+  long[] lens=new long[numFiles];
+  stm=dfs.open(trgPath);
+  stm.readFully(0,bytes[0]);
+  stm.close();
+  int i;
+  for (i=0; i < files.length; i++) {
+    files[i]=new Path("/file" + i);
+    Path path=files[i];
+    System.out.println("Creating file " + path);
+    DFSTestUtil.createFile(dfs,path,fileLen,REPL_FACTOR,i);
+    fStatus=nn.getFileInfo(path.toUri().getPath());
+    lens[i]=fStatus.getLen();
+    assertEquals(trgLen,lens[i]);
+    lblocks[i]=nn.getBlockLocations(path.toUri().getPath(),0,lens[i]);
+    stm=dfs.open(path);
+    stm.readFully(0,bytes[i + 1]);
+    stm.close();
+  }
+  final UserGroupInformation user1=UserGroupInformation.createUserForTesting("theDoctor",new String[]{"tardis"});
+  DistributedFileSystem hdfs=(DistributedFileSystem)DFSTestUtil.getFileSystemAs(user1,conf);
+  try {
+    hdfs.concat(trgPath,files);
+    fail("Permission exception expected");
+  }
+ catch (  IOException ie) {
+    System.out.println("Got expected exception for permissions:" + ie.getLocalizedMessage());
+  }
+  ContentSummary cBefore=dfs.getContentSummary(trgPath.getParent());
+  for (int j=0; j < files.length / 2; j++) {
+    Path tempPath=files[j];
+    files[j]=files[files.length - 1 - j];
+    files[files.length - 1 - j]=tempPath;
+    byte[] tempBytes=bytes[1 + j];
+    bytes[1 + j]=bytes[files.length - 1 - j + 1];
+    bytes[files.length - 1 - j + 1]=tempBytes;
+  }
+  dfs.concat(trgPath,files);
+  ContentSummary cAfter=dfs.getContentSummary(trgPath.getParent());
+  assertEquals(cBefore.getFileCount(),cAfter.getFileCount() + files.length);
+  long totalLen=trgLen;
+  long totalBlocks=trgBlocks;
+  for (i=0; i < files.length; i++) {
+    totalLen+=lens[i];
+    totalBlocks+=lblocks[i].locatedBlockCount();
+  }
+  System.out.println("total len=" + totalLen + "; totalBlocks="+ totalBlocks);
+  fStatus=nn.getFileInfo(trg);
+  trgLen=fStatus.getLen();
+  stm=dfs.open(trgPath);
+  byte[] byteFileConcat=new byte[(int)trgLen];
+  stm.readFully(0,byteFileConcat);
+  stm.close();
+  trgBlocks=nn.getBlockLocations(trg,0,trgLen).locatedBlockCount();
+  assertEquals(trgBlocks,totalBlocks);
+  assertEquals(trgLen,totalLen);
+  for (  Path p : files) {
+    fStatus=nn.getFileInfo(p.toUri().getPath());
+    assertNull("File " + p + " still exists",fStatus);
+    DFSTestUtil.createFile(dfs,p,fileLen,REPL_FACTOR,1);
+  }
+  checkFileContent(byteFileConcat,bytes);
+  Path smallFile=new Path("/sfile");
+  int sFileLen=10;
+  DFSTestUtil.createFile(dfs,smallFile,sFileLen,REPL_FACTOR,1);
+  dfs.concat(trgPath,new Path[]{smallFile});
+  fStatus=nn.getFileInfo(trg);
+  trgLen=fStatus.getLen();
+  trgBlocks=nn.getBlockLocations(trg,0,trgLen).locatedBlockCount();
+  assertEquals(trgBlocks,totalBlocks + 1);
+  assertEquals(trgLen,totalLen + sFileLen);
+}

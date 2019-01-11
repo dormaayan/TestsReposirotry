@@ -1,0 +1,57 @@
+/** 
+ * Tests to verify that only few datanodes are available and few striped blocks are able to move. Others are still trying to find available nodes. For example, we have 3 nodes A(disk, disk), B(disk, disk), C(disk, archive) Assume a block with storage locations A(disk), B(disk), C(disk). Now, set policy as COLD and invoked  {@link HdfsAdmin#satisfyStoragePolicy(Path)}, while choosing the target node for A, it shouldn't choose C. For C, it should do local block movement as it has ARCHIVE storage type.
+ */
+@Test(timeout=300000) public void testWhenOnlyFewTargetNodesAreAvailableToSatisfyStoragePolicy() throws Exception {
+  int numOfDatanodes=11;
+  int storagesPerDatanode=2;
+  long capacity=20 * defaultStripeBlockSize;
+  long[][] capacities=new long[numOfDatanodes][storagesPerDatanode];
+  for (int i=0; i < numOfDatanodes; i++) {
+    for (int j=0; j < storagesPerDatanode; j++) {
+      capacities[i][j]=capacity;
+    }
+  }
+  final MiniDFSCluster cluster=new MiniDFSCluster.Builder(conf).numDataNodes(numOfDatanodes).storagesPerDatanode(storagesPerDatanode).storageTypes(new StorageType[][]{{StorageType.DISK,StorageType.DISK},{StorageType.DISK,StorageType.DISK},{StorageType.DISK,StorageType.DISK},{StorageType.DISK,StorageType.DISK},{StorageType.DISK,StorageType.DISK},{StorageType.DISK,StorageType.DISK},{StorageType.DISK,StorageType.DISK},{StorageType.DISK,StorageType.DISK},{StorageType.DISK,StorageType.ARCHIVE},{StorageType.DISK,StorageType.ARCHIVE},{StorageType.DISK,StorageType.ARCHIVE}}).storageCapacities(capacities).build();
+  HdfsAdmin hdfsAdmin=new HdfsAdmin(FileSystem.getDefaultUri(conf),conf);
+  try {
+    cluster.waitActive();
+    startSPS();
+    DistributedFileSystem dfs=cluster.getFileSystem();
+    dfs.enableErasureCodingPolicy(StripedFileTestUtil.getDefaultECPolicy().getName());
+    ClientProtocol client=NameNodeProxies.createProxy(conf,cluster.getFileSystem(0).getUri(),ClientProtocol.class).getProxy();
+    String barDir="/bar";
+    client.mkdirs(barDir,new FsPermission((short)777),true);
+    client.setStoragePolicy(barDir,HdfsConstants.HOT_STORAGE_POLICY_NAME);
+    client.setErasureCodingPolicy(barDir,StripedFileTestUtil.getDefaultECPolicy().getName());
+    final String fooFile="/bar/foo";
+    long fileLen=cellSize * dataBlocks;
+    DFSTestUtil.createFile(cluster.getFileSystem(),new Path(fooFile),fileLen,(short)3,0);
+    LocatedBlocks locatedBlocks=client.getBlockLocations(fooFile,0,fileLen);
+    for (    LocatedBlock lb : locatedBlocks.getLocatedBlocks()) {
+      for (      StorageType type : lb.getStorageTypes()) {
+        Assert.assertEquals(StorageType.DISK,type);
+      }
+    }
+    Thread.sleep(5000);
+    StripedFileTestUtil.verifyLocatedStripedBlocks(locatedBlocks,dataBlocks + parityBlocks);
+    int numOfNewDatanodes=2;
+    capacities=new long[numOfNewDatanodes][storagesPerDatanode];
+    for (int i=0; i < numOfNewDatanodes; i++) {
+      for (int j=0; j < storagesPerDatanode; j++) {
+        capacities[i][j]=capacity;
+      }
+    }
+    cluster.startDataNodes(conf,2,new StorageType[][]{{StorageType.ARCHIVE,StorageType.ARCHIVE},{StorageType.ARCHIVE,StorageType.ARCHIVE}},true,null,null,null,capacities,null,false,false,false,null);
+    cluster.triggerHeartbeats();
+    client.setStoragePolicy(barDir,"COLD");
+    hdfsAdmin.satisfyStoragePolicy(new Path(fooFile));
+    LOG.info("Sets storage policy to COLD and invoked satisfyStoragePolicy");
+    cluster.triggerHeartbeats();
+    waitForAttemptedItems(1,30000);
+    waitExpectedStorageType(cluster,fooFile,fileLen,StorageType.ARCHIVE,5,9,60000);
+  }
+  finally {
+    cluster.shutdown();
+    sps.stopGracefully();
+  }
+}

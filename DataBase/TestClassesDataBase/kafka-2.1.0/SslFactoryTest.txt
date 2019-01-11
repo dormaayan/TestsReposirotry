@@ -1,0 +1,121 @@
+/** 
+ * A set of tests for the selector over ssl. These use a test harness that runs a simple socket server that echos back responses.
+ */
+public class SslFactoryTest {
+  @Test public void testSslFactoryConfiguration() throws Exception {
+    File trustStoreFile=File.createTempFile("truststore",".jks");
+    Map<String,Object> serverSslConfig=TestSslUtils.createSslConfig(false,true,Mode.SERVER,trustStoreFile,"server");
+    SslFactory sslFactory=new SslFactory(Mode.SERVER);
+    sslFactory.configure(serverSslConfig);
+    SSLEngine engine=sslFactory.createSslEngine("localhost",0);
+    assertNotNull(engine);
+    String[] expectedProtocols={"TLSv1.2"};
+    assertArrayEquals(expectedProtocols,engine.getEnabledProtocols());
+    assertEquals(false,engine.getUseClientMode());
+  }
+  @Test public void testSslFactoryWithoutPasswordConfiguration() throws Exception {
+    File trustStoreFile=File.createTempFile("truststore",".jks");
+    Map<String,Object> serverSslConfig=TestSslUtils.createSslConfig(false,true,Mode.SERVER,trustStoreFile,"server");
+    serverSslConfig.remove(SslConfigs.SSL_TRUSTSTORE_PASSWORD_CONFIG);
+    SslFactory sslFactory=new SslFactory(Mode.SERVER);
+    try {
+      sslFactory.configure(serverSslConfig);
+    }
+ catch (    Exception e) {
+      fail("An exception was thrown when configuring the truststore without a password: " + e);
+    }
+  }
+  @Test public void testClientMode() throws Exception {
+    File trustStoreFile=File.createTempFile("truststore",".jks");
+    Map<String,Object> clientSslConfig=TestSslUtils.createSslConfig(false,true,Mode.CLIENT,trustStoreFile,"client");
+    SslFactory sslFactory=new SslFactory(Mode.CLIENT);
+    sslFactory.configure(clientSslConfig);
+    SSLEngine engine=sslFactory.createSslEngine("localhost",0);
+    assertTrue(engine.getUseClientMode());
+  }
+  @Test public void testReconfiguration() throws Exception {
+    File trustStoreFile=File.createTempFile("truststore",".jks");
+    Map<String,Object> sslConfig=TestSslUtils.createSslConfig(false,true,Mode.SERVER,trustStoreFile,"server");
+    SslFactory sslFactory=new SslFactory(Mode.SERVER);
+    sslFactory.configure(sslConfig);
+    SSLContext sslContext=sslFactory.sslContext();
+    assertNotNull("SSL context not created",sslContext);
+    assertSame("SSL context recreated unnecessarily",sslContext,sslFactory.sslContext());
+    assertFalse(sslFactory.createSslEngine("localhost",0).getUseClientMode());
+    sslFactory.reconfigure(sslConfig);
+    assertSame("SSL context recreated unnecessarily",sslContext,sslFactory.sslContext());
+    trustStoreFile=File.createTempFile("truststore",".jks");
+    sslConfig=TestSslUtils.createSslConfig(false,true,Mode.SERVER,trustStoreFile,"server");
+    sslFactory.reconfigure(sslConfig);
+    assertNotSame("SSL context not recreated",sslContext,sslFactory.sslContext());
+    sslContext=sslFactory.sslContext();
+    trustStoreFile.setLastModified(System.currentTimeMillis() + 10000);
+    sslFactory.reconfigure(sslConfig);
+    assertNotSame("SSL context not recreated",sslContext,sslFactory.sslContext());
+    sslContext=sslFactory.sslContext();
+    File keyStoreFile=new File((String)sslConfig.get(SslConfigs.SSL_KEYSTORE_LOCATION_CONFIG));
+    keyStoreFile.setLastModified(System.currentTimeMillis() + 10000);
+    sslFactory.reconfigure(sslConfig);
+    assertNotSame("SSL context not recreated",sslContext,sslFactory.sslContext());
+    sslContext=sslFactory.sslContext();
+    keyStoreFile.setLastModified(System.currentTimeMillis() + 20000);
+    Files.delete(keyStoreFile.toPath());
+    sslFactory.reconfigure(sslConfig);
+    assertSame("SSL context recreated unnecessarily",sslContext,sslFactory.sslContext());
+  }
+  @Test public void testKeyStoreTrustStoreValidation() throws Exception {
+    File trustStoreFile=File.createTempFile("truststore",".jks");
+    Map<String,Object> serverSslConfig=TestSslUtils.createSslConfig(false,true,Mode.SERVER,trustStoreFile,"server");
+    SslFactory sslFactory=new SslFactory(Mode.SERVER);
+    sslFactory.configure(serverSslConfig);
+    SSLContext sslContext=sslFactory.createSSLContext(sslKeyStore(serverSslConfig),null);
+    assertNotNull("SSL context not created",sslContext);
+    SSLContext sslContext2=sslFactory.createSSLContext(null,sslTrustStore(serverSslConfig));
+    assertNotNull("SSL context not created",sslContext2);
+    SSLContext sslContext3=sslFactory.createSSLContext(sslKeyStore(serverSslConfig),sslTrustStore(serverSslConfig));
+    assertNotNull("SSL context not created",sslContext3);
+  }
+  @Test public void testUntrustedKeyStoreValidation() throws Exception {
+    File trustStoreFile=File.createTempFile("truststore",".jks");
+    Map<String,Object> serverSslConfig=TestSslUtils.createSslConfig(false,true,Mode.SERVER,trustStoreFile,"server");
+    Map<String,Object> untrustedConfig=TestSslUtils.createSslConfig(false,true,Mode.SERVER,File.createTempFile("truststore",".jks"),"server");
+    SslFactory sslFactory=new SslFactory(Mode.SERVER,null,true);
+    sslFactory.configure(serverSslConfig);
+    try {
+      sslFactory.createSSLContext(sslKeyStore(untrustedConfig),null);
+      fail("Validation did not fail with untrusted keystore");
+    }
+ catch (    SSLHandshakeException e) {
+    }
+    try {
+      sslFactory.createSSLContext(null,sslTrustStore(untrustedConfig));
+      fail("Validation did not fail with untrusted truststore");
+    }
+ catch (    SSLHandshakeException e) {
+    }
+    try {
+      sslFactory.createSSLContext(sslKeyStore(untrustedConfig),sslTrustStore(untrustedConfig));
+      fail("Validation did not fail with untrusted truststore");
+    }
+ catch (    SSLHandshakeException e) {
+    }
+  }
+  @Test public void testCertificateEntriesValidation() throws Exception {
+    File trustStoreFile=File.createTempFile("truststore",".jks");
+    Map<String,Object> serverSslConfig=TestSslUtils.createSslConfig(false,true,Mode.SERVER,trustStoreFile,"server");
+    Map<String,Object> newCnConfig=TestSslUtils.createSslConfig(false,true,Mode.SERVER,File.createTempFile("truststore",".jks"),"server","Another CN");
+    KeyStore ks1=sslKeyStore(serverSslConfig).load();
+    KeyStore ks2=sslKeyStore(serverSslConfig).load();
+    assertEquals(SslFactory.CertificateEntries.create(ks1),SslFactory.CertificateEntries.create(ks2));
+    ks2.setCertificateEntry("another",ks1.getCertificate("localhost"));
+    assertEquals(SslFactory.CertificateEntries.create(ks1),SslFactory.CertificateEntries.create(ks2));
+    KeyStore ks3=sslKeyStore(newCnConfig).load();
+    assertNotEquals(SslFactory.CertificateEntries.create(ks1),SslFactory.CertificateEntries.create(ks3));
+  }
+  private SslFactory.SecurityStore sslKeyStore(  Map<String,Object> sslConfig){
+    return new SslFactory.SecurityStore((String)sslConfig.get(SslConfigs.SSL_KEYSTORE_TYPE_CONFIG),(String)sslConfig.get(SslConfigs.SSL_KEYSTORE_LOCATION_CONFIG),(Password)sslConfig.get(SslConfigs.SSL_KEYSTORE_PASSWORD_CONFIG),(Password)sslConfig.get(SslConfigs.SSL_KEY_PASSWORD_CONFIG));
+  }
+  private SslFactory.SecurityStore sslTrustStore(  Map<String,Object> sslConfig){
+    return new SslFactory.SecurityStore((String)sslConfig.get(SslConfigs.SSL_TRUSTSTORE_TYPE_CONFIG),(String)sslConfig.get(SslConfigs.SSL_TRUSTSTORE_LOCATION_CONFIG),(Password)sslConfig.get(SslConfigs.SSL_TRUSTSTORE_PASSWORD_CONFIG),null);
+  }
+}

@@ -1,0 +1,186 @@
+/** 
+ * Test the basic  {@link MembershipStore} membership functionality.
+ */
+public class TestStateStoreMembershipState extends TestStateStoreBase {
+  private static MembershipStore membershipStore;
+  @BeforeClass public static void create(){
+    getConf().setLong(RBFConfigKeys.FEDERATION_STORE_MEMBERSHIP_EXPIRATION_MS,TimeUnit.SECONDS.toMillis(5));
+  }
+  @Before public void setup() throws IOException, InterruptedException {
+    membershipStore=getStateStore().getRegisteredRecordStore(MembershipStore.class);
+    assertTrue(clearRecords(getStateStore(),MembershipState.class));
+  }
+  @Test public void testNamenodeStateOverride() throws Exception {
+    String ns="ns0";
+    String nn="nn0";
+    MembershipState report=createRegistration(ns,nn,ROUTERS[1],FederationNamenodeServiceState.STANDBY);
+    assertTrue(namenodeHeartbeat(report));
+    assertTrue(getStateStore().loadCache(MembershipStore.class,true));
+    MembershipState existingState=getNamenodeRegistration(ns,nn);
+    assertEquals(FederationNamenodeServiceState.STANDBY,existingState.getState());
+    UpdateNamenodeRegistrationRequest request=UpdateNamenodeRegistrationRequest.newInstance(ns,nn,FederationNamenodeServiceState.ACTIVE);
+    assertTrue(membershipStore.updateNamenodeRegistration(request).getResult());
+    MembershipState newState=getNamenodeRegistration(ns,nn);
+    assertEquals(FederationNamenodeServiceState.ACTIVE,newState.getState());
+  }
+  @Test public void testStateStoreDisconnected() throws Exception {
+    getStateStore().closeDriver();
+    assertFalse(getStateStore().isDriverReady());
+    NamenodeHeartbeatRequest hbRequest=NamenodeHeartbeatRequest.newInstance();
+    hbRequest.setNamenodeMembership(createMockRegistrationForNamenode("test","test",FederationNamenodeServiceState.UNAVAILABLE));
+    verifyException(membershipStore,"namenodeHeartbeat",StateStoreUnavailableException.class,new Class[]{NamenodeHeartbeatRequest.class},new Object[]{hbRequest});
+    GetNamenodeRegistrationsRequest getRequest=GetNamenodeRegistrationsRequest.newInstance();
+    verifyException(membershipStore,"getNamenodeRegistrations",null,new Class[]{GetNamenodeRegistrationsRequest.class},new Object[]{getRequest});
+    verifyException(membershipStore,"getExpiredNamenodeRegistrations",null,new Class[]{GetNamenodeRegistrationsRequest.class},new Object[]{getRequest});
+    UpdateNamenodeRegistrationRequest overrideRequest=UpdateNamenodeRegistrationRequest.newInstance();
+    verifyException(membershipStore,"updateNamenodeRegistration",null,new Class[]{UpdateNamenodeRegistrationRequest.class},new Object[]{overrideRequest});
+  }
+  private void registerAndLoadRegistrations(  List<MembershipState> registrationList) throws IOException {
+    assertTrue(synchronizeRecords(getStateStore(),registrationList,MembershipState.class));
+    assertTrue(getStateStore().loadCache(MembershipStore.class,true));
+  }
+  private MembershipState createRegistration(  String ns,  String nn,  String router,  FederationNamenodeServiceState state) throws IOException {
+    MembershipState record=MembershipState.newInstance(router,ns,nn,"testcluster","testblock-" + ns,"testrpc-" + ns + nn,"testservice-" + ns + nn,"testlifeline-" + ns + nn,"testweb-" + ns + nn,state,false);
+    return record;
+  }
+  @Test public void testRegistrationMajorityQuorum() throws InterruptedException, IOException {
+    String ns="ns0";
+    String nn="nn0";
+    MembershipState report=createRegistration(ns,nn,ROUTERS[1],FederationNamenodeServiceState.ACTIVE);
+    assertTrue(namenodeHeartbeat(report));
+    Thread.sleep(1000);
+    report=createRegistration(ns,nn,ROUTERS[2],FederationNamenodeServiceState.ACTIVE);
+    assertTrue(namenodeHeartbeat(report));
+    Thread.sleep(1000);
+    report=createRegistration(ns,nn,ROUTERS[3],FederationNamenodeServiceState.ACTIVE);
+    assertTrue(namenodeHeartbeat(report));
+    report=createRegistration(ns,nn,ROUTERS[0],FederationNamenodeServiceState.STANDBY);
+    assertTrue(namenodeHeartbeat(report));
+    assertTrue(getStateStore().loadCache(MembershipStore.class,true));
+    MembershipState quorumEntry=getNamenodeRegistration(report.getNameserviceId(),report.getNamenodeId());
+    assertNotNull(quorumEntry);
+    assertEquals(quorumEntry.getRouterId(),ROUTERS[3]);
+  }
+  @Test public void testRegistrationQuorumExcludesExpired() throws InterruptedException, IOException {
+    List<MembershipState> registrationList=new ArrayList<>();
+    String ns="ns0";
+    String nn="nn0";
+    String rpcAddress="testrpcaddress";
+    String serviceAddress="testserviceaddress";
+    String lifelineAddress="testlifelineaddress";
+    String blockPoolId="testblockpool";
+    String clusterId="testcluster";
+    String webAddress="testwebaddress";
+    boolean safemode=false;
+    MembershipState record=MembershipState.newInstance(ROUTERS[0],ns,nn,clusterId,blockPoolId,rpcAddress,serviceAddress,lifelineAddress,webAddress,FederationNamenodeServiceState.ACTIVE,safemode);
+    registrationList.add(record);
+    record=MembershipState.newInstance(ROUTERS[1],ns,nn,clusterId,blockPoolId,rpcAddress,serviceAddress,lifelineAddress,webAddress,FederationNamenodeServiceState.EXPIRED,safemode);
+    registrationList.add(record);
+    record=MembershipState.newInstance(ROUTERS[2],ns,nn,clusterId,blockPoolId,rpcAddress,serviceAddress,lifelineAddress,webAddress,FederationNamenodeServiceState.EXPIRED,safemode);
+    registrationList.add(record);
+    record=MembershipState.newInstance(ROUTERS[3],ns,nn,clusterId,blockPoolId,rpcAddress,serviceAddress,lifelineAddress,webAddress,FederationNamenodeServiceState.EXPIRED,safemode);
+    registrationList.add(record);
+    registerAndLoadRegistrations(registrationList);
+    MembershipState quorumEntry=getNamenodeRegistration(record.getNameserviceId(),record.getNamenodeId());
+    assertNotNull(quorumEntry);
+    assertEquals(ROUTERS[0],quorumEntry.getRouterId());
+  }
+  @Test public void testRegistrationQuorumAllExpired() throws IOException {
+    List<MembershipState> registrationList=new ArrayList<>();
+    String ns=NAMESERVICES[0];
+    String nn=NAMENODES[0];
+    String rpcAddress="testrpcaddress";
+    String serviceAddress="testserviceaddress";
+    String lifelineAddress="testlifelineaddress";
+    String blockPoolId="testblockpool";
+    String clusterId="testcluster";
+    String webAddress="testwebaddress";
+    boolean safemode=false;
+    long startingTime=Time.now();
+    MembershipState record=MembershipState.newInstance(ROUTERS[0],ns,nn,clusterId,blockPoolId,rpcAddress,webAddress,lifelineAddress,webAddress,FederationNamenodeServiceState.EXPIRED,safemode);
+    record.setDateModified(startingTime - 10000);
+    registrationList.add(record);
+    record=MembershipState.newInstance(ROUTERS[1],ns,nn,clusterId,blockPoolId,rpcAddress,serviceAddress,lifelineAddress,webAddress,FederationNamenodeServiceState.EXPIRED,safemode);
+    record.setDateModified(startingTime);
+    registrationList.add(record);
+    record=MembershipState.newInstance(ROUTERS[2],ns,nn,clusterId,blockPoolId,rpcAddress,serviceAddress,lifelineAddress,webAddress,FederationNamenodeServiceState.EXPIRED,safemode);
+    record.setDateModified(startingTime);
+    registrationList.add(record);
+    record=MembershipState.newInstance(ROUTERS[3],ns,nn,clusterId,blockPoolId,rpcAddress,serviceAddress,lifelineAddress,webAddress,FederationNamenodeServiceState.EXPIRED,safemode);
+    record.setDateModified(startingTime);
+    registrationList.add(record);
+    registerAndLoadRegistrations(registrationList);
+    assertNull(getNamenodeRegistration(record.getNameserviceId(),record.getNamenodeId()));
+  }
+  @Test public void testRegistrationNoQuorum() throws InterruptedException, IOException {
+    MembershipState report1=createRegistration(NAMESERVICES[0],NAMENODES[0],ROUTERS[1],FederationNamenodeServiceState.STANDBY);
+    assertTrue(namenodeHeartbeat(report1));
+    Thread.sleep(100);
+    MembershipState report2=createRegistration(NAMESERVICES[0],NAMENODES[0],ROUTERS[2],FederationNamenodeServiceState.ACTIVE);
+    assertTrue(namenodeHeartbeat(report2));
+    Thread.sleep(100);
+    MembershipState report3=createRegistration(NAMESERVICES[0],NAMENODES[0],ROUTERS[3],FederationNamenodeServiceState.ACTIVE);
+    assertTrue(namenodeHeartbeat(report3));
+    Thread.sleep(100);
+    MembershipState report4=createRegistration(NAMESERVICES[0],NAMENODES[0],ROUTERS[0],FederationNamenodeServiceState.STANDBY);
+    assertTrue(namenodeHeartbeat(report4));
+    assertTrue(getStateStore().loadCache(MembershipStore.class,true));
+    MembershipState quorumEntry=getNamenodeRegistration(report1.getNameserviceId(),report1.getNamenodeId());
+    assertNotNull(quorumEntry);
+    assertEquals(ROUTERS[0],quorumEntry.getRouterId());
+    assertEquals(FederationNamenodeServiceState.STANDBY,quorumEntry.getState());
+  }
+  @Test public void testRegistrationExpired() throws InterruptedException, IOException {
+    MembershipState report=createRegistration(NAMESERVICES[0],NAMENODES[0],ROUTERS[0],FederationNamenodeServiceState.ACTIVE);
+    assertTrue(namenodeHeartbeat(report));
+    assertTrue(getStateStore().loadCache(MembershipStore.class,true));
+    MembershipState quorumEntry=getNamenodeRegistration(report.getNameserviceId(),report.getNamenodeId());
+    assertNotNull(quorumEntry);
+    assertEquals(ROUTERS[0],quorumEntry.getRouterId());
+    assertEquals(FederationNamenodeServiceState.ACTIVE,quorumEntry.getState());
+    Thread.sleep(6000);
+    assertTrue(getStateStore().loadCache(MembershipStore.class,true));
+    quorumEntry=getNamenodeRegistration(NAMESERVICES[0],NAMENODES[0]);
+    assertNull(quorumEntry);
+    quorumEntry=getNamenodeRegistration(report.getNameserviceId(),report.getNamenodeId());
+    assertNull(quorumEntry);
+    assertTrue(namenodeHeartbeat(report));
+    assertTrue(getStateStore().loadCache(MembershipStore.class,true));
+    quorumEntry=getNamenodeRegistration(report.getNameserviceId(),report.getNamenodeId());
+    assertNotNull(quorumEntry);
+    assertEquals(ROUTERS[0],quorumEntry.getRouterId());
+    assertEquals(FederationNamenodeServiceState.ACTIVE,quorumEntry.getState());
+  }
+  /** 
+ * Get a single namenode membership record from the store.
+ * @param nsId The HDFS nameservice ID to search for
+ * @param nnId The HDFS namenode ID to search for
+ * @return The single NamenodeMembershipRecord that matches the query or nullif not found.
+ * @throws IOException if the query could not be executed.
+ */
+  private MembershipState getNamenodeRegistration(  final String nsId,  final String nnId) throws IOException {
+    MembershipState partial=MembershipState.newInstance();
+    partial.setNameserviceId(nsId);
+    partial.setNamenodeId(nnId);
+    GetNamenodeRegistrationsRequest request=GetNamenodeRegistrationsRequest.newInstance(partial);
+    GetNamenodeRegistrationsResponse response=membershipStore.getNamenodeRegistrations(request);
+    List<MembershipState> results=response.getNamenodeMemberships();
+    if (results != null && results.size() == 1) {
+      MembershipState record=results.get(0);
+      return record;
+    }
+    return null;
+  }
+  /** 
+ * Register a namenode heartbeat with the state store.
+ * @param store FederationMembershipStateStore instance to retrieve themembership data records.
+ * @param namenode A fully populated namenode membership record to becommitted to the data store.
+ * @return True if successful, false otherwise.
+ * @throws IOException if the state store query could not be performed.
+ */
+  private boolean namenodeHeartbeat(  MembershipState namenode) throws IOException {
+    NamenodeHeartbeatRequest request=NamenodeHeartbeatRequest.newInstance(namenode);
+    NamenodeHeartbeatResponse response=membershipStore.namenodeHeartbeat(request);
+    return response.getResult();
+  }
+}

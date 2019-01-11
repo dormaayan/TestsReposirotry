@@ -1,0 +1,50 @@
+@Test public void shouldForwardToCorrectProcessorNodeWhenMultiCacheEvictions(){
+  final String tableOne="tableOne";
+  final String tableTwo="tableTwo";
+  final StreamsBuilder builder=new StreamsBuilder();
+  final String reduceTopic="TestDriver-reducer-store-repartition";
+  final Map<String,Long> reduceResults=new HashMap<>();
+  final KTable<String,String> one=builder.table(tableOne,consumed);
+  final KTable<Long,String> two=builder.table(tableTwo,Consumed.with(Serdes.Long(),Serdes.String()));
+  final KTable<String,Long> reduce=two.groupBy(new KeyValueMapper<Long,String,KeyValue<String,Long>>(){
+    @Override public KeyValue<String,Long> apply(    final Long key,    final String value){
+      return new KeyValue<>(value,key);
+    }
+  }
+,Serialized.with(Serdes.String(),Serdes.Long())).reduce(new Reducer<Long>(){
+    @Override public Long apply(    final Long value1,    final Long value2){
+      return value1 + value2;
+    }
+  }
+,new Reducer<Long>(){
+    @Override public Long apply(    final Long value1,    final Long value2){
+      return value1 - value2;
+    }
+  }
+,Materialized.<String,Long,KeyValueStore<Bytes,byte[]>>as("reducer-store"));
+  reduce.toStream().foreach(new ForeachAction<String,Long>(){
+    @Override public void apply(    final String key,    final Long value){
+      reduceResults.put(key,value);
+    }
+  }
+);
+  one.leftJoin(reduce,new ValueJoiner<String,Long,String>(){
+    @Override public String apply(    final String value1,    final Long value2){
+      return value1 + ":" + value2;
+    }
+  }
+).mapValues(new ValueMapper<String,String>(){
+    @Override public String apply(    final String value){
+      return value;
+    }
+  }
+);
+  driver.setUp(builder,stateDir,111);
+  driver.process(reduceTopic,"1",new Change<>(1L,null));
+  driver.process("tableOne","2","2");
+  driver.process(reduceTopic,"2",new Change<>(2L,null));
+  driver.process(reduceTopic,"2",new Change<>(2L,null));
+  assertEquals(Long.valueOf(2L),reduceResults.get("2"));
+  driver.process("tableOne","1","5");
+  assertEquals(Long.valueOf(4L),reduceResults.get("2"));
+}

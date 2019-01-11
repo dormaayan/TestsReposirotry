@@ -1,0 +1,62 @@
+@Test(timeout=200000) public void testComponentHealthThresholdMonitor() throws Exception {
+  YarnConfiguration conf=new YarnConfiguration();
+  conf.set(YarnConfiguration.RM_PLACEMENT_CONSTRAINTS_HANDLER,YarnConfiguration.SCHEDULER_RM_PLACEMENT_CONSTRAINTS_HANDLER);
+  setConf(conf);
+  setupInternal(3);
+  ServiceClient client=createClient(getConf());
+  Service exampleApp=new Service();
+  exampleApp.setName("example-app");
+  exampleApp.setVersion("v1");
+  Component comp=createComponent("compa",3L,"sleep 1000");
+  PlacementPolicy pp=new PlacementPolicy();
+  PlacementConstraint pc=new PlacementConstraint();
+  pc.setName("CA1");
+  pc.setTargetTags(Collections.singletonList("compa"));
+  pc.setScope(PlacementScope.NODE);
+  pc.setType(PlacementType.ANTI_AFFINITY);
+  pp.setConstraints(Collections.singletonList(pc));
+  comp.setPlacementPolicy(pp);
+  Configuration config=new Configuration();
+  config.setProperty(CONTAINER_HEALTH_THRESHOLD_PERCENT,"65");
+  config.setProperty(CONTAINER_HEALTH_THRESHOLD_WINDOW_SEC,"3");
+  config.setProperty(CONTAINER_HEALTH_THRESHOLD_INIT_DELAY_SEC,"0");
+  config.setProperty(CONTAINER_HEALTH_THRESHOLD_POLL_FREQUENCY_SEC,"1");
+  config.setProperty(DEFAULT_READINESS_CHECK_ENABLED,"false");
+  comp.setConfiguration(config);
+  exampleApp.addComponent(comp);
+  Configuration serviceConfig=new Configuration();
+  serviceConfig.setProperty(AM_RESTART_MAX,"1");
+  exampleApp.setConfiguration(serviceConfig);
+  client.actionCreate(exampleApp);
+  waitForServiceToBeStable(client,exampleApp);
+  Service service=client.getStatus(exampleApp.getName());
+  Component component=service.getComponent("compa");
+  Assert.assertEquals("Service state should be STABLE",ServiceState.STABLE,service.getState());
+  Assert.assertEquals("3 containers are expected to be running",3,component.getContainers().size());
+  Map<String,Long> compCounts=new HashMap<>();
+  compCounts.put("compa",4L);
+  exampleApp.getComponent("compa").setNumberOfContainers(4L);
+  client.flexByRestService(exampleApp.getName(),compCounts);
+  try {
+    waitForServiceToBeStable(client,exampleApp,6000);
+    Assert.fail("Service should not be in a stable state. It should throw " + "a timeout exception.");
+  }
+ catch (  Exception e) {
+    service=client.getStatus(exampleApp.getName());
+    component=service.getComponent("compa");
+    Assert.assertEquals("Service state should be STARTED",ServiceState.STARTED,service.getState());
+    Assert.assertEquals("Component state should be FLEXING",ComponentState.FLEXING,component.getState());
+    Assert.assertEquals("3 containers are expected to be running",3,component.getContainers().size());
+  }
+  compCounts.put("compa",5L);
+  exampleApp.getComponent("compa").setNumberOfContainers(5L);
+  client.flexByRestService(exampleApp.getName(),compCounts);
+  try {
+    waitForServiceToBeInState(client,exampleApp,ServiceState.FAILED,14000);
+  }
+ catch (  Exception e) {
+    Assert.fail("Should not have thrown exception");
+  }
+  LOG.info("Destroy service {}",exampleApp);
+  client.actionDestroy(exampleApp.getName());
+}

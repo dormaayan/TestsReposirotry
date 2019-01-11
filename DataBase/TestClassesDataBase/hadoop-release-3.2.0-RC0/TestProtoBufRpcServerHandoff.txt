@@ -1,0 +1,70 @@
+public class TestProtoBufRpcServerHandoff {
+  public static final Logger LOG=LoggerFactory.getLogger(TestProtoBufRpcServerHandoff.class);
+  @Test(timeout=20000) public void test() throws Exception {
+    Configuration conf=new Configuration();
+    TestProtoBufRpcServerHandoffServer serverImpl=new TestProtoBufRpcServerHandoffServer();
+    BlockingService blockingService=TestProtobufRpcHandoffProto.newReflectiveBlockingService(serverImpl);
+    RPC.setProtocolEngine(conf,TestProtoBufRpcServerHandoffProtocol.class,ProtobufRpcEngine.class);
+    RPC.Server server=new RPC.Builder(conf).setProtocol(TestProtoBufRpcServerHandoffProtocol.class).setInstance(blockingService).setVerbose(true).setNumHandlers(1).build();
+    server.start();
+    InetSocketAddress address=server.getListenerAddress();
+    long serverStartTime=System.currentTimeMillis();
+    LOG.info("Server started at: " + address + " at time: "+ serverStartTime);
+    final TestProtoBufRpcServerHandoffProtocol client=RPC.getProxy(TestProtoBufRpcServerHandoffProtocol.class,1,address,conf);
+    ExecutorService executorService=Executors.newFixedThreadPool(2);
+    CompletionService<ClientInvocationCallable> completionService=new ExecutorCompletionService<ClientInvocationCallable>(executorService);
+    completionService.submit(new ClientInvocationCallable(client,5000l));
+    completionService.submit(new ClientInvocationCallable(client,5000l));
+    long submitTime=System.currentTimeMillis();
+    Future<ClientInvocationCallable> future1=completionService.take();
+    Future<ClientInvocationCallable> future2=completionService.take();
+    ClientInvocationCallable callable1=future1.get();
+    ClientInvocationCallable callable2=future2.get();
+    LOG.info(callable1.toString());
+    LOG.info(callable2.toString());
+    Assert.assertTrue(Math.abs(callable1.endTime - callable2.endTime) < 2000l);
+    Assert.assertTrue(System.currentTimeMillis() - submitTime < 7000l);
+  }
+private static class ClientInvocationCallable implements Callable<ClientInvocationCallable> {
+    final TestProtoBufRpcServerHandoffProtocol client;
+    final long sleepTime;
+    TestProtos.SleepResponseProto2 result;
+    long startTime;
+    long endTime;
+    private ClientInvocationCallable(    TestProtoBufRpcServerHandoffProtocol client,    long sleepTime){
+      this.client=client;
+      this.sleepTime=sleepTime;
+    }
+    @Override public ClientInvocationCallable call() throws Exception {
+      startTime=System.currentTimeMillis();
+      result=client.sleep(null,TestProtos.SleepRequestProto2.newBuilder().setSleepTime(sleepTime).build());
+      endTime=System.currentTimeMillis();
+      return this;
+    }
+    @Override public String toString(){
+      return "startTime=" + startTime + ", endTime="+ endTime+ (result != null ? ", result.receiveTime=" + result.getReceiveTime() + ", result.responseTime="+ result.getResponseTime() : "");
+    }
+  }
+@ProtocolInfo(protocolName="org.apache.hadoop.ipc.TestProtoBufRpcServerHandoff$TestProtoBufRpcServerHandoffProtocol",protocolVersion=1) public interface TestProtoBufRpcServerHandoffProtocol extends TestProtobufRpcHandoffProto.BlockingInterface {
+  }
+public static class TestProtoBufRpcServerHandoffServer implements TestProtoBufRpcServerHandoffProtocol {
+    @Override public TestProtos.SleepResponseProto2 sleep(    RpcController controller,    TestProtos.SleepRequestProto2 request) throws ServiceException {
+      final long startTime=System.currentTimeMillis();
+      final ProtobufRpcEngineCallback callback=ProtobufRpcEngine.Server.registerForDeferredResponse();
+      final long sleepTime=request.getSleepTime();
+      new Thread(){
+        @Override public void run(){
+          try {
+            Thread.sleep(sleepTime);
+          }
+ catch (          InterruptedException e) {
+            throw new RuntimeException(e);
+          }
+          callback.setResponse(TestProtos.SleepResponseProto2.newBuilder().setReceiveTime(startTime).setResponseTime(System.currentTimeMillis()).build());
+        }
+      }
+.start();
+      return null;
+    }
+  }
+}

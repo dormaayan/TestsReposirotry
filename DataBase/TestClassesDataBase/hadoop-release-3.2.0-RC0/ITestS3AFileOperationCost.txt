@@ -1,0 +1,221 @@
+/** 
+ * Use metrics to assert about the cost of file status queries. {@link S3AFileSystem#getFileStatus(Path)}.
+ */
+public class ITestS3AFileOperationCost extends AbstractS3ATestBase {
+  private MetricDiff metadataRequests;
+  private MetricDiff listRequests;
+  private static final Logger LOG=LoggerFactory.getLogger(ITestS3AFileOperationCost.class);
+  @Override public void setup() throws Exception {
+    super.setup();
+    S3AFileSystem fs=getFileSystem();
+    metadataRequests=new MetricDiff(fs,OBJECT_METADATA_REQUESTS);
+    listRequests=new MetricDiff(fs,OBJECT_LIST_REQUESTS);
+    skipDuringFaultInjection(fs);
+  }
+  @Test public void testCostOfGetFileStatusOnFile() throws Throwable {
+    describe("performing getFileStatus on a file");
+    Path simpleFile=path("simple.txt");
+    S3AFileSystem fs=getFileSystem();
+    touch(fs,simpleFile);
+    resetMetricDiffs();
+    FileStatus status=fs.getFileStatus(simpleFile);
+    assertTrue("not a file: " + status,status.isFile());
+    if (!fs.hasMetadataStore()) {
+      metadataRequests.assertDiffEquals(1);
+    }
+    listRequests.assertDiffEquals(0);
+  }
+  private void resetMetricDiffs(){
+    reset(metadataRequests,listRequests);
+  }
+  @Test public void testCostOfGetFileStatusOnEmptyDir() throws Throwable {
+    describe("performing getFileStatus on an empty directory");
+    S3AFileSystem fs=getFileSystem();
+    Path dir=path("empty");
+    fs.mkdirs(dir);
+    resetMetricDiffs();
+    S3AFileStatus status=fs.innerGetFileStatus(dir,true);
+    assertSame("not empty: " + status,status.isEmptyDirectory(),Tristate.TRUE);
+    if (!fs.hasMetadataStore()) {
+      metadataRequests.assertDiffEquals(2);
+    }
+    listRequests.assertDiffEquals(0);
+  }
+  @Test public void testCostOfGetFileStatusOnMissingFile() throws Throwable {
+    describe("performing getFileStatus on a missing file");
+    S3AFileSystem fs=getFileSystem();
+    Path path=path("missing");
+    resetMetricDiffs();
+    intercept(FileNotFoundException.class,() -> fs.getFileStatus(path));
+    metadataRequests.assertDiffEquals(2);
+    listRequests.assertDiffEquals(1);
+  }
+  @Test public void testCostOfGetFileStatusOnMissingSubPath() throws Throwable {
+    describe("performing getFileStatus on a missing file");
+    S3AFileSystem fs=getFileSystem();
+    Path path=path("missingdir/missingpath");
+    resetMetricDiffs();
+    intercept(FileNotFoundException.class,() -> fs.getFileStatus(path));
+    metadataRequests.assertDiffEquals(2);
+    listRequests.assertDiffEquals(1);
+  }
+  @Test public void testCostOfGetFileStatusOnNonEmptyDir() throws Throwable {
+    describe("performing getFileStatus on a non-empty directory");
+    S3AFileSystem fs=getFileSystem();
+    Path dir=path("empty");
+    fs.mkdirs(dir);
+    Path simpleFile=new Path(dir,"simple.txt");
+    touch(fs,simpleFile);
+    resetMetricDiffs();
+    S3AFileStatus status=fs.innerGetFileStatus(dir,true);
+    if (status.isEmptyDirectory() == Tristate.TRUE) {
+      String fsState=fs.toString();
+      fail("FileStatus says directory isempty: " + status + "\n"+ ContractTestUtils.ls(fs,dir)+ "\n"+ fsState);
+    }
+    if (!fs.hasMetadataStore()) {
+      metadataRequests.assertDiffEquals(2);
+      listRequests.assertDiffEquals(1);
+    }
+  }
+  @Test public void testCostOfCopyFromLocalFile() throws Throwable {
+    describe("testCostOfCopyFromLocalFile");
+    File localTestDir=getTestDir("tmp");
+    localTestDir.mkdirs();
+    File tmpFile=File.createTempFile("tests3acost",".txt",localTestDir);
+    tmpFile.delete();
+    try {
+      URI localFileURI=tmpFile.toURI();
+      FileSystem localFS=FileSystem.get(localFileURI,getFileSystem().getConf());
+      Path localPath=new Path(localFileURI);
+      int len=10 * 1024;
+      byte[] data=dataset(len,'A','Z');
+      writeDataset(localFS,localPath,data,len,1024,true);
+      S3AFileSystem s3a=getFileSystem();
+      MetricDiff copyLocalOps=new MetricDiff(s3a,INVOCATION_COPY_FROM_LOCAL_FILE);
+      MetricDiff putRequests=new MetricDiff(s3a,OBJECT_PUT_REQUESTS);
+      MetricDiff putBytes=new MetricDiff(s3a,OBJECT_PUT_BYTES);
+      Path remotePath=path("copied");
+      s3a.copyFromLocalFile(false,true,localPath,remotePath);
+      verifyFileContents(s3a,remotePath,data);
+      copyLocalOps.assertDiffEquals(1);
+      putRequests.assertDiffEquals(1);
+      putBytes.assertDiffEquals(len);
+      LOG.info("Filesystem {}",s3a);
+    }
+  finally {
+      tmpFile.delete();
+    }
+  }
+  private boolean reset(  MetricDiff... diffs){
+    for (    MetricDiff diff : diffs) {
+      diff.reset();
+    }
+    return true;
+  }
+  @Test public void testFakeDirectoryDeletion() throws Throwable {
+    describe("Verify whether create file works after renaming a file. " + "In S3, rename deletes any fake directories as a part of " + "clean up activity");
+    S3AFileSystem fs=getFileSystem();
+    Path srcBaseDir=path("src");
+    mkdirs(srcBaseDir);
+    MetricDiff deleteRequests=new MetricDiff(fs,Statistic.OBJECT_DELETE_REQUESTS);
+    MetricDiff directoriesDeleted=new MetricDiff(fs,Statistic.DIRECTORIES_DELETED);
+    MetricDiff fakeDirectoriesDeleted=new MetricDiff(fs,Statistic.FAKE_DIRECTORIES_DELETED);
+    MetricDiff directoriesCreated=new MetricDiff(fs,Statistic.DIRECTORIES_CREATED);
+    Object summary=new Object(){
+      @Override public String toString(){
+        return String.format("[%s, %s, %s, %s]",directoriesCreated,directoriesDeleted,deleteRequests,fakeDirectoriesDeleted);
+      }
+    }
+;
+    Callable<Boolean> reset=() -> reset(deleteRequests,directoriesCreated,directoriesDeleted,fakeDirectoriesDeleted);
+    Path srcDir=new Path(srcBaseDir,"1/2/3/4/5/6");
+    int srcDirDepth=directoriesInPath(srcDir);
+    mkdirs(srcDir);
+    String state="after mkdir(srcDir) " + summary;
+    directoriesCreated.assertDiffEquals(state,1);
+    deleteRequests.assertDiffEquals(state,1);
+    directoriesDeleted.assertDiffEquals(state,0);
+    fakeDirectoriesDeleted.assertDiffEquals(state,srcDirDepth - 1);
+    reset.call();
+    final Path srcFilePath=new Path(srcDir,"source.txt");
+    touch(fs,srcFilePath);
+    state="after touch(fs, srcFilePath) " + summary;
+    deleteRequests.assertDiffEquals(state,1);
+    directoriesCreated.assertDiffEquals(state,0);
+    directoriesDeleted.assertDiffEquals(state,0);
+    fakeDirectoriesDeleted.assertDiffEquals(state,srcDirDepth);
+    reset.call();
+    Path destBaseDir=path("dest");
+    Path destDir=new Path(destBaseDir,"1/2/3/4/5/6");
+    Path destFilePath=new Path(destDir,"dest.txt");
+    mkdirs(destDir);
+    state="after mkdir(destDir) " + summary;
+    int destDirDepth=directoriesInPath(destDir);
+    directoriesCreated.assertDiffEquals(state,1);
+    deleteRequests.assertDiffEquals(state,1);
+    directoriesDeleted.assertDiffEquals(state,0);
+    fakeDirectoriesDeleted.assertDiffEquals(state,destDirDepth - 1);
+    final Path srcFile2=new Path(srcDir.toUri() + "/source2.txt");
+    touch(fs,srcFile2);
+    reset.call();
+    fs.rename(srcFilePath,destFilePath);
+    state=String.format("after rename(srcFilePath, destFilePath)" + " %s dest dir depth=%d",summary,destDirDepth);
+    directoriesCreated.assertDiffEquals(state,0);
+    deleteRequests.assertDiffEquals(state,2);
+    directoriesDeleted.assertDiffEquals(state,0);
+    fakeDirectoriesDeleted.assertDiffEquals(state,destDirDepth);
+    assertIsFile(destFilePath);
+    assertIsDirectory(srcDir);
+    assertPathDoesNotExist("should have gone in the rename",srcFilePath);
+    reset.call();
+    fs.rename(srcFile2,srcFilePath);
+    state=String.format("after rename(%s, %s) %s dest dir depth=%d",srcFile2,srcFilePath,summary,destDirDepth);
+    directoriesCreated.assertDiffEquals(state,0);
+    deleteRequests.assertDiffEquals(state,1);
+    directoriesDeleted.assertDiffEquals(state,0);
+    fakeDirectoriesDeleted.assertDiffEquals(state,0);
+  }
+  private int directoriesInPath(  Path path){
+    return path.isRoot() ? 0 : 1 + directoriesInPath(path.getParent());
+  }
+  @Test public void testCostOfRootRename() throws Throwable {
+    describe("assert that a root directory rename doesn't" + " do much in terms of parent dir operations");
+    S3AFileSystem fs=getFileSystem();
+    String uuid=UUID.randomUUID().toString();
+    Path src=new Path("/src-" + uuid);
+    Path dest=new Path("/dest-" + uuid);
+    try {
+      MetricDiff deleteRequests=new MetricDiff(fs,Statistic.OBJECT_DELETE_REQUESTS);
+      MetricDiff directoriesDeleted=new MetricDiff(fs,Statistic.DIRECTORIES_DELETED);
+      MetricDiff fakeDirectoriesDeleted=new MetricDiff(fs,Statistic.FAKE_DIRECTORIES_DELETED);
+      MetricDiff directoriesCreated=new MetricDiff(fs,Statistic.DIRECTORIES_CREATED);
+      touch(fs,src);
+      fs.rename(src,dest);
+      Object summary=new Object(){
+        @Override public String toString(){
+          return String.format("[%s, %s, %s, %s]",directoriesCreated,directoriesDeleted,deleteRequests,fakeDirectoriesDeleted);
+        }
+      }
+;
+      String state=String.format("after touch(%s) %s",src,summary);
+      touch(fs,src);
+      fs.rename(src,dest);
+      directoriesCreated.assertDiffEquals(state,0);
+      state=String.format("after rename(%s, %s) %s",src,dest,summary);
+      directoriesCreated.assertDiffEquals(state,0);
+      deleteRequests.assertDiffEquals(state,1);
+      directoriesDeleted.assertDiffEquals(state,0);
+      fakeDirectoriesDeleted.assertDiffEquals(state,0);
+      reset(deleteRequests,directoriesCreated,directoriesDeleted,fakeDirectoriesDeleted);
+      fs.delete(dest,false);
+      directoriesCreated.assertDiffEquals(state,0);
+      deleteRequests.assertDiffEquals(state,1);
+      directoriesDeleted.assertDiffEquals(state,0);
+      fakeDirectoriesDeleted.assertDiffEquals(state,0);
+    }
+  finally {
+      fs.delete(src,false);
+      fs.delete(dest,false);
+    }
+  }
+}

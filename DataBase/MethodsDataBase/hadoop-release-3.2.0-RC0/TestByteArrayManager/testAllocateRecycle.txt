@@ -1,0 +1,71 @@
+@Test public void testAllocateRecycle() throws Exception {
+  final int countThreshold=4;
+  final int countLimit=8;
+  final long countResetTimePeriodMs=200L;
+  final ByteArrayManager.Impl bam=new ByteArrayManager.Impl(new ByteArrayManager.Conf(countThreshold,countLimit,countResetTimePeriodMs));
+  final CounterMap counters=bam.getCounters();
+  final ManagerMap managers=bam.getManagers();
+  final int[] uncommonArrays={0,1,2,4,8,16,32,64};
+  final int arrayLength=1024;
+  final Allocator allocator=new Allocator(bam);
+  final Recycler recycler=new Recycler(bam);
+  try {
+{
+      for (int i=0; i < countThreshold; i++) {
+        allocator.submit(arrayLength);
+      }
+      waitForAll(allocator.futures);
+      Assert.assertEquals(countThreshold,counters.get(arrayLength,false).getCount());
+      Assert.assertNull(managers.get(arrayLength,false));
+      for (      int n : uncommonArrays) {
+        Assert.assertNull(counters.get(n,false));
+        Assert.assertNull(managers.get(n,false));
+      }
+    }
+{
+      for (int i=0; i < countThreshold / 2; i++) {
+        recycler.submit(removeLast(allocator.futures).get());
+      }
+      for (      Future<Integer> f : recycler.furtures) {
+        Assert.assertEquals(-1,f.get().intValue());
+      }
+      recycler.furtures.clear();
+    }
+{
+      allocator.submit(arrayLength).get();
+      Assert.assertEquals(countThreshold + 1,counters.get(arrayLength,false).getCount());
+      Assert.assertNotNull(managers.get(arrayLength,false));
+    }
+{
+      final int n=allocator.recycleAll(recycler);
+      recycler.verify(n);
+    }
+{
+      for (int i=0; i < countLimit; i++) {
+        allocator.submit(arrayLength);
+      }
+      waitForAll(allocator.futures);
+      final AllocatorThread t=new AllocatorThread(arrayLength,bam);
+      t.start();
+      for (int i=0; i < 5; i++) {
+        Thread.sleep(100);
+        final Thread.State threadState=t.getState();
+        if (threadState != Thread.State.RUNNABLE && threadState != Thread.State.WAITING && threadState != Thread.State.TIMED_WAITING) {
+          Assert.fail("threadState = " + threadState);
+        }
+      }
+      recycler.submit(removeLast(allocator.futures).get());
+      Assert.assertEquals(1,removeLast(recycler.furtures).get().intValue());
+      Thread.sleep(100);
+      Assert.assertEquals(Thread.State.TERMINATED,t.getState());
+      Assert.assertEquals(countLimit - 1,allocator.recycleAll(recycler));
+      recycler.submit(t.array);
+      recycler.verify(countLimit);
+      Assert.assertEquals(countLimit,bam.release(new byte[arrayLength]));
+    }
+  }
+  finally {
+    allocator.pool.shutdown();
+    recycler.pool.shutdown();
+  }
+}

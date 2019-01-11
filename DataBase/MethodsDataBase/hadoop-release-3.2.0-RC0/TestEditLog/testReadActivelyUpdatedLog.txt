@@ -1,0 +1,62 @@
+/** 
+ * @throws Exception
+ */
+@Test public void testReadActivelyUpdatedLog() throws Exception {
+  final TestAppender appender=new TestAppender();
+  LogManager.getRootLogger().addAppender(appender);
+  Configuration conf=new HdfsConfiguration();
+  conf.setBoolean(DFSConfigKeys.DFS_NAMENODE_ACLS_ENABLED_KEY,true);
+  conf.setInt(DFSConfigKeys.DFS_NAMENODE_HANDLER_COUNT_KEY,1);
+  MiniDFSCluster cluster=null;
+  try {
+    cluster=new MiniDFSCluster.Builder(conf).numDataNodes(1).build();
+    cluster.waitActive();
+    FSImage fsimage=cluster.getNamesystem().getFSImage();
+    StorageDirectory sd=fsimage.getStorage().getStorageDir(0);
+    final DistributedFileSystem fileSys=cluster.getFileSystem();
+    DFSInotifyEventInputStream events=fileSys.getInotifyEventStream();
+    fileSys.mkdirs(new Path("/test"));
+    fileSys.mkdirs(new Path("/test/dir1"));
+    fileSys.delete(new Path("/test/dir1"),true);
+    fsimage.getEditLog().logSync();
+    fileSys.mkdirs(new Path("/test/dir2"));
+    final File inProgressEdit=NNStorage.getInProgressEditsFile(sd,1);
+    assertTrue(inProgressEdit.exists());
+    EditLogFileInputStream elis=new EditLogFileInputStream(inProgressEdit);
+    FSEditLogOp op;
+    long pos=0;
+    while (true) {
+      op=elis.readOp();
+      if (op != null && op.opCode != FSEditLogOpCodes.OP_INVALID) {
+        pos=elis.getPosition();
+      }
+ else {
+        break;
+      }
+    }
+    elis.close();
+    assertTrue(pos > 0);
+    RandomAccessFile rwf=new RandomAccessFile(inProgressEdit,"rw");
+    rwf.seek(pos);
+    assertEquals(rwf.readByte(),(byte)-1);
+    rwf.seek(pos + 1);
+    rwf.writeByte(2);
+    rwf.close();
+    events.poll();
+    String pattern="Caught exception after reading (.*) ops";
+    Pattern r=Pattern.compile(pattern);
+    final List<LoggingEvent> log=appender.getLog();
+    for (    LoggingEvent event : log) {
+      Matcher m=r.matcher(event.getRenderedMessage());
+      if (m.find()) {
+        fail("Should not try to read past latest syned edit log op");
+      }
+    }
+  }
+  finally {
+    if (cluster != null) {
+      cluster.shutdown();
+    }
+    LogManager.getRootLogger().removeAppender(appender);
+  }
+}

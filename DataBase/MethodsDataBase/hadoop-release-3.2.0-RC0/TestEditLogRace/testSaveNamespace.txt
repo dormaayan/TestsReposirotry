@@ -1,0 +1,45 @@
+/** 
+ * Tests saving fs image while transactions are ongoing.
+ */
+@Test public void testSaveNamespace() throws Exception {
+  Configuration conf=getConf();
+  MiniDFSCluster cluster=null;
+  FileSystem fileSys=null;
+  AtomicReference<Throwable> caughtErr=new AtomicReference<Throwable>();
+  try {
+    cluster=new MiniDFSCluster.Builder(conf).numDataNodes(NUM_DATA_NODES).build();
+    cluster.waitActive();
+    fileSys=cluster.getFileSystem();
+    final FSNamesystem namesystem=cluster.getNamesystem();
+    FSImage fsimage=namesystem.getFSImage();
+    FSEditLog editLog=fsimage.getEditLog();
+    startTransactionWorkers(cluster,caughtErr);
+    for (int i=0; i < NUM_SAVE_IMAGE && caughtErr.get() == null; i++) {
+      try {
+        Thread.sleep(20);
+      }
+ catch (      InterruptedException ignored) {
+      }
+      LOG.info("Save " + i + ": entering safe mode");
+      namesystem.enterSafeMode(false);
+      long logStartTxId=fsimage.getStorage().getMostRecentCheckpointTxId() + 1;
+      verifyEditLogs(namesystem,fsimage,NNStorage.getInProgressEditsFileName(logStartTxId),logStartTxId);
+      LOG.info("Save " + i + ": saving namespace");
+      namesystem.saveNamespace(0,0);
+      LOG.info("Save " + i + ": leaving safemode");
+      long savedImageTxId=fsimage.getStorage().getMostRecentCheckpointTxId();
+      verifyEditLogs(namesystem,fsimage,NNStorage.getFinalizedEditsFileName(logStartTxId,savedImageTxId),logStartTxId);
+      assertEquals(fsimage.getStorage().getMostRecentCheckpointTxId(),editLog.getLastWrittenTxId() - 1);
+      namesystem.leaveSafeMode(false);
+      LOG.info("Save " + i + ": complete");
+    }
+  }
+  finally {
+    stopTransactionWorkers();
+    if (caughtErr.get() != null) {
+      throw new RuntimeException(caughtErr.get());
+    }
+    if (fileSys != null)     fileSys.close();
+    if (cluster != null)     cluster.shutdown();
+  }
+}

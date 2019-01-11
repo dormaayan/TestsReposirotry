@@ -1,0 +1,55 @@
+@Test public void testQueueMetricsWithLabelsOnDefaultLabelNode() throws Exception {
+  CapacitySchedulerConfiguration csConf=new CapacitySchedulerConfiguration(this.conf);
+  csConf.setQueues(CapacitySchedulerConfiguration.ROOT,new String[]{"a","b"});
+  csConf.setCapacityByLabel(CapacitySchedulerConfiguration.ROOT,"x",100);
+  final String queueA=CapacitySchedulerConfiguration.ROOT + ".a";
+  csConf.setCapacity(queueA,25);
+  csConf.setAccessibleNodeLabels(queueA,toSet("x"));
+  csConf.setCapacityByLabel(queueA,"x",50);
+  csConf.setMaximumCapacityByLabel(queueA,"x",50);
+  final String queueB=CapacitySchedulerConfiguration.ROOT + ".b";
+  csConf.setCapacity(queueB,75);
+  csConf.setAccessibleNodeLabels(queueB,toSet("x"));
+  csConf.setCapacityByLabel(queueB,"x",50);
+  csConf.setMaximumCapacityByLabel(queueB,"x",50);
+  mgr.addToCluserNodeLabels(ImmutableSet.of(NodeLabel.newInstance("x",false)));
+  mgr.addLabelsToNode(ImmutableMap.of(NodeId.newInstance("h1",0),toSet("x")));
+  MockRM rm1=new MockRM(csConf){
+    @Override public RMNodeLabelsManager createNodeLabelManager(){
+      return mgr;
+    }
+  }
+;
+  rm1.getRMContext().setNodeLabelManager(mgr);
+  rm1.start();
+  MockNM nm1=rm1.registerNode("h1:1234",10 * GB);
+  MockNM nm2=rm1.registerNode("h2:1234",10 * GB);
+  RMApp app1=rm1.submitApp(1 * GB,"app","user",null,"a");
+  MockAM am1=MockRM.launchAndRegisterAM(app1,rm1,nm2);
+  am1.allocate("*",1 * GB,3,new ArrayList<ContainerId>());
+  CapacityScheduler cs=(CapacityScheduler)rm1.getResourceScheduler();
+  RMNode rmNode1=rm1.getRMContext().getRMNodes().get(nm1.getNodeId());
+  SchedulerNode schedulerNode1=cs.getSchedulerNode(nm1.getNodeId());
+  for (int i=0; i < 50; i++) {
+    cs.handle(new NodeUpdateSchedulerEvent(rmNode1));
+  }
+  Assert.assertEquals(3,schedulerNode1.getNumContainers());
+  SchedulerNodeReport reportNm1=rm1.getResourceScheduler().getNodeReport(nm1.getNodeId());
+  Assert.assertEquals(3 * GB,reportNm1.getUsedResource().getMemorySize());
+  Assert.assertEquals(7 * GB,reportNm1.getAvailableResource().getMemorySize());
+  SchedulerNodeReport reportNm2=rm1.getResourceScheduler().getNodeReport(nm2.getNodeId());
+  Assert.assertEquals(1 * GB,reportNm2.getUsedResource().getMemorySize());
+  Assert.assertEquals(9 * GB,reportNm2.getAvailableResource().getMemorySize());
+  LeafQueue leafQueue=(LeafQueue)cs.getQueue("a");
+  double delta=0.0001;
+  assertEquals(6.5 * GB,leafQueue.getMetrics().getAvailableMB(),delta);
+  assertEquals(1 * GB,leafQueue.getMetrics().getAllocatedMB());
+  am1.allocate("*",1 * GB,5,new ArrayList<ContainerId>());
+  RMNode rmNode2=rm1.getRMContext().getRMNodes().get(nm2.getNodeId());
+  SchedulerNode schedulerNode2=cs.getSchedulerNode(nm2.getNodeId());
+  cs.handle(new NodeUpdateSchedulerEvent(rmNode2));
+  Assert.assertEquals(2,schedulerNode2.getNumContainers());
+  assertEquals(2.5 * GB,leafQueue.getMetrics().getAvailableMB(),delta);
+  assertEquals(2 * GB,leafQueue.getMetrics().getAllocatedMB());
+  rm1.close();
+}

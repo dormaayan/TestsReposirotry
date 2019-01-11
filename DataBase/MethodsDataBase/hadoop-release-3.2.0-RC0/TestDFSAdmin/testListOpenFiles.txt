@@ -1,0 +1,82 @@
+@Test(timeout=300000L) public void testListOpenFiles() throws Exception {
+  redirectStream();
+  final Configuration dfsConf=new HdfsConfiguration();
+  dfsConf.setInt(DFSConfigKeys.DFS_NAMENODE_HEARTBEAT_RECHECK_INTERVAL_KEY,500);
+  dfsConf.setLong(DFS_HEARTBEAT_INTERVAL_KEY,1);
+  dfsConf.setLong(DFSConfigKeys.DFS_NAMENODE_LIST_OPENFILES_NUM_RESPONSES,5);
+  final Path baseDir=new Path(PathUtils.getTestDir(getClass()).getAbsolutePath(),GenericTestUtils.getMethodName());
+  dfsConf.set(MiniDFSCluster.HDFS_MINIDFS_BASEDIR,baseDir.toString());
+  final int numDataNodes=3;
+  final int numClosedFiles=25;
+  final int numOpenFiles=15;
+  try (MiniDFSCluster miniCluster=new MiniDFSCluster.Builder(dfsConf).numDataNodes(numDataNodes).build()){
+    final short replFactor=1;
+    final long fileLength=512L;
+    final FileSystem fs=miniCluster.getFileSystem();
+    final Path parentDir=new Path("/tmp/files/");
+    fs.mkdirs(parentDir);
+    HashSet<Path> closedFileSet=new HashSet<>();
+    for (int i=0; i < numClosedFiles; i++) {
+      Path file=new Path(parentDir,"closed-file-" + i);
+      DFSTestUtil.createFile(fs,file,fileLength,replFactor,12345L);
+      closedFileSet.add(file);
+    }
+    HashMap<Path,FSDataOutputStream> openFilesMap=new HashMap<>();
+    for (int i=0; i < numOpenFiles; i++) {
+      Path file=new Path(parentDir,"open-file-" + i);
+      DFSTestUtil.createFile(fs,file,fileLength,replFactor,12345L);
+      FSDataOutputStream outputStream=fs.append(file);
+      openFilesMap.put(file,outputStream);
+    }
+    final DFSAdmin dfsAdmin=new DFSAdmin(dfsConf);
+    assertEquals(0,ToolRunner.run(dfsAdmin,new String[]{"-listOpenFiles"}));
+    verifyOpenFilesListing(closedFileSet,openFilesMap);
+    for (int count=0; count < numOpenFiles; count++) {
+      closedFileSet.addAll(DFSTestUtil.closeOpenFiles(openFilesMap,1));
+      resetStream();
+      assertEquals(0,ToolRunner.run(dfsAdmin,new String[]{"-listOpenFiles"}));
+      verifyOpenFilesListing(closedFileSet,openFilesMap);
+    }
+    openFilesMap.clear();
+    Path file;
+    HashMap<Path,FSDataOutputStream> openFiles1=new HashMap<>();
+    HashMap<Path,FSDataOutputStream> openFiles2=new HashMap<>();
+    for (int i=0; i < numOpenFiles; i++) {
+      if (i % 2 == 0) {
+        file=new Path(new Path("/tmp/files/a"),"open-file-" + i);
+      }
+ else {
+        file=new Path(new Path("/tmp/files/b"),"open-file-" + i);
+      }
+      DFSTestUtil.createFile(fs,file,fileLength,replFactor,12345L);
+      FSDataOutputStream outputStream=fs.append(file);
+      if (i % 2 == 0) {
+        openFiles1.put(file,outputStream);
+      }
+ else {
+        openFiles2.put(file,outputStream);
+      }
+      openFilesMap.put(file,outputStream);
+    }
+    resetStream();
+    assertEquals(0,ToolRunner.run(dfsAdmin,new String[]{"-listOpenFiles"}));
+    verifyOpenFilesListing(null,openFilesMap);
+    resetStream();
+    assertEquals(0,ToolRunner.run(dfsAdmin,new String[]{"-listOpenFiles","-path","/tmp/files/a"}));
+    verifyOpenFilesListing(null,openFiles1);
+    resetStream();
+    assertEquals(-1,ToolRunner.run(dfsAdmin,new String[]{"-listOpenFiles","-path"}));
+    String outStr=scanIntoString(err);
+    assertTrue(outStr.contains("listOpenFiles: option" + " -path requires 1 argument"));
+    resetStream();
+    assertEquals(0,ToolRunner.run(dfsAdmin,new String[]{"-listOpenFiles","-path",""}));
+    verifyOpenFilesListing(null,openFilesMap);
+    resetStream();
+    assertEquals(0,ToolRunner.run(dfsAdmin,new String[]{"-listOpenFiles","-path","/invalid_path"}));
+    outStr=scanIntoString(out);
+    for (    Path openFilePath : openFilesMap.keySet()) {
+      assertThat(outStr,not(containsString(openFilePath.toString())));
+    }
+    DFSTestUtil.closeOpenFiles(openFilesMap,openFilesMap.size());
+  }
+ }

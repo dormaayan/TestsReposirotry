@@ -1,0 +1,85 @@
+@Test public void testHandshake() throws Exception {
+  assumeCipherAvailable(serverSslProvider,rfcCipherName);
+  assumeCipherAvailable(clientSslProvider,rfcCipherName);
+  List<String> ciphers=Collections.singletonList(rfcCipherName);
+  final SslContext sslServerContext=SslContextBuilder.forServer(CERT.certificate(),CERT.privateKey()).sslProvider(serverSslProvider).ciphers(ciphers).protocols(SslUtils.PROTOCOL_TLS_V1_2).build();
+  try {
+    final SslContext sslClientContext=SslContextBuilder.forClient().sslProvider(clientSslProvider).ciphers(ciphers).protocols(SslUtils.PROTOCOL_TLS_V1_2).trustManager(InsecureTrustManagerFactory.INSTANCE).build();
+    try {
+      final Promise<Object> serverPromise=GROUP.next().newPromise();
+      final Promise<Object> clientPromise=GROUP.next().newPromise();
+      ChannelHandler serverHandler=new ChannelInitializer<Channel>(){
+        @Override protected void initChannel(        Channel ch) throws Exception {
+          ChannelPipeline pipeline=ch.pipeline();
+          pipeline.addLast(sslServerContext.newHandler(ch.alloc()));
+          pipeline.addLast(new SimpleChannelInboundHandler<Object>(){
+            @Override public void channelInactive(            ChannelHandlerContext ctx) throws Exception {
+              serverPromise.cancel(true);
+              ctx.fireChannelInactive();
+            }
+            @Override public void channelRead0(            ChannelHandlerContext ctx,            Object msg) throws Exception {
+              if (serverPromise.trySuccess(null)) {
+                ctx.writeAndFlush(Unpooled.wrappedBuffer(new byte[]{'P','O','N','G'}));
+              }
+              ctx.close();
+            }
+            @Override public void exceptionCaught(            ChannelHandlerContext ctx,            Throwable cause) throws Exception {
+              if (!serverPromise.tryFailure(cause)) {
+                ctx.fireExceptionCaught(cause);
+              }
+            }
+          }
+);
+        }
+      }
+;
+      LocalAddress address=new LocalAddress("test-" + serverSslProvider + '-'+ clientSslProvider+ '-'+ rfcCipherName);
+      Channel server=server(address,serverHandler);
+      try {
+        ChannelHandler clientHandler=new ChannelInitializer<Channel>(){
+          @Override protected void initChannel(          Channel ch) throws Exception {
+            ChannelPipeline pipeline=ch.pipeline();
+            pipeline.addLast(sslClientContext.newHandler(ch.alloc()));
+            pipeline.addLast(new SimpleChannelInboundHandler<Object>(){
+              @Override public void channelInactive(              ChannelHandlerContext ctx) throws Exception {
+                clientPromise.cancel(true);
+                ctx.fireChannelInactive();
+              }
+              @Override public void channelRead0(              ChannelHandlerContext ctx,              Object msg) throws Exception {
+                clientPromise.trySuccess(null);
+                ctx.close();
+              }
+              @Override public void exceptionCaught(              ChannelHandlerContext ctx,              Throwable cause) throws Exception {
+                if (!clientPromise.tryFailure(cause)) {
+                  ctx.fireExceptionCaught(cause);
+                }
+              }
+            }
+);
+          }
+        }
+;
+        Channel client=client(server,clientHandler);
+        try {
+          client.writeAndFlush(Unpooled.wrappedBuffer(new byte[]{'P','I','N','G'})).syncUninterruptibly();
+          assertTrue("client timeout",clientPromise.await(5L,TimeUnit.SECONDS));
+          assertTrue("server timeout",serverPromise.await(5L,TimeUnit.SECONDS));
+          clientPromise.sync();
+          serverPromise.sync();
+        }
+  finally {
+          client.close().sync();
+        }
+      }
+  finally {
+        server.close().sync();
+      }
+    }
+  finally {
+      ReferenceCountUtil.release(sslClientContext);
+    }
+  }
+  finally {
+    ReferenceCountUtil.release(sslServerContext);
+  }
+}

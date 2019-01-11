@@ -1,0 +1,138 @@
+/** 
+ * Tests for checking Scheduling with allocationRequestId, i.e. mapping of allocated containers to the original client  {@code ResourceRequest}.
+ */
+public class TestSchedulingWithAllocationRequestId extends ParameterizedSchedulerTestBase {
+  private static final Logger LOG=LoggerFactory.getLogger(TestSchedulingWithAllocationRequestId.class);
+  private static final int GB=1024;
+  public TestSchedulingWithAllocationRequestId(  SchedulerType type) throws IOException {
+    super(type);
+  }
+  @Override public YarnConfiguration getConf(){
+    YarnConfiguration conf=super.getConf();
+    if (getSchedulerType().equals(SchedulerType.FAIR)) {
+      conf.setBoolean(FairSchedulerConfiguration.ASSIGN_MULTIPLE,true);
+    }
+    return conf;
+  }
+  @Test(timeout=10000) public void testMultipleAllocationRequestIds() throws Exception {
+    YarnConfiguration conf=getConf();
+    MockRM rm=new MockRM(conf);
+    try {
+      rm.start();
+      MockNM nm1=rm.registerNode("127.0.0.1:1234",4 * GB);
+      MockNM nm2=rm.registerNode("127.0.0.2:5678",4 * GB);
+      RMApp app1=rm.submitApp(2048);
+      nm1.nodeHeartbeat(true);
+      RMAppAttempt attempt1=app1.getCurrentAppAttempt();
+      MockAM am1=rm.sendAMLaunched(attempt1.getAppAttemptId());
+      am1.registerAppAttempt();
+      am1.allocate(am1.createReq(new String[]{"127.0.0.1"},2 * GB,1,1,10L),null);
+      am1.allocate(am1.createReq(new String[]{"127.0.0.2"},2 * GB,1,2,20L),null);
+      AllocateResponse allocResponse=waitForAllocResponse(rm,am1,nm1,1);
+      List<Container> allocated=allocResponse.getAllocatedContainers();
+      Assert.assertEquals(1,allocated.size());
+      checkAllocatedContainer(allocated.get(0),2 * GB,nm1.getNodeId(),10);
+      allocResponse=waitForAllocResponse(rm,am1,nm2,2);
+      allocated=allocResponse.getAllocatedContainers();
+      Assert.assertEquals(2,allocated.size());
+      for (      Container container : allocated) {
+        checkAllocatedContainer(container,2 * GB,nm2.getNodeId(),20);
+      }
+    }
+  finally {
+      if (rm != null) {
+        rm.stop();
+      }
+    }
+  }
+  @Test(timeout=10000) public void testMultipleAllocationRequestDiffPriority() throws Exception {
+    YarnConfiguration conf=getConf();
+    MockRM rm=new MockRM(conf);
+    try {
+      rm.start();
+      MockNM nm1=rm.registerNode("127.0.0.1:1234",4 * GB);
+      MockNM nm2=rm.registerNode("127.0.0.2:5678",4 * GB);
+      RMApp app1=rm.submitApp(2048);
+      nm1.nodeHeartbeat(true);
+      RMAppAttempt attempt1=app1.getCurrentAppAttempt();
+      MockAM am1=rm.sendAMLaunched(attempt1.getAppAttemptId());
+      am1.registerAppAttempt();
+      am1.allocate(am1.createReq(new String[]{"127.0.0.1"},2 * GB,2,1,10L),null);
+      am1.allocate(am1.createReq(new String[]{"127.0.0.2"},2 * GB,1,2,20L),null);
+      AllocateResponse allocResponse=waitForAllocResponse(rm,am1,nm2,2);
+      List<Container> allocated=allocResponse.getAllocatedContainers();
+      Assert.assertEquals(2,allocated.size());
+      for (      Container container : allocated) {
+        checkAllocatedContainer(container,2 * GB,nm2.getNodeId(),20);
+      }
+      allocResponse=waitForAllocResponse(rm,am1,nm1,1);
+      allocated=allocResponse.getAllocatedContainers();
+      Assert.assertEquals(1,allocated.size());
+      checkAllocatedContainer(allocated.get(0),2 * GB,nm1.getNodeId(),10);
+    }
+  finally {
+      if (rm != null) {
+        rm.stop();
+      }
+    }
+  }
+  private void checkAllocatedContainer(  Container allocated,  int memory,  NodeId nodeId,  long allocationRequestId){
+    Assert.assertEquals(memory,allocated.getResource().getMemorySize());
+    Assert.assertEquals(nodeId,allocated.getNodeId());
+    Assert.assertEquals(allocationRequestId,allocated.getAllocationRequestId());
+  }
+  @Test(timeout=10000) public void testMultipleAppsWithAllocationReqId() throws Exception {
+    YarnConfiguration conf=getConf();
+    MockRM rm=new MockRM(conf);
+    try {
+      rm.start();
+      String host0="host_0";
+      String host1="host_1";
+      MockNM nm1=new MockNM(host0 + ":1234",8 * GB,rm.getResourceTrackerService());
+      nm1.registerNode();
+      MockNM nm2=new MockNM(host1 + ":2351",8 * GB,rm.getResourceTrackerService());
+      nm2.registerNode();
+      RMApp app1=rm.submitApp(1 * GB,"user_0","a1");
+      MockAM am1=MockRM.launchAndRegisterAM(app1,rm,nm1);
+      int numContainers=1;
+      am1.allocate(am1.createReq(new String[]{host0,host1},1 * GB,1,numContainers,5L),null);
+      AllocateResponse allocResponse=waitForAllocResponse(rm,am1,nm1,1);
+      List<Container> allocated=allocResponse.getAllocatedContainers();
+      Assert.assertEquals(1,allocated.size());
+      checkAllocatedContainer(allocated.get(0),1 * GB,nm1.getNodeId(),5L);
+      RMApp app2=rm.submitApp(1 * GB,"user_1","a2");
+      MockAM am2=MockRM.launchAndRegisterAM(app2,rm,nm2);
+      am2.allocate(am1.createReq(new String[]{host0,host1},2 * GB,1,numContainers,5L),null);
+      allocResponse=waitForAllocResponse(rm,am2,nm2,1);
+      allocated=allocResponse.getAllocatedContainers();
+      Assert.assertEquals(1,allocated.size());
+      checkAllocatedContainer(allocated.get(0),2 * GB,nm2.getNodeId(),5L);
+      am2.allocate(am1.createReq(new String[]{host0,host1},3 * GB,1,numContainers,10L),null);
+      allocResponse=waitForAllocResponse(rm,am2,nm1,1);
+      allocated=allocResponse.getAllocatedContainers();
+      Assert.assertEquals(1,allocated.size());
+      checkAllocatedContainer(allocated.get(0),3 * GB,nm1.getNodeId(),10L);
+      am1.allocate(am1.createReq(new String[]{host0,host1},4 * GB,1,numContainers,10L),null);
+      allocResponse=waitForAllocResponse(rm,am1,nm2,1);
+      allocated=allocResponse.getAllocatedContainers();
+      Assert.assertEquals(1,allocated.size());
+      checkAllocatedContainer(allocated.get(0),4 * GB,nm2.getNodeId(),10L);
+    }
+  finally {
+      if (rm != null) {
+        rm.stop();
+      }
+    }
+  }
+  private AllocateResponse waitForAllocResponse(  MockRM rm,  MockAM am,  MockNM nm,  int size) throws Exception {
+    AllocateResponse allocResponse=am.doHeartbeat();
+    while (allocResponse.getAllocatedContainers().size() < size) {
+      LOG.info("Waiting for containers to be created for app...");
+      nm.nodeHeartbeat(true);
+      ((AbstractYarnScheduler)rm.getResourceScheduler()).update();
+      Thread.sleep(100);
+      allocResponse=am.doHeartbeat();
+    }
+    return allocResponse;
+  }
+}

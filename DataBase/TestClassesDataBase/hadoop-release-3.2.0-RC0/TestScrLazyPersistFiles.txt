@@ -1,0 +1,131 @@
+/** 
+ * Test Lazy persist behavior with short-circuit reads. These tests will be run on Linux only with Native IO enabled. The tests fake RAM_DISK storage using local disk.
+ */
+public class TestScrLazyPersistFiles extends LazyPersistTestCase {
+  @BeforeClass public static void init(){
+    DomainSocket.disableBindPathValidation();
+  }
+  @Before public void before(){
+    Assume.assumeTrue(NativeCodeLoader.isNativeCodeLoaded());
+    assumeNotWindows();
+    Assume.assumeThat(DomainSocket.getLoadingFailureReason(),equalTo(null));
+    final long osPageSize=NativeIO.POSIX.getCacheManipulator().getOperatingSystemPageSize();
+    Preconditions.checkState(BLOCK_SIZE >= osPageSize);
+    Preconditions.checkState(BLOCK_SIZE % osPageSize == 0);
+  }
+  @Rule public ExpectedException exception=ExpectedException.none();
+  /** 
+ * Read in-memory block with Short Circuit Read Note: the test uses faked RAM_DISK from physical disk.
+ */
+  @Test public void testRamDiskShortCircuitRead() throws IOException, InterruptedException, TimeoutException {
+    getClusterBuilder().setUseScr(true).build();
+    final String METHOD_NAME=GenericTestUtils.getMethodName();
+    final int SEED=0xFADED;
+    Path path=new Path("/" + METHOD_NAME + ".dat");
+    makeRandomTestFile(path,BLOCK_SIZE,true,SEED);
+    ensureFileReplicasOnStorageType(path,RAM_DISK);
+    waitForMetric("RamDiskBlocksLazyPersisted",1);
+    HdfsDataInputStream fis=(HdfsDataInputStream)fs.open(path);
+    try {
+      byte[] buf=new byte[BUFFER_LENGTH];
+      fis.read(0,buf,0,BUFFER_LENGTH);
+      Assert.assertEquals(BUFFER_LENGTH,fis.getReadStatistics().getTotalBytesRead());
+      Assert.assertEquals(BUFFER_LENGTH,fis.getReadStatistics().getTotalShortCircuitBytesRead());
+    }
+  finally {
+      fis.close();
+      fis=null;
+    }
+  }
+  /** 
+ * Eviction of lazy persisted blocks with Short Circuit Read handle open Note: the test uses faked RAM_DISK from physical disk.
+ * @throws IOException
+ * @throws InterruptedException
+ */
+  @Test public void tesScrDuringEviction() throws Exception {
+    getClusterBuilder().setUseScr(true).build();
+    final String METHOD_NAME=GenericTestUtils.getMethodName();
+    Path path1=new Path("/" + METHOD_NAME + ".01.dat");
+    makeTestFile(path1,BLOCK_SIZE,true);
+    ensureFileReplicasOnStorageType(path1,RAM_DISK);
+    waitForMetric("RamDiskBlocksLazyPersisted",1);
+    HdfsDataInputStream fis=(HdfsDataInputStream)fs.open(path1);
+    try {
+      byte[] buf=new byte[BUFFER_LENGTH];
+      fis.read(0,buf,0,BUFFER_LENGTH);
+      triggerEviction(cluster.getDataNodes().get(0));
+      fis.read(0,buf,0,BUFFER_LENGTH);
+      assertThat(fis.getReadStatistics().getTotalBytesRead(),is((long)2 * BUFFER_LENGTH));
+      assertThat(fis.getReadStatistics().getTotalShortCircuitBytesRead(),is((long)2 * BUFFER_LENGTH));
+    }
+  finally {
+      IOUtils.closeQuietly(fis);
+    }
+  }
+  @Test public void testScrAfterEviction() throws IOException, InterruptedException, TimeoutException {
+    getClusterBuilder().setUseScr(true).setUseLegacyBlockReaderLocal(false).build();
+    doShortCircuitReadAfterEvictionTest();
+  }
+  @Test public void testLegacyScrAfterEviction() throws IOException, InterruptedException, TimeoutException {
+    getClusterBuilder().setUseScr(true).setUseLegacyBlockReaderLocal(true).build();
+    doShortCircuitReadAfterEvictionTest();
+    ClientContext clientContext=client.getClientContext();
+    Assert.assertFalse(clientContext.getDisableLegacyBlockReaderLocal());
+  }
+  private void doShortCircuitReadAfterEvictionTest() throws IOException, InterruptedException, TimeoutException {
+    final String METHOD_NAME=GenericTestUtils.getMethodName();
+    Path path1=new Path("/" + METHOD_NAME + ".01.dat");
+    final int SEED=0xFADED;
+    makeRandomTestFile(path1,BLOCK_SIZE,true,SEED);
+    ensureFileReplicasOnStorageType(path1,RAM_DISK);
+    waitForMetric("RamDiskBlocksLazyPersisted",1);
+    File metaFile=cluster.getBlockMetadataFile(0,DFSTestUtil.getFirstBlock(fs,path1));
+    assertTrue(metaFile.length() <= BlockMetadataHeader.getHeaderSize());
+    assertTrue(verifyReadRandomFile(path1,BLOCK_SIZE,SEED));
+    triggerEviction(cluster.getDataNodes().get(0));
+    ensureFileReplicasOnStorageType(path1,DEFAULT);
+    metaFile=cluster.getBlockMetadataFile(0,DFSTestUtil.getFirstBlock(fs,path1));
+    assertTrue(metaFile.length() > BlockMetadataHeader.getHeaderSize());
+    assertTrue(verifyReadRandomFile(path1,BLOCK_SIZE,SEED));
+  }
+  @Test public void testScrBlockFileCorruption() throws IOException, InterruptedException, TimeoutException {
+    getClusterBuilder().setUseScr(true).setUseLegacyBlockReaderLocal(false).build();
+    doShortCircuitReadBlockFileCorruptionTest();
+  }
+  @Test public void testLegacyScrBlockFileCorruption() throws IOException, InterruptedException, TimeoutException {
+    getClusterBuilder().setUseScr(true).setUseLegacyBlockReaderLocal(true).build();
+    doShortCircuitReadBlockFileCorruptionTest();
+  }
+  public void doShortCircuitReadBlockFileCorruptionTest() throws IOException, InterruptedException, TimeoutException {
+    final String METHOD_NAME=GenericTestUtils.getMethodName();
+    Path path1=new Path("/" + METHOD_NAME + ".01.dat");
+    makeTestFile(path1,BLOCK_SIZE,true);
+    ensureFileReplicasOnStorageType(path1,RAM_DISK);
+    waitForMetric("RamDiskBlocksLazyPersisted",1);
+    triggerEviction(cluster.getDataNodes().get(0));
+    ensureFileReplicasOnStorageType(path1,DEFAULT);
+    cluster.corruptReplica(0,DFSTestUtil.getFirstBlock(fs,path1));
+    exception.expect(ChecksumException.class);
+    DFSTestUtil.readFileBuffer(fs,path1);
+  }
+  @Test public void testScrMetaFileCorruption() throws IOException, InterruptedException, TimeoutException {
+    getClusterBuilder().setUseScr(true).setUseLegacyBlockReaderLocal(false).build();
+    doShortCircuitReadMetaFileCorruptionTest();
+  }
+  @Test public void testLegacyScrMetaFileCorruption() throws IOException, InterruptedException, TimeoutException {
+    getClusterBuilder().setUseScr(true).setUseLegacyBlockReaderLocal(true).build();
+    doShortCircuitReadMetaFileCorruptionTest();
+  }
+  public void doShortCircuitReadMetaFileCorruptionTest() throws IOException, InterruptedException, TimeoutException {
+    final String METHOD_NAME=GenericTestUtils.getMethodName();
+    Path path1=new Path("/" + METHOD_NAME + ".01.dat");
+    makeTestFile(path1,BLOCK_SIZE,true);
+    ensureFileReplicasOnStorageType(path1,RAM_DISK);
+    waitForMetric("RamDiskBlocksLazyPersisted",1);
+    triggerEviction(cluster.getDataNodes().get(0));
+    ensureFileReplicasOnStorageType(path1,DEFAULT);
+    cluster.corruptMeta(0,DFSTestUtil.getFirstBlock(fs,path1));
+    exception.expect(ChecksumException.class);
+    DFSTestUtil.readFileBuffer(fs,path1);
+  }
+}

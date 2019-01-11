@@ -1,0 +1,113 @@
+/** 
+ * Unit tests for the  {@link StorageLocationChecker} class.
+ */
+public class TestStorageLocationChecker {
+  public static final Logger LOG=LoggerFactory.getLogger(TestStorageLocationChecker.class);
+  @Rule public ExpectedException thrown=ExpectedException.none();
+  /** 
+ * Verify that all healthy locations are correctly handled and that the check routine is invoked as expected.
+ * @throws Exception
+ */
+  @Test(timeout=30000) public void testAllLocationsHealthy() throws Exception {
+    final List<StorageLocation> locations=makeMockLocations(HEALTHY,HEALTHY,HEALTHY);
+    final Configuration conf=new HdfsConfiguration();
+    conf.setInt(DFS_DATANODE_FAILED_VOLUMES_TOLERATED_KEY,0);
+    StorageLocationChecker checker=new StorageLocationChecker(conf,new FakeTimer());
+    List<StorageLocation> filteredLocations=checker.check(conf,locations);
+    assertThat(filteredLocations.size(),is(3));
+    for (    StorageLocation location : locations) {
+      verify(location).check(any(StorageLocation.CheckContext.class));
+    }
+  }
+  /** 
+ * Test handling when the number of failed locations is below the max volume failure threshold.
+ * @throws Exception
+ */
+  @Test(timeout=30000) public void testFailedLocationsBelowThreshold() throws Exception {
+    final List<StorageLocation> locations=makeMockLocations(HEALTHY,HEALTHY,FAILED);
+    final Configuration conf=new HdfsConfiguration();
+    conf.setInt(DFS_DATANODE_FAILED_VOLUMES_TOLERATED_KEY,1);
+    StorageLocationChecker checker=new StorageLocationChecker(conf,new FakeTimer());
+    List<StorageLocation> filteredLocations=checker.check(conf,locations);
+    assertThat(filteredLocations.size(),is(2));
+  }
+  /** 
+ * Test handling when the number of volume failures tolerated is the same as the number of volumes.
+ * @throws Exception
+ */
+  @Test(timeout=30000) public void testFailedLocationsAboveThreshold() throws Exception {
+    final List<StorageLocation> locations=makeMockLocations(HEALTHY,FAILED,FAILED);
+    final Configuration conf=new HdfsConfiguration();
+    conf.setInt(DFS_DATANODE_FAILED_VOLUMES_TOLERATED_KEY,1);
+    thrown.expect(IOException.class);
+    thrown.expectMessage("Too many failed volumes - current valid volumes: 1," + " volumes configured: 3, volumes failed: 2, volume failures" + " tolerated: 1");
+    StorageLocationChecker checker=new StorageLocationChecker(conf,new FakeTimer());
+    checker.check(conf,locations);
+  }
+  /** 
+ * Test handling all storage locations are failed.
+ * @throws Exception
+ */
+  @Test(timeout=30000) public void testBadConfiguration() throws Exception {
+    final List<StorageLocation> locations=makeMockLocations(HEALTHY,HEALTHY,HEALTHY);
+    final Configuration conf=new HdfsConfiguration();
+    conf.setInt(DFS_DATANODE_FAILED_VOLUMES_TOLERATED_KEY,3);
+    thrown.expect(IOException.class);
+    thrown.expectMessage("Invalid value configured");
+    StorageLocationChecker checker=new StorageLocationChecker(conf,new FakeTimer());
+    checker.check(conf,locations);
+  }
+  /** 
+ * Verify that a  {@link StorageLocation#check} timeout is correctly detectedas a failure. This is hard to test without a  {@link Thread#sleep} call.
+ * @throws Exception
+ */
+  @Test(timeout=300000) public void testTimeoutInCheck() throws Exception {
+    final Configuration conf=new HdfsConfiguration();
+    conf.setTimeDuration(DFS_DATANODE_DISK_CHECK_TIMEOUT_KEY,1,TimeUnit.SECONDS);
+    conf.setInt(DFS_DATANODE_FAILED_VOLUMES_TOLERATED_KEY,1);
+    final FakeTimer timer=new FakeTimer();
+    final List<StorageLocation> locations=makeSlowLocations(2000,1);
+    StorageLocationChecker checker=new StorageLocationChecker(conf,timer);
+    try {
+      List<StorageLocation> filteredList=checker.check(conf,locations);
+      assertThat(filteredList.size(),is(1));
+    }
+  finally {
+      checker.shutdownAndWait(10,TimeUnit.SECONDS);
+    }
+  }
+  /** 
+ * Return a list of storage locations - one per argument - which return health check results corresponding to the supplied arguments.
+ */
+  private List<StorageLocation> makeMockLocations(  VolumeCheckResult... args) throws IOException {
+    final List<StorageLocation> locations=new ArrayList<>(args.length);
+    final AtomicInteger index=new AtomicInteger(0);
+    for (    VolumeCheckResult result : args) {
+      final StorageLocation location=mock(StorageLocation.class);
+      when(location.toString()).thenReturn("/" + index.incrementAndGet());
+      when(location.check(any(StorageLocation.CheckContext.class))).thenReturn(result);
+      locations.add(location);
+    }
+    return locations;
+  }
+  /** 
+ * Return a list of storage locations - one per argument - whose check() method takes at least the specified number of milliseconds to complete.
+ */
+  private List<StorageLocation> makeSlowLocations(  long... args) throws IOException {
+    final List<StorageLocation> locations=new ArrayList<>(args.length);
+    final AtomicInteger index=new AtomicInteger(0);
+    for (    final long checkDelayMs : args) {
+      final StorageLocation location=mock(StorageLocation.class);
+      when(location.toString()).thenReturn("/" + index.incrementAndGet());
+      when(location.check(any(StorageLocation.CheckContext.class))).thenAnswer(new Answer<VolumeCheckResult>(){
+        @Override public VolumeCheckResult answer(        InvocationOnMock invocation) throws Throwable {
+          Thread.sleep(checkDelayMs);
+          return VolumeCheckResult.HEALTHY;
+        }
+      }
+);
+      locations.add(location);
+    }
+    return locations;
+  }
+}

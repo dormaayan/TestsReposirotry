@@ -1,0 +1,33 @@
+@Test public void testAbortUnsentBatches() throws Exception {
+  int lingerMs=Integer.MAX_VALUE;
+  int numRecords=100;
+  final AtomicInteger numExceptionReceivedInCallback=new AtomicInteger(0);
+  final RecordAccumulator accum=createTestRecordAccumulator(128 + DefaultRecordBatch.RECORD_BATCH_OVERHEAD,64 * 1024,CompressionType.NONE,lingerMs);
+  final KafkaException cause=new KafkaException();
+class TestCallback implements Callback {
+    @Override public void onCompletion(    RecordMetadata metadata,    Exception exception){
+      assertEquals(cause,exception);
+      numExceptionReceivedInCallback.incrementAndGet();
+    }
+  }
+  for (int i=0; i < numRecords; i++)   accum.append(new TopicPartition(topic,i % 3),0L,key,value,null,new TestCallback(),maxBlockTimeMs);
+  RecordAccumulator.ReadyCheckResult result=accum.ready(cluster,time.milliseconds());
+  assertFalse(result.readyNodes.isEmpty());
+  Map<Integer,List<ProducerBatch>> drained=accum.drain(cluster,result.readyNodes,Integer.MAX_VALUE,time.milliseconds());
+  assertTrue(accum.hasUndrained());
+  assertTrue(accum.hasIncomplete());
+  accum.abortUndrainedBatches(cause);
+  int numDrainedRecords=0;
+  for (  Map.Entry<Integer,List<ProducerBatch>> drainedEntry : drained.entrySet()) {
+    for (    ProducerBatch batch : drainedEntry.getValue()) {
+      assertTrue(batch.isClosed());
+      assertFalse(batch.produceFuture.completed());
+      numDrainedRecords+=batch.recordCount;
+    }
+  }
+  assertTrue(numDrainedRecords > 0);
+  assertTrue(numExceptionReceivedInCallback.get() > 0);
+  assertEquals(numRecords,numExceptionReceivedInCallback.get() + numDrainedRecords);
+  assertFalse(accum.hasUndrained());
+  assertTrue(accum.hasIncomplete());
+}

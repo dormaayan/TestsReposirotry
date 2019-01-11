@@ -1,0 +1,293 @@
+/** 
+ * Unit test for Journal Node formatting upon re-installation and syncing.
+ */
+public class TestJournalNodeSync {
+  private Configuration conf;
+  private MiniQJMHACluster qjmhaCluster;
+  private MiniDFSCluster dfsCluster;
+  private MiniJournalCluster jCluster;
+  private FSNamesystem namesystem;
+  private int editsPerformed=0;
+  private final String jid="ns1";
+  private int activeNNindex=0;
+  private static final int DFS_HA_TAILEDITS_PERIOD_SECONDS=1;
+  @Rule public TestName testName=new TestName();
+  @Before public void setUpMiniCluster() throws IOException {
+    conf=new HdfsConfiguration();
+    conf.setBoolean(DFSConfigKeys.DFS_JOURNALNODE_ENABLE_SYNC_KEY,true);
+    conf.setLong(DFSConfigKeys.DFS_JOURNALNODE_SYNC_INTERVAL_KEY,1000L);
+    if (testName.getMethodName().equals("testSyncAfterJNdowntimeWithoutQJournalQueue")) {
+      conf.setInt(DFSConfigKeys.DFS_QJOURNAL_QUEUE_SIZE_LIMIT_KEY,0);
+    }
+    if (testName.getMethodName().equals("testSyncDuringRollingUpgrade")) {
+      conf.setInt(DFSConfigKeys.DFS_HA_TAILEDITS_PERIOD_KEY,DFS_HA_TAILEDITS_PERIOD_SECONDS);
+    }
+    qjmhaCluster=new MiniQJMHACluster.Builder(conf).setNumNameNodes(2).build();
+    dfsCluster=qjmhaCluster.getDfsCluster();
+    jCluster=qjmhaCluster.getJournalCluster();
+    dfsCluster.transitionToActive(0);
+    namesystem=dfsCluster.getNamesystem(0);
+  }
+  @After public void shutDownMiniCluster() throws IOException {
+    if (qjmhaCluster != null) {
+      qjmhaCluster.shutdown();
+    }
+  }
+  @Test(timeout=30000) public void testJournalNodeSync() throws Exception {
+    for (int i=0; i < 3; i++) {
+      Assert.assertEquals(true,jCluster.getJournalNode(i).getJournalSyncerStatus("ns1"));
+    }
+    File firstJournalDir=jCluster.getJournalDir(0,jid);
+    File firstJournalCurrentDir=new StorageDirectory(firstJournalDir).getCurrentDir();
+    long firstTxId=generateEditLog();
+    generateEditLog();
+    File missingLog=deleteEditLog(firstJournalCurrentDir,firstTxId);
+    GenericTestUtils.waitFor(editLogExists(Lists.newArrayList(missingLog)),500,10000);
+  }
+  @Test(timeout=30000) public void testSyncForMultipleMissingLogs() throws Exception {
+    File firstJournalDir=jCluster.getJournalDir(0,jid);
+    File firstJournalCurrentDir=new StorageDirectory(firstJournalDir).getCurrentDir();
+    long firstTxId=generateEditLog();
+    long nextTxId=generateEditLog();
+    List<File> missingLogs=Lists.newArrayList();
+    missingLogs.add(deleteEditLog(firstJournalCurrentDir,firstTxId));
+    missingLogs.add(deleteEditLog(firstJournalCurrentDir,nextTxId));
+    GenericTestUtils.waitFor(editLogExists(missingLogs),500,10000);
+  }
+  @Test(timeout=30000) public void testSyncForDiscontinuousMissingLogs() throws Exception {
+    File firstJournalDir=jCluster.getJournalDir(0,jid);
+    File firstJournalCurrentDir=new StorageDirectory(firstJournalDir).getCurrentDir();
+    long firstTxId=generateEditLog();
+    generateEditLog();
+    long nextTxId=generateEditLog();
+    List<File> missingLogs=Lists.newArrayList();
+    missingLogs.add(deleteEditLog(firstJournalCurrentDir,firstTxId));
+    missingLogs.add(deleteEditLog(firstJournalCurrentDir,nextTxId));
+    GenericTestUtils.waitFor(editLogExists(missingLogs),500,10000);
+  }
+  @Test(timeout=30000) public void testMultipleJournalsMissingLogs() throws Exception {
+    File firstJournalDir=jCluster.getJournalDir(0,jid);
+    File firstJournalCurrentDir=new StorageDirectory(firstJournalDir).getCurrentDir();
+    File secondJournalDir=jCluster.getJournalDir(1,jid);
+    StorageDirectory sd=new StorageDirectory(secondJournalDir);
+    File secondJournalCurrentDir=sd.getCurrentDir();
+    long firstTxId=generateEditLog();
+    generateEditLog();
+    List<File> missingLogs=Lists.newArrayList();
+    missingLogs.add(deleteEditLog(firstJournalCurrentDir,firstTxId));
+    missingLogs.add(deleteEditLog(secondJournalCurrentDir,firstTxId));
+    GenericTestUtils.waitFor(editLogExists(missingLogs),500,10000);
+  }
+  @Test(timeout=60000) public void testMultipleJournalsMultipleMissingLogs() throws Exception {
+    File firstJournalDir=jCluster.getJournalDir(0,jid);
+    File firstJournalCurrentDir=new StorageDirectory(firstJournalDir).getCurrentDir();
+    File secondJournalDir=jCluster.getJournalDir(1,jid);
+    File secondJournalCurrentDir=new StorageDirectory(secondJournalDir).getCurrentDir();
+    File thirdJournalDir=jCluster.getJournalDir(2,jid);
+    File thirdJournalCurrentDir=new StorageDirectory(thirdJournalDir).getCurrentDir();
+    long firstTxId=generateEditLog();
+    long secondTxId=generateEditLog();
+    long thirdTxId=generateEditLog();
+    List<File> missingLogs=Lists.newArrayList();
+    missingLogs.add(deleteEditLog(firstJournalCurrentDir,firstTxId));
+    missingLogs.add(deleteEditLog(secondJournalCurrentDir,firstTxId));
+    missingLogs.add(deleteEditLog(secondJournalCurrentDir,secondTxId));
+    missingLogs.add(deleteEditLog(thirdJournalCurrentDir,thirdTxId));
+    GenericTestUtils.waitFor(editLogExists(missingLogs),500,30000);
+  }
+  @Test(timeout=60000) public void testRandomJournalMissingLogs() throws Exception {
+    List<File> missingLogs=deleteEditLogsFromRandomJN();
+    GenericTestUtils.waitFor(editLogExists(missingLogs),500,30000);
+  }
+  @Test(timeout=300_000) public void testSyncAfterJNdowntime() throws Exception {
+    File firstJournalDir=jCluster.getJournalDir(0,jid);
+    File firstJournalCurrentDir=new StorageDirectory(firstJournalDir).getCurrentDir();
+    File secondJournalDir=jCluster.getJournalDir(1,jid);
+    File secondJournalCurrentDir=new StorageDirectory(secondJournalDir).getCurrentDir();
+    long[] startTxIds=new long[10];
+    startTxIds[0]=generateEditLog();
+    startTxIds[1]=generateEditLog();
+    jCluster.getJournalNode(0).stop(0);
+    for (int i=2; i < 10; i++) {
+      startTxIds[i]=generateEditLog(5);
+    }
+    jCluster.restartJournalNode(0);
+    generateEditLog();
+    List<File> missingLogs=Lists.newArrayList();
+    for (int i=2; i < 10; i++) {
+      EditLogFile logFile=getLogFile(secondJournalCurrentDir,startTxIds[i],false);
+      missingLogs.add(new File(firstJournalCurrentDir,logFile.getFile().getName()));
+    }
+    GenericTestUtils.waitFor(editLogExists(missingLogs),500,30000);
+  }
+  /** 
+ * Test JournalNode Sync when a JN id down while NN is actively writing logs and comes back up after some time with no edit log queueing. Queuing disabled during the cluster setup  {@link #setUpMiniCluster()}
+ * @throws Exception
+ */
+  @Test(timeout=300_000) public void testSyncAfterJNdowntimeWithoutQJournalQueue() throws Exception {
+    File firstJournalDir=jCluster.getJournalDir(0,jid);
+    File firstJournalCurrentDir=new StorageDirectory(firstJournalDir).getCurrentDir();
+    File secondJournalDir=jCluster.getJournalDir(1,jid);
+    File secondJournalCurrentDir=new StorageDirectory(secondJournalDir).getCurrentDir();
+    long[] startTxIds=new long[10];
+    startTxIds[0]=generateEditLog();
+    startTxIds[1]=generateEditLog(2);
+    jCluster.getJournalNode(0).stop(0);
+    for (int i=2; i < 10; i++) {
+      startTxIds[i]=generateEditLog(5);
+    }
+    jCluster.restartJournalNode(0);
+    generateEditLog(2);
+    List<File> missingLogs=Lists.newArrayList();
+    for (int i=2; i < 10; i++) {
+      EditLogFile logFile=getLogFile(secondJournalCurrentDir,startTxIds[i],false);
+      missingLogs.add(new File(firstJournalCurrentDir,logFile.getFile().getName()));
+    }
+    GenericTestUtils.waitFor(editLogExists(missingLogs),500,30000);
+    long numEditLogsSynced=jCluster.getJournalNode(0).getOrCreateJournal(jid).getMetrics().getNumEditLogsSynced().value();
+    Assert.assertTrue("Edit logs downloaded outside syncer. Expected 8 or " + "more downloads, got " + numEditLogsSynced + " downloads instead",numEditLogsSynced >= 8);
+  }
+  @Test(timeout=300_000) public void testSyncAfterJNformat() throws Exception {
+    File firstJournalDir=jCluster.getJournalDir(0,jid);
+    File firstJournalCurrentDir=new StorageDirectory(firstJournalDir).getCurrentDir();
+    File secondJournalDir=jCluster.getJournalDir(1,jid);
+    File secondJournalCurrentDir=new StorageDirectory(secondJournalDir).getCurrentDir();
+    long[] startTxIds=new long[10];
+    startTxIds[0]=generateEditLog(1);
+    startTxIds[1]=generateEditLog(2);
+    startTxIds[2]=generateEditLog(4);
+    startTxIds[3]=generateEditLog(6);
+    Journal journal1=jCluster.getJournalNode(0).getOrCreateJournal(jid);
+    NamespaceInfo nsInfo=journal1.getStorage().getNamespaceInfo();
+    for (    File file : firstJournalCurrentDir.listFiles()) {
+      file.delete();
+    }
+    journal1.format(nsInfo,false);
+    for (int i=4; i < 10; i++) {
+      startTxIds[i]=generateEditLog(5);
+    }
+    List<File> missingLogs=Lists.newArrayList();
+    for (int i=0; i < 10; i++) {
+      EditLogFile logFile=getLogFile(secondJournalCurrentDir,startTxIds[i],false);
+      missingLogs.add(new File(firstJournalCurrentDir,logFile.getFile().getName()));
+    }
+    GenericTestUtils.waitFor(editLogExists(missingLogs),500,30000);
+  }
+  @Test(timeout=300_000) public void testSyncDuringRollingUpgrade() throws Exception {
+    DistributedFileSystem dfsActive;
+    int standbyNNindex;
+    if (dfsCluster.getNameNode(0).isActiveState()) {
+      activeNNindex=0;
+      standbyNNindex=1;
+    }
+ else {
+      activeNNindex=1;
+      standbyNNindex=0;
+    }
+    dfsActive=dfsCluster.getFileSystem(activeNNindex);
+    final RollingUpgradeInfo info=dfsActive.rollingUpgrade(HdfsConstants.RollingUpgradeAction.PREPARE);
+    Assert.assertEquals(info,dfsActive.rollingUpgrade(HdfsConstants.RollingUpgradeAction.QUERY));
+    dfsCluster.restartNameNode(standbyNNindex,true,"-rollingUpgrade","started");
+    Assert.assertEquals(info,dfsActive.rollingUpgrade(HdfsConstants.RollingUpgradeAction.QUERY));
+    List<File> missingLogs=deleteEditLogsFromRandomJN();
+    GenericTestUtils.waitFor(editLogExists(missingLogs),500,30000);
+    dfsCluster.transitionToStandby(activeNNindex);
+    Thread.sleep(30 * DFS_HA_TAILEDITS_PERIOD_SECONDS * 1000);
+    dfsCluster.transitionToActive(standbyNNindex);
+    dfsCluster.waitActive();
+    activeNNindex=standbyNNindex;
+    standbyNNindex=((activeNNindex + 1) % 2);
+    dfsActive=dfsCluster.getFileSystem(activeNNindex);
+    Assert.assertTrue(dfsCluster.getNameNode(activeNNindex).isActiveState());
+    Assert.assertFalse(dfsCluster.getNameNode(standbyNNindex).isActiveState());
+    dfsCluster.restartNameNode(standbyNNindex,true,"-rollingUpgrade","started");
+    Assert.assertEquals(info,dfsActive.rollingUpgrade(HdfsConstants.RollingUpgradeAction.QUERY));
+    dfsCluster.waitActive();
+    missingLogs.addAll(deleteEditLogsFromRandomJN());
+    GenericTestUtils.waitFor(editLogExists(missingLogs),500,30000);
+    final RollingUpgradeInfo finalize=dfsActive.rollingUpgrade(HdfsConstants.RollingUpgradeAction.FINALIZE);
+    Assert.assertTrue(finalize.isFinalized());
+    for (    File editLog : missingLogs) {
+      Assert.assertTrue("Edit log missing after finalizing rolling upgrade",editLog.exists());
+    }
+  }
+  private File deleteEditLog(  File currentDir,  long startTxId) throws IOException {
+    EditLogFile logFile=getLogFile(currentDir,startTxId);
+    while (logFile.isInProgress()) {
+      dfsCluster.getNameNode(activeNNindex).getRpcServer().rollEditLog();
+      logFile=getLogFile(currentDir,startTxId);
+    }
+    File deleteFile=logFile.getFile();
+    Assert.assertTrue("Couldn't delete edit log file",deleteFile.delete());
+    return deleteFile;
+  }
+  private List<File> deleteEditLogsFromRandomJN() throws IOException {
+    Random random=new Random();
+    List<File> journalCurrentDirs=Lists.newArrayList();
+    for (int i=0; i < 3; i++) {
+      journalCurrentDirs.add(new StorageDirectory(jCluster.getJournalDir(i,jid)).getCurrentDir());
+    }
+    long[] startTxIds=new long[20];
+    for (int i=0; i < 20; i++) {
+      startTxIds[i]=generateEditLog();
+    }
+    int count=0, startTxIdIndex;
+    long startTxId;
+    int journalIndex;
+    List<File> missingLogs=Lists.newArrayList();
+    List<Integer> deletedStartTxIds=Lists.newArrayList();
+    while (count < 5) {
+      startTxIdIndex=random.nextInt(20);
+      while (deletedStartTxIds.contains(startTxIdIndex)) {
+        startTxIdIndex=random.nextInt(20);
+      }
+      startTxId=startTxIds[startTxIdIndex];
+      deletedStartTxIds.add(startTxIdIndex);
+      journalIndex=random.nextInt(3);
+      missingLogs.add(deleteEditLog(journalCurrentDirs.get(journalIndex),startTxId));
+      count++;
+    }
+    return missingLogs;
+  }
+  /** 
+ * Do a mutative metadata operation on the file system.
+ * @return true if the operation was successful, false otherwise.
+ */
+  private boolean doAnEdit() throws IOException {
+    return dfsCluster.getFileSystem(activeNNindex).mkdirs(new Path("/tmp",Integer.toString(editsPerformed++)));
+  }
+  /** 
+ * Does an edit and rolls the Edit Log.
+ * @return the startTxId of next segment after rolling edits.
+ */
+  private long generateEditLog() throws IOException {
+    return generateEditLog(1);
+  }
+  /** 
+ * Does specified number of edits and rolls the Edit Log.
+ * @param numEdits number of Edits to perform
+ * @return the startTxId of next segment after rolling edits.
+ */
+  private long generateEditLog(  int numEdits) throws IOException {
+    long lastWrittenTxId=dfsCluster.getNameNode(activeNNindex).getFSImage().getEditLog().getLastWrittenTxId();
+    for (int i=1; i <= numEdits; i++) {
+      Assert.assertTrue("Failed to do an edit",doAnEdit());
+    }
+    dfsCluster.getNameNode(activeNNindex).getRpcServer().rollEditLog();
+    return lastWrittenTxId;
+  }
+  private Supplier<Boolean> editLogExists(  List<File> editLogs){
+    Supplier<Boolean> supplier=new Supplier<Boolean>(){
+      @Override public Boolean get(){
+        for (        File editLog : editLogs) {
+          if (!editLog.exists()) {
+            return false;
+          }
+        }
+        return true;
+      }
+    }
+;
+    return supplier;
+  }
+}

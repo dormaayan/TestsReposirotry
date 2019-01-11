@@ -1,0 +1,36 @@
+@Test public void testExpiryOfFirstBatchShouldCauseResetIfFutureBatchesFail() throws Exception {
+  final long producerId=343434L;
+  TransactionManager transactionManager=new TransactionManager();
+  setupWithTransactionState(transactionManager);
+  prepareAndReceiveInitProducerId(producerId,Errors.NONE);
+  assertTrue(transactionManager.hasProducerId());
+  assertEquals(0,transactionManager.sequenceNumber(tp0).longValue());
+  Future<RecordMetadata> request1=accumulator.append(tp0,time.milliseconds(),"key".getBytes(),"value".getBytes(),null,null,MAX_BLOCK_TIMEOUT).future;
+  sender.run(time.milliseconds());
+  time.sleep(1000L);
+  Future<RecordMetadata> request2=accumulator.append(tp0,time.milliseconds(),"key".getBytes(),"value".getBytes(),null,null,MAX_BLOCK_TIMEOUT).future;
+  sender.run(time.milliseconds());
+  assertEquals(2,client.inFlightRequestCount());
+  sendIdempotentProducerResponse(0,tp0,Errors.NOT_LEADER_FOR_PARTITION,-1);
+  sender.run(time.milliseconds());
+  Node node=this.cluster.nodes().get(0);
+  time.sleep(1000L);
+  client.disconnect(node.idString());
+  client.blackout(node,10);
+  sender.run(time.milliseconds());
+  assertFutureFailure(request1,TimeoutException.class);
+  assertTrue(transactionManager.hasUnresolvedSequence(tp0));
+  Future<RecordMetadata> request3=accumulator.append(tp0,time.milliseconds(),"key".getBytes(),"value".getBytes(),null,null,MAX_BLOCK_TIMEOUT).future;
+  time.sleep(20);
+  assertFalse(request2.isDone());
+  sender.run(time.milliseconds());
+  sendIdempotentProducerResponse(1,tp0,Errors.OUT_OF_ORDER_SEQUENCE_NUMBER,1);
+  sender.run(time.milliseconds());
+  assertFutureFailure(request2,OutOfOrderSequenceException.class);
+  Deque<ProducerBatch> batches=accumulator.batches().get(tp0);
+  assertEquals(1,batches.size());
+  assertFalse(batches.peekFirst().hasSequence());
+  assertFalse(client.hasInFlightRequests());
+  assertFalse(transactionManager.hasProducerId());
+  assertFalse(transactionManager.hasUnresolvedSequence(tp0));
+}

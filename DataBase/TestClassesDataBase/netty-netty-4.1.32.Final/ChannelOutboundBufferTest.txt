@@ -1,0 +1,303 @@
+public class ChannelOutboundBufferTest {
+  @Test public void testEmptyNioBuffers(){
+    TestChannel channel=new TestChannel();
+    ChannelOutboundBuffer buffer=new ChannelOutboundBuffer(channel);
+    assertEquals(0,buffer.nioBufferCount());
+    ByteBuffer[] buffers=buffer.nioBuffers();
+    assertNotNull(buffers);
+    for (    ByteBuffer b : buffers) {
+      assertNull(b);
+    }
+    assertEquals(0,buffer.nioBufferCount());
+    release(buffer);
+  }
+  @Test public void testNioBuffersSingleBacked(){
+    TestChannel channel=new TestChannel();
+    ChannelOutboundBuffer buffer=new ChannelOutboundBuffer(channel);
+    assertEquals(0,buffer.nioBufferCount());
+    ByteBuf buf=copiedBuffer("buf1",CharsetUtil.US_ASCII);
+    ByteBuffer nioBuf=buf.internalNioBuffer(buf.readerIndex(),buf.readableBytes());
+    buffer.addMessage(buf,buf.readableBytes(),channel.voidPromise());
+    assertEquals("Should still be 0 as not flushed yet",0,buffer.nioBufferCount());
+    buffer.addFlush();
+    ByteBuffer[] buffers=buffer.nioBuffers();
+    assertNotNull(buffers);
+    assertEquals("Should still be 0 as not flushed yet",1,buffer.nioBufferCount());
+    for (int i=0; i < buffer.nioBufferCount(); i++) {
+      if (i == 0) {
+        assertEquals(buffers[i],nioBuf);
+      }
+ else {
+        assertNull(buffers[i]);
+      }
+    }
+    release(buffer);
+  }
+  @Test public void testNioBuffersExpand(){
+    TestChannel channel=new TestChannel();
+    ChannelOutboundBuffer buffer=new ChannelOutboundBuffer(channel);
+    ByteBuf buf=directBuffer().writeBytes("buf1".getBytes(CharsetUtil.US_ASCII));
+    for (int i=0; i < 64; i++) {
+      buffer.addMessage(buf.copy(),buf.readableBytes(),channel.voidPromise());
+    }
+    assertEquals("Should still be 0 as not flushed yet",0,buffer.nioBufferCount());
+    buffer.addFlush();
+    ByteBuffer[] buffers=buffer.nioBuffers();
+    assertEquals(64,buffer.nioBufferCount());
+    for (int i=0; i < buffer.nioBufferCount(); i++) {
+      assertEquals(buffers[i],buf.internalNioBuffer(buf.readerIndex(),buf.readableBytes()));
+    }
+    release(buffer);
+    buf.release();
+  }
+  @Test public void testNioBuffersExpand2(){
+    TestChannel channel=new TestChannel();
+    ChannelOutboundBuffer buffer=new ChannelOutboundBuffer(channel);
+    CompositeByteBuf comp=compositeBuffer(256);
+    ByteBuf buf=directBuffer().writeBytes("buf1".getBytes(CharsetUtil.US_ASCII));
+    for (int i=0; i < 65; i++) {
+      comp.addComponent(true,buf.copy());
+    }
+    buffer.addMessage(comp,comp.readableBytes(),channel.voidPromise());
+    assertEquals("Should still be 0 as not flushed yet",0,buffer.nioBufferCount());
+    buffer.addFlush();
+    ByteBuffer[] buffers=buffer.nioBuffers();
+    assertEquals(65,buffer.nioBufferCount());
+    for (int i=0; i < buffer.nioBufferCount(); i++) {
+      if (i < 65) {
+        assertEquals(buffers[i],buf.internalNioBuffer(buf.readerIndex(),buf.readableBytes()));
+      }
+ else {
+        assertNull(buffers[i]);
+      }
+    }
+    release(buffer);
+    buf.release();
+  }
+  private static void release(  ChannelOutboundBuffer buffer){
+    for (; ; ) {
+      if (!buffer.remove()) {
+        break;
+      }
+    }
+  }
+private static final class TestChannel extends AbstractChannel {
+    private static final ChannelMetadata TEST_METADATA=new ChannelMetadata(false);
+    private final ChannelConfig config=new DefaultChannelConfig(this);
+    TestChannel(){
+      super(null);
+    }
+    @Override protected AbstractUnsafe newUnsafe(){
+      return new TestUnsafe();
+    }
+    @Override protected boolean isCompatible(    EventLoop loop){
+      return false;
+    }
+    @Override protected SocketAddress localAddress0(){
+      throw new UnsupportedOperationException();
+    }
+    @Override protected SocketAddress remoteAddress0(){
+      throw new UnsupportedOperationException();
+    }
+    @Override protected void doBind(    SocketAddress localAddress) throws Exception {
+      throw new UnsupportedOperationException();
+    }
+    @Override protected void doDisconnect() throws Exception {
+      throw new UnsupportedOperationException();
+    }
+    @Override protected void doClose() throws Exception {
+      throw new UnsupportedOperationException();
+    }
+    @Override protected void doBeginRead() throws Exception {
+      throw new UnsupportedOperationException();
+    }
+    @Override protected void doWrite(    ChannelOutboundBuffer in) throws Exception {
+      throw new UnsupportedOperationException();
+    }
+    @Override public ChannelConfig config(){
+      return config;
+    }
+    @Override public boolean isOpen(){
+      return true;
+    }
+    @Override public boolean isActive(){
+      return true;
+    }
+    @Override public ChannelMetadata metadata(){
+      return TEST_METADATA;
+    }
+final class TestUnsafe extends AbstractUnsafe {
+      @Override public void connect(      SocketAddress remoteAddress,      SocketAddress localAddress,      ChannelPromise promise){
+        throw new UnsupportedOperationException();
+      }
+    }
+  }
+  @Test public void testWritability(){
+    final StringBuilder buf=new StringBuilder();
+    EmbeddedChannel ch=new EmbeddedChannel(new ChannelInboundHandlerAdapter(){
+      @Override public void channelWritabilityChanged(      ChannelHandlerContext ctx) throws Exception {
+        buf.append(ctx.channel().isWritable());
+        buf.append(' ');
+      }
+    }
+);
+    ch.config().setWriteBufferLowWaterMark(128 + ChannelOutboundBuffer.CHANNEL_OUTBOUND_BUFFER_ENTRY_OVERHEAD);
+    ch.config().setWriteBufferHighWaterMark(256 + ChannelOutboundBuffer.CHANNEL_OUTBOUND_BUFFER_ENTRY_OVERHEAD);
+    ch.write(buffer().writeZero(128));
+    ch.write(buffer().writeZero(2));
+    assertThat(buf.toString(),is(""));
+    ch.unsafe().outboundBuffer().addFlush();
+    ch.write(buffer().writeZero(127));
+    assertThat(buf.toString(),is("false "));
+    assertThat(ch.unsafe().outboundBuffer().remove(),is(true));
+    assertThat(ch.unsafe().outboundBuffer().remove(),is(true));
+    assertThat(ch.unsafe().outboundBuffer().totalPendingWriteBytes(),is(127L + ChannelOutboundBuffer.CHANNEL_OUTBOUND_BUFFER_ENTRY_OVERHEAD));
+    assertThat(buf.toString(),is("false true "));
+    safeClose(ch);
+  }
+  @Test public void testUserDefinedWritability(){
+    final StringBuilder buf=new StringBuilder();
+    EmbeddedChannel ch=new EmbeddedChannel(new ChannelInboundHandlerAdapter(){
+      @Override public void channelWritabilityChanged(      ChannelHandlerContext ctx) throws Exception {
+        buf.append(ctx.channel().isWritable());
+        buf.append(' ');
+      }
+    }
+);
+    ch.config().setWriteBufferLowWaterMark(128);
+    ch.config().setWriteBufferHighWaterMark(256);
+    ChannelOutboundBuffer cob=ch.unsafe().outboundBuffer();
+    for (int i=1; i <= 30; i++) {
+      assertThat(cob.getUserDefinedWritability(i),is(true));
+    }
+    cob.setUserDefinedWritability(1,false);
+    ch.runPendingTasks();
+    assertThat(buf.toString(),is("false "));
+    cob.setUserDefinedWritability(1,true);
+    ch.runPendingTasks();
+    assertThat(buf.toString(),is("false true "));
+    safeClose(ch);
+  }
+  @Test public void testUserDefinedWritability2(){
+    final StringBuilder buf=new StringBuilder();
+    EmbeddedChannel ch=new EmbeddedChannel(new ChannelInboundHandlerAdapter(){
+      @Override public void channelWritabilityChanged(      ChannelHandlerContext ctx) throws Exception {
+        buf.append(ctx.channel().isWritable());
+        buf.append(' ');
+      }
+    }
+);
+    ch.config().setWriteBufferLowWaterMark(128);
+    ch.config().setWriteBufferHighWaterMark(256);
+    ChannelOutboundBuffer cob=ch.unsafe().outboundBuffer();
+    cob.setUserDefinedWritability(1,false);
+    ch.runPendingTasks();
+    assertThat(buf.toString(),is("false "));
+    cob.setUserDefinedWritability(2,false);
+    ch.runPendingTasks();
+    assertThat(buf.toString(),is("false "));
+    cob.setUserDefinedWritability(1,true);
+    ch.runPendingTasks();
+    assertThat(buf.toString(),is("false "));
+    cob.setUserDefinedWritability(2,true);
+    ch.runPendingTasks();
+    assertThat(buf.toString(),is("false true "));
+    safeClose(ch);
+  }
+  @Test public void testMixedWritability(){
+    final StringBuilder buf=new StringBuilder();
+    EmbeddedChannel ch=new EmbeddedChannel(new ChannelInboundHandlerAdapter(){
+      @Override public void channelWritabilityChanged(      ChannelHandlerContext ctx) throws Exception {
+        buf.append(ctx.channel().isWritable());
+        buf.append(' ');
+      }
+    }
+);
+    ch.config().setWriteBufferLowWaterMark(128);
+    ch.config().setWriteBufferHighWaterMark(256);
+    ChannelOutboundBuffer cob=ch.unsafe().outboundBuffer();
+    ch.write(buffer().writeZero(257));
+    assertThat(buf.toString(),is("false "));
+    cob.setUserDefinedWritability(1,false);
+    ch.runPendingTasks();
+    assertThat(buf.toString(),is("false "));
+    ch.flush();
+    assertThat(cob.totalPendingWriteBytes(),is(0L));
+    assertThat(buf.toString(),is("false "));
+    cob.setUserDefinedWritability(1,true);
+    ch.runPendingTasks();
+    assertThat(buf.toString(),is("false true "));
+    safeClose(ch);
+  }
+  @Test(timeout=5000) public void testWriteTaskRejected() throws Exception {
+    final SingleThreadEventExecutor executor=new SingleThreadEventExecutor(null,new DefaultThreadFactory("executorPool"),true,1,RejectedExecutionHandlers.reject()){
+      @Override protected void run(){
+        do {
+          Runnable task=takeTask();
+          if (task != null) {
+            task.run();
+            updateLastExecutionTime();
+          }
+        }
+ while (!confirmShutdown());
+      }
+      @Override protected Queue<Runnable> newTaskQueue(      int maxPendingTasks){
+        return super.newTaskQueue(1);
+      }
+    }
+;
+    final CountDownLatch handlerAddedLatch=new CountDownLatch(1);
+    EmbeddedChannel ch=new EmbeddedChannel();
+    ch.pipeline().addLast(executor,new ChannelOutboundHandlerAdapter(){
+      @Override public void write(      ChannelHandlerContext ctx,      Object msg,      ChannelPromise promise) throws Exception {
+        promise.setFailure(new AssertionError("Should not be called"));
+      }
+      @Override public void handlerAdded(      ChannelHandlerContext ctx) throws Exception {
+        handlerAddedLatch.countDown();
+      }
+    }
+);
+    handlerAddedLatch.await();
+    final CountDownLatch executeLatch=new CountDownLatch(1);
+    final CountDownLatch runLatch=new CountDownLatch(1);
+    executor.execute(new Runnable(){
+      @Override public void run(){
+        try {
+          runLatch.countDown();
+          executeLatch.await();
+        }
+ catch (        InterruptedException e) {
+          Thread.currentThread().interrupt();
+        }
+      }
+    }
+);
+    runLatch.await();
+    executor.execute(new Runnable(){
+      @Override public void run(){
+      }
+    }
+);
+    assertEquals(1,executor.pendingTasks());
+    assertEquals(0,ch.unsafe().outboundBuffer().totalPendingWriteBytes());
+    ByteBuf buffer=buffer(128).writeZero(128);
+    ChannelFuture future=ch.write(buffer);
+    ch.runPendingTasks();
+    assertTrue(future.cause() instanceof RejectedExecutionException);
+    assertEquals(0,buffer.refCnt());
+    assertEquals(0,ch.unsafe().outboundBuffer().totalPendingWriteBytes());
+    executeLatch.countDown();
+    safeClose(ch);
+    executor.shutdownGracefully();
+  }
+  private static void safeClose(  EmbeddedChannel ch){
+    ch.finish();
+    for (; ; ) {
+      ByteBuf m=ch.readOutbound();
+      if (m == null) {
+        break;
+      }
+      m.release();
+    }
+  }
+}

@@ -1,0 +1,161 @@
+@Test public void testCommitWithOutOfOrderCallback() throws Exception {
+  createTask(initialState);
+  expectInitializeTask();
+  expectPollInitialAssignment();
+  expectConsumerPoll(1);
+  expectConversionAndTransformation(4);
+  sinkTask.put(EasyMock.<Collection<SinkRecord>>anyObject());
+  EasyMock.expectLastCall();
+  final Map<TopicPartition,OffsetAndMetadata> workerStartingOffsets=new HashMap<>();
+  workerStartingOffsets.put(TOPIC_PARTITION,new OffsetAndMetadata(FIRST_OFFSET));
+  workerStartingOffsets.put(TOPIC_PARTITION2,new OffsetAndMetadata(FIRST_OFFSET));
+  final Map<TopicPartition,OffsetAndMetadata> workerCurrentOffsets=new HashMap<>();
+  workerCurrentOffsets.put(TOPIC_PARTITION,new OffsetAndMetadata(FIRST_OFFSET + 1));
+  workerCurrentOffsets.put(TOPIC_PARTITION2,new OffsetAndMetadata(FIRST_OFFSET));
+  final List<TopicPartition> originalPartitions=asList(TOPIC_PARTITION,TOPIC_PARTITION2);
+  final List<TopicPartition> rebalancedPartitions=asList(TOPIC_PARTITION,TOPIC_PARTITION2,TOPIC_PARTITION3);
+  final Map<TopicPartition,OffsetAndMetadata> rebalanceOffsets=new HashMap<>();
+  rebalanceOffsets.put(TOPIC_PARTITION,workerCurrentOffsets.get(TOPIC_PARTITION));
+  rebalanceOffsets.put(TOPIC_PARTITION2,workerCurrentOffsets.get(TOPIC_PARTITION2));
+  rebalanceOffsets.put(TOPIC_PARTITION3,new OffsetAndMetadata(FIRST_OFFSET));
+  final Map<TopicPartition,OffsetAndMetadata> postRebalanceCurrentOffsets=new HashMap<>();
+  postRebalanceCurrentOffsets.put(TOPIC_PARTITION,new OffsetAndMetadata(FIRST_OFFSET + 3));
+  postRebalanceCurrentOffsets.put(TOPIC_PARTITION2,new OffsetAndMetadata(FIRST_OFFSET));
+  postRebalanceCurrentOffsets.put(TOPIC_PARTITION3,new OffsetAndMetadata(FIRST_OFFSET + 2));
+  sinkTask.preCommit(workerCurrentOffsets);
+  EasyMock.expectLastCall().andReturn(workerCurrentOffsets);
+  final AtomicReference<Runnable> asyncCallbackRunner=new AtomicReference<>();
+  final AtomicBoolean asyncCallbackRan=new AtomicBoolean();
+  consumer.commitAsync(EasyMock.eq(workerCurrentOffsets),EasyMock.<OffsetCommitCallback>anyObject());
+  EasyMock.expectLastCall().andAnswer(new IAnswer<Void>(){
+    @SuppressWarnings("unchecked") @Override public Void answer() throws Throwable {
+      final Object[] args=EasyMock.getCurrentArguments();
+      final Map<TopicPartition,OffsetAndMetadata> offsets=(Map<TopicPartition,OffsetAndMetadata>)args[0];
+      final OffsetCommitCallback callback=(OffsetCommitCallback)args[1];
+      asyncCallbackRunner.set(new Runnable(){
+        @Override public void run(){
+          callback.onComplete(offsets,null);
+          asyncCallbackRan.set(true);
+        }
+      }
+);
+      return null;
+    }
+  }
+);
+  final AtomicBoolean rebalanced=new AtomicBoolean();
+  EasyMock.expect(consumer.poll(Duration.ofMillis(EasyMock.anyLong()))).andAnswer(new IAnswer<ConsumerRecords<byte[],byte[]>>(){
+    @Override public ConsumerRecords<byte[],byte[]> answer() throws Throwable {
+      rebalanceListener.getValue().onPartitionsRevoked(originalPartitions);
+      Map<TopicPartition,Long> offsets=new HashMap<>();
+      offsets.put(TOPIC_PARTITION,rebalanceOffsets.get(TOPIC_PARTITION).offset());
+      offsets.put(TOPIC_PARTITION2,rebalanceOffsets.get(TOPIC_PARTITION2).offset());
+      offsets.put(TOPIC_PARTITION3,rebalanceOffsets.get(TOPIC_PARTITION3).offset());
+      sinkTaskContext.getValue().offset(offsets);
+      rebalanceListener.getValue().onPartitionsAssigned(rebalancedPartitions);
+      rebalanced.set(true);
+      asyncCallbackRunner.get().run();
+      long timestamp=RecordBatch.NO_TIMESTAMP;
+      TimestampType timestampType=TimestampType.NO_TIMESTAMP_TYPE;
+      List<ConsumerRecord<byte[],byte[]>> records=new ArrayList<>();
+      records.add(new ConsumerRecord<>(TOPIC,PARTITION,FIRST_OFFSET + recordsReturnedTp1 + 1,timestamp,timestampType,0L,0,0,RAW_KEY,RAW_VALUE));
+      records.add(new ConsumerRecord<>(TOPIC,PARTITION3,FIRST_OFFSET + recordsReturnedTp3 + 1,timestamp,timestampType,0L,0,0,RAW_KEY,RAW_VALUE));
+      recordsReturnedTp1+=1;
+      recordsReturnedTp3+=1;
+      return new ConsumerRecords<>(Collections.singletonMap(new TopicPartition(TOPIC,PARTITION),records));
+    }
+  }
+);
+  sinkTask.preCommit(workerCurrentOffsets);
+  EasyMock.expectLastCall().andReturn(workerCurrentOffsets);
+  sinkTask.put(EasyMock.<Collection<SinkRecord>>anyObject());
+  EasyMock.expectLastCall();
+  sinkTask.close(workerCurrentOffsets.keySet());
+  EasyMock.expectLastCall();
+  consumer.commitSync(workerCurrentOffsets);
+  EasyMock.expectLastCall();
+  final long offsetTp1=rebalanceOffsets.get(TOPIC_PARTITION).offset();
+  final long offsetTp2=rebalanceOffsets.get(TOPIC_PARTITION2).offset();
+  final long offsetTp3=rebalanceOffsets.get(TOPIC_PARTITION3).offset();
+  EasyMock.expect(consumer.position(TOPIC_PARTITION)).andReturn(offsetTp1);
+  EasyMock.expect(consumer.position(TOPIC_PARTITION2)).andReturn(offsetTp2);
+  EasyMock.expect(consumer.position(TOPIC_PARTITION3)).andReturn(offsetTp3);
+  sinkTask.open(rebalancedPartitions);
+  EasyMock.expectLastCall();
+  consumer.seek(TOPIC_PARTITION,offsetTp1);
+  EasyMock.expectLastCall();
+  consumer.seek(TOPIC_PARTITION2,offsetTp2);
+  EasyMock.expectLastCall();
+  consumer.seek(TOPIC_PARTITION3,offsetTp3);
+  EasyMock.expectLastCall();
+  sinkTask.preCommit(postRebalanceCurrentOffsets);
+  EasyMock.expectLastCall().andReturn(postRebalanceCurrentOffsets);
+  final Capture<OffsetCommitCallback> callback=EasyMock.newCapture();
+  consumer.commitAsync(EasyMock.eq(postRebalanceCurrentOffsets),EasyMock.capture(callback));
+  EasyMock.expectLastCall().andAnswer(new IAnswer<Void>(){
+    @Override public Void answer() throws Throwable {
+      callback.getValue().onComplete(postRebalanceCurrentOffsets,null);
+      return null;
+    }
+  }
+);
+  expectConsumerPoll(1);
+  sinkTask.put(EasyMock.<Collection<SinkRecord>>anyObject());
+  EasyMock.expectLastCall();
+  PowerMock.replayAll();
+  workerTask.initialize(TASK_CONFIG);
+  workerTask.initializeAndStart();
+  workerTask.iteration();
+  assertEquals(workerStartingOffsets,Whitebox.getInternalState(workerTask,"currentOffsets"));
+  assertEquals(workerStartingOffsets,Whitebox.getInternalState(workerTask,"lastCommittedOffsets"));
+  time.sleep(WorkerConfig.OFFSET_COMMIT_TIMEOUT_MS_DEFAULT);
+  workerTask.iteration();
+  sinkTaskContext.getValue().requestCommit();
+  workerTask.iteration();
+  assertSinkMetricValue("partition-count",3);
+  assertSinkMetricValue("sink-record-read-total",3.0);
+  assertSinkMetricValue("sink-record-send-total",3.0);
+  assertSinkMetricValue("sink-record-active-count",4.0);
+  assertSinkMetricValue("sink-record-active-count-max",4.0);
+  assertSinkMetricValue("sink-record-active-count-avg",0.71429);
+  assertSinkMetricValue("offset-commit-seq-no",2.0);
+  assertSinkMetricValue("offset-commit-completion-total",1.0);
+  assertSinkMetricValue("offset-commit-skip-total",1.0);
+  assertTaskMetricValue("status","running");
+  assertTaskMetricValue("running-ratio",1.0);
+  assertTaskMetricValue("pause-ratio",0.0);
+  assertTaskMetricValue("batch-size-max",2.0);
+  assertTaskMetricValue("batch-size-avg",1.0);
+  assertTaskMetricValue("offset-commit-max-time-ms",0.0);
+  assertTaskMetricValue("offset-commit-avg-time-ms",0.0);
+  assertTaskMetricValue("offset-commit-failure-percentage",0.0);
+  assertTaskMetricValue("offset-commit-success-percentage",1.0);
+  assertTrue(asyncCallbackRan.get());
+  assertTrue(rebalanced.get());
+  assertEquals(postRebalanceCurrentOffsets,Whitebox.getInternalState(workerTask,"currentOffsets"));
+  assertEquals(rebalanceOffsets,Whitebox.getInternalState(workerTask,"lastCommittedOffsets"));
+  time.sleep(WorkerConfig.OFFSET_COMMIT_TIMEOUT_MS_DEFAULT);
+  sinkTaskContext.getValue().requestCommit();
+  workerTask.iteration();
+  assertEquals(postRebalanceCurrentOffsets,Whitebox.getInternalState(workerTask,"currentOffsets"));
+  assertEquals(postRebalanceCurrentOffsets,Whitebox.getInternalState(workerTask,"lastCommittedOffsets"));
+  assertSinkMetricValue("partition-count",3);
+  assertSinkMetricValue("sink-record-read-total",4.0);
+  assertSinkMetricValue("sink-record-send-total",4.0);
+  assertSinkMetricValue("sink-record-active-count",0.0);
+  assertSinkMetricValue("sink-record-active-count-max",4.0);
+  assertSinkMetricValue("sink-record-active-count-avg",0.5555555);
+  assertSinkMetricValue("offset-commit-seq-no",3.0);
+  assertSinkMetricValue("offset-commit-completion-total",2.0);
+  assertSinkMetricValue("offset-commit-skip-total",1.0);
+  assertTaskMetricValue("status","running");
+  assertTaskMetricValue("running-ratio",1.0);
+  assertTaskMetricValue("pause-ratio",0.0);
+  assertTaskMetricValue("batch-size-max",2.0);
+  assertTaskMetricValue("batch-size-avg",1.0);
+  assertTaskMetricValue("offset-commit-max-time-ms",0.0);
+  assertTaskMetricValue("offset-commit-avg-time-ms",0.0);
+  assertTaskMetricValue("offset-commit-failure-percentage",0.0);
+  assertTaskMetricValue("offset-commit-success-percentage",1.0);
+  PowerMock.verifyAll();
+}

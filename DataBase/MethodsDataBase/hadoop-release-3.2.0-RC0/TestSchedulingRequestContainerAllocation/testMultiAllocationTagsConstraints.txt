@@ -1,0 +1,47 @@
+@Test(timeout=30000L) public void testMultiAllocationTagsConstraints() throws Exception {
+  YarnConfiguration config=new YarnConfiguration();
+  config.set(YarnConfiguration.RM_PLACEMENT_CONSTRAINTS_HANDLER,YarnConfiguration.SCHEDULER_RM_PLACEMENT_CONSTRAINTS_HANDLER);
+  config.setClass(YarnConfiguration.RM_SCHEDULER,CapacityScheduler.class,ResourceScheduler.class);
+  MockRM rm=new MockRM(config);
+  try {
+    rm.start();
+    MockNM nm1=rm.registerNode("192.168.0.1:1234",10 * GB,10);
+    MockNM nm2=rm.registerNode("192.168.0.2:1234",10 * GB,10);
+    MockNM nm3=rm.registerNode("192.168.0.3:1234",10 * GB,10);
+    MockNM nm4=rm.registerNode("192.168.0.4:1234",10 * GB,10);
+    MockNM nm5=rm.registerNode("192.168.0.5:1234",10 * GB,10);
+    RMApp app1=rm.submitApp(1 * GB,ImmutableSet.of("server1"));
+    doNodeHeartbeat(nm1);
+    RMAppAttempt attempt1=app1.getCurrentAppAttempt();
+    MockAM am1=rm.sendAMLaunched(attempt1.getAppAttemptId());
+    am1.registerAppAttempt();
+    String[] server1Ports=new String[]{"port_6000","port_7000","port_8000"};
+    PlacementConstraint pc=targetNotIn("node",allocationTagWithNamespace(AllocationTagNamespaceType.ALL.toString(),server1Ports)).build();
+    am1.addSchedulingRequest(ImmutableList.of(schedulingRequest(1,2,1,1024,pc,server1Ports)));
+    List<Container> allocated=waitForAllocation(2,3000,am1,nm1,nm2,nm3,nm4,nm5);
+    Assert.assertEquals(2,allocated.size());
+    Assert.assertEquals(2,getContainerNodesNum(allocated));
+    String[] server2Ports=new String[]{"port_6000"};
+    RMApp app2=rm.submitApp(1 * GB,ImmutableSet.of("server2"));
+    doNodeHeartbeat(nm2);
+    RMAppAttempt app2attempt1=app2.getCurrentAppAttempt();
+    MockAM am2=rm.sendAMLaunched(app2attempt1.getAppAttemptId());
+    am2.registerAppAttempt();
+    pc=targetNotIn("node",allocationTagWithNamespace(AllocationTagNamespaceType.ALL.toString(),server2Ports)).build();
+    am2.addSchedulingRequest(ImmutableList.of(schedulingRequest(1,3,1,1024,pc,server2Ports)));
+    allocated=waitForAllocation(3,3000,am2,nm1,nm2,nm3,nm4,nm5);
+    Assert.assertEquals(3,allocated.size());
+    Assert.assertEquals(3,getContainerNodesNum(allocated));
+    ConcurrentMap<NodeId,RMNode> rmNodes=rm.getRMContext().getRMNodes();
+    for (    Container c : allocated) {
+      RMNode rmNode=rmNodes.get(c.getNodeId());
+      Assert.assertNotNull(rmNode);
+      Assert.assertTrue("server2 should not co-allocate to server1 as" + " they both need to use port 6000",rmNode.getAllocationTagsWithCount().get("port_6000") == 1);
+      Assert.assertFalse(rmNode.getAllocationTagsWithCount().containsKey("port_7000"));
+      Assert.assertFalse(rmNode.getAllocationTagsWithCount().containsKey("port_8000"));
+    }
+  }
+  finally {
+    rm.stop();
+  }
+}

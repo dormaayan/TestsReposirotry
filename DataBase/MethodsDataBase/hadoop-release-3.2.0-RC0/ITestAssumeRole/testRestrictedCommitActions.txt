@@ -1,0 +1,60 @@
+@Test public void testRestrictedCommitActions() throws Throwable {
+  describe("Attempt commit operations against a path with restricted rights");
+  Configuration conf=createAssumedRoleConfig();
+  conf.setBoolean(CommitConstants.MAGIC_COMMITTER_ENABLED,true);
+  final int uploadPartSize=5 * 1024 * 1024;
+  Path basePath=methodPath();
+  Path readOnlyDir=new Path(basePath,"readOnlyDir");
+  Path writeableDir=new Path(basePath,"writeableDir");
+  S3AFileSystem fs=getFileSystem();
+  fs.delete(basePath,true);
+  fs.mkdirs(readOnlyDir);
+  bindRolePolicyStatements(conf,STATEMENT_S3GUARD_CLIENT,STATEMENT_ALLOW_SSE_KMS_RW,statement(true,S3_ALL_BUCKETS,S3_ROOT_READ_OPERATIONS),new Statement(Effects.Allow).addActions(S3_PATH_RW_OPERATIONS).addResources(directory(writeableDir)));
+  roleFS=(S3AFileSystem)writeableDir.getFileSystem(conf);
+  CommitOperations fullOperations=new CommitOperations(fs);
+  CommitOperations operations=new CommitOperations(roleFS);
+  File localSrc=File.createTempFile("source","");
+  writeCSVData(localSrc);
+  Path uploadDest=new Path(readOnlyDir,"restricted.csv");
+  forbidden("initiate MultiPartUpload",() -> {
+    return operations.uploadFileToPendingCommit(localSrc,uploadDest,"",uploadPartSize);
+  }
+);
+  localSrc.delete();
+  localSrc.mkdirs();
+  int range=2;
+  IntStream.rangeClosed(1,range).parallel().forEach((i) -> eval(() -> {
+    String name="part-000" + i;
+    File src=new File(localSrc,name);
+    Path dest=new Path(readOnlyDir,name);
+    writeCSVData(src);
+    SinglePendingCommit pending=fullOperations.uploadFileToPendingCommit(src,dest,"",uploadPartSize);
+    pending.save(fs,new Path(readOnlyDir,name + CommitConstants.PENDING_SUFFIX),true);
+    assertTrue(src.delete());
+  }
+));
+  try {
+    Pair<PendingSet,List<Pair<LocatedFileStatus,IOException>>> pendingCommits=operations.loadSinglePendingCommits(readOnlyDir,true);
+    List<SinglePendingCommit> commits=pendingCommits.getLeft().getCommits();
+    assertEquals(range,commits.size());
+    commits.parallelStream().forEach((c) -> {
+      CommitOperations.MaybeIOE maybeIOE=operations.commit(c,"origin");
+      Path path=c.destinationPath();
+      assertCommitAccessDenied(path,maybeIOE);
+    }
+);
+    LOG.info("abortAllSinglePendingCommits({})",readOnlyDir);
+    assertCommitAccessDenied(readOnlyDir,operations.abortAllSinglePendingCommits(readOnlyDir,true));
+    Path magicDestPath=new Path(readOnlyDir,CommitConstants.MAGIC + "/" + "magic.txt");
+    forbidden("",() -> {
+      touch(roleFS,magicDestPath);
+      return fs.getFileStatus(magicDestPath);
+    }
+);
+    forbidden("",() -> operations.abortPendingUploadsUnderPath(readOnlyDir));
+  }
+  finally {
+    LOG.info("Cleanup");
+    fullOperations.abortPendingUploadsUnderPath(readOnlyDir);
+  }
+}

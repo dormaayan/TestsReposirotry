@@ -1,0 +1,29 @@
+@Test public void testCreateTopicsRetryBackoff() throws Exception {
+  Cluster cluster=mockCluster(0);
+  MockTime time=new MockTime();
+  MockClient mockClient=new MockClient(time);
+  int retryBackoff=100;
+  mockClient.prepareResponse(body -> body instanceof MetadataRequest,new MetadataResponse(cluster.nodes(),cluster.clusterResource().clusterId(),1,Collections.emptyList()));
+  AtomicLong firstAttemptTime=new AtomicLong(0);
+  AtomicLong secondAttemptTime=new AtomicLong(0);
+  mockClient.prepareResponse(body -> {
+    firstAttemptTime.set(time.milliseconds());
+    return body instanceof CreateTopicsRequest;
+  }
+,null,true);
+  mockClient.prepareResponse(body -> {
+    secondAttemptTime.set(time.milliseconds());
+    return body instanceof CreateTopicsRequest;
+  }
+,new CreateTopicsResponse(Collections.singletonMap("myTopic",new ApiError(Errors.NONE,""))));
+  try (final AdminClientUnitTestEnv env=new AdminClientUnitTestEnv(mockClient,time,cluster,newStrMap(AdminClientConfig.RETRY_BACKOFF_MS_CONFIG,"" + retryBackoff))){
+    mockClient.setNodeApiVersions(NodeApiVersions.create());
+    mockClient.setNode(env.cluster().controller());
+    KafkaFuture<Void> future=env.adminClient().createTopics(Collections.singleton(new NewTopic("myTopic",Collections.singletonMap(0,asList(0,1,2)))),new CreateTopicsOptions().timeoutMs(10000)).all();
+    TestUtils.waitForCondition(() -> mockClient.numAwaitingResponses() == 1,"Failed awaiting CreateTopics first request failure");
+    time.sleep(retryBackoff);
+    future.get();
+  }
+   long actualRetryBackoff=secondAttemptTime.get() - firstAttemptTime.get();
+  assertEquals("CreateTopics retry did not await expected backoff",retryBackoff,actualRetryBackoff);
+}

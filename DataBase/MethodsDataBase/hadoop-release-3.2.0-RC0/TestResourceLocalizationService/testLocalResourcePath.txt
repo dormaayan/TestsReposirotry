@@ -1,0 +1,73 @@
+@Test(timeout=10000) @SuppressWarnings("unchecked") public void testLocalResourcePath() throws Exception {
+  DrainDispatcher dispatcher1=null;
+  try {
+    dispatcher1=new DrainDispatcher();
+    String user="testuser";
+    ApplicationId appId=BuilderUtils.newApplicationId(1,1);
+    List<Path> localDirs=new ArrayList<Path>();
+    String[] sDirs=new String[1];
+    for (int i=0; i < 1; ++i) {
+      localDirs.add(lfs.makeQualified(new Path(basedir,i + "")));
+      sDirs[i]=localDirs.get(i).toString();
+    }
+    conf.setStrings(YarnConfiguration.NM_LOCAL_DIRS,sDirs);
+    LocalDirsHandlerService localDirHandler=new LocalDirsHandlerService();
+    localDirHandler.init(conf);
+    EventHandler<ApplicationEvent> applicationBus=mock(EventHandler.class);
+    dispatcher1.register(ApplicationEventType.class,applicationBus);
+    EventHandler<ContainerEvent> containerBus=mock(EventHandler.class);
+    dispatcher1.register(ContainerEventType.class,containerBus);
+    ContainerExecutor exec=mock(ContainerExecutor.class);
+    DeletionService delService=mock(DeletionService.class);
+    LocalDirsHandlerService dirsHandler=new LocalDirsHandlerService();
+    dirsHandler.init(conf);
+    dispatcher1.init(conf);
+    dispatcher1.start();
+    ResourceLocalizationService rls=new ResourceLocalizationService(dispatcher1,exec,delService,localDirHandler,nmContext,metrics);
+    dispatcher1.register(LocalizationEventType.class,rls);
+    rls.init(conf);
+    rls.handle(createApplicationLocalizationEvent(user,appId));
+    Container container1=createMockContainer(user,1);
+    String localizerId1=container1.getContainerId().toString();
+    rls.getPrivateLocalizers().put(localizerId1,rls.new LocalizerRunner(new LocalizerContext(user,container1.getContainerId(),null),localizerId1));
+    LocalResourceRequest reqPriv=new LocalResourceRequest(new Path("file:///tmp1"),123L,LocalResourceType.FILE,LocalResourceVisibility.PRIVATE,"");
+    List<LocalResourceRequest> privList=new ArrayList<LocalResourceRequest>();
+    privList.add(reqPriv);
+    LocalResourceRequest reqApp=new LocalResourceRequest(new Path("file:///tmp2"),123L,LocalResourceType.FILE,LocalResourceVisibility.APPLICATION,"");
+    List<LocalResourceRequest> appList=new ArrayList<LocalResourceRequest>();
+    appList.add(reqApp);
+    Map<LocalResourceVisibility,Collection<LocalResourceRequest>> rsrcs=new HashMap<LocalResourceVisibility,Collection<LocalResourceRequest>>();
+    rsrcs.put(LocalResourceVisibility.APPLICATION,appList);
+    rsrcs.put(LocalResourceVisibility.PRIVATE,privList);
+    dispatcher1.getEventHandler().handle(new ContainerLocalizationRequestEvent(container1,rsrcs));
+    Assert.assertTrue(waitForPrivateDownloadToStart(rls,localizerId1,2,5000));
+    String userCachePath=StringUtils.join(Path.SEPARATOR,Arrays.asList(localDirs.get(0).toUri().getRawPath(),ContainerLocalizer.USERCACHE,user,ContainerLocalizer.FILECACHE));
+    String userAppCachePath=StringUtils.join(Path.SEPARATOR,Arrays.asList(localDirs.get(0).toUri().getRawPath(),ContainerLocalizer.USERCACHE,user,ContainerLocalizer.APPCACHE,appId.toString(),ContainerLocalizer.FILECACHE));
+    int returnedResources=0;
+    boolean appRsrc=false, privRsrc=false;
+    while (returnedResources < 2) {
+      LocalizerHeartbeatResponse response=rls.heartbeat(createLocalizerStatus(localizerId1));
+      for (      ResourceLocalizationSpec resourceSpec : response.getResourceSpecs()) {
+        returnedResources++;
+        Path destinationDirectory=new Path(resourceSpec.getDestinationDirectory().getFile());
+        if (resourceSpec.getResource().getVisibility() == LocalResourceVisibility.APPLICATION) {
+          appRsrc=true;
+          Assert.assertEquals(userAppCachePath,destinationDirectory.getParent().toUri().toString());
+        }
+ else         if (resourceSpec.getResource().getVisibility() == LocalResourceVisibility.PRIVATE) {
+          privRsrc=true;
+          Assert.assertEquals(userCachePath,destinationDirectory.getParent().toUri().toString());
+        }
+ else {
+          throw new Exception("Unexpected resource received.");
+        }
+      }
+    }
+    Assert.assertTrue(appRsrc && privRsrc);
+  }
+  finally {
+    if (dispatcher1 != null) {
+      dispatcher1.stop();
+    }
+  }
+}

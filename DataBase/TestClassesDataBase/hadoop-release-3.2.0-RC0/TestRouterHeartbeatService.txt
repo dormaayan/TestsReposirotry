@@ -1,0 +1,68 @@
+/** 
+ * Test cases for router heartbeat service.
+ */
+public class TestRouterHeartbeatService {
+  private Router router;
+  private final String routerId="router1";
+  private TestingServer testingServer;
+  private CuratorFramework curatorFramework;
+  @Before public void setup() throws Exception {
+    router=new Router();
+    router.setRouterId(routerId);
+    Configuration conf=new Configuration();
+    conf.setInt(RBFConfigKeys.DFS_ROUTER_CACHE_TIME_TO_LIVE_MS,1);
+    Configuration routerConfig=new RouterConfigBuilder(conf).stateStore().build();
+    routerConfig.setLong(RBFConfigKeys.FEDERATION_STORE_CONNECTION_TEST_MS,TimeUnit.HOURS.toMillis(1));
+    routerConfig.setClass(RBFConfigKeys.FEDERATION_STORE_DRIVER_CLASS,StateStoreZooKeeperImpl.class,StateStoreDriver.class);
+    testingServer=new TestingServer();
+    String connectStr=testingServer.getConnectString();
+    curatorFramework=CuratorFrameworkFactory.builder().connectString(connectStr).retryPolicy(new RetryNTimes(100,100)).build();
+    curatorFramework.start();
+    routerConfig.set(CommonConfigurationKeys.ZK_ADDRESS,connectStr);
+    router.init(routerConfig);
+    router.start();
+    waitStateStore(router.getStateStore(),TimeUnit.SECONDS.toMicros(10));
+  }
+  @Test public void testStateStoreUnavailable() throws IOException {
+    curatorFramework.close();
+    testingServer.stop();
+    router.getStateStore().stop();
+    assertFalse(router.getStateStore().isDriverReady());
+    RouterHeartbeatService heartbeatService=new RouterHeartbeatService(router);
+    heartbeatService.updateStateStore();
+  }
+  @Test public void testStateStoreAvailable() throws Exception {
+    StateStoreService stateStore=router.getStateStore();
+    assertTrue(router.getStateStore().isDriverReady());
+    RouterStore routerStore=router.getRouterStateManager();
+    stateStore.refreshCaches(true);
+    GetRouterRegistrationRequest request=GetRouterRegistrationRequest.newInstance(routerId);
+    GetRouterRegistrationResponse response=router.getRouterStateManager().getRouterRegistration(request);
+    RouterState routerState=response.getRouter();
+    String id=routerState.getRouterId();
+    StateStoreVersion version=routerState.getStateStoreVersion();
+    assertNull(id);
+    assertNull(version);
+    RouterHeartbeatService heartbeatService=new RouterHeartbeatService(router);
+    heartbeatService.updateStateStore();
+    stateStore.refreshCaches(true);
+    request=GetRouterRegistrationRequest.newInstance(routerId);
+    response=routerStore.getRouterRegistration(request);
+    routerState=response.getRouter();
+    id=routerState.getRouterId();
+    version=routerState.getStateStoreVersion();
+    assertNotNull(id);
+    assertNotNull(version);
+  }
+  @After public void tearDown() throws IOException {
+    if (curatorFramework != null) {
+      curatorFramework.close();
+    }
+    if (testingServer != null) {
+      testingServer.stop();
+    }
+    if (router != null) {
+      router.shutDown();
+    }
+  }
+}

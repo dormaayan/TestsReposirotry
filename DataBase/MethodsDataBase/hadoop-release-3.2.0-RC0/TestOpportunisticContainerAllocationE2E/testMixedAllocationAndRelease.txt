@@ -1,0 +1,90 @@
+@Test(timeout=60000) public void testMixedAllocationAndRelease() throws YarnException, IOException {
+  assertEquals(0,amClient.ask.size());
+  assertEquals(0,amClient.release.size());
+  amClient.addContainerRequest(new AMRMClient.ContainerRequest(capability,nodes,racks,priority));
+  amClient.addContainerRequest(new AMRMClient.ContainerRequest(capability,nodes,racks,priority));
+  amClient.addContainerRequest(new AMRMClient.ContainerRequest(capability,nodes,racks,priority));
+  amClient.addContainerRequest(new AMRMClient.ContainerRequest(capability,nodes,racks,priority));
+  amClient.addContainerRequest(new AMRMClient.ContainerRequest(capability,null,null,priority2,0,true,null,ExecutionTypeRequest.newInstance(ExecutionType.OPPORTUNISTIC,true)));
+  amClient.addContainerRequest(new AMRMClient.ContainerRequest(capability,null,null,priority2,0,true,null,ExecutionTypeRequest.newInstance(ExecutionType.OPPORTUNISTIC,true)));
+  int containersRequestedNode=amClient.getTable(0).get(priority,node,ExecutionType.GUARANTEED,capability).remoteRequest.getNumContainers();
+  int containersRequestedRack=amClient.getTable(0).get(priority,rack,ExecutionType.GUARANTEED,capability).remoteRequest.getNumContainers();
+  int containersRequestedAny=amClient.getTable(0).get(priority,ResourceRequest.ANY,ExecutionType.GUARANTEED,capability).remoteRequest.getNumContainers();
+  int oppContainersRequestedAny=amClient.getTable(0).get(priority2,ResourceRequest.ANY,ExecutionType.OPPORTUNISTIC,capability).remoteRequest.getNumContainers();
+  assertEquals(4,containersRequestedNode);
+  assertEquals(4,containersRequestedRack);
+  assertEquals(4,containersRequestedAny);
+  assertEquals(2,oppContainersRequestedAny);
+  assertEquals(4,amClient.ask.size());
+  assertEquals(0,amClient.release.size());
+  amClient.removeContainerRequest(new AMRMClient.ContainerRequest(capability,nodes,racks,priority));
+  amClient.removeContainerRequest(new AMRMClient.ContainerRequest(capability,nodes,racks,priority));
+  amClient.removeContainerRequest(new AMRMClient.ContainerRequest(capability,null,null,priority2,0,true,null,ExecutionTypeRequest.newInstance(ExecutionType.OPPORTUNISTIC,true)));
+  containersRequestedNode=amClient.getTable(0).get(priority,node,ExecutionType.GUARANTEED,capability).remoteRequest.getNumContainers();
+  containersRequestedRack=amClient.getTable(0).get(priority,rack,ExecutionType.GUARANTEED,capability).remoteRequest.getNumContainers();
+  containersRequestedAny=amClient.getTable(0).get(priority,ResourceRequest.ANY,ExecutionType.GUARANTEED,capability).remoteRequest.getNumContainers();
+  oppContainersRequestedAny=amClient.getTable(0).get(priority2,ResourceRequest.ANY,ExecutionType.OPPORTUNISTIC,capability).remoteRequest.getNumContainers();
+  assertEquals(2,containersRequestedNode);
+  assertEquals(2,containersRequestedRack);
+  assertEquals(2,containersRequestedAny);
+  assertEquals(1,oppContainersRequestedAny);
+  assertEquals(4,amClient.ask.size());
+  assertEquals(0,amClient.release.size());
+  int allocatedContainerCount=0;
+  int allocatedOpportContainerCount=0;
+  int iterationsLeft=50;
+  Set<ContainerId> releases=new TreeSet<>();
+  amClient.getNMTokenCache().clearCache();
+  Assert.assertEquals(0,amClient.getNMTokenCache().numberOfTokensInCache());
+  HashMap<String,Token> receivedNMTokens=new HashMap<>();
+  while (allocatedContainerCount < containersRequestedAny + oppContainersRequestedAny && iterationsLeft-- > 0) {
+    AllocateResponse allocResponse=amClient.allocate(0.1f);
+    assertEquals(0,amClient.ask.size());
+    assertEquals(0,amClient.release.size());
+    allocatedContainerCount+=allocResponse.getAllocatedContainers().size();
+    for (    Container container : allocResponse.getAllocatedContainers()) {
+      if (container.getExecutionType() == ExecutionType.OPPORTUNISTIC) {
+        allocatedOpportContainerCount++;
+      }
+      ContainerId rejectContainerId=container.getId();
+      releases.add(rejectContainerId);
+    }
+    for (    NMToken token : allocResponse.getNMTokens()) {
+      String nodeID=token.getNodeId().toString();
+      receivedNMTokens.put(nodeID,token.getToken());
+    }
+    if (allocatedContainerCount < containersRequestedAny) {
+      sleep(100);
+    }
+  }
+  assertEquals(containersRequestedAny + oppContainersRequestedAny,allocatedContainerCount);
+  assertEquals(oppContainersRequestedAny,allocatedOpportContainerCount);
+  for (  ContainerId rejectContainerId : releases) {
+    amClient.releaseAssignedContainer(rejectContainerId);
+  }
+  assertEquals(3,amClient.release.size());
+  assertEquals(0,amClient.ask.size());
+  amClient.removeContainerRequest(new AMRMClient.ContainerRequest(capability,nodes,racks,priority));
+  amClient.removeContainerRequest(new AMRMClient.ContainerRequest(capability,nodes,racks,priority));
+  amClient.removeContainerRequest(new AMRMClient.ContainerRequest(capability,nodes,racks,priority2,0,true,null,ExecutionTypeRequest.newInstance(ExecutionType.OPPORTUNISTIC,true)));
+  assertEquals(4,amClient.ask.size());
+  iterationsLeft=3;
+  while (iterationsLeft-- > 0) {
+    AllocateResponse allocResponse=amClient.allocate(0.1f);
+    assertEquals(0,allocResponse.getAllocatedContainers().size());
+    if (allocResponse.getCompletedContainersStatuses().size() > 0) {
+      for (      ContainerStatus cStatus : allocResponse.getCompletedContainersStatuses()) {
+        if (releases.contains(cStatus.getContainerId())) {
+          assertEquals(cStatus.getState(),ContainerState.COMPLETE);
+          assertEquals(-100,cStatus.getExitStatus());
+          releases.remove(cStatus.getContainerId());
+        }
+      }
+    }
+    if (iterationsLeft > 0) {
+      sleep(100);
+    }
+  }
+  assertEquals(0,amClient.ask.size());
+  assertEquals(0,amClient.release.size());
+}

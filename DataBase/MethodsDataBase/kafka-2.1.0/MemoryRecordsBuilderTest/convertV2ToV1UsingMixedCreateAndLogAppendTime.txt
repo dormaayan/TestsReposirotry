@@ -1,0 +1,40 @@
+@Test public void convertV2ToV1UsingMixedCreateAndLogAppendTime(){
+  if (compressionType == CompressionType.ZSTD) {
+    exceptionRule.expect(UnsupportedCompressionTypeException.class);
+    exceptionRule.expectMessage("Down-conversion of zstandard-compressed batches is not supported");
+  }
+  ByteBuffer buffer=ByteBuffer.allocate(512);
+  MemoryRecordsBuilder builder=MemoryRecords.builder(buffer,RecordBatch.MAGIC_VALUE_V2,compressionType,TimestampType.LOG_APPEND_TIME,0L);
+  builder.append(10L,"1".getBytes(),"a".getBytes());
+  builder.close();
+  int sizeExcludingTxnMarkers=buffer.position();
+  MemoryRecords.writeEndTransactionalMarker(buffer,1L,System.currentTimeMillis(),0,15L,(short)0,new EndTransactionMarker(ControlRecordType.ABORT,0));
+  int position=buffer.position();
+  builder=MemoryRecords.builder(buffer,RecordBatch.MAGIC_VALUE_V2,compressionType,TimestampType.CREATE_TIME,1L);
+  builder.append(12L,"2".getBytes(),"b".getBytes());
+  builder.append(13L,"3".getBytes(),"c".getBytes());
+  builder.close();
+  sizeExcludingTxnMarkers+=buffer.position() - position;
+  MemoryRecords.writeEndTransactionalMarker(buffer,14L,System.currentTimeMillis(),0,1L,(short)0,new EndTransactionMarker(ControlRecordType.COMMIT,0));
+  buffer.flip();
+  ConvertedRecords<MemoryRecords> convertedRecords=MemoryRecords.readableRecords(buffer).downConvert(RecordBatch.MAGIC_VALUE_V1,0,time);
+  MemoryRecords records=convertedRecords.records();
+  verifyRecordsProcessingStats(convertedRecords.recordConversionStats(),3,3,records.sizeInBytes(),sizeExcludingTxnMarkers);
+  List<? extends RecordBatch> batches=Utils.toList(records.batches().iterator());
+  if (compressionType != CompressionType.NONE) {
+    assertEquals(2,batches.size());
+    assertEquals(TimestampType.LOG_APPEND_TIME,batches.get(0).timestampType());
+    assertEquals(TimestampType.CREATE_TIME,batches.get(1).timestampType());
+  }
+ else {
+    assertEquals(3,batches.size());
+    assertEquals(TimestampType.LOG_APPEND_TIME,batches.get(0).timestampType());
+    assertEquals(TimestampType.CREATE_TIME,batches.get(1).timestampType());
+    assertEquals(TimestampType.CREATE_TIME,batches.get(2).timestampType());
+  }
+  List<Record> logRecords=Utils.toList(records.records().iterator());
+  assertEquals(3,logRecords.size());
+  assertEquals(ByteBuffer.wrap("1".getBytes()),logRecords.get(0).key());
+  assertEquals(ByteBuffer.wrap("2".getBytes()),logRecords.get(1).key());
+  assertEquals(ByteBuffer.wrap("3".getBytes()),logRecords.get(2).key());
+}

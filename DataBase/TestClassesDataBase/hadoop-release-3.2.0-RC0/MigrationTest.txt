@@ -1,0 +1,152 @@
+class MigrationTest {
+  private final ClusterScheme clusterScheme;
+  private final NamespaceScheme nsScheme;
+  private final Configuration conf;
+  private MiniDFSCluster cluster;
+  private DistributedFileSystem dfs;
+  private final BlockStoragePolicySuite policies;
+  MigrationTest(  ClusterScheme cScheme,  NamespaceScheme nsScheme){
+    this.clusterScheme=cScheme;
+    this.nsScheme=nsScheme;
+    this.conf=clusterScheme.conf;
+    this.policies=DEFAULT_POLICIES;
+  }
+  /** 
+ * Set up the cluster and start NameNode and DataNodes according to the corresponding scheme.
+ */
+  void setupCluster() throws Exception {
+    cluster=new MiniDFSCluster.Builder(conf).numDataNodes(clusterScheme.numDataNodes).storageTypes(clusterScheme.storageTypes).storageCapacities(clusterScheme.storageCapacities).build();
+    cluster.waitActive();
+    dfs=cluster.getFileSystem();
+  }
+  private void runBasicTest(  boolean shutdown) throws Exception {
+    setupCluster();
+    try {
+      prepareNamespace();
+      verify(true);
+      setStoragePolicy();
+      migrate(ExitStatus.SUCCESS);
+      verify(true);
+    }
+  finally {
+      if (shutdown) {
+        shutdownCluster();
+      }
+    }
+  }
+  void shutdownCluster() throws Exception {
+    IOUtils.cleanup(null,dfs);
+    if (cluster != null) {
+      cluster.shutdown();
+    }
+  }
+  /** 
+ * Create files/directories and set their storage policies according to the corresponding scheme.
+ */
+  void prepareNamespace() throws Exception {
+    nsScheme.prepare(dfs,clusterScheme.repl);
+  }
+  void setStoragePolicy() throws Exception {
+    nsScheme.setStoragePolicy(dfs);
+  }
+  /** 
+ * Run the migration tool.
+ */
+  void migrate(  ExitStatus expectedExitCode) throws Exception {
+    runMover(expectedExitCode);
+    Thread.sleep(5000);
+  }
+  /** 
+ * Verify block locations after running the migration tool.
+ */
+  void verify(  boolean verifyAll) throws Exception {
+    for (    DataNode dn : cluster.getDataNodes()) {
+      DataNodeTestUtils.triggerBlockReport(dn);
+    }
+    if (verifyAll) {
+      verifyNamespace();
+    }
+  }
+  private void runMover(  ExitStatus expectedExitCode) throws Exception {
+    Collection<URI> namenodes=DFSUtil.getInternalNsRpcUris(conf);
+    Map<URI,List<Path>> nnMap=Maps.newHashMap();
+    for (    URI nn : namenodes) {
+      nnMap.put(nn,null);
+    }
+    int result=Mover.run(nnMap,conf);
+    Assert.assertEquals(expectedExitCode.getExitCode(),result);
+  }
+  private void verifyNamespace() throws Exception {
+    HdfsFileStatus status=dfs.getClient().getFileInfo("/");
+    verifyRecursively(null,status);
+  }
+  private void verifyRecursively(  final Path parent,  final HdfsFileStatus status) throws Exception {
+    if (status.isDirectory()) {
+      Path fullPath=parent == null ? new Path("/") : status.getFullPath(parent);
+      DirectoryListing children=dfs.getClient().listPaths(fullPath.toString(),HdfsFileStatus.EMPTY_NAME,true);
+      for (      HdfsFileStatus child : children.getPartialListing()) {
+        verifyRecursively(fullPath,child);
+      }
+    }
+ else     if (!status.isSymlink()) {
+      verifyFile(parent,status,null);
+    }
+  }
+  void verifyFile(  final Path file,  final Byte expectedPolicyId) throws Exception {
+    final Path parent=file.getParent();
+    DirectoryListing children=dfs.getClient().listPaths(parent.toString(),HdfsFileStatus.EMPTY_NAME,true);
+    for (    HdfsFileStatus child : children.getPartialListing()) {
+      if (child.getLocalName().equals(file.getName())) {
+        verifyFile(parent,child,expectedPolicyId);
+        return;
+      }
+    }
+    Assert.fail("File " + file + " not found.");
+  }
+  private void verifyFile(  final Path parent,  final HdfsFileStatus status,  final Byte expectedPolicyId) throws Exception {
+    HdfsLocatedFileStatus fileStatus=(HdfsLocatedFileStatus)status;
+    byte policyId=fileStatus.getStoragePolicy();
+    BlockStoragePolicy policy=policies.getPolicy(policyId);
+    if (expectedPolicyId != null) {
+      Assert.assertEquals((byte)expectedPolicyId,policy.getId());
+    }
+    final List<StorageType> types=policy.chooseStorageTypes(status.getReplication());
+    for (    LocatedBlock lb : fileStatus.getLocatedBlocks().getLocatedBlocks()) {
+      final Mover.StorageTypeDiff diff=new Mover.StorageTypeDiff(types,lb.getStorageTypes());
+      Assert.assertTrue(fileStatus.getFullName(parent.toString()) + " with policy " + policy+ " has non-empty overlap: "+ diff+ ", the corresponding block is "+ lb.getBlock().getLocalBlock(),diff.removeOverlap(true));
+    }
+  }
+  Replication getReplication(  Path file) throws IOException {
+    return getOrVerifyReplication(file,null);
+  }
+  Replication verifyReplication(  Path file,  int expectedDiskCount,  int expectedArchiveCount) throws IOException {
+    final Replication r=new Replication();
+    r.disk=expectedDiskCount;
+    r.archive=expectedArchiveCount;
+    return getOrVerifyReplication(file,r);
+  }
+  private Replication getOrVerifyReplication(  Path file,  Replication expected) throws IOException {
+    final List<LocatedBlock> lbs=dfs.getClient().getLocatedBlocks(file.toString(),0).getLocatedBlocks();
+    Assert.assertEquals(1,lbs.size());
+    LocatedBlock lb=lbs.get(0);
+    StringBuilder types=new StringBuilder();
+    final Replication r=new Replication();
+    for (    StorageType t : lb.getStorageTypes()) {
+      types.append(t).append(", ");
+      if (t == StorageType.DISK) {
+        r.disk++;
+      }
+ else       if (t == StorageType.ARCHIVE) {
+        r.archive++;
+      }
+ else {
+        Assert.fail("Unexpected storage type " + t);
+      }
+    }
+    if (expected != null) {
+      final String s="file = " + file + "\n  types = ["+ types+ "]";
+      Assert.assertEquals(s,expected,r);
+    }
+    return r;
+  }
+}
