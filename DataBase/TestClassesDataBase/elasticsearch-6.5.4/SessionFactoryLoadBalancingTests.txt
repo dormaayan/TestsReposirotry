@@ -1,0 +1,176 @@
+/** 
+ * Tests that the server sets properly load balance connections without throwing exceptions
+ */
+@TestLogging("org.elasticsearch.xpack.security.authc.ldap.support:DEBUG") public class SessionFactoryLoadBalancingTests extends LdapTestCase {
+  private ThreadPool threadPool;
+  @Before public void init() throws Exception {
+    threadPool=new TestThreadPool("SessionFactoryLoadBalancingTests thread pool");
+  }
+  @After public void shutdown() throws InterruptedException {
+    terminate(threadPool);
+  }
+  public void testRoundRobin() throws Exception {
+    TestSessionFactory testSessionFactory=createSessionFactory(LdapLoadBalancing.ROUND_ROBIN);
+    final int numberOfIterations=randomIntBetween(1,5);
+    for (int iteration=0; iteration < numberOfIterations; iteration++) {
+      for (int i=0; i < numberOfLdapServers; i++) {
+        LDAPConnection connection=null;
+        try {
+          connection=LdapUtils.privilegedConnect(testSessionFactory.getServerSet()::getConnection);
+          assertThat(connection.getConnectedPort(),is(ldapServers[i].getListenPort()));
+        }
+  finally {
+          if (connection != null) {
+            connection.close();
+          }
+        }
+      }
+    }
+  }
+  public void testRoundRobinWithFailures() throws Exception {
+    assumeTrue("at least one ldap server should be present for this test",ldapServers.length > 1);
+    logger.debug("using [{}] ldap servers, urls {}",ldapServers.length,ldapUrls());
+    TestSessionFactory testSessionFactory=createSessionFactory(LdapLoadBalancing.ROUND_ROBIN);
+    List<Integer> ports=new ArrayList<>(numberOfLdapServers);
+    for (int i=0; i < ldapServers.length; i++) {
+      ports.add(ldapServers[i].getListenPort());
+    }
+    logger.debug("list of all ports {}",ports);
+    final int numberToKill=randomIntBetween(1,numberOfLdapServers - 1);
+    logger.debug("killing [{}] servers",numberToKill);
+    final List<InMemoryDirectoryServer> ldapServersToKill=randomSubsetOf(numberToKill,ldapServers);
+    final List<InMemoryDirectoryServer> ldapServersList=Arrays.asList(ldapServers);
+    final InetAddress local=InetAddress.getByName("localhost");
+    final MockServerSocket mockServerSocket=new MockServerSocket(0,0,local);
+    final List<Thread> listenThreads=new ArrayList<>();
+    final CountDownLatch latch=new CountDownLatch(ldapServersToKill.size());
+    final CountDownLatch closeLatch=new CountDownLatch(1);
+    try {
+      for (      InMemoryDirectoryServer ldapServerToKill : ldapServersToKill) {
+        final int index=ldapServersList.indexOf(ldapServerToKill);
+        assertThat(index,greaterThanOrEqualTo(0));
+        final Integer port=Integer.valueOf(ldapServers[index].getListenPort());
+        logger.debug("shutting down server index [{}] listening on [{}]",index,port);
+        assertTrue(ports.remove(port));
+        ldapServers[index].shutDown(true);
+        logger.debug("opening mock server socket listening on [{}]",port);
+        Runnable runnable=() -> {
+          try (Socket socket=openMockSocket(local,mockServerSocket.getLocalPort(),local,port)){
+            logger.debug("opened socket [{}]",socket);
+            latch.countDown();
+            closeLatch.await();
+            logger.debug("closing socket [{}]",socket);
+          }
+ catch (          IOException|InterruptedException e) {
+            logger.debug("caught exception",e);
+          }
+        }
+;
+        Thread thread=new Thread(runnable);
+        thread.start();
+        listenThreads.add(thread);
+        assertThat(ldapServers[index].getListenPort(),is(-1));
+      }
+      latch.await();
+      final int numberOfIterations=randomIntBetween(1,5);
+      for (int iteration=0; iteration < numberOfIterations; iteration++) {
+        logger.debug("iteration [{}]",iteration);
+        for (        Integer port : ports) {
+          logger.debug("attempting connection with expected port [{}]",port);
+          try (LDAPConnection connection=LdapUtils.privilegedConnect(testSessionFactory.getServerSet()::getConnection)){
+            assertThat(connection.getConnectedPort(),is(port));
+          }
+         }
+      }
+    }
+  finally {
+      closeLatch.countDown();
+      mockServerSocket.close();
+      for (      Thread t : listenThreads) {
+        t.join();
+      }
+    }
+  }
+  @SuppressForbidden(reason="Allow opening socket for test") private MockSocket openMockSocket(  InetAddress remoteAddress,  int remotePort,  InetAddress localAddress,  int localPort) throws IOException {
+    final MockSocket socket=new MockSocket();
+    socket.setReuseAddress(true);
+    socket.setSoLinger(true,0);
+    socket.bind(new InetSocketAddress(localAddress,localPort));
+    SocketAccess.doPrivileged(() -> socket.connect(new InetSocketAddress(localAddress,remotePort)));
+    return socket;
+  }
+  public void testFailover() throws Exception {
+    assumeTrue("at least one ldap server should be present for this test",ldapServers.length > 1);
+    logger.debug("using [{}] ldap servers, urls {}",ldapServers.length,ldapUrls());
+    TestSessionFactory testSessionFactory=createSessionFactory(LdapLoadBalancing.FAILOVER);
+    final int firstPort=ldapServers[0].getListenPort();
+    for (int i=0; i < numberOfLdapServers; i++) {
+      LDAPConnection connection=null;
+      try {
+        connection=LdapUtils.privilegedConnect(testSessionFactory.getServerSet()::getConnection);
+        assertThat(connection.getConnectedPort(),is(firstPort));
+      }
+  finally {
+        if (connection != null) {
+          connection.close();
+        }
+      }
+    }
+    logger.debug("shutting down server index [0] listening on [{}]",ldapServers[0].getListenPort());
+    ldapServers[0].shutDown(true);
+    assertThat(ldapServers[0].getListenPort(),is(-1));
+    if (ldapServers.length > 2) {
+      final int numberToKill=randomIntBetween(1,numberOfLdapServers - 2);
+      InMemoryDirectoryServer[] allButFirstServer=Arrays.copyOfRange(ldapServers,1,ldapServers.length);
+      final List<InMemoryDirectoryServer> ldapServersToKill=randomSubsetOf(numberToKill,allButFirstServer);
+      final List<InMemoryDirectoryServer> ldapServersList=Arrays.asList(ldapServers);
+      for (      InMemoryDirectoryServer ldapServerToKill : ldapServersToKill) {
+        final int index=ldapServersList.indexOf(ldapServerToKill);
+        assertThat(index,greaterThanOrEqualTo(1));
+        final Integer port=Integer.valueOf(ldapServers[index].getListenPort());
+        logger.debug("shutting down server index [{}] listening on [{}]",index,port);
+        ldapServers[index].shutDown(true);
+        assertThat(ldapServers[index].getListenPort(),is(-1));
+      }
+    }
+    int firstNonStoppedPort=-1;
+    for (int i=0; i < numberOfLdapServers; i++) {
+      if (ldapServers[i].getListenPort() != -1) {
+        firstNonStoppedPort=ldapServers[i].getListenPort();
+        break;
+      }
+    }
+    logger.debug("first non stopped port [{}]",firstNonStoppedPort);
+    assertThat(firstNonStoppedPort,not(-1));
+    final int numberOfIterations=randomIntBetween(1,5);
+    for (int iteration=0; iteration < numberOfIterations; iteration++) {
+      LDAPConnection connection=null;
+      try {
+        logger.debug("attempting connection with expected port [{}] iteration [{}]",firstNonStoppedPort,iteration);
+        connection=LdapUtils.privilegedConnect(testSessionFactory.getServerSet()::getConnection);
+        assertThat(connection.getConnectedPort(),is(firstNonStoppedPort));
+      }
+  finally {
+        if (connection != null) {
+          connection.close();
+        }
+      }
+    }
+  }
+  private TestSessionFactory createSessionFactory(  LdapLoadBalancing loadBalancing) throws Exception {
+    String groupSearchBase="cn=HMS Lydia,ou=crews,ou=groups,o=sevenSeas";
+    String userTemplate="cn={0},ou=people,o=sevenSeas";
+    Settings settings=buildLdapSettings(ldapUrls(),new String[]{userTemplate},groupSearchBase,LdapSearchScope.SUB_TREE,loadBalancing);
+    Settings globalSettings=Settings.builder().put("path.home",createTempDir()).build();
+    RealmConfig config=new RealmConfig("test-session-factory",settings,globalSettings,TestEnvironment.newEnvironment(globalSettings),new ThreadContext(Settings.EMPTY));
+    return new TestSessionFactory(config,new SSLService(Settings.EMPTY,TestEnvironment.newEnvironment(config.globalSettings())),threadPool);
+  }
+static class TestSessionFactory extends SessionFactory {
+    protected TestSessionFactory(    RealmConfig config,    SSLService sslService,    ThreadPool threadPool){
+      super(config,sslService,threadPool);
+    }
+    @Override public void session(    String user,    SecureString password,    ActionListener<LdapSession> listener){
+      listener.onResponse(null);
+    }
+  }
+}

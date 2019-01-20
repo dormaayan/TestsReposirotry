@@ -1,0 +1,145 @@
+@Category({MasterTests.class,MediumTests.class}) public class TestReplicationBarrierCleaner {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestReplicationBarrierCleaner.class);
+  private static final Logger LOG=LoggerFactory.getLogger(TestHFileCleaner.class);
+  private static final HBaseTestingUtility UTIL=new HBaseTestingUtility();
+  @Rule public final TestName name=new TestName();
+  @BeforeClass public static void setUpBeforeClass() throws Exception {
+    UTIL.startMiniCluster(1);
+  }
+  @AfterClass public static void tearDownAfterClass() throws Exception {
+    UTIL.shutdownMiniCluster();
+  }
+  @After public void tearDown() throws IOException {
+    try (Table table=UTIL.getConnection().getTable(TableName.META_TABLE_NAME);ResultScanner scanner=table.getScanner(new Scan().addFamily(HConstants.CATALOG_FAMILY).addFamily(HConstants.REPLICATION_BARRIER_FAMILY).setFilter(new FirstKeyOnlyFilter()))){
+      for (; ; ) {
+        Result result=scanner.next();
+        if (result == null) {
+          break;
+        }
+        TableName tableName=RegionInfo.getTable(result.getRow());
+        if (!tableName.isSystemTable()) {
+          table.delete(new Delete(result.getRow()));
+        }
+      }
+    }
+   }
+  private ReplicationPeerManager create(  ReplicationQueueStorage queueStorage,  List<String> firstPeerIds,  @SuppressWarnings("unchecked") List<String>... peerIds){
+    ReplicationPeerManager peerManager=mock(ReplicationPeerManager.class);
+    if (queueStorage != null) {
+      when(peerManager.getQueueStorage()).thenReturn(queueStorage);
+    }
+    if (peerIds.length == 0) {
+      when(peerManager.getSerialPeerIdsBelongsTo(any(TableName.class))).thenReturn(firstPeerIds);
+    }
+ else {
+      when(peerManager.getSerialPeerIdsBelongsTo(any(TableName.class))).thenReturn(firstPeerIds,peerIds);
+    }
+    return peerManager;
+  }
+  private ReplicationQueueStorage create(  Long lastPushedSeqId,  Long... lastPushedSeqIds) throws ReplicationException {
+    ReplicationQueueStorage queueStorage=mock(ReplicationQueueStorage.class);
+    if (lastPushedSeqIds.length == 0) {
+      when(queueStorage.getLastSequenceId(anyString(),anyString())).thenReturn(lastPushedSeqId);
+    }
+ else {
+      when(queueStorage.getLastSequenceId(anyString(),anyString())).thenReturn(lastPushedSeqId,lastPushedSeqIds);
+    }
+    return queueStorage;
+  }
+  private ReplicationBarrierCleaner create(  ReplicationPeerManager peerManager) throws IOException {
+    return new ReplicationBarrierCleaner(UTIL.getConfiguration(),new WarnOnlyStoppable(),UTIL.getConnection(),peerManager);
+  }
+  private void addBarrier(  RegionInfo region,  long... barriers) throws IOException {
+    Put put=new Put(region.getRegionName(),EnvironmentEdgeManager.currentTime());
+    for (int i=0; i < barriers.length; i++) {
+      put.addColumn(HConstants.REPLICATION_BARRIER_FAMILY,HConstants.SEQNUM_QUALIFIER,put.getTimestamp() - barriers.length + i,Bytes.toBytes(barriers[i]));
+    }
+    try (Table table=UTIL.getConnection().getTable(TableName.META_TABLE_NAME)){
+      table.put(put);
+    }
+   }
+  private void fillCatalogFamily(  RegionInfo region) throws IOException {
+    try (Table table=UTIL.getConnection().getTable(TableName.META_TABLE_NAME)){
+      table.put(new Put(region.getRegionName()).addColumn(HConstants.CATALOG_FAMILY,Bytes.toBytes("whatever"),Bytes.toBytes("whatever")));
+    }
+   }
+  private void clearCatalogFamily(  RegionInfo region) throws IOException {
+    try (Table table=UTIL.getConnection().getTable(TableName.META_TABLE_NAME)){
+      table.delete(new Delete(region.getRegionName()).addFamily(HConstants.CATALOG_FAMILY));
+    }
+   }
+  @Test public void testNothing() throws IOException {
+    ReplicationPeerManager peerManager=mock(ReplicationPeerManager.class);
+    ReplicationBarrierCleaner cleaner=create(peerManager);
+    cleaner.chore();
+    verify(peerManager,never()).getSerialPeerIdsBelongsTo(any(TableName.class));
+    verify(peerManager,never()).getQueueStorage();
+  }
+  @Test public void testCleanNoPeers() throws IOException {
+    TableName tableName1=TableName.valueOf(name.getMethodName() + "_1");
+    RegionInfo region11=RegionInfoBuilder.newBuilder(tableName1).setEndKey(Bytes.toBytes(1)).build();
+    addBarrier(region11,10,20,30,40,50,60);
+    RegionInfo region12=RegionInfoBuilder.newBuilder(tableName1).setStartKey(Bytes.toBytes(1)).build();
+    addBarrier(region12,20,30,40,50,60,70);
+    TableName tableName2=TableName.valueOf(name.getMethodName() + "_2");
+    RegionInfo region21=RegionInfoBuilder.newBuilder(tableName2).setEndKey(Bytes.toBytes(1)).build();
+    addBarrier(region21,100,200,300,400);
+    RegionInfo region22=RegionInfoBuilder.newBuilder(tableName2).setStartKey(Bytes.toBytes(1)).build();
+    addBarrier(region22,200,300,400,500,600);
+    @SuppressWarnings("unchecked") ReplicationPeerManager peerManager=create(null,Collections.emptyList(),Collections.emptyList());
+    ReplicationBarrierCleaner cleaner=create(peerManager);
+    cleaner.chore();
+    verify(peerManager,never()).getQueueStorage();
+    verify(peerManager,times(2)).getSerialPeerIdsBelongsTo(any(TableName.class));
+    assertArrayEquals(new long[]{60},MetaTableAccessor.getReplicationBarrier(UTIL.getConnection(),region11.getRegionName()));
+    assertArrayEquals(new long[]{70},MetaTableAccessor.getReplicationBarrier(UTIL.getConnection(),region12.getRegionName()));
+    assertArrayEquals(new long[]{400},MetaTableAccessor.getReplicationBarrier(UTIL.getConnection(),region21.getRegionName()));
+    assertArrayEquals(new long[]{600},MetaTableAccessor.getReplicationBarrier(UTIL.getConnection(),region22.getRegionName()));
+  }
+  @Test public void testDeleteBarriers() throws IOException, ReplicationException {
+    TableName tableName=TableName.valueOf(name.getMethodName());
+    RegionInfo region=RegionInfoBuilder.newBuilder(tableName).build();
+    addBarrier(region,10,20,30,40,50,60);
+    ReplicationQueueStorage queueStorage=create(-1L,2L,15L,25L,20L,25L,65L,55L,70L,70L);
+    List<String> peerIds=Lists.newArrayList("1","2");
+    @SuppressWarnings("unchecked") ReplicationPeerManager peerManager=create(queueStorage,peerIds,peerIds,peerIds,peerIds,peerIds);
+    ReplicationBarrierCleaner cleaner=create(peerManager);
+    cleaner.chore();
+    assertArrayEquals(new long[]{10,20,30,40,50,60},MetaTableAccessor.getReplicationBarrier(UTIL.getConnection(),region.getRegionName()));
+    cleaner.chore();
+    assertArrayEquals(new long[]{10,20,30,40,50,60},MetaTableAccessor.getReplicationBarrier(UTIL.getConnection(),region.getRegionName()));
+    cleaner.chore();
+    assertArrayEquals(new long[]{20,30,40,50,60},MetaTableAccessor.getReplicationBarrier(UTIL.getConnection(),region.getRegionName()));
+    cleaner.chore();
+    assertArrayEquals(new long[]{50,60},MetaTableAccessor.getReplicationBarrier(UTIL.getConnection(),region.getRegionName()));
+    cleaner.chore();
+    assertArrayEquals(new long[]{60},MetaTableAccessor.getReplicationBarrier(UTIL.getConnection(),region.getRegionName()));
+  }
+  @Test public void testDeleteRowForDeletedRegion() throws IOException, ReplicationException {
+    TableName tableName=TableName.valueOf(name.getMethodName());
+    RegionInfo region=RegionInfoBuilder.newBuilder(tableName).build();
+    addBarrier(region,40,50,60);
+    fillCatalogFamily(region);
+    String peerId="1";
+    ReplicationQueueStorage queueStorage=create(59L);
+    @SuppressWarnings("unchecked") ReplicationPeerManager peerManager=create(queueStorage,Lists.newArrayList(peerId));
+    ReplicationBarrierCleaner cleaner=create(peerManager);
+    cleaner.chore();
+    assertArrayEquals(new long[]{50,60},MetaTableAccessor.getReplicationBarrier(UTIL.getConnection(),region.getRegionName()));
+    verify(queueStorage,never()).removeLastSequenceIds(anyString(),anyList());
+    clearCatalogFamily(region);
+    cleaner.chore();
+    try (Table table=UTIL.getConnection().getTable(TableName.META_TABLE_NAME)){
+      assertFalse(table.exists(new Get(region.getRegionName()).addFamily(HConstants.REPLICATION_BARRIER_FAMILY)));
+    }
+     verify(queueStorage,times(1)).removeLastSequenceIds(peerId,Arrays.asList(region.getEncodedName()));
+  }
+private static class WarnOnlyStoppable implements Stoppable {
+    @Override public void stop(    String why){
+      LOG.warn("TestReplicationBarrierCleaner received stop, ignoring. Reason: " + why);
+    }
+    @Override public boolean isStopped(){
+      return false;
+    }
+  }
+}

@@ -1,0 +1,59 @@
+/** 
+ * Tests that logs are rolled upon detecting datanode death Requires an HDFS jar with HDFS-826 & syncFs() support (HDFS-200)
+ */
+@Test public void testLogRollOnDatanodeDeath() throws Exception {
+  TEST_UTIL.ensureSomeRegionServersAvailable(2);
+  assertTrue("This test requires WAL file replication set to 2.",fs.getDefaultReplication(TEST_UTIL.getDataTestDirOnTestFS()) == 2);
+  LOG.info("Replication=" + fs.getDefaultReplication(TEST_UTIL.getDataTestDirOnTestFS()));
+  this.server=cluster.getRegionServer(0);
+  TableDescriptor desc=TableDescriptorBuilder.newBuilder(TableName.valueOf(getName())).setColumnFamily(ColumnFamilyDescriptorBuilder.of(HConstants.CATALOG_FAMILY)).build();
+  admin.createTable(desc);
+  Table table=TEST_UTIL.getConnection().getTable(desc.getTableName());
+  server=TEST_UTIL.getRSForFirstRegionInTable(desc.getTableName());
+  RegionInfo region=server.getRegions(desc.getTableName()).get(0).getRegionInfo();
+  final FSHLog log=(FSHLog)server.getWAL(region);
+  final AtomicBoolean lowReplicationHookCalled=new AtomicBoolean(false);
+  log.registerWALActionsListener(new WALActionsListener(){
+    @Override public void logRollRequested(    boolean lowReplication){
+      if (lowReplication) {
+        lowReplicationHookCalled.lazySet(true);
+      }
+    }
+  }
+);
+  List<DataNode> existingNodes=dfsCluster.getDataNodes();
+  int numDataNodes=3;
+  dfsCluster.startDataNodes(TEST_UTIL.getConfiguration(),numDataNodes,true,null,null);
+  List<DataNode> allNodes=dfsCluster.getDataNodes();
+  for (int i=allNodes.size() - 1; i >= 0; i--) {
+    if (existingNodes.contains(allNodes.get(i))) {
+      dfsCluster.stopDataNode(i);
+    }
+  }
+  assertTrue("DataNodes " + dfsCluster.getDataNodes().size() + " default replication "+ fs.getDefaultReplication(TEST_UTIL.getDataTestDirOnTestFS()),dfsCluster.getDataNodes().size() >= fs.getDefaultReplication(TEST_UTIL.getDataTestDirOnTestFS()) + 1);
+  writeData(table,2);
+  long curTime=System.currentTimeMillis();
+  LOG.info("log.getCurrentFileName(): " + log.getCurrentFileName());
+  long oldFilenum=AbstractFSWALProvider.extractFileNumFromWAL(log);
+  assertTrue("Log should have a timestamp older than now",curTime > oldFilenum && oldFilenum != -1);
+  assertTrue("The log shouldn't have rolled yet",oldFilenum == AbstractFSWALProvider.extractFileNumFromWAL(log));
+  final DatanodeInfo[] pipeline=log.getPipeline();
+  assertTrue(pipeline.length == fs.getDefaultReplication(TEST_UTIL.getDataTestDirOnTestFS()));
+  assertTrue(dfsCluster.stopDataNode(pipeline[0].getName()) != null);
+  writeData(table,2);
+  long newFilenum=AbstractFSWALProvider.extractFileNumFromWAL(log);
+  assertTrue("Missing datanode should've triggered a log roll",newFilenum > oldFilenum && newFilenum > curTime);
+  assertTrue("The log rolling hook should have been called with the low replication flag",lowReplicationHookCalled.get());
+  writeData(table,3);
+  assertTrue("The log should not roll again.",AbstractFSWALProvider.extractFileNumFromWAL(log) == newFilenum);
+  assertTrue(dfsCluster.stopDataNode(pipeline[1].getName()) != null);
+  batchWriteAndWait(table,log,3,false,14000);
+  int replication=log.getLogReplication();
+  assertTrue("LowReplication Roller should've been disabled, current replication=" + replication,!log.isLowReplicationRollEnabled());
+  dfsCluster.startDataNodes(TEST_UTIL.getConfiguration(),1,true,null,null);
+  log.rollWriter(true);
+  batchWriteAndWait(table,log,13,true,10000);
+  replication=log.getLogReplication();
+  assertTrue("New log file should have the default replication instead of " + replication,replication == fs.getDefaultReplication(TEST_UTIL.getDataTestDirOnTestFS()));
+  assertTrue("LowReplication Roller should've been enabled",log.isLowReplicationRollEnabled());
+}

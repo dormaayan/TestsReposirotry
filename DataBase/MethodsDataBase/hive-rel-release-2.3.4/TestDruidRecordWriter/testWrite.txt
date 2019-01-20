@@ -1,0 +1,41 @@
+@Ignore @Test public void testWrite() throws IOException, SegmentLoadingException {
+  final String dataSourceName="testDataSource";
+  final File segmentOutputDir=temporaryFolder.newFolder();
+  final File workingDir=temporaryFolder.newFolder();
+  Configuration config=new Configuration();
+  final InputRowParser inputRowParser=new MapInputRowParser(new TimeAndDimsParseSpec(new TimestampSpec(DruidTable.DEFAULT_TIMESTAMP_COLUMN,"auto",null),new DimensionsSpec(ImmutableList.<DimensionSchema>of(new StringDimensionSchema("host")),null,null)));
+  final Map<String,Object> parserMap=objectMapper.convertValue(inputRowParser,Map.class);
+  DataSchema dataSchema=new DataSchema(dataSourceName,parserMap,new AggregatorFactory[]{new LongSumAggregatorFactory("visited_sum","visited_sum"),new HyperUniquesAggregatorFactory("unique_hosts","unique_hosts")},new UniformGranularitySpec(Granularity.DAY,QueryGranularities.NONE,ImmutableList.of(INTERVAL_FULL)),objectMapper);
+  RealtimeTuningConfig tuningConfig=RealtimeTuningConfig.makeDefaultTuningConfig(temporaryFolder.newFolder());
+  LocalFileSystem localFileSystem=FileSystem.getLocal(config);
+  DataSegmentPusher dataSegmentPusher=new LocalDataSegmentPusher(new LocalDataSegmentPusherConfig(){
+    @Override public File getStorageDirectory(){
+      return segmentOutputDir;
+    }
+  }
+,objectMapper);
+  Path segmentDescriptroPath=new Path(workingDir.getAbsolutePath(),DruidStorageHandler.SEGMENTS_DESCRIPTOR_DIR_NAME);
+  druidRecordWriter=new DruidRecordWriter(dataSchema,tuningConfig,dataSegmentPusher,20,segmentDescriptroPath,localFileSystem);
+  List<DruidWritable> druidWritables=Lists.transform(expectedRows,new Function<ImmutableMap<String,Object>,DruidWritable>(){
+    @Nullable @Override public DruidWritable apply(    @Nullable ImmutableMap<String,Object> input){
+      return new DruidWritable(ImmutableMap.<String,Object>builder().putAll(input).put(Constants.DRUID_TIMESTAMP_GRANULARITY_COL_NAME,Granularity.DAY.truncate(new DateTime((long)input.get(DruidTable.DEFAULT_TIMESTAMP_COLUMN))).getMillis()).build());
+    }
+  }
+);
+  for (  DruidWritable druidWritable : druidWritables) {
+    druidRecordWriter.write(druidWritable);
+  }
+  druidRecordWriter.close(false);
+  List<DataSegment> dataSegmentList=DruidStorageHandlerUtils.getPublishedSegments(segmentDescriptroPath,config);
+  Assert.assertEquals(1,dataSegmentList.size());
+  File tmpUnzippedSegmentDir=temporaryFolder.newFolder();
+  new LocalDataSegmentPuller().getSegmentFiles(dataSegmentList.get(0),tmpUnzippedSegmentDir);
+  final QueryableIndex queryableIndex=DruidStorageHandlerUtils.INDEX_IO.loadIndex(tmpUnzippedSegmentDir);
+  QueryableIndexStorageAdapter adapter=new QueryableIndexStorageAdapter(queryableIndex);
+  Firehose firehose=new IngestSegmentFirehose(ImmutableList.of(new WindowedStorageAdapter(adapter,adapter.getInterval())),ImmutableList.of("host"),ImmutableList.of("visited_sum","unique_hosts"),null,QueryGranularities.NONE);
+  List<InputRow> rows=Lists.newArrayList();
+  while (firehose.hasMore()) {
+    rows.add(firehose.nextRow());
+  }
+  verifyRows(expectedRows,rows);
+}

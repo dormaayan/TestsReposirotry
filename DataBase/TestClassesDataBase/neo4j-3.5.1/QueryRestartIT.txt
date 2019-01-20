@@ -1,0 +1,135 @@
+public class QueryRestartIT {
+  @Rule public final TestDirectory testDirectory=TestDirectory.testDirectory();
+  private GraphDatabaseService database;
+  private TestTransactionVersionContextSupplier testContextSupplier;
+  private File storeDir;
+  private TestVersionContext testCursorContext;
+  @Before public void setUp(){
+    storeDir=testDirectory.directory();
+    testContextSupplier=new TestTransactionVersionContextSupplier();
+    database=startSnapshotQueryDb();
+    createData();
+    testCursorContext=testCursorContext();
+    testContextSupplier.setCursorContext(testCursorContext);
+  }
+  @After public void tearDown(){
+    if (database != null) {
+      database.shutdown();
+    }
+  }
+  @Test public void executeQueryWithoutRestarts(){
+    testCursorContext.setWrongLastClosedTxId(false);
+    Result result=database.execute("MATCH (n:label) RETURN n.c");
+    while (result.hasNext()) {
+      assertEquals("d",result.next().get("n.c"));
+    }
+    assertEquals(0,testCursorContext.getAdditionalAttempts());
+  }
+  @Test public void executeQueryWithSingleRetry(){
+    Result result=database.execute("MATCH (n) RETURN n.c");
+    assertEquals(1,testCursorContext.getAdditionalAttempts());
+    while (result.hasNext()) {
+      assertEquals("d",result.next().get("n.c"));
+    }
+  }
+  @Test public void executeCountStoreQueryWithSingleRetry(){
+    Result result=database.execute("MATCH (n:toRetry) RETURN count(n)");
+    assertEquals(1,testCursorContext.getAdditionalAttempts());
+    while (result.hasNext()) {
+      assertEquals(1L,result.next().get("count(n)"));
+    }
+  }
+  @Test public void executeLabelScanQueryWithSingleRetry(){
+    Result result=database.execute("MATCH (n:toRetry) RETURN n.c");
+    assertEquals(1,testCursorContext.getAdditionalAttempts());
+    while (result.hasNext()) {
+      assertEquals("d",result.next().get("n.c"));
+    }
+  }
+  @Test public void queryThatModifyDataAndSeeUnstableSnapshotThrowException(){
+    try {
+      database.execute("MATCH (n:toRetry) CREATE () RETURN n.c");
+    }
+ catch (    QueryExecutionException e) {
+      assertEquals("Unable to get clean data snapshot for query " + "'MATCH (n:toRetry) CREATE () RETURN n.c' that perform updates.",e.getMessage());
+    }
+  }
+  private GraphDatabaseService startSnapshotQueryDb(){
+    return new CustomGraphDatabaseFactory(new CustomFacadeFactory()).newEmbeddedDatabaseBuilder(storeDir).setConfig(GraphDatabaseSettings.snapshot_query,Settings.TRUE).newGraphDatabase();
+  }
+  private void createData(){
+    Label label=Label.label("toRetry");
+    try (Transaction transaction=database.beginTx()){
+      Node node=database.createNode(label);
+      node.setProperty("c","d");
+      transaction.success();
+    }
+   }
+  private TestVersionContext testCursorContext(){
+    TransactionIdStore transactionIdStore=getTransactionIdStore();
+    return new TestVersionContext(transactionIdStore::getLastClosedTransactionId);
+  }
+  private TransactionIdStore getTransactionIdStore(){
+    DependencyResolver dependencyResolver=((GraphDatabaseAPI)database).getDependencyResolver();
+    return dependencyResolver.resolveDependency(TransactionIdStore.class);
+  }
+private class CustomGraphDatabaseFactory extends TestGraphDatabaseFactory {
+    private GraphDatabaseFacadeFactory customFacadeFactory;
+    CustomGraphDatabaseFactory(    GraphDatabaseFacadeFactory customFacadeFactory){
+      this.customFacadeFactory=customFacadeFactory;
+    }
+    @Override protected GraphDatabaseBuilder.DatabaseCreator createDatabaseCreator(    File storeDir,    GraphDatabaseFactoryState state){
+      return new GraphDatabaseBuilder.DatabaseCreator(){
+        @Override public GraphDatabaseService newDatabase(        Config config){
+          return customFacadeFactory.newFacade(storeDir,config,GraphDatabaseDependencies.newDependencies(state.databaseDependencies()));
+        }
+      }
+;
+    }
+  }
+private class CustomFacadeFactory extends GraphDatabaseFacadeFactory {
+    CustomFacadeFactory(){
+      super(DatabaseInfo.COMMUNITY,CommunityEditionModule::new);
+    }
+    @Override protected PlatformModule createPlatform(    File storeDir,    Config config,    Dependencies dependencies){
+      return new PlatformModule(storeDir,config,databaseInfo,dependencies){
+        @Override protected VersionContextSupplier createCursorContextSupplier(        Config config){
+          return testContextSupplier != null ? testContextSupplier : super.createCursorContextSupplier(config);
+        }
+      }
+;
+    }
+  }
+private class TestVersionContext extends TransactionVersionContext {
+    private boolean wrongLastClosedTxId=true;
+    private int additionalAttempts;
+    TestVersionContext(    LongSupplier transactionIdSupplier){
+      super(transactionIdSupplier);
+    }
+    @Override public long lastClosedTransactionId(){
+      return wrongLastClosedTxId ? TransactionIdStore.BASE_TX_ID : super.lastClosedTransactionId();
+    }
+    @Override public void markAsDirty(){
+      super.markAsDirty();
+      wrongLastClosedTxId=false;
+    }
+    void setWrongLastClosedTxId(    boolean wrongLastClosedTxId){
+      this.wrongLastClosedTxId=wrongLastClosedTxId;
+    }
+    @Override public boolean isDirty(){
+      boolean dirty=super.isDirty();
+      if (dirty) {
+        additionalAttempts++;
+      }
+      return dirty;
+    }
+    int getAdditionalAttempts(){
+      return additionalAttempts;
+    }
+  }
+private class TestTransactionVersionContextSupplier extends TransactionVersionContextSupplier {
+    void setCursorContext(    VersionContext versionContext){
+      this.cursorContext.set(versionContext);
+    }
+  }
+}

@@ -1,0 +1,88 @@
+public class FileStructureFinderManagerTests extends FileStructureTestCase {
+  private ScheduledExecutorService scheduler;
+  private FileStructureFinderManager structureFinderManager;
+  @Before public void setup(){
+    scheduler=new ScheduledThreadPoolExecutor(1);
+    structureFinderManager=new FileStructureFinderManager(scheduler);
+  }
+  @After public void shutdownScheduler(){
+    scheduler.shutdown();
+  }
+  public void testFindCharsetGivenCharacterWidths() throws Exception {
+    for (    Charset charset : Arrays.asList(StandardCharsets.UTF_8,StandardCharsets.UTF_16LE,StandardCharsets.UTF_16BE)) {
+      CharsetMatch charsetMatch=structureFinderManager.findCharset(explanation,new ByteArrayInputStream(TEXT_SAMPLE.getBytes(charset)),NOOP_TIMEOUT_CHECKER);
+      assertEquals(charset.name(),charsetMatch.getName());
+    }
+  }
+  public void testFindCharsetGivenBinary() throws Exception {
+    int size=1000;
+    byte[] binaryBytes=randomByteArrayOfLength(size);
+    for (int i=0; i < 10; ++i) {
+      binaryBytes[randomIntBetween(0,size - 1)]=0;
+    }
+    try {
+      CharsetMatch charsetMatch=structureFinderManager.findCharset(explanation,new ByteArrayInputStream(binaryBytes),NOOP_TIMEOUT_CHECKER);
+      assertThat(charsetMatch.getName(),startsWith("UTF-16"));
+    }
+ catch (    IllegalArgumentException e) {
+      assertEquals("Could not determine a usable character encoding for the input - could it be binary data?",e.getMessage());
+    }
+  }
+  public void testMakeBestStructureGivenNdJson() throws Exception {
+    assertThat(structureFinderManager.makeBestStructureFinder(explanation,NDJSON_SAMPLE,StandardCharsets.UTF_8.name(),randomBoolean(),EMPTY_OVERRIDES,NOOP_TIMEOUT_CHECKER),instanceOf(NdJsonFileStructureFinder.class));
+  }
+  public void testMakeBestStructureGivenNdJsonAndDelimitedOverride() throws Exception {
+    FileStructureOverrides overrides=FileStructureOverrides.builder().setFormat(FileStructure.Format.DELIMITED).setQuote('\'').build();
+    assertThat(structureFinderManager.makeBestStructureFinder(explanation,NDJSON_SAMPLE,StandardCharsets.UTF_8.name(),randomBoolean(),overrides,NOOP_TIMEOUT_CHECKER),instanceOf(DelimitedFileStructureFinder.class));
+  }
+  public void testMakeBestStructureGivenXml() throws Exception {
+    assertThat(structureFinderManager.makeBestStructureFinder(explanation,XML_SAMPLE,StandardCharsets.UTF_8.name(),randomBoolean(),EMPTY_OVERRIDES,NOOP_TIMEOUT_CHECKER),instanceOf(XmlFileStructureFinder.class));
+  }
+  public void testMakeBestStructureGivenXmlAndTextOverride() throws Exception {
+    FileStructureOverrides overrides=FileStructureOverrides.builder().setFormat(FileStructure.Format.SEMI_STRUCTURED_TEXT).build();
+    assertThat(structureFinderManager.makeBestStructureFinder(explanation,XML_SAMPLE,StandardCharsets.UTF_8.name(),randomBoolean(),overrides,NOOP_TIMEOUT_CHECKER),instanceOf(TextLogFileStructureFinder.class));
+  }
+  public void testMakeBestStructureGivenCsv() throws Exception {
+    assertThat(structureFinderManager.makeBestStructureFinder(explanation,CSV_SAMPLE,StandardCharsets.UTF_8.name(),randomBoolean(),EMPTY_OVERRIDES,NOOP_TIMEOUT_CHECKER),instanceOf(DelimitedFileStructureFinder.class));
+  }
+  public void testMakeBestStructureGivenCsvAndJsonOverride(){
+    FileStructureOverrides overrides=FileStructureOverrides.builder().setFormat(FileStructure.Format.NDJSON).build();
+    IllegalArgumentException e=expectThrows(IllegalArgumentException.class,() -> structureFinderManager.makeBestStructureFinder(explanation,CSV_SAMPLE,StandardCharsets.UTF_8.name(),randomBoolean(),overrides,NOOP_TIMEOUT_CHECKER));
+    assertEquals("Input did not match the specified format [ndjson]",e.getMessage());
+  }
+  public void testMakeBestStructureGivenText() throws Exception {
+    assertThat(structureFinderManager.makeBestStructureFinder(explanation,TEXT_SAMPLE,StandardCharsets.UTF_8.name(),randomBoolean(),EMPTY_OVERRIDES,NOOP_TIMEOUT_CHECKER),instanceOf(TextLogFileStructureFinder.class));
+  }
+  public void testMakeBestStructureGivenTextAndDelimitedOverride() throws Exception {
+    FileStructureOverrides overrides=FileStructureOverrides.builder().setFormat(FileStructure.Format.DELIMITED).setDelimiter(':').build();
+    assertThat(structureFinderManager.makeBestStructureFinder(explanation,TEXT_SAMPLE,StandardCharsets.UTF_8.name(),randomBoolean(),overrides,NOOP_TIMEOUT_CHECKER),instanceOf(DelimitedFileStructureFinder.class));
+  }
+  public void testFindFileStructureTimeout() throws IOException, InterruptedException {
+    int linesOfJunk=10000;
+    TimeValue timeout=new TimeValue(10,TimeUnit.MILLISECONDS);
+    try (PipedOutputStream generator=new PipedOutputStream()){
+      Thread junkProducer=new Thread(() -> {
+        try {
+          for (int count=0; count < linesOfJunk; ++count) {
+            generator.write(randomAlphaOfLength(100).getBytes(StandardCharsets.UTF_8));
+            generator.write(',');
+            generator.write(randomAlphaOfLength(100).getBytes(StandardCharsets.UTF_8));
+            generator.write(',');
+            generator.write(randomAlphaOfLength(100).getBytes(StandardCharsets.UTF_8));
+            generator.write('\n');
+          }
+        }
+ catch (        IOException e) {
+        }
+      }
+);
+      try (InputStream bigInput=new PipedInputStream(generator)){
+        junkProducer.start();
+        ElasticsearchTimeoutException e=expectThrows(ElasticsearchTimeoutException.class,() -> structureFinderManager.findFileStructure(explanation,linesOfJunk - 1,bigInput,EMPTY_OVERRIDES,timeout));
+        assertThat(e.getMessage(),startsWith("Aborting structure analysis during ["));
+        assertThat(e.getMessage(),endsWith("] as it has taken longer than the timeout of [" + timeout + "]"));
+      }
+       junkProducer.join(10000L);
+    }
+   }
+}

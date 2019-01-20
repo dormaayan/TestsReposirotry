@@ -1,0 +1,46 @@
+@Test public void testStopWorker() throws Exception {
+  new Context(){
+{
+      startResourceManager();
+      CompletableFuture<?> registerSlotRequestFuture=resourceManager.runInMainThread(() -> {
+        rmServices.slotManager.registerSlotRequest(new SlotRequest(new JobID(),new AllocationID(),resourceProfile1,taskHost));
+        return null;
+      }
+);
+      registerSlotRequestFuture.get();
+      Container testingContainer=mock(Container.class);
+      when(testingContainer.getId()).thenReturn(ContainerId.newInstance(ApplicationAttemptId.newInstance(ApplicationId.newInstance(System.currentTimeMillis(),1),1),1));
+      when(testingContainer.getNodeId()).thenReturn(NodeId.newInstance("container",1234));
+      when(testingContainer.getResource()).thenReturn(Resource.newInstance(200,1));
+      when(testingContainer.getPriority()).thenReturn(Priority.UNDEFINED);
+      resourceManager.onContainersAllocated(ImmutableList.of(testingContainer));
+      verify(mockResourceManagerClient).addContainerRequest(any(AMRMClient.ContainerRequest.class));
+      verify(mockNMClient).startContainer(eq(testingContainer),any(ContainerLaunchContext.class));
+      TaskExecutorGateway mockTaskExecutorGateway=mock(TaskExecutorGateway.class);
+      rpcService.registerGateway(taskHost,mockTaskExecutorGateway);
+      final ResourceManagerGateway rmGateway=resourceManager.getSelfGateway(ResourceManagerGateway.class);
+      final ResourceID taskManagerResourceId=new ResourceID(testingContainer.getId().toString());
+      final SlotReport slotReport=new SlotReport(new SlotStatus(new SlotID(taskManagerResourceId,1),new ResourceProfile(10,1,1,1,0,Collections.emptyMap())));
+      CompletableFuture<Integer> numberRegisteredSlotsFuture=rmGateway.registerTaskExecutor(taskHost,taskManagerResourceId,dataPort,hardwareDescription,Time.seconds(10L)).thenCompose((      RegistrationResponse response) -> {
+        assertThat(response,instanceOf(TaskExecutorRegistrationSuccess.class));
+        final TaskExecutorRegistrationSuccess success=(TaskExecutorRegistrationSuccess)response;
+        return rmGateway.sendSlotReport(taskManagerResourceId,success.getRegistrationId(),slotReport,Time.seconds(10L));
+      }
+).handleAsync((      Acknowledge ignored,      Throwable throwable) -> rmServices.slotManager.getNumberRegisteredSlots(),resourceManager.getMainThreadExecutorForTesting());
+      final int numberRegisteredSlots=numberRegisteredSlotsFuture.get();
+      assertEquals(1,numberRegisteredSlots);
+      CompletableFuture<?> unregisterAndReleaseFuture=resourceManager.runInMainThread(() -> {
+        rmServices.slotManager.unregisterTaskManagersAndReleaseResources();
+        return null;
+      }
+);
+      unregisterAndReleaseFuture.get();
+      verify(mockNMClient).stopContainer(any(ContainerId.class),any(NodeId.class));
+      verify(mockResourceManagerClient).releaseAssignedContainer(any(ContainerId.class));
+      stopResourceManager();
+      assertTrue(rmServices.slotManager.getNumberRegisteredSlots() == 0);
+      assertTrue(resourceManager.getNumberOfRegisteredTaskManagers().get() == 0);
+    }
+  }
+;
+}

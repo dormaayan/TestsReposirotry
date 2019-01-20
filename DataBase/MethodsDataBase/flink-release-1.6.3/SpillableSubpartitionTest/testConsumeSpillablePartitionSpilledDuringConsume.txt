@@ -1,0 +1,56 @@
+/** 
+ * Tests that a spilled partition is correctly read back in via a spilled read view.
+ */
+@Test public void testConsumeSpillablePartitionSpilledDuringConsume() throws Exception {
+  SpillableSubpartition partition=createSubpartition();
+  BufferConsumer bufferConsumer=createFilledBufferConsumer(BUFFER_DATA_SIZE,BUFFER_DATA_SIZE);
+  BufferConsumer eventBufferConsumer=EventSerializer.toBufferConsumer(new CancelCheckpointMarker(1));
+  final int eventSize=eventBufferConsumer.getWrittenBytes();
+  partition.add(bufferConsumer.copy());
+  partition.add(bufferConsumer.copy());
+  partition.add(eventBufferConsumer);
+  partition.add(bufferConsumer);
+  partition.finish();
+  assertEquals(5,partition.getTotalNumberOfBuffers());
+  assertEquals(3,partition.getBuffersInBacklog());
+  assertEquals(0,partition.getTotalNumberOfBytes());
+  AwaitableBufferAvailablityListener listener=new AwaitableBufferAvailablityListener();
+  SpillableSubpartitionView reader=(SpillableSubpartitionView)partition.createReadView(listener);
+  assertEquals(1,listener.getNumNotifications());
+  assertFalse(bufferConsumer.isRecycled());
+  assertFalse(reader.nextBufferIsEvent());
+  assertNextBuffer(reader,BUFFER_DATA_SIZE,true,2,false,false);
+  assertEquals(BUFFER_DATA_SIZE,partition.getTotalNumberOfBytes());
+  assertEquals(2,partition.getBuffersInBacklog());
+  assertEquals(1,listener.getNumNotifications());
+  assertFalse(bufferConsumer.isRecycled());
+  assertEquals(3,partition.releaseMemory());
+  assertFalse(bufferConsumer.isRecycled());
+  assertEquals(5,partition.getTotalNumberOfBuffers());
+  assertEquals(2,partition.getBuffersInBacklog());
+  assertEquals(BUFFER_DATA_SIZE * 2 + eventSize + 4,partition.getTotalNumberOfBytes());
+  listener.awaitNotifications(2,30_000);
+  assertEquals(2,listener.getNumNotifications());
+  Buffer buffer=bufferConsumer.build();
+  buffer.retainBuffer();
+  assertNextBuffer(reader,BUFFER_DATA_SIZE,true,1,true,false);
+  assertEquals(BUFFER_DATA_SIZE * 3 + eventSize + 4,partition.getTotalNumberOfBytes());
+  assertEquals(1,partition.getBuffersInBacklog());
+  bufferConsumer.close();
+  assertNextEvent(reader,eventSize,CancelCheckpointMarker.class,true,1,false,true);
+  assertEquals(BUFFER_DATA_SIZE * 3 + eventSize + 4,partition.getTotalNumberOfBytes());
+  assertEquals(1,partition.getBuffersInBacklog());
+  assertNextBuffer(reader,BUFFER_DATA_SIZE,true,0,true,true);
+  assertEquals(BUFFER_DATA_SIZE * 3 + eventSize + 4,partition.getTotalNumberOfBytes());
+  assertEquals(0,partition.getBuffersInBacklog());
+  buffer.recycleBuffer();
+  assertTrue(buffer.isRecycled());
+  assertNextEvent(reader,4,EndOfPartitionEvent.class,false,0,false,true);
+  assertEquals(BUFFER_DATA_SIZE * 3 + eventSize + 4,partition.getTotalNumberOfBytes());
+  assertEquals(0,partition.getBuffersInBacklog());
+  final long deadline=System.currentTimeMillis() + 30_000L;
+  while (!bufferConsumer.isRecycled() && System.currentTimeMillis() < deadline) {
+    Thread.sleep(1);
+  }
+  assertTrue(bufferConsumer.isRecycled());
+}

@@ -1,0 +1,103 @@
+public class HouseKeeperTest {
+  private EmbeddedChannel channel;
+  @After public void cleanup(){
+    if (channel != null) {
+      channel.finishAndReleaseAll();
+    }
+  }
+  @Test public void shouldStopConnectionOnChannelInactive(){
+    BoltConnection connection=mock(BoltConnection.class);
+    channel=new EmbeddedChannel(new HouseKeeper(connection,NullLog.getInstance()));
+    channel.pipeline().fireChannelInactive();
+    verify(connection).stop();
+  }
+  @Test public void shouldNotPropagateChannelInactive() throws Exception {
+    ChannelInboundHandler next=mock(ChannelInboundHandler.class);
+    BoltConnection connection=mock(BoltConnection.class);
+    channel=new EmbeddedChannel(new HouseKeeper(connection,NullLog.getInstance()),next);
+    channel.pipeline().fireChannelInactive();
+    verify(next,never()).channelInactive(any());
+  }
+  @Test public void shouldStopConnectionOnExceptionCaught(){
+    BoltConnection connection=mock(BoltConnection.class);
+    channel=new EmbeddedChannel(new HouseKeeper(connection,NullLog.getInstance()));
+    channel.pipeline().fireExceptionCaught(new RuntimeException("some exception"));
+    verify(connection).stop();
+  }
+  @Test public void shouldLogExceptionOnExceptionCaught(){
+    AssertableLogProvider logProvider=new AssertableLogProvider();
+    BoltConnection connection=mock(BoltConnection.class);
+    channel=new EmbeddedChannel(new HouseKeeper(connection,logProvider.getLog(HouseKeeper.class)));
+    RuntimeException exception=new RuntimeException("some exception");
+    channel.pipeline().fireExceptionCaught(exception);
+    verify(connection).stop();
+    logProvider.assertExactly(inLog(HouseKeeper.class).error(startsWith("Fatal error occurred when handling a client connection"),equalTo(exception)));
+  }
+  @Test public void shouldNotPropagateExceptionCaught() throws Exception {
+    ChannelInboundHandler next=mock(ChannelInboundHandler.class);
+    BoltConnection connection=mock(BoltConnection.class);
+    channel=new EmbeddedChannel(new HouseKeeper(connection,NullLog.getInstance()),next);
+    channel.pipeline().fireExceptionCaught(new RuntimeException("some exception"));
+    verify(next,never()).exceptionCaught(any(),any());
+  }
+  @Test public void shouldNotLogExceptionsWhenEvenLoopIsShuttingDown() throws Exception {
+    AssertableLogProvider logProvider=new AssertableLogProvider();
+    BoltConnection connection=mock(BoltConnection.class);
+    HouseKeeper houseKeeper=new HouseKeeper(connection,logProvider.getLog(HouseKeeper.class));
+    Bootstrap bootstrap=newBootstrap(houseKeeper);
+    try (ServerSocket serverSocket=new ServerSocket(0)){
+      ChannelFuture future=bootstrap.connect("localhost",serverSocket.getLocalPort()).sync();
+      Channel channel=future.channel();
+      for (int i=0; i < 100; i++) {
+        channel.write(writeUtf8(channel.alloc(),"Hello"),channel.voidPromise());
+      }
+      bootstrap.config().group().shutdownGracefully();
+      channel.closeFuture().sync();
+    }
+  finally {
+      bootstrap.config().group().shutdownGracefully().sync();
+    }
+    logProvider.assertNoLoggingOccurred();
+  }
+  @Test public void shouldLogOnlyTheFirstCaughtException() throws Exception {
+    AssertableLogProvider logProvider=new AssertableLogProvider();
+    BoltConnection connection=mock(BoltConnection.class);
+    HouseKeeper houseKeeper=new HouseKeeper(connection,logProvider.getLog(HouseKeeper.class));
+    Bootstrap bootstrap=newBootstrap(houseKeeper);
+    RuntimeException error1=new RuntimeException("error #1");
+    RuntimeException error2=new RuntimeException("error #2");
+    RuntimeException error3=new RuntimeException("error #3");
+    try (ServerSocket serverSocket=new ServerSocket(0)){
+      ChannelFuture future=bootstrap.connect("localhost",serverSocket.getLocalPort()).sync();
+      Channel channel=future.channel();
+      channel.pipeline().fireExceptionCaught(error1);
+      channel.pipeline().fireExceptionCaught(error2);
+      channel.pipeline().fireExceptionCaught(error3);
+      channel.closeFuture().sync();
+    }
+  finally {
+      bootstrap.config().group().shutdownGracefully().sync();
+    }
+    logProvider.assertExactly(inLog(HouseKeeper.class).error(startsWith("Fatal error occurred when handling a client connection"),equalTo(error1)));
+  }
+  @Test public void shouldNotLogConnectionResetErrors() throws Exception {
+    AssertableLogProvider logProvider=new AssertableLogProvider();
+    HouseKeeper keeper=new HouseKeeper(null,logProvider.getLog(HouseKeeper.class));
+    Channel channel=mock(Channel.class);
+    when(channel.toString()).thenReturn("[some channel info]");
+    ChannelHandlerContext ctx=mock(ChannelHandlerContext.class);
+    when(ctx.channel()).thenReturn(channel);
+    when(ctx.executor()).thenReturn(mock(EventExecutor.class));
+    IOException connResetError=new IOException("Connection reset by peer");
+    keeper.exceptionCaught(ctx,connResetError);
+    logProvider.assertExactly(AssertableLogProvider.inLog(HouseKeeper.class).warn("Fatal error occurred when handling a client connection, " + "remote peer unexpectedly closed connection: %s",channel));
+  }
+  private static Bootstrap newBootstrap(  HouseKeeper houseKeeper){
+    return new Bootstrap().group(new NioEventLoopGroup(1)).channel(NioSocketChannel.class).handler(new ChannelInitializer<SocketChannel>(){
+      @Override protected void initChannel(      SocketChannel ch) throws Exception {
+        ch.pipeline().addLast(houseKeeper);
+      }
+    }
+);
+  }
+}

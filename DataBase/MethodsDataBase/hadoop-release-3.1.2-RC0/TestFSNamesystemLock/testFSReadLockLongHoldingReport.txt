@@ -1,0 +1,82 @@
+/** 
+ * Test when FSNamesystem read lock is held for a long time, logger will report it.
+ */
+@Test(timeout=45000) public void testFSReadLockLongHoldingReport() throws Exception {
+  final long readLockReportingThreshold=100L;
+  final long readLockSuppressWarningInterval=10000L;
+  final String readLockLogStmt="FSNamesystem read lock held for ";
+  Configuration conf=new Configuration();
+  conf.setLong(DFSConfigKeys.DFS_NAMENODE_READ_LOCK_REPORTING_THRESHOLD_MS_KEY,readLockReportingThreshold);
+  conf.setTimeDuration(DFSConfigKeys.DFS_LOCK_SUPPRESS_WARNING_INTERVAL_KEY,readLockSuppressWarningInterval,TimeUnit.MILLISECONDS);
+  final FakeTimer timer=new FakeTimer();
+  final FSNamesystemLock fsnLock=new FSNamesystemLock(conf,null,timer);
+  timer.advance(readLockSuppressWarningInterval);
+  LogCapturer logs=LogCapturer.captureLogs(FSNamesystem.LOG);
+  GenericTestUtils.setLogLevel(FSNamesystem.LOG,Level.INFO);
+  fsnLock.readLock();
+  fsnLock.readUnlock();
+  assertFalse(logs.getOutput().contains(GenericTestUtils.getMethodName()) && logs.getOutput().contains(readLockLogStmt));
+  fsnLock.readLock();
+  timer.advance(readLockReportingThreshold + 10);
+  logs.clearOutput();
+  fsnLock.readUnlock();
+  assertTrue(logs.getOutput().contains(GenericTestUtils.getMethodName()) && logs.getOutput().contains(readLockLogStmt));
+  fsnLock.readLock();
+  timer.advance(readLockReportingThreshold + 10);
+  logs.clearOutput();
+  fsnLock.readUnlock();
+  assertFalse(logs.getOutput().contains(GenericTestUtils.getMethodName()) && logs.getOutput().contains(readLockLogStmt));
+  fsnLock.readLock();
+  timer.advance(readLockReportingThreshold / 2 + 1);
+  fsnLock.readLock();
+  timer.advance(readLockReportingThreshold / 2 + 1);
+  logs.clearOutput();
+  fsnLock.readUnlock();
+  assertFalse(logs.getOutput().contains(GenericTestUtils.getMethodName()) || logs.getOutput().contains(readLockLogStmt));
+  logs.clearOutput();
+  fsnLock.readUnlock();
+  assertFalse(logs.getOutput().contains(GenericTestUtils.getMethodName()) && logs.getOutput().contains(readLockLogStmt));
+  timer.advance(readLockSuppressWarningInterval);
+  logs.clearOutput();
+  final CountDownLatch barrier=new CountDownLatch(1);
+  final CountDownLatch barrier2=new CountDownLatch(1);
+  Thread t1=new Thread(){
+    @Override public void run(){
+      try {
+        fsnLock.readLock();
+        timer.advance(readLockReportingThreshold + 1);
+        barrier.countDown();
+        barrier2.await();
+        fsnLock.readUnlock();
+      }
+ catch (      InterruptedException e) {
+        fail("Interrupted during testing");
+      }
+    }
+  }
+;
+  Thread t2=new Thread(){
+    @Override public void run(){
+      try {
+        barrier.await();
+        fsnLock.readLock();
+        barrier2.countDown();
+        fsnLock.readUnlock();
+      }
+ catch (      InterruptedException e) {
+        fail("Interrupted during testing");
+      }
+    }
+  }
+;
+  t1.start();
+  t2.start();
+  t1.join();
+  t2.join();
+  String stackTracePatternString=String.format("INFO.+%s(.+\n){5}\\Q%%s\\E\\.run",readLockLogStmt);
+  Pattern t1Pattern=Pattern.compile(String.format(stackTracePatternString,t1.getClass().getName()));
+  assertTrue(t1Pattern.matcher(logs.getOutput()).find());
+  Pattern t2Pattern=Pattern.compile(String.format(stackTracePatternString,t2.getClass().getName()));
+  assertFalse(t2Pattern.matcher(logs.getOutput()).find());
+  assertTrue(logs.getOutput().contains("Number of suppressed read-lock reports: 2"));
+}

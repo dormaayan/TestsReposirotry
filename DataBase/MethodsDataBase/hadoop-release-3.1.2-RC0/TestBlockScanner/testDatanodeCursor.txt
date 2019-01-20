@@ -1,0 +1,79 @@
+/** 
+ * Test that we save the scan cursor when shutting down the datanode, and restart scanning from there when the datanode is restarted.
+ */
+@Test(timeout=120000) public void testDatanodeCursor() throws Exception {
+  Configuration conf=new Configuration();
+  conf.setLong(DFS_DATANODE_SCAN_PERIOD_HOURS_KEY,100L);
+  conf.set(INTERNAL_VOLUME_SCANNER_SCAN_RESULT_HANDLER,TestScanResultHandler.class.getName());
+  conf.setLong(INTERNAL_DFS_BLOCK_SCANNER_CURSOR_SAVE_INTERVAL_MS,0L);
+  final TestContext ctx=new TestContext(conf,1);
+  final int NUM_EXPECTED_BLOCKS=10;
+  ctx.createFiles(0,NUM_EXPECTED_BLOCKS,1);
+  final TestScanResultHandler.Info info=TestScanResultHandler.getInfo(ctx.volumes.get(0));
+synchronized (info) {
+    info.sem=new Semaphore(5);
+    info.shouldRun=true;
+    info.notify();
+  }
+  GenericTestUtils.waitFor(new Supplier<Boolean>(){
+    @Override public Boolean get(){
+synchronized (info) {
+        return info.blocksScanned == 5;
+      }
+    }
+  }
+,3,30000);
+synchronized (info) {
+    assertEquals(5,info.goodBlocks.size());
+    assertEquals(5,info.blocksScanned);
+    info.shouldRun=false;
+  }
+  ctx.datanode.shutdown();
+  URI vURI=ctx.volumes.get(0).getStorageLocation().getUri();
+  File cursorPath=new File(new File(new File(new File(vURI),"current"),ctx.bpids[0]),"scanner.cursor");
+  assertTrue("Failed to find cursor save file in " + cursorPath.getAbsolutePath(),cursorPath.exists());
+  Set<ExtendedBlock> prevGoodBlocks=new HashSet<ExtendedBlock>();
+synchronized (info) {
+    info.sem=new Semaphore(4);
+    prevGoodBlocks.addAll(info.goodBlocks);
+    info.goodBlocks.clear();
+  }
+  ctx.cluster.restartDataNode(0);
+synchronized (info) {
+    info.shouldRun=true;
+    info.notify();
+  }
+  GenericTestUtils.waitFor(new Supplier<Boolean>(){
+    @Override public Boolean get(){
+synchronized (info) {
+        if (info.blocksScanned != 9) {
+          LOG.info("Waiting for blocksScanned to reach 9.  It is at {}",info.blocksScanned);
+        }
+        return info.blocksScanned == 9;
+      }
+    }
+  }
+,3,30000);
+synchronized (info) {
+    assertEquals(4,info.goodBlocks.size());
+    info.goodBlocks.addAll(prevGoodBlocks);
+    assertEquals(9,info.goodBlocks.size());
+    assertEquals(9,info.blocksScanned);
+  }
+  ctx.datanode.shutdown();
+synchronized (info) {
+    info.sem=null;
+    info.shouldRun=false;
+    info.goodBlocks.clear();
+  }
+  ctx.cluster.restartDataNode(0);
+synchronized (info) {
+    info.shouldRun=true;
+    info.notify();
+  }
+  Thread.sleep(3000);
+synchronized (info) {
+    assertTrue(info.goodBlocks.isEmpty());
+  }
+  ctx.close();
+}

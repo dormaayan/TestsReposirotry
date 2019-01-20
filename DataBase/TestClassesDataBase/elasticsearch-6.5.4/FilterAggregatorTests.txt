@@ -1,0 +1,72 @@
+public class FilterAggregatorTests extends AggregatorTestCase {
+  private MappedFieldType fieldType;
+  @Before public void setUpTest() throws Exception {
+    super.setUp();
+    fieldType=new KeywordFieldMapper.KeywordFieldType();
+    fieldType.setHasDocValues(true);
+    fieldType.setIndexOptions(IndexOptions.DOCS);
+    fieldType.setName("field");
+  }
+  public void testEmpty() throws Exception {
+    Directory directory=newDirectory();
+    RandomIndexWriter indexWriter=new RandomIndexWriter(random(),directory);
+    indexWriter.close();
+    IndexReader indexReader=DirectoryReader.open(directory);
+    IndexSearcher indexSearcher=newSearcher(indexReader,true,true);
+    QueryBuilder filter=QueryBuilders.termQuery("field",randomAlphaOfLength(5));
+    FilterAggregationBuilder builder=new FilterAggregationBuilder("test",filter);
+    InternalFilter response=search(indexSearcher,new MatchAllDocsQuery(),builder,fieldType);
+    assertEquals(response.getDocCount(),0);
+    indexReader.close();
+    directory.close();
+  }
+  public void testRandom() throws Exception {
+    Directory directory=newDirectory();
+    RandomIndexWriter indexWriter=new RandomIndexWriter(random(),directory);
+    int numDocs=randomIntBetween(100,200);
+    int maxTerm=randomIntBetween(10,50);
+    int[] expectedBucketCount=new int[maxTerm];
+    Document document=new Document();
+    for (int i=0; i < numDocs; i++) {
+      if (frequently()) {
+        indexWriter.getReader().close();
+      }
+      int value=randomInt(maxTerm - 1);
+      expectedBucketCount[value]+=1;
+      document.add(new Field("field",Integer.toString(value),fieldType));
+      indexWriter.addDocument(document);
+      document.clear();
+    }
+    indexWriter.close();
+    IndexReader indexReader=DirectoryReader.open(directory);
+    IndexSearcher indexSearcher=newSearcher(indexReader,true,true);
+    int value=randomInt(maxTerm - 1);
+    QueryBuilder filter=QueryBuilders.termQuery("field",Integer.toString(value));
+    FilterAggregationBuilder builder=new FilterAggregationBuilder("test",filter);
+    for (    boolean doReduce : new boolean[]{true,false}) {
+      final InternalFilter response;
+      if (doReduce) {
+        response=searchAndReduce(indexSearcher,new MatchAllDocsQuery(),builder,fieldType);
+      }
+ else {
+        response=search(indexSearcher,new MatchAllDocsQuery(),builder,fieldType);
+      }
+      assertEquals(response.getDocCount(),(long)expectedBucketCount[value]);
+    }
+    indexReader.close();
+    directory.close();
+  }
+  public void testParsedAsFilter() throws IOException {
+    IndexReader indexReader=new MultiReader();
+    IndexSearcher indexSearcher=newSearcher(indexReader);
+    QueryBuilder filter=QueryBuilders.boolQuery().must(QueryBuilders.termQuery("field","foo")).should(QueryBuilders.termQuery("field","bar"));
+    FilterAggregationBuilder builder=new FilterAggregationBuilder("test",filter);
+    AggregatorFactory<?> factory=createAggregatorFactory(builder,indexSearcher,fieldType);
+    assertThat(factory,Matchers.instanceOf(FilterAggregatorFactory.class));
+    FilterAggregatorFactory filterFactory=(FilterAggregatorFactory)factory;
+    Query parsedQuery=filterFactory.getWeight().getQuery();
+    assertThat(parsedQuery,Matchers.instanceOf(BooleanQuery.class));
+    assertEquals(2,((BooleanQuery)parsedQuery).clauses().size());
+    assertEquals(1,((BooleanQuery)parsedQuery).getMinimumNumberShouldMatch());
+  }
+}

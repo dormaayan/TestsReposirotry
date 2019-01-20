@@ -1,0 +1,62 @@
+@Test public void testStoreCloseAndDischargeRunningInParallel() throws Exception {
+  byte[] fam=Bytes.toBytes("f");
+  byte[] col=Bytes.toBytes("c");
+  byte[] val=Bytes.toBytes("val");
+  TableName tableName=TableName.valueOf(name.getMethodName());
+  TableDescriptor htd=TableDescriptorBuilder.newBuilder(tableName).setColumnFamily(ColumnFamilyDescriptorBuilder.of(fam)).build();
+  RegionInfo info=RegionInfoBuilder.newBuilder(tableName).build();
+  HRegion region=initHRegion(htd,info);
+  RegionServerServices rss=mock(RegionServerServices.class);
+  List<HRegion> regions=new ArrayList<>();
+  regions.add(region);
+  Mockito.doReturn(regions).when(rss).getRegions();
+  CompactedHFilesDischarger cleaner=new CompactedHFilesDischarger(1000,(Stoppable)null,rss,false);
+  int batchSize=10;
+  int fileCount=10;
+  for (int f=0; f < fileCount; f++) {
+    int start=f * batchSize;
+    for (int i=start; i < start + batchSize; i++) {
+      Put p=new Put(Bytes.toBytes("row" + i));
+      p.addColumn(fam,col,val);
+      region.put(p);
+    }
+    region.flush(true);
+  }
+  HStore store=region.getStore(fam);
+  assertEquals(fileCount,store.getStorefilesCount());
+  Collection<HStoreFile> storefiles=store.getStorefiles();
+  for (  HStoreFile file : storefiles) {
+    assertFalse(file.isCompactedAway());
+  }
+  region.compact(true);
+  Thread cleanerThread=new Thread(){
+    @Override public void run(){
+      cleaner.chore();
+    }
+  }
+;
+  cleanerThread.start();
+synchronized (archived) {
+    if (!archived.get()) {
+      archived.wait();
+    }
+  }
+  final AtomicReference<Exception> closeException=new AtomicReference<>();
+  Thread closeThread=new Thread(){
+    @Override public void run(){
+      try {
+        ((HRegion)region).close();
+      }
+ catch (      IOException e) {
+        closeException.set(e);
+      }
+    }
+  }
+;
+  closeThread.start();
+  closeThread.join();
+  cleanerThread.join();
+  if (closeException.get() != null) {
+    throw closeException.get();
+  }
+}

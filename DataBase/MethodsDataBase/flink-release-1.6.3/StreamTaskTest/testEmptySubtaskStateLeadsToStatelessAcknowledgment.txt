@@ -1,0 +1,43 @@
+/** 
+ * FLINK-5985 <p>This test ensures that empty snapshots (no op/keyed stated whatsoever) will be reported as stateless tasks. This happens by translating an empty  {@link SubtaskState} into reporting 'null' to #acknowledgeCheckpoint.
+ */
+@Test public void testEmptySubtaskStateLeadsToStatelessAcknowledgment() throws Exception {
+  final long checkpointId=42L;
+  final long timestamp=1L;
+  Environment mockEnvironment=spy(new MockEnvironmentBuilder().build());
+  final OneShotLatch checkpointCompletedLatch=new OneShotLatch();
+  final List<SubtaskState> checkpointResult=new ArrayList<>(1);
+  CheckpointResponder checkpointResponder=mock(CheckpointResponder.class);
+  doAnswer(new Answer(){
+    @Override public Object answer(    InvocationOnMock invocation) throws Throwable {
+      SubtaskState subtaskState=invocation.getArgumentAt(4,SubtaskState.class);
+      checkpointResult.add(subtaskState);
+      checkpointCompletedLatch.trigger();
+      return null;
+    }
+  }
+).when(checkpointResponder).acknowledgeCheckpoint(any(JobID.class),any(ExecutionAttemptID.class),anyLong(),any(CheckpointMetrics.class),any(TaskStateSnapshot.class));
+  TaskStateManager taskStateManager=new TaskStateManagerImpl(new JobID(1L,2L),new ExecutionAttemptID(1L,2L),mock(TaskLocalStateStoreImpl.class),null,checkpointResponder);
+  when(mockEnvironment.getTaskStateManager()).thenReturn(taskStateManager);
+  StreamTask<?,?> streamTask=new EmptyStreamTask(mockEnvironment);
+  CheckpointMetaData checkpointMetaData=new CheckpointMetaData(checkpointId,timestamp);
+  StreamOperator<?> statelessOperator=mock(StreamOperator.class);
+  final OperatorID operatorID=new OperatorID();
+  when(statelessOperator.getOperatorID()).thenReturn(operatorID);
+  OperatorSnapshotFutures statelessOperatorSnapshotResult=new OperatorSnapshotFutures();
+  when(statelessOperator.snapshotState(anyLong(),anyLong(),any(CheckpointOptions.class),any(CheckpointStreamFactory.class))).thenReturn(statelessOperatorSnapshotResult);
+  StreamOperator<?>[] streamOperators={statelessOperator};
+  OperatorChain<Void,AbstractStreamOperator<Void>> operatorChain=mock(OperatorChain.class);
+  when(operatorChain.getAllOperators()).thenReturn(streamOperators);
+  Whitebox.setInternalState(streamTask,"isRunning",true);
+  Whitebox.setInternalState(streamTask,"lock",new Object());
+  Whitebox.setInternalState(streamTask,"operatorChain",operatorChain);
+  Whitebox.setInternalState(streamTask,"cancelables",new CloseableRegistry());
+  Whitebox.setInternalState(streamTask,"configuration",new StreamConfig(new Configuration()));
+  Whitebox.setInternalState(streamTask,"asyncOperationsThreadPool",Executors.newCachedThreadPool());
+  Whitebox.setInternalState(streamTask,"checkpointStorage",new MemoryBackendCheckpointStorage(new JobID(),null,null,Integer.MAX_VALUE));
+  streamTask.triggerCheckpoint(checkpointMetaData,CheckpointOptions.forCheckpointWithDefaultLocation());
+  checkpointCompletedLatch.await(30,TimeUnit.SECONDS);
+  streamTask.cancel();
+  Assert.assertNull(checkpointResult.get(0));
+}

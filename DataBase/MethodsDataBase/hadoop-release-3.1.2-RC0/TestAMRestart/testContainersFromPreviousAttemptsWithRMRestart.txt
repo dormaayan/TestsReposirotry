@@ -1,0 +1,78 @@
+@Test(timeout=200000) public void testContainersFromPreviousAttemptsWithRMRestart() throws Exception {
+  getConf().setInt(YarnConfiguration.RM_AM_MAX_ATTEMPTS,2);
+  getConf().setBoolean(YarnConfiguration.RECOVERY_ENABLED,true);
+  getConf().setBoolean(YarnConfiguration.RM_WORK_PRESERVING_RECOVERY_ENABLED,true);
+  getConf().setLong(YarnConfiguration.RM_WORK_PRESERVING_RECOVERY_SCHEDULING_WAIT_MS,0);
+  getConf().set(YarnConfiguration.RM_STORE,MemoryRMStateStore.class.getName());
+  MockRM rm1=new MockRM(getConf());
+  MemoryRMStateStore memStore=(MemoryRMStateStore)rm1.getRMStateStore();
+  rm1.start();
+  YarnScheduler scheduler=rm1.getResourceScheduler();
+  String nm1Address="127.0.0.1:1234";
+  MockNM nm1=new MockNM(nm1Address,10240,rm1.getResourceTrackerService());
+  nm1.registerNode();
+  String nm2Address="127.0.0.1:2351";
+  MockNM nm2=new MockNM(nm2Address,4089,rm1.getResourceTrackerService());
+  nm2.registerNode();
+  RMApp app1=rm1.submitApp(200,"name","user",new HashMap<>(),false,"default",-1,null,"MAPREDUCE",false,true);
+  MockAM am1=MockRM.launchAndRegisterAM(app1,rm1,nm1);
+  allocateContainers(nm1,am1,1);
+  allocateContainers(nm2,am1,1);
+  nm1.nodeHeartbeat(am1.getApplicationAttemptId(),2,ContainerState.RUNNING);
+  ContainerId containerId2=ContainerId.newContainerId(am1.getApplicationAttemptId(),2);
+  rm1.waitForState(nm1,containerId2,RMContainerState.RUNNING);
+  nm2.nodeHeartbeat(am1.getApplicationAttemptId(),3,ContainerState.RUNNING);
+  ContainerId containerId3=ContainerId.newContainerId(am1.getApplicationAttemptId(),3);
+  rm1.waitForState(nm2,containerId3,RMContainerState.RUNNING);
+  nm1.nodeHeartbeat(am1.getApplicationAttemptId(),1,ContainerState.COMPLETE);
+  rm1.waitForState(am1.getApplicationAttemptId(),RMAppAttemptState.FAILED);
+  TestSchedulerUtils.waitSchedulerApplicationAttemptStopped((AbstractYarnScheduler)scheduler,am1.getApplicationAttemptId());
+  MockRM rm2=new MockRM(getConf(),memStore);
+  rm2.start();
+  nm1.setResourceTrackerService(rm2.getResourceTrackerService());
+  NMContainerStatus container2Status=TestRMRestart.createNMContainerStatus(am1.getApplicationAttemptId(),2,ContainerState.RUNNING);
+  nm1.registerNode(Lists.newArrayList(container2Status),null);
+  Thread.sleep(3000);
+  nm1.nodeHeartbeat(am1.getApplicationAttemptId(),2,ContainerState.RUNNING);
+  rm2.waitForState(nm1,containerId2,RMContainerState.RUNNING);
+  Assert.assertNotNull(rm2.getResourceScheduler().getRMContainer(containerId2));
+  rm2.waitForState(app1.getApplicationId(),RMAppState.ACCEPTED);
+  ApplicationAttemptId newAttemptId=app1.getCurrentAppAttempt().getAppAttemptId();
+  Assert.assertFalse(newAttemptId.equals(am1.getApplicationAttemptId()));
+  MockAM am2=MockRM.launchAMWhenAsyncSchedulingEnabled(app1,rm2);
+  RegisterApplicationMasterResponse registerResponse=am2.registerAppAttempt();
+  Assert.assertEquals(1,registerResponse.getContainersFromPreviousAttempts().size());
+  Assert.assertEquals("container 2",containerId2,registerResponse.getContainersFromPreviousAttempts().get(0).getId());
+  List<NMToken> prevNMTokens=registerResponse.getNMTokensFromPreviousAttempts();
+  Assert.assertEquals(1,prevNMTokens.size());
+  Assert.assertEquals(nm1Address,prevNMTokens.get(0).getNodeId().toString());
+  rm2.waitForState(app1.getApplicationId(),RMAppState.RUNNING);
+  nm2.setResourceTrackerService(rm2.getResourceTrackerService());
+  NMContainerStatus container3Status=TestRMRestart.createNMContainerStatus(am1.getApplicationAttemptId(),3,ContainerState.RUNNING);
+  nm2.registerNode(Lists.newArrayList(container3Status),null);
+  nm2.nodeHeartbeat(am1.getApplicationAttemptId(),3,ContainerState.RUNNING);
+  rm2.waitForState(nm2,containerId3,RMContainerState.RUNNING);
+  Assert.assertNotNull(rm2.getResourceScheduler().getRMContainer(containerId3));
+  List<Container> containersFromPreviousAttempts=new ArrayList<>();
+  GenericTestUtils.waitFor(() -> {
+    try {
+      AllocateResponse allocateResponse=am2.doHeartbeat();
+      if (allocateResponse.getContainersFromPreviousAttempts().size() > 0) {
+        containersFromPreviousAttempts.addAll(allocateResponse.getContainersFromPreviousAttempts());
+        Assert.assertEquals("new containers should not be allocated",0,allocateResponse.getAllocatedContainers().size());
+        List<NMToken> nmTokens=allocateResponse.getNMTokens();
+        Assert.assertEquals(1,nmTokens.size());
+        Assert.assertEquals(nm2Address,nmTokens.get(0).getNodeId().toString());
+        return true;
+      }
+    }
+ catch (    Exception e) {
+      Throwables.propagate(e);
+    }
+    return false;
+  }
+,2000,200000);
+  Assert.assertEquals("container 3",containerId3,containersFromPreviousAttempts.get(0).getId());
+  rm2.stop();
+  rm1.stop();
+}

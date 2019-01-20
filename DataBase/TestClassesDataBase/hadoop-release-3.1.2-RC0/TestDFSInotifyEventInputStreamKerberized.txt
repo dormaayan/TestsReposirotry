@@ -1,0 +1,108 @@
+/** 
+ * Class for Kerberized test cases for  {@link DFSInotifyEventInputStream}.
+ */
+public class TestDFSInotifyEventInputStreamKerberized {
+  private static final Logger LOG=LoggerFactory.getLogger(TestDFSInotifyEventInputStreamKerberized.class);
+  private File baseDir;
+  private String keystoresDir;
+  private String sslConfDir;
+  private MiniKdc kdc;
+  private Configuration baseConf;
+  private Configuration conf;
+  private MiniQJMHACluster cluster;
+  private File generalHDFSKeytabFile;
+  private File nnKeytabFile;
+  @Rule public Timeout timeout=new Timeout(180000);
+  @Test public void testWithKerberizedCluster() throws Exception {
+    conf=new HdfsConfiguration(baseConf);
+    conf.setInt(HADOOP_KERBEROS_MIN_SECONDS_BEFORE_RELOGIN,3);
+    conf.setInt(IPC_CLIENT_CONNECTION_IDLESCANINTERVAL_KEY,100);
+    conf.setInt(IPC_CLIENT_CONNECTION_MAXIDLETIME_KEY,2000);
+    Client.setConnectTimeout(conf,2000);
+    cluster=new MiniQJMHACluster.Builder(conf).setForceRemoteEditsOnly(true).build();
+    cluster.getDfsCluster().waitActive();
+    cluster.getDfsCluster().transitionToActive(0);
+    final UserGroupInformation ugi=UserGroupInformation.loginUserFromKeytabAndReturnUGI("hdfs",generalHDFSKeytabFile.getAbsolutePath());
+    UserGroupInformation.setShouldRenewImmediatelyForTests(true);
+    ugi.doAs(new PrivilegedExceptionAction<Void>(){
+      @Override public Void run() throws Exception {
+        LOG.info("Current user is: " + UserGroupInformation.getCurrentUser() + " login user is:"+ UserGroupInformation.getLoginUser());
+        Configuration clientConf=new Configuration(cluster.getDfsCluster().getConfiguration(0));
+        try (DistributedFileSystem clientFs=(DistributedFileSystem)FileSystem.get(clientConf)){
+          clientFs.mkdirs(new Path("/test"));
+          LOG.info("mkdir /test success");
+          final DFSInotifyEventInputStream eis=clientFs.getInotifyEventStream();
+          EventBatch batch;
+          while ((batch=eis.poll()) != null) {
+            LOG.info("txid: " + batch.getTxid());
+          }
+          assertNull("poll should not return anything",eis.poll());
+          Thread.sleep(6000);
+          LOG.info("Slept 6 seconds to make sure the TGT has expired.");
+          UserGroupInformation.getCurrentUser().checkTGTAndReloginFromKeytab();
+          clientFs.mkdirs(new Path("/test1"));
+          LOG.info("mkdir /test1 success");
+          batch=eis.poll();
+          assertNotNull("poll should return something",batch);
+          assertEquals(1,batch.getEvents().length);
+          assertNull("poll should not return anything",eis.poll());
+          return null;
+        }
+       }
+    }
+);
+  }
+  @Before public void initKerberizedCluster() throws Exception {
+    baseDir=new File(System.getProperty("test.build.dir","target/test-dir"),TestDFSInotifyEventInputStreamKerberized.class.getSimpleName());
+    FileUtil.fullyDelete(baseDir);
+    assertTrue(baseDir.mkdirs());
+    final Properties kdcConf=MiniKdc.createConf();
+    kdcConf.setProperty(MiniKdc.MAX_TICKET_LIFETIME,"5");
+    kdcConf.setProperty(MiniKdc.MIN_TICKET_LIFETIME,"5");
+    kdc=new MiniKdc(kdcConf,baseDir);
+    kdc.start();
+    baseConf=new HdfsConfiguration();
+    SecurityUtil.setAuthenticationMethod(UserGroupInformation.AuthenticationMethod.KERBEROS,baseConf);
+    UserGroupInformation.setConfiguration(baseConf);
+    assertTrue("Expected configuration to enable security",UserGroupInformation.isSecurityEnabled());
+    final String userName="hdfs";
+    nnKeytabFile=new File(baseDir,userName + ".keytab");
+    final String keytab=nnKeytabFile.getAbsolutePath();
+    final String krbInstance=Path.WINDOWS ? "127.0.0.1" : "localhost";
+    kdc.createPrincipal(nnKeytabFile,userName + "/" + krbInstance,"HTTP/" + krbInstance);
+    generalHDFSKeytabFile=new File(baseDir,"hdfs_general.keytab");
+    kdc.createPrincipal(generalHDFSKeytabFile,"hdfs");
+    assertTrue(generalHDFSKeytabFile.exists());
+    final String hdfsPrincipal=userName + "/" + krbInstance+ "@"+ kdc.getRealm();
+    final String spnegoPrincipal="HTTP/" + krbInstance + "@"+ kdc.getRealm();
+    baseConf.set(DFS_NAMENODE_KERBEROS_PRINCIPAL_KEY,hdfsPrincipal);
+    baseConf.set(DFS_NAMENODE_KEYTAB_FILE_KEY,keytab);
+    baseConf.set(DFS_DATANODE_KERBEROS_PRINCIPAL_KEY,hdfsPrincipal);
+    baseConf.set(DFS_DATANODE_KEYTAB_FILE_KEY,keytab);
+    baseConf.set(DFS_WEB_AUTHENTICATION_KERBEROS_PRINCIPAL_KEY,spnegoPrincipal);
+    baseConf.set(DFS_JOURNALNODE_KEYTAB_FILE_KEY,keytab);
+    baseConf.set(DFS_JOURNALNODE_KERBEROS_PRINCIPAL_KEY,hdfsPrincipal);
+    baseConf.set(DFS_JOURNALNODE_KERBEROS_INTERNAL_SPNEGO_PRINCIPAL_KEY,spnegoPrincipal);
+    baseConf.setBoolean(DFS_BLOCK_ACCESS_TOKEN_ENABLE_KEY,true);
+    baseConf.set(DFS_HTTP_POLICY_KEY,HttpConfig.Policy.HTTPS_ONLY.name());
+    baseConf.set(DFS_NAMENODE_HTTPS_ADDRESS_KEY,"localhost:0");
+    baseConf.set(DFS_DATANODE_HTTPS_ADDRESS_KEY,"localhost:0");
+    baseConf.set(DFS_JOURNALNODE_HTTPS_ADDRESS_KEY,"localhost:0");
+    baseConf.setInt(IPC_CLIENT_CONNECT_MAX_RETRIES_ON_SASL_KEY,10);
+    keystoresDir=baseDir.getAbsolutePath();
+    sslConfDir=KeyStoreTestUtil.getClasspathDir(TestSecureNNWithQJM.class);
+    KeyStoreTestUtil.setupSSLConfig(keystoresDir,sslConfDir,baseConf,false);
+    baseConf.set(DFS_CLIENT_HTTPS_KEYSTORE_RESOURCE_KEY,KeyStoreTestUtil.getClientSSLConfigFileName());
+    baseConf.set(DFS_SERVER_HTTPS_KEYSTORE_RESOURCE_KEY,KeyStoreTestUtil.getServerSSLConfigFileName());
+  }
+  @After public void shutdownCluster() throws Exception {
+    if (cluster != null) {
+      cluster.shutdown();
+    }
+    if (kdc != null) {
+      kdc.stop();
+    }
+    FileUtil.fullyDelete(baseDir);
+    KeyStoreTestUtil.cleanupSSLConfig(keystoresDir,sslConfDir);
+  }
+}

@@ -1,0 +1,58 @@
+@Test public void testCombinationInputFormatWithAcid() throws Exception {
+  StructObjectInspector inspector;
+  final int PARTITIONS=2;
+  final int BUCKETS=3;
+synchronized (TestOrcFile.class) {
+    inspector=(StructObjectInspector)ObjectInspectorFactory.getReflectionObjectInspector(MyRow.class,ObjectInspectorFactory.ObjectInspectorOptions.JAVA);
+  }
+  JobConf conf=createMockExecutionEnvironment(workDir,new Path("mock:///"),"combinationAcid",inspector,false,PARTITIONS);
+  Path[] partDir=new Path[PARTITIONS];
+  String[] paths=conf.getStrings("mapred.input.dir");
+  for (int p=0; p < PARTITIONS; ++p) {
+    partDir[p]=new Path(paths[p]);
+  }
+  OrcRecordUpdater writer=new OrcRecordUpdater(partDir[0],new AcidOutputFormat.Options(conf).maximumTransactionId(10).writingBase(true).bucket(0).inspector(inspector).finalDestination(partDir[0]));
+  for (int i=0; i < 10; ++i) {
+    writer.insert(10,new MyRow(i,2 * i));
+  }
+  writer.close(false);
+  Path base0=new Path("mock:/combinationAcid/p=0/base_0000010/bucket_00000");
+  setBlocks(base0,conf,new MockBlock("host1","host2"));
+  writer=new OrcRecordUpdater(partDir[0],new AcidOutputFormat.Options(conf).maximumTransactionId(10).writingBase(true).bucket(1).inspector(inspector).finalDestination(partDir[0]));
+  for (int i=10; i < 20; ++i) {
+    writer.insert(10,new MyRow(i,2 * i));
+  }
+  writer.close(false);
+  Path base1=new Path("mock:/combinationAcid/p=0/base_0000010/bucket_00001");
+  setBlocks(base1,conf,new MockBlock("host1","host2"));
+  for (int bucket=0; bucket < BUCKETS; ++bucket) {
+    Path path=new Path(partDir[1],"00000" + bucket + "_0");
+    Writer orc=OrcFile.createWriter(path,OrcFile.writerOptions(conf).blockPadding(false).bufferSize(1024).inspector(inspector));
+    orc.addRow(new MyRow(1,2));
+    orc.close();
+    setBlocks(path,conf,new MockBlock("host3","host4"));
+  }
+  conf.setInt(hive_metastoreConstants.BUCKET_COUNT,BUCKETS);
+  HiveInputFormat<?,?> inputFormat=new CombineHiveInputFormat<WritableComparable,Writable>();
+  InputSplit[] splits=inputFormat.getSplits(conf,1);
+  assertEquals(3,splits.length);
+  HiveInputFormat.HiveInputSplit split=(HiveInputFormat.HiveInputSplit)splits[0];
+  assertEquals("org.apache.hadoop.hive.ql.io.orc.OrcInputFormat",split.inputFormatClassName());
+  assertEquals("mock:/combinationAcid/p=0/base_0000010/bucket_00000",split.getPath().toString());
+  assertEquals(0,split.getStart());
+  assertEquals(607,split.getLength());
+  split=(HiveInputFormat.HiveInputSplit)splits[1];
+  assertEquals("org.apache.hadoop.hive.ql.io.orc.OrcInputFormat",split.inputFormatClassName());
+  assertEquals("mock:/combinationAcid/p=0/base_0000010/bucket_00001",split.getPath().toString());
+  assertEquals(0,split.getStart());
+  assertEquals(629,split.getLength());
+  CombineHiveInputFormat.CombineHiveInputSplit combineSplit=(CombineHiveInputFormat.CombineHiveInputSplit)splits[2];
+  assertEquals(BUCKETS,combineSplit.getNumPaths());
+  for (int bucket=0; bucket < BUCKETS; ++bucket) {
+    assertEquals("mock:/combinationAcid/p=1/00000" + bucket + "_0",combineSplit.getPath(bucket).toString());
+    assertEquals(0,combineSplit.getOffset(bucket));
+    assertEquals(241,combineSplit.getLength(bucket));
+  }
+  String[] hosts=combineSplit.getLocations();
+  assertEquals(2,hosts.length);
+}

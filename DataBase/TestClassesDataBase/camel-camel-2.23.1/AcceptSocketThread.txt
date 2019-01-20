@@ -1,0 +1,217 @@
+/** 
+ * Nested class to accept TCP connections
+ */
+class AcceptSocketThread extends Thread {
+  final long bindTimeout=30000;
+  final long bindRetryDelay=1000;
+  Logger log=LoggerFactory.getLogger(this.getClass());
+  ServerSocket serverSocket;
+  List<ClientSocketThread> clientSocketThreads=new LinkedList<>();
+  String listenHost;
+  int listenPort;
+  int backlog=5;
+  int acceptTimeout=5000;
+  boolean raiseExceptionOnAcceptTimeout;
+  AcceptSocketThread() throws IOException {
+    bind();
+  }
+  AcceptSocketThread(  int listenPort) throws IOException {
+    this.listenPort=listenPort;
+    bind();
+  }
+  AcceptSocketThread(  int listenPort,  int backlog) throws IOException {
+    this.listenPort=listenPort;
+    this.backlog=backlog;
+    bind();
+  }
+  AcceptSocketThread(  String listenHost,  int listenPort,  int backlog) throws IOException {
+    this.listenHost=listenHost;
+    this.listenPort=listenPort;
+    this.backlog=backlog;
+    bind();
+  }
+  /** 
+ * Open the TCP Listener
+ * @throws IOException
+ */
+  private void bind() throws IOException {
+    this.setDaemon(true);
+    serverSocket=new ServerSocket();
+    serverSocket.setSoTimeout(acceptTimeout);
+    serverSocket.setReuseAddress(true);
+    InetSocketAddress listenAddress;
+    if (null != this.listenHost) {
+      listenAddress=new InetSocketAddress(this.listenHost,this.listenPort);
+    }
+ else {
+      listenAddress=new InetSocketAddress(this.listenPort);
+    }
+    long startTicks=System.currentTimeMillis();
+    while (!serverSocket.isBound()) {
+      try {
+        serverSocket.bind(listenAddress,backlog);
+      }
+ catch (      BindException bindEx) {
+        if (System.currentTimeMillis() < startTicks + bindTimeout) {
+          log.warn("Unable to bind to {} - retrying in {} milliseconds",listenAddress,bindRetryDelay);
+          try {
+            Thread.sleep(bindRetryDelay);
+          }
+ catch (          InterruptedException interruptedEx) {
+            log.error("Wait for bind retry was interrupted - rethrowing BindException");
+            throw bindEx;
+          }
+        }
+      }
+    }
+    if (0 >= this.listenPort) {
+      this.listenPort=serverSocket.getLocalPort();
+    }
+    log.info("Opened TCP Listener on port {}",serverSocket.getLocalPort());
+  }
+  void checkClientConnections(){
+    if (clientSocketThreads != null) {
+      for (      ClientSocketThread clientSocketThread : clientSocketThreads) {
+        clientSocketThread.checkConnection();
+      }
+    }
+  }
+  void closeClientConnections(){
+    if (clientSocketThreads != null) {
+      for (      ClientSocketThread clientSocketThread : clientSocketThreads) {
+        clientSocketThread.closeConnection();
+      }
+    }
+  }
+  void resetClientConnections(){
+    if (clientSocketThreads != null) {
+      for (      ClientSocketThread clientSocketThread : clientSocketThreads) {
+        clientSocketThread.resetConnection();
+      }
+    }
+  }
+  /** 
+ * Accept TCP connections and create ClientSocketThreads for them
+ */
+  public void run(){
+    log.info("Accepting connections on port {}",serverSocket.getLocalPort());
+    this.setName("MllpServerResource$AcceptSocketThread - " + serverSocket.getLocalSocketAddress().toString());
+    while (!isInterrupted() && serverSocket.isBound() && !serverSocket.isClosed()) {
+      Socket clientSocket=null;
+      try {
+        clientSocket=serverSocket.accept();
+      }
+ catch (      SocketTimeoutException timeoutEx) {
+        if (raiseExceptionOnAcceptTimeout) {
+          throw new MllpJUnitResourceTimeoutException("Timeout Accepting client connection",timeoutEx);
+        }
+        log.warn("Timeout waiting for client connection");
+      }
+catch (      SocketException socketEx) {
+        log.debug("SocketException encountered accepting client connection - ignoring",socketEx);
+        if (null == clientSocket) {
+          continue;
+        }
+ else         if (!clientSocket.isClosed()) {
+          try {
+            clientSocket.setSoLinger(true,0);
+          }
+ catch (          SocketException soLingerEx) {
+            log.warn("Ignoring SocketException encountered when setting SO_LINGER in preparation of resetting client Socket",soLingerEx);
+          }
+          try {
+            clientSocket.close();
+          }
+ catch (          IOException ioEx) {
+            log.warn("Ignoring IOException encountered when resetting client Socket",ioEx);
+          }
+          continue;
+        }
+ else {
+          throw new MllpJUnitResourceException("Unexpected SocketException encountered accepting client connection",socketEx);
+        }
+      }
+catch (      Exception ex) {
+        throw new MllpJUnitResourceException("Unexpected exception encountered accepting client connection",ex);
+      }
+      if (null != clientSocket) {
+        try {
+          clientSocket.setKeepAlive(true);
+          clientSocket.setTcpNoDelay(false);
+          clientSocket.setSoLinger(false,-1);
+          clientSocket.setSoTimeout(5000);
+          ClientSocketThread clientSocketThread=new ClientSocketThread(clientSocket);
+          clientSocketThread.setDaemon(true);
+          clientSocketThread.start();
+          clientSocketThreads.add(clientSocketThread);
+        }
+ catch (        Exception unexpectedEx) {
+          log.warn("Unexpected exception encountered configuring client socket");
+          try {
+            clientSocket.close();
+          }
+ catch (          IOException ingoreEx) {
+            log.warn("Exceptiong encountered closing client socket after attempting to accept connection",ingoreEx);
+          }
+          throw new MllpJUnitResourceException("Unexpected exception encountered configuring client socket",unexpectedEx);
+        }
+      }
+    }
+    log.info("No longer accepting connections - closing TCP Listener on port {}",serverSocket.getLocalPort());
+    try {
+      serverSocket.close();
+    }
+ catch (    IOException e) {
+      e.printStackTrace();
+    }
+    log.info("Closed TCP Listener on port {}",serverSocket.getLocalPort());
+  }
+  public void shutdown(){
+    this.interrupt();
+  }
+  public String getListenHost(){
+    return listenHost;
+  }
+  public int getListenPort(){
+    return listenPort;
+  }
+  public int getBacklog(){
+    return backlog;
+  }
+  public int getAcceptTimeout(){
+    return acceptTimeout;
+  }
+  /** 
+ * Enable/disable a timeout while waiting for a TCP connection, in milliseconds. With this option set to a non-zero timeout, the AcceptSocketThread will block for only this amount of time while waiting for a tcp connection. If the timeout expires and raiseExceptionOnAcceptTimeout is set to true, a MllpJUnitResourceTimeoutException is raised. Otherwise, the AcceptSocketThread will continue to poll for new TCP connections.
+ * @param acceptTimeout the timeout in milliseconds - zero is interpreted as an infinite timeout
+ */
+  public void setAcceptTimeout(  int acceptTimeout){
+    this.acceptTimeout=acceptTimeout;
+  }
+  public boolean isRaiseExceptionOnAcceptTimeout(){
+    return raiseExceptionOnAcceptTimeout;
+  }
+  /** 
+ * Enable/Disable the generation of MllpJUnitResourceTimeoutException if the ServerSocket.accept() call raises a SocketTimeoutException.
+ * @param raiseExceptionOnAcceptTimeout true enables exceptions on an accept timeout
+ */
+  public void setRaiseExceptionOnAcceptTimeout(  boolean raiseExceptionOnAcceptTimeout){
+    this.raiseExceptionOnAcceptTimeout=raiseExceptionOnAcceptTimeout;
+  }
+  public void close(){
+  }
+  @Override public void interrupt(){
+    for (    ClientSocketThread clientSocketThread : clientSocketThreads) {
+      clientSocketThread.interrupt();
+    }
+    if (serverSocket != null && serverSocket.isBound() && !serverSocket.isClosed()) {
+      try {
+        serverSocket.close();
+      }
+ catch (      Exception ex) {
+        log.warn("Exception encountered closing server socket on interrupt",ex);
+      }
+    }
+    super.interrupt();
+  }
+}

@@ -1,0 +1,108 @@
+@Category({CoprocessorTests.class,MediumTests.class}) public class TestCoprocessorTableEndpoint {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestCoprocessorTableEndpoint.class);
+  private static final byte[] TEST_FAMILY=Bytes.toBytes("TestFamily");
+  private static final byte[] TEST_QUALIFIER=Bytes.toBytes("TestQualifier");
+  private static final byte[] ROW=Bytes.toBytes("testRow");
+  private static final int ROWSIZE=20;
+  private static final int rowSeperator1=5;
+  private static final int rowSeperator2=12;
+  private static final byte[][] ROWS=makeN(ROW,ROWSIZE);
+  private static final HBaseTestingUtility TEST_UTIL=new HBaseTestingUtility();
+  @Rule public TestName name=new TestName();
+  @BeforeClass public static void setupBeforeClass() throws Exception {
+    TEST_UTIL.startMiniCluster(2);
+  }
+  @AfterClass public static void tearDownAfterClass() throws Exception {
+    TEST_UTIL.shutdownMiniCluster();
+  }
+  @Test public void testCoprocessorTableEndpoint() throws Throwable {
+    final TableName tableName=TableName.valueOf(name.getMethodName());
+    HTableDescriptor desc=new HTableDescriptor(tableName);
+    desc.addFamily(new HColumnDescriptor(TEST_FAMILY));
+    desc.addCoprocessor(ColumnAggregationEndpoint.class.getName());
+    createTable(desc);
+    verifyTable(tableName);
+  }
+  @Test public void testDynamicCoprocessorTableEndpoint() throws Throwable {
+    final TableName tableName=TableName.valueOf(name.getMethodName());
+    HTableDescriptor desc=new HTableDescriptor(tableName);
+    desc.addFamily(new HColumnDescriptor(TEST_FAMILY));
+    createTable(desc);
+    desc.addCoprocessor(ColumnAggregationEndpoint.class.getName());
+    updateTable(desc);
+    verifyTable(tableName);
+  }
+  private static byte[][] makeN(  byte[] base,  int n){
+    byte[][] ret=new byte[n][];
+    for (int i=0; i < n; i++) {
+      ret[i]=Bytes.add(base,Bytes.toBytes(String.format("%02d",i)));
+    }
+    return ret;
+  }
+  private static Map<byte[],Long> sum(  final Table table,  final byte[] family,  final byte[] qualifier,  final byte[] start,  final byte[] end) throws ServiceException, Throwable {
+    return table.coprocessorService(ColumnAggregationProtos.ColumnAggregationService.class,start,end,new Batch.Call<ColumnAggregationProtos.ColumnAggregationService,Long>(){
+      @Override public Long call(      ColumnAggregationProtos.ColumnAggregationService instance) throws IOException {
+        CoprocessorRpcUtils.BlockingRpcCallback<ColumnAggregationProtos.SumResponse> rpcCallback=new CoprocessorRpcUtils.BlockingRpcCallback<>();
+        ColumnAggregationProtos.SumRequest.Builder builder=ColumnAggregationProtos.SumRequest.newBuilder();
+        builder.setFamily(ByteString.copyFrom(family));
+        if (qualifier != null && qualifier.length > 0) {
+          builder.setQualifier(ByteString.copyFrom(qualifier));
+        }
+        instance.sum(null,builder.build(),rpcCallback);
+        return rpcCallback.get().getSum();
+      }
+    }
+);
+  }
+  private static final void createTable(  HTableDescriptor desc) throws Exception {
+    Admin admin=TEST_UTIL.getAdmin();
+    admin.createTable(desc,new byte[][]{ROWS[rowSeperator1],ROWS[rowSeperator2]});
+    TEST_UTIL.waitUntilAllRegionsAssigned(desc.getTableName());
+    Table table=TEST_UTIL.getConnection().getTable(desc.getTableName());
+    try {
+      for (int i=0; i < ROWSIZE; i++) {
+        Put put=new Put(ROWS[i]);
+        put.addColumn(TEST_FAMILY,TEST_QUALIFIER,Bytes.toBytes(i));
+        table.put(put);
+      }
+    }
+  finally {
+      table.close();
+    }
+  }
+  private static void updateTable(  HTableDescriptor desc) throws Exception {
+    Admin admin=TEST_UTIL.getAdmin();
+    admin.disableTable(desc.getTableName());
+    admin.modifyTable(desc.getTableName(),desc);
+    admin.enableTable(desc.getTableName());
+  }
+  private static final void verifyTable(  TableName tableName) throws Throwable {
+    Table table=TEST_UTIL.getConnection().getTable(tableName);
+    try {
+      Map<byte[],Long> results=sum(table,TEST_FAMILY,TEST_QUALIFIER,ROWS[0],ROWS[ROWS.length - 1]);
+      int sumResult=0;
+      int expectedResult=0;
+      for (      Map.Entry<byte[],Long> e : results.entrySet()) {
+        sumResult+=e.getValue();
+      }
+      for (int i=0; i < ROWSIZE; i++) {
+        expectedResult+=i;
+      }
+      assertEquals("Invalid result",expectedResult,sumResult);
+      results.clear();
+      results=sum(table,TEST_FAMILY,TEST_QUALIFIER,ROWS[rowSeperator1],ROWS[ROWS.length - 1]);
+      sumResult=0;
+      expectedResult=0;
+      for (      Map.Entry<byte[],Long> e : results.entrySet()) {
+        sumResult+=e.getValue();
+      }
+      for (int i=rowSeperator1; i < ROWSIZE; i++) {
+        expectedResult+=i;
+      }
+      assertEquals("Invalid result",expectedResult,sumResult);
+    }
+  finally {
+      table.close();
+    }
+  }
+}

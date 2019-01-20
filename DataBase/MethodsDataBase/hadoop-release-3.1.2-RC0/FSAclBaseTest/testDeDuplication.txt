@@ -1,0 +1,112 @@
+/** 
+ * Verify the de-duplication of AclFeatures with same entries.
+ * @throws Exception
+ */
+@Test public void testDeDuplication() throws Exception {
+  shutdown();
+  AclStorage.getUniqueAclFeatures().clear();
+  startCluster();
+  setUp();
+  int currentSize=0;
+  Path p1=new Path("/testDeduplication");
+{
+    List<AclEntry> aclSpec=Lists.newArrayList(aclEntry(DEFAULT,USER,"testdeduplicateuser",ALL),aclEntry(DEFAULT,GROUP,"testdeduplicategroup",ALL));
+    fs.mkdirs(p1);
+    fs.modifyAclEntries(p1,aclSpec);
+    assertEquals("One more ACL feature should be unique",currentSize + 1,AclStorage.getUniqueAclFeatures().getUniqueElementsSize());
+    currentSize++;
+  }
+  Path child1=new Path(p1,"child1");
+  AclFeature child1AclFeature;
+{
+    fs.mkdirs(child1);
+    assertEquals("One more ACL feature should be unique",currentSize + 1,AclStorage.getUniqueAclFeatures().getUniqueElementsSize());
+    child1AclFeature=getAclFeature(child1,cluster);
+    assertEquals("Reference count should be 1",1,child1AclFeature.getRefCount());
+    currentSize++;
+  }
+  Path child2=new Path(p1,"child2");
+{
+    fs.mkdirs(child2);
+    assertEquals("existing AclFeature should be re-used",currentSize,AclStorage.getUniqueAclFeatures().getUniqueElementsSize());
+    AclFeature child2AclFeature=getAclFeature(child1,cluster);
+    assertSame("Same Aclfeature should be re-used",child1AclFeature,child2AclFeature);
+    assertEquals("Reference count should be 2",2,child2AclFeature.getRefCount());
+  }
+{
+    List<AclEntry> aclSpec=Lists.newArrayList(aclEntry(ACCESS,USER,"user1",ALL));
+    fs.modifyAclEntries(child1,aclSpec);
+    AclFeature modifiedAclFeature=getAclFeature(child1,cluster);
+    assertEquals("Old Reference count should be 1",1,child1AclFeature.getRefCount());
+    assertEquals("New Reference count should be 1",1,modifiedAclFeature.getRefCount());
+    AclEntry aclEntry=new AclEntry.Builder().setScope(ACCESS).setType(USER).setName("user1").build();
+    fs.removeAclEntries(child1,Lists.newArrayList(aclEntry));
+    assertEquals("Old Reference count should be 2 again",2,child1AclFeature.getRefCount());
+    assertEquals("New Reference count should be 0",0,modifiedAclFeature.getRefCount());
+  }
+{
+    fs.removeAcl(child2);
+    assertEquals("Reference count should be 1",1,child1AclFeature.getRefCount());
+  }
+{
+    fs.delete(child1,true);
+    assertEquals("Reference count should be 0",0,child1AclFeature.getRefCount());
+  }
+  Path file1=new Path(p1,"file1");
+  Path file2=new Path(p1,"file2");
+  AclFeature fileAclFeature;
+{
+    fs.create(file1).close();
+    fileAclFeature=getAclFeature(file1,cluster);
+    assertEquals("Reference count should be 1",1,fileAclFeature.getRefCount());
+    fs.create(file2).close();
+    assertEquals("Reference count should be 2",2,fileAclFeature.getRefCount());
+  }
+{
+    List<AclEntry> aclSpec=Lists.newArrayList(aclEntry(ACCESS,USER,"user1",ALL));
+    fs.modifyAclEntries(file1,aclSpec);
+    AclFeature modifiedFileAcl=getAclFeature(file1,cluster);
+    assertEquals("Old Reference count should be 1",1,fileAclFeature.getRefCount());
+    assertEquals("New Reference count should be 1",1,modifiedFileAcl.getRefCount());
+    AclEntry aclEntry=new AclEntry.Builder().setScope(ACCESS).setType(USER).setName("user1").build();
+    fs.removeAclEntries(file1,Lists.newArrayList(aclEntry));
+    assertEquals("Old Reference count should be 2",2,fileAclFeature.getRefCount());
+    assertEquals("New Reference count should be 0",0,modifiedFileAcl.getRefCount());
+  }
+{
+    fs.delete(file2,true);
+    assertEquals("Reference count should be decreased on delete of the file",1,fileAclFeature.getRefCount());
+    fs.delete(file1,true);
+    assertEquals("Reference count should be decreased on delete of the file",0,fileAclFeature.getRefCount());
+    fs.create(file1).close();
+    AclFeature newFileAclFeature=getAclFeature(file1,cluster);
+    assertNotSame("Instance should be different on reference count 0",fileAclFeature,newFileAclFeature);
+    fileAclFeature=newFileAclFeature;
+  }
+  Map<AclFeature,Integer> restartRefCounter=new HashMap<>();
+  List<AclFeature> entriesBeforeRestart=AclStorage.getUniqueAclFeatures().getEntries();
+{
+    for (    AclFeature aclFeature : entriesBeforeRestart) {
+      restartRefCounter.put(aclFeature,aclFeature.getRefCount());
+    }
+    cluster.restartNameNode(true);
+    List<AclFeature> entriesAfterRestart=AclStorage.getUniqueAclFeatures().getEntries();
+    assertEquals("Entries before and after should be same",entriesBeforeRestart,entriesAfterRestart);
+    for (    AclFeature aclFeature : entriesAfterRestart) {
+      int before=restartRefCounter.get(aclFeature);
+      assertEquals("ReferenceCount After Restart should be doubled",before * 2,aclFeature.getRefCount());
+    }
+  }
+{
+    cluster.getNameNodeRpc().setSafeMode(SafeModeAction.SAFEMODE_ENTER,false);
+    cluster.getNameNodeRpc().saveNamespace(0,0);
+    cluster.getNameNodeRpc().setSafeMode(SafeModeAction.SAFEMODE_LEAVE,false);
+    cluster.restartNameNode(true);
+    List<AclFeature> entriesAfterRestart=AclStorage.getUniqueAclFeatures().getEntries();
+    assertEquals("Entries before and after should be same",entriesBeforeRestart,entriesAfterRestart);
+    for (    AclFeature aclFeature : entriesAfterRestart) {
+      int before=restartRefCounter.get(aclFeature);
+      assertEquals("ReferenceCount After 2 Restarts should be tripled",before * 3,aclFeature.getRefCount());
+    }
+  }
+}

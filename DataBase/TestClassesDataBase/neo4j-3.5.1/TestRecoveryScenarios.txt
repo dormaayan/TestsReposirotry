@@ -1,0 +1,171 @@
+/** 
+ * Arbitrary recovery scenarios boiled down to as small tests as possible
+ */
+@RunWith(Parameterized.class) public class TestRecoveryScenarios {
+  @Rule public final EphemeralFileSystemRule fsRule=new EphemeralFileSystemRule();
+  private final Label label=label("label");
+  private GraphDatabaseAPI db;
+  private final FlushStrategy flush;
+  @SuppressWarnings("deprecation") @Before public void before(){
+    db=(GraphDatabaseAPI)databaseFactory(fsRule.get()).newImpermanentDatabase();
+  }
+  public TestRecoveryScenarios(  FlushStrategy flush){
+    this.flush=flush;
+  }
+  @After public void after(){
+    db.shutdown();
+  }
+  @Test public void shouldRecoverTransactionWhereNodeIsDeletedInTheFuture() throws Exception {
+    Node node=createNodeWithProperty("key","value",label);
+    checkPoint();
+    setProperty(node,"other-key",1);
+    deleteNode(node);
+    flush.flush(db);
+    crashAndRestart();
+    try (Transaction tx=db.beginTx()){
+      node=db.getNodeById(node.getId());
+      tx.success();
+      fail("Should not exist");
+    }
+ catch (    NotFoundException e) {
+      assertEquals("Node " + node.getId() + " not found",e.getMessage());
+    }
+  }
+  @Test public void shouldRecoverTransactionWherePropertyIsRemovedInTheFuture() throws Exception {
+    createIndex(label,"key");
+    Node node=createNodeWithProperty("key","value");
+    checkPoint();
+    addLabel(node,label);
+    removeProperty(node,"key");
+    flush.flush(db);
+    crashAndRestart();
+    try (Transaction tx=db.beginTx()){
+      assertEquals("Updates not propagated correctly during recovery",Collections.<Node>emptyList(),Iterators.asList(db.findNodes(label,"key","value")));
+      tx.success();
+    }
+   }
+  @Test public void shouldRecoverTransactionWhereManyLabelsAreRemovedInTheFuture() throws Exception {
+    createIndex(label,"key");
+    Label[] labels=new Label[16];
+    for (int i=0; i < labels.length; i++) {
+      labels[i]=label("Label" + Integer.toHexString(i));
+    }
+    Node node;
+    try (Transaction tx=db.beginTx()){
+      node=db.createNode(labels);
+      node.addLabel(label);
+      tx.success();
+    }
+     checkPoint();
+    setProperty(node,"key","value");
+    removeLabels(node,labels);
+    flush.flush(db);
+    crashAndRestart();
+    try (Transaction tx=db.beginTx()){
+      assertEquals(node,db.findNode(label,"key","value"));
+      tx.success();
+    }
+   }
+  @Test public void shouldRecoverCounts() throws Exception {
+    Node node=createNode(label);
+    checkPoint();
+    deleteNode(node);
+    crashAndRestart();
+    try (org.neo4j.internal.kernel.api.Transaction tx=db.getDependencyResolver().resolveDependency(Kernel.class).beginTransaction(explicit,LoginContext.AUTH_DISABLED)){
+      assertEquals(0,tx.dataRead().countsForNode(-1));
+      final TokenHolder holder=db.getDependencyResolver().resolveDependency(TokenHolders.class).labelTokens();
+      int labelId=holder.getIdByName(label.name());
+      assertEquals(0,tx.dataRead().countsForNode(labelId));
+      tx.success();
+    }
+   }
+  private void removeLabels(  Node node,  Label... labels){
+    try (Transaction tx=db.beginTx()){
+      for (      Label label : labels) {
+        node.removeLabel(label);
+      }
+      tx.success();
+    }
+   }
+  private void removeProperty(  Node node,  String key){
+    try (Transaction tx=db.beginTx()){
+      node.removeProperty(key);
+      tx.success();
+    }
+   }
+  private void addLabel(  Node node,  Label label){
+    try (Transaction tx=db.beginTx()){
+      node.addLabel(label);
+      tx.success();
+    }
+   }
+  private Node createNode(  Label... labels){
+    try (Transaction tx=db.beginTx()){
+      Node node=db.createNode(labels);
+      tx.success();
+      return node;
+    }
+   }
+  private Node createNodeWithProperty(  String key,  String value,  Label... labels){
+    try (Transaction tx=db.beginTx()){
+      Node node=db.createNode(labels);
+      node.setProperty(key,value);
+      tx.success();
+      return node;
+    }
+   }
+  private void createIndex(  Label label,  String key){
+    try (Transaction tx=db.beginTx()){
+      db.schema().indexFor(label).on(key).create();
+      tx.success();
+    }
+     try (Transaction tx=db.beginTx()){
+      db.schema().awaitIndexesOnline(10,SECONDS);
+      tx.success();
+    }
+   }
+  @Parameterized.Parameters(name="{0}") public static List<Object[]> flushStrategy(){
+    List<Object[]> parameters=new ArrayList<>();
+    for (    FlushStrategy flushStrategy : FlushStrategy.values()) {
+      parameters.add(flushStrategy.parameters);
+    }
+    return parameters;
+  }
+  @SuppressWarnings("deprecation") public enum FlushStrategy {  FORCE_EVERYTHING{
+    @Override void flush(    GraphDatabaseAPI db){
+      IOLimiter limiter=IOLimiter.UNLIMITED;
+      db.getDependencyResolver().resolveDependency(StorageEngine.class).flushAndForce(limiter);
+    }
+  }
+,   FLUSH_PAGE_CACHE{
+    @Override void flush(    GraphDatabaseAPI db) throws IOException {
+      db.getDependencyResolver().resolveDependency(PageCache.class).flushAndForce();
+    }
+  }
+;   final Object[] parameters=new Object[]{this};
+  abstract void flush(  GraphDatabaseAPI db) throws IOException ;
+}
+  private void checkPoint() throws IOException {
+    db.getDependencyResolver().resolveDependency(CheckPointer.class).forceCheckPoint(new SimpleTriggerInfo("test"));
+  }
+  private void deleteNode(  Node node){
+    try (Transaction tx=db.beginTx()){
+      node.delete();
+      tx.success();
+    }
+   }
+  private void setProperty(  Node node,  String key,  Object value){
+    try (Transaction tx=db.beginTx()){
+      node.setProperty(key,value);
+      tx.success();
+    }
+   }
+  private TestGraphDatabaseFactory databaseFactory(  FileSystemAbstraction fs){
+    return new TestGraphDatabaseFactory().setFileSystem(fs);
+  }
+  @SuppressWarnings("deprecation") private void crashAndRestart() throws Exception {
+    final GraphDatabaseService db1=db;
+    FileSystemAbstraction uncleanFs=fsRule.snapshot(db1::shutdown);
+    db=(GraphDatabaseAPI)databaseFactory(uncleanFs).newImpermanentDatabase();
+  }
+}

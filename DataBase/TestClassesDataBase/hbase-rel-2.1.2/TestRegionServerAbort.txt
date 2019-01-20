@@ -1,0 +1,116 @@
+/** 
+ * Tests around regionserver shutdown and abort
+ */
+@Category({RegionServerTests.class,MediumTests.class}) public class TestRegionServerAbort {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestRegionServerAbort.class);
+  private static final byte[] FAMILY_BYTES=Bytes.toBytes("f");
+  private static final Logger LOG=LoggerFactory.getLogger(TestRegionServerAbort.class);
+  private HBaseTestingUtility testUtil;
+  private Configuration conf;
+  private MiniDFSCluster dfsCluster;
+  private MiniHBaseCluster cluster;
+  @Before public void setup() throws Exception {
+    testUtil=new HBaseTestingUtility();
+    conf=testUtil.getConfiguration();
+    conf.set(CoprocessorHost.REGIONSERVER_COPROCESSOR_CONF_KEY,StopBlockingRegionObserver.class.getName());
+    conf.set(CoprocessorHost.REGION_COPROCESSOR_CONF_KEY,StopBlockingRegionObserver.class.getName());
+    conf.set("dfs.blocksize",Long.toString(100 * 1024));
+    conf.set(DFSConfigKeys.DFS_CLIENT_READ_PREFETCH_SIZE_KEY,Long.toString(100 * 1024));
+    conf.set(HConstants.REGION_IMPL,ErrorThrowingHRegion.class.getName());
+    testUtil.startMiniZKCluster();
+    dfsCluster=testUtil.startMiniDFSCluster(2);
+    cluster=testUtil.startMiniHBaseCluster(1,2);
+  }
+  @After public void tearDown() throws Exception {
+    String className=StopBlockingRegionObserver.class.getName();
+    for (    JVMClusterUtil.RegionServerThread t : cluster.getRegionServerThreads()) {
+      HRegionServer rs=t.getRegionServer();
+      RegionServerCoprocessorHost cpHost=rs.getRegionServerCoprocessorHost();
+      StopBlockingRegionObserver cp=(StopBlockingRegionObserver)cpHost.findCoprocessor(className);
+      cp.setStopAllowed(true);
+    }
+    HMaster master=cluster.getMaster();
+    RegionServerCoprocessorHost host=master.getRegionServerCoprocessorHost();
+    if (host != null) {
+      StopBlockingRegionObserver obs=(StopBlockingRegionObserver)host.findCoprocessor(className);
+      if (obs != null)       obs.setStopAllowed(true);
+    }
+    testUtil.shutdownMiniCluster();
+  }
+  /** 
+ * Test that a regionserver is able to abort properly, even when a coprocessor throws an exception in preStopRegionServer().
+ */
+  @Test public void testAbortFromRPC() throws Exception {
+    TableName tableName=TableName.valueOf("testAbortFromRPC");
+    Table table=testUtil.createTable(tableName,FAMILY_BYTES);
+    testUtil.loadTable(table,FAMILY_BYTES);
+    LOG.info("Wrote data");
+    cluster.flushcache(tableName);
+    LOG.info("Flushed table");
+    Put put=new Put(new byte[]{0,0,0,0});
+    put.addColumn(FAMILY_BYTES,Bytes.toBytes("c"),new byte[]{});
+    put.setAttribute(StopBlockingRegionObserver.DO_ABORT,new byte[]{1});
+    List<HRegion> regions=cluster.findRegionsForTable(tableName);
+    HRegion firstRegion=cluster.findRegionsForTable(tableName).get(0);
+    table.put(put);
+    assertNotNull(firstRegion);
+    assertNotNull(firstRegion.getRegionServerServices());
+    LOG.info("isAborted = " + firstRegion.getRegionServerServices().isAborted());
+    assertTrue(firstRegion.getRegionServerServices().isAborted());
+    LOG.info("isStopped = " + firstRegion.getRegionServerServices().isStopped());
+    assertTrue(firstRegion.getRegionServerServices().isStopped());
+  }
+  /** 
+ * Test that a coprocessor is able to override a normal regionserver stop request.
+ */
+  @Test public void testStopOverrideFromCoprocessor() throws Exception {
+    Admin admin=testUtil.getHBaseAdmin();
+    HRegionServer regionserver=cluster.getRegionServer(0);
+    admin.stopRegionServer(regionserver.getServerName().getHostAndPort());
+    assertFalse(cluster.getRegionServer(0).isAborted());
+    assertFalse(cluster.getRegionServer(0).isStopped());
+  }
+@CoreCoprocessor public static class StopBlockingRegionObserver implements RegionServerCoprocessor, RegionCoprocessor, RegionServerObserver, RegionObserver {
+    public static final String DO_ABORT="DO_ABORT";
+    private boolean stopAllowed;
+    @Override public Optional<RegionObserver> getRegionObserver(){
+      return Optional.of(this);
+    }
+    @Override public Optional<RegionServerObserver> getRegionServerObserver(){
+      return Optional.of(this);
+    }
+    @Override public void prePut(    ObserverContext<RegionCoprocessorEnvironment> c,    Put put,    WALEdit edit,    Durability durability) throws IOException {
+      if (put.getAttribute(DO_ABORT) != null) {
+        RegionServerServices rss=((HasRegionServerServices)c.getEnvironment()).getRegionServerServices();
+        String str="Aborting for test";
+        LOG.info(str + " " + rss.getServerName());
+        rss.abort(str,new Throwable(str));
+      }
+    }
+    @Override public void preStopRegionServer(    ObserverContext<RegionServerCoprocessorEnvironment> env) throws IOException {
+      if (!stopAllowed) {
+        throw new IOException("Stop not allowed");
+      }
+    }
+    public void setStopAllowed(    boolean allowed){
+      this.stopAllowed=allowed;
+    }
+  }
+  /** 
+ * Throws an exception during store file refresh in order to trigger a regionserver abort.
+ */
+public static class ErrorThrowingHRegion extends HRegion {
+    public ErrorThrowingHRegion(    Path tableDir,    WAL wal,    FileSystem fs,    Configuration confParam,    RegionInfo regionInfo,    TableDescriptor htd,    RegionServerServices rsServices){
+      super(tableDir,wal,fs,confParam,regionInfo,htd,rsServices);
+    }
+    public ErrorThrowingHRegion(    HRegionFileSystem fs,    WAL wal,    Configuration confParam,    TableDescriptor htd,    RegionServerServices rsServices){
+      super(fs,wal,confParam,htd,rsServices);
+    }
+    @Override protected boolean refreshStoreFiles(    boolean force) throws IOException {
+      if (force) {
+        throw new IOException("Failing file refresh for testing");
+      }
+      return super.refreshStoreFiles(force);
+    }
+  }
+}

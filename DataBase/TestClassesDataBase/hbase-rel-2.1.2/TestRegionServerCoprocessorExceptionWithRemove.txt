@@ -1,0 +1,56 @@
+/** 
+ * Tests unhandled exceptions thrown by coprocessors running on regionserver. Expected result is that the region server will remove the buggy coprocessor from its set of coprocessors and throw a org.apache.hadoop.hbase.exceptions.DoNotRetryIOException back to the client. (HBASE-4014).
+ */
+@Category({CoprocessorTests.class,MediumTests.class}) public class TestRegionServerCoprocessorExceptionWithRemove {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestRegionServerCoprocessorExceptionWithRemove.class);
+public static class BuggyRegionObserver extends SimpleRegionObserver {
+    @SuppressWarnings("null") @Override public void prePut(    final ObserverContext<RegionCoprocessorEnvironment> c,    final Put put,    final WALEdit edit,    final Durability durability){
+      String tableName=c.getEnvironment().getRegion().getRegionInfo().getTable().getNameAsString();
+      if (tableName.equals("observed_table")) {
+        Integer i=null;
+        i=i + 1;
+      }
+    }
+  }
+  private static HBaseTestingUtility TEST_UTIL=new HBaseTestingUtility();
+  @BeforeClass public static void setupBeforeClass() throws Exception {
+    Configuration conf=TEST_UTIL.getConfiguration();
+    conf.set(CoprocessorHost.REGION_COPROCESSOR_CONF_KEY,BuggyRegionObserver.class.getName());
+    TEST_UTIL.getConfiguration().setBoolean(CoprocessorHost.ABORT_ON_ERROR_KEY,false);
+    TEST_UTIL.startMiniCluster();
+  }
+  @AfterClass public static void teardownAfterClass() throws Exception {
+    TEST_UTIL.shutdownMiniCluster();
+  }
+  @Test public void testExceptionFromCoprocessorDuringPut() throws IOException, InterruptedException {
+    TableName TEST_TABLE=TableName.valueOf("observed_table");
+    byte[] TEST_FAMILY=Bytes.toBytes("aaa");
+    Table table=TEST_UTIL.createMultiRegionTable(TEST_TABLE,TEST_FAMILY);
+    TEST_UTIL.waitUntilAllRegionsAssigned(TEST_TABLE);
+    HRegionServer regionServer=TEST_UTIL.getRSForFirstRegionInTable(TEST_TABLE);
+    boolean threwIOE=false;
+    try {
+      final byte[] ROW=Bytes.toBytes("aaa");
+      Put put=new Put(ROW);
+      put.addColumn(TEST_FAMILY,ROW,ROW);
+      table.put(put);
+      table.put(put);
+    }
+ catch (    IOException e) {
+      threwIOE=true;
+    }
+ finally {
+      assertTrue("The regionserver should have thrown an exception",threwIOE);
+    }
+    for (int i=0; i < 10; i++) {
+      assertFalse(regionServer.isAborted());
+      try {
+        Thread.sleep(1000);
+      }
+ catch (      InterruptedException e) {
+        fail("InterruptedException while waiting for regionserver " + "zk node to be deleted.");
+      }
+    }
+    table.close();
+  }
+}

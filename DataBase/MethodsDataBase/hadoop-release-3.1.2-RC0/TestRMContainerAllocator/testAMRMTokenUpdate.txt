@@ -1,0 +1,55 @@
+@Test(timeout=60000) public void testAMRMTokenUpdate() throws Exception {
+  LOG.info("Running testAMRMTokenUpdate");
+  final String rmAddr="somermaddress:1234";
+  final Configuration conf=new YarnConfiguration();
+  conf.setLong(YarnConfiguration.RM_AMRM_TOKEN_MASTER_KEY_ROLLING_INTERVAL_SECS,8);
+  conf.setLong(YarnConfiguration.RM_AM_EXPIRY_INTERVAL_MS,2000);
+  conf.set(YarnConfiguration.RM_SCHEDULER_ADDRESS,rmAddr);
+  final MyResourceManager rm=new MyResourceManager(conf);
+  rm.start();
+  AMRMTokenSecretManager secretMgr=rm.getRMContext().getAMRMTokenSecretManager();
+  RMApp app=rm.submitApp(1024);
+  rm.drainEvents();
+  MockNM amNodeManager=rm.registerNode("amNM:1234",2048);
+  amNodeManager.nodeHeartbeat(true);
+  rm.drainEvents();
+  final ApplicationAttemptId appAttemptId=app.getCurrentAppAttempt().getAppAttemptId();
+  final ApplicationId appId=app.getApplicationId();
+  rm.sendAMLaunched(appAttemptId);
+  rm.drainEvents();
+  JobId jobId=MRBuilderUtils.newJobId(appAttemptId.getApplicationId(),0);
+  final Job mockJob=mock(Job.class);
+  when(mockJob.getReport()).thenReturn(MRBuilderUtils.newJobReport(jobId,"job","user",JobState.RUNNING,0,0,0,0,0,0,0,"jobfile",null,false,""));
+  final Token<AMRMTokenIdentifier> oldToken=rm.getRMContext().getRMApps().get(appId).getRMAppAttempt(appAttemptId).getAMRMToken();
+  Assert.assertNotNull("app should have a token",oldToken);
+  UserGroupInformation testUgi=UserGroupInformation.createUserForTesting("someuser",new String[0]);
+  Token<AMRMTokenIdentifier> newToken=testUgi.doAs(new PrivilegedExceptionAction<Token<AMRMTokenIdentifier>>(){
+    @Override public Token<AMRMTokenIdentifier> run() throws Exception {
+      MyContainerAllocator allocator=new MyContainerAllocator(rm,conf,appAttemptId,mockJob);
+      Token<AMRMTokenIdentifier> currentToken=oldToken;
+      long startTime=Time.monotonicNow();
+      while (currentToken == oldToken) {
+        if (Time.monotonicNow() - startTime > 20000) {
+          Assert.fail("Took to long to see AMRM token change");
+        }
+        Thread.sleep(100);
+        allocator.schedule();
+        currentToken=rm.getRMContext().getRMApps().get(appId).getRMAppAttempt(appAttemptId).getAMRMToken();
+      }
+      return currentToken;
+    }
+  }
+);
+  int tokenCount=0;
+  Token<? extends TokenIdentifier> ugiToken=null;
+  for (  Token<? extends TokenIdentifier> token : testUgi.getTokens()) {
+    if (AMRMTokenIdentifier.KIND_NAME.equals(token.getKind())) {
+      ugiToken=token;
+      ++tokenCount;
+    }
+  }
+  Assert.assertEquals("too many AMRM tokens",1,tokenCount);
+  Assert.assertArrayEquals("token identifier not updated",newToken.getIdentifier(),ugiToken.getIdentifier());
+  Assert.assertArrayEquals("token password not updated",newToken.getPassword(),ugiToken.getPassword());
+  Assert.assertEquals("AMRM token service not updated",new Text(rmAddr),ugiToken.getService());
+}

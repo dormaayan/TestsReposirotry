@@ -1,0 +1,49 @@
+@Test public void testExceptionFromCoprocessorWhenCreatingTable() throws IOException {
+  MiniHBaseCluster cluster=UTIL.getHBaseCluster();
+  HMaster master=cluster.getMaster();
+  MasterCoprocessorHost host=master.getMasterCoprocessorHost();
+  BuggyMasterObserver cp=host.findCoprocessor(BuggyMasterObserver.class);
+  assertFalse("No table created yet",cp.wasCreateTableCalled());
+  ZKWatcher zkw=new ZKWatcher(UTIL.getConfiguration(),"unittest",new Abortable(){
+    @Override public void abort(    String why,    Throwable e){
+      throw new RuntimeException("Fatal ZK error: " + why,e);
+    }
+    @Override public boolean isAborted(){
+      return false;
+    }
+  }
+);
+  MasterTracker masterTracker=new MasterTracker(zkw,"/hbase/master",new Abortable(){
+    @Override public void abort(    String why,    Throwable e){
+      throw new RuntimeException("Fatal ZK master tracker error, why=",e);
+    }
+    @Override public boolean isAborted(){
+      return false;
+    }
+  }
+);
+  masterTracker.start();
+  zkw.registerListener(masterTracker);
+  assertTrue(HMaster.getLoadedCoprocessors().contains(TestMasterCoprocessorExceptionWithAbort.BuggyMasterObserver.class.getName()));
+  CreateTableThread createTableThread=new CreateTableThread(UTIL);
+  createTableThread.start();
+  for (int i=0; i < 30; i++) {
+    if (masterTracker.masterZKNodeWasDeleted == true) {
+      break;
+    }
+    try {
+      Thread.sleep(1000);
+    }
+ catch (    InterruptedException e) {
+      fail("InterruptedException while waiting for master zk node to " + "be deleted.");
+    }
+  }
+  assertTrue("Master aborted on coprocessor exception, as expected.",masterTracker.masterZKNodeWasDeleted);
+  createTableThread.interrupt();
+  try {
+    createTableThread.join(1000);
+  }
+ catch (  InterruptedException e) {
+    assertTrue("Ignoring InterruptedException while waiting for " + " createTableThread.join().",true);
+  }
+}

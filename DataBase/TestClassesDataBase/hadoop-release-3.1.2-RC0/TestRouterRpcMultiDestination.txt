@@ -1,0 +1,93 @@
+/** 
+ * The the RPC interface of the  {@link getRouter()} implemented by{@link RouterRpcServer}.
+ */
+public class TestRouterRpcMultiDestination extends TestRouterRpc {
+  @Override public void testSetup() throws Exception {
+    MiniRouterDFSCluster cluster=getCluster();
+    getCluster().installMockLocations();
+    List<RouterContext> routers=cluster.getRouters();
+    for (    RouterContext rc : routers) {
+      Router router=rc.getRouter();
+      MockResolver resolver=(MockResolver)router.getSubclusterResolver();
+      resolver.addLocation("/",cluster.getNameservices().get(1),"/");
+    }
+    for (    RouterContext rc : routers) {
+      Router router=rc.getRouter();
+      MockResolver resolver=(MockResolver)router.getSubclusterResolver();
+      List<String> nss=cluster.getNameservices();
+      String ns0=nss.get(0);
+      resolver.addLocation("/same",ns0,"/");
+      resolver.addLocation("/same",ns0,cluster.getNamenodePathForNS(ns0));
+    }
+    cluster.deleteAllFiles();
+    cluster.createTestDirectoriesNamenode();
+    Thread.sleep(100);
+    RouterContext router=cluster.getRandomRouter();
+    this.setRouter(router);
+    String ns=cluster.getRandomNameservice();
+    this.setNs(ns);
+    this.setNamenode(cluster.getNamenode(ns,null));
+    Random r=new Random();
+    String randomString="testfile-" + r.nextInt();
+    setNamenodeFile("/" + randomString);
+    setRouterFile("/" + randomString);
+    FileSystem nnFs=getNamenodeFileSystem();
+    FileSystem routerFs=getRouterFileSystem();
+    createFile(nnFs,getNamenodeFile(),32);
+    verifyFileExists(nnFs,getNamenodeFile());
+    verifyFileExists(routerFs,getRouterFile());
+  }
+  private void testListing(  String path) throws IOException {
+    Set<String> requiredPaths=new TreeSet<>();
+    RouterContext rc=getRouterContext();
+    Router router=rc.getRouter();
+    FileSubclusterResolver subclusterResolver=router.getSubclusterResolver();
+    for (    String mount : subclusterResolver.getMountPoints(path)) {
+      requiredPaths.add(mount);
+    }
+    PathLocation location=subclusterResolver.getDestinationForPath(path);
+    for (    RemoteLocation loc : location.getDestinations()) {
+      String nsId=loc.getNameserviceId();
+      String dest=loc.getDest();
+      NamenodeContext nn=getCluster().getNamenode(nsId,null);
+      FileSystem fs=nn.getFileSystem();
+      FileStatus[] files=fs.listStatus(new Path(dest));
+      for (      FileStatus file : files) {
+        String pathName=file.getPath().getName();
+        requiredPaths.add(pathName);
+      }
+    }
+    DirectoryListing listing=getRouterProtocol().getListing(path,HdfsFileStatus.EMPTY_NAME,false);
+    Iterator<String> requiredPathsIterator=requiredPaths.iterator();
+    HdfsFileStatus[] partialListing=listing.getPartialListing();
+    for (    HdfsFileStatus fileStatus : listing.getPartialListing()) {
+      String fileName=requiredPathsIterator.next();
+      String currentFile=fileStatus.getFullPath(new Path(path)).getName();
+      assertEquals(currentFile,fileName);
+    }
+    assertEquals(requiredPaths + " doesn't match " + Arrays.toString(partialListing),requiredPaths.size(),partialListing.length);
+  }
+  @Override public void testProxyListFiles() throws IOException, InterruptedException, URISyntaxException, NoSuchMethodException, SecurityException {
+    testListing("/");
+    testListing("/same");
+    ClientProtocol namenodeProtocol=getCluster().getRandomNamenode().getClient().getNamenode();
+    Method m=ClientProtocol.class.getMethod("getListing",String.class,byte[].class,boolean.class);
+    String badPath="/unknownlocation/unknowndir";
+    compareResponses(getRouterProtocol(),namenodeProtocol,m,new Object[]{badPath,HdfsFileStatus.EMPTY_NAME,false});
+  }
+  @Override public void testProxyRenameFiles() throws IOException, InterruptedException {
+    super.testProxyRenameFiles();
+    List<String> nss=getCluster().getNameservices();
+    String ns0=nss.get(0);
+    String ns1=nss.get(1);
+    String testDir0=getCluster().getFederatedTestDirectoryForNS(ns0);
+    String filename0=testDir0 + "/testrename";
+    String renamedFile="/testrename";
+    testRename(getRouterContext(),filename0,renamedFile,false);
+    testRename2(getRouterContext(),filename0,renamedFile,false);
+    String testDir1=getCluster().getFederatedTestDirectoryForNS(ns1);
+    String filename1=testDir1 + "/testrename";
+    testRename(getRouterContext(),filename1,renamedFile,false);
+    testRename2(getRouterContext(),filename1,renamedFile,false);
+  }
+}

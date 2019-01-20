@@ -1,0 +1,113 @@
+/** 
+ * Tests that a regionserver that dies after reporting for duty gets removed from list of online regions. See HBASE-9593.
+ */
+@Category({RegionServerTests.class,MediumTests.class}) @Ignore("See HBASE-19515") public class TestRSKilledWhenInitializing {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestRSKilledWhenInitializing.class);
+  private static final Logger LOG=LoggerFactory.getLogger(TestRSKilledWhenInitializing.class);
+  @Rule public TestName testName=new TestName();
+  private static AtomicBoolean masterActive=new AtomicBoolean(false);
+  private static final AtomicReference<ServerName> killedRS=new AtomicReference<ServerName>();
+  private static final int NUM_MASTERS=1;
+  private static final int NUM_RS=2;
+  /** 
+ * Test verifies whether a region server is removed from online servers list in master if it went down after registering with master. Test will TIMEOUT if an error!!!!
+ * @throws Exception
+ */
+  @Test public void testRSTerminationAfterRegisteringToMasterBeforeCreatingEphemeralNode() throws Exception {
+    Configuration conf=HBaseConfiguration.create();
+    conf.setInt(ServerManager.WAIT_ON_REGIONSERVERS_MINTOSTART,1);
+    final HBaseTestingUtility TEST_UTIL=new HBaseTestingUtility(conf);
+    TEST_UTIL.startMiniDFSCluster(3);
+    TEST_UTIL.startMiniZKCluster();
+    TEST_UTIL.createRootDir();
+    final LocalHBaseCluster cluster=new LocalHBaseCluster(conf,NUM_MASTERS,NUM_RS,HMaster.class,RegisterAndDieRegionServer.class);
+    final MasterThread master=startMaster(cluster.getMasters().get(0));
+    try {
+      for (int i=0; i < NUM_RS; i++) {
+        cluster.getRegionServers().get(i).start();
+      }
+      int expectedTotalRegionServers=NUM_RS + (LoadBalancer.isTablesOnMaster(conf) ? 1 : 0);
+      List<ServerName> onlineServersList=null;
+      do {
+        onlineServersList=master.getMaster().getServerManager().getOnlineServersList();
+      }
+ while (onlineServersList.size() < expectedTotalRegionServers);
+      while (killedRS.get() == null) {
+        Threads.sleep(1);
+      }
+      while (cluster.getLiveRegionServers().size() >= expectedTotalRegionServers) {
+        Threads.sleep(1);
+      }
+      while (!master.getMaster().isInitialized()) {
+        Threads.sleep(1);
+      }
+      assertTrue(master.getMaster().getServerManager().isServerOnline(killedRS.get()));
+      Map<RegionInfo,ServerName> assignments=null;
+      do {
+        assignments=master.getMaster().getAssignmentManager().getRegionStates().getRegionAssignments();
+      }
+ while (assignments == null || assignments.size() < 2);
+      RegionInfo hri=null;
+      for (      Map.Entry<RegionInfo,ServerName> e : assignments.entrySet()) {
+        if (e.getKey().isMetaRegion())         continue;
+        hri=e.getKey();
+        break;
+      }
+      assertEquals(expectedTotalRegionServers,master.getMaster().getServerManager().getOnlineServersList().size());
+      LOG.info("Move " + hri.getEncodedName() + " to "+ killedRS.get());
+      master.getMaster().move(hri.getEncodedNameAsBytes(),Bytes.toBytes(killedRS.get().toString()));
+      while (onlineServersList.size() > (NUM_RS + 1)) {
+        Thread.sleep(100);
+        onlineServersList=master.getMaster().getServerManager().getOnlineServersList();
+      }
+    }
+  finally {
+      cluster.shutdown();
+      cluster.join();
+      TEST_UTIL.shutdownMiniDFSCluster();
+      TEST_UTIL.shutdownMiniZKCluster();
+      TEST_UTIL.cleanupTestDir();
+    }
+  }
+  /** 
+ * Start Master. Get as far as the state where Master is waiting on RegionServers to check in, then return.
+ */
+  private MasterThread startMaster(  MasterThread master){
+    master.start();
+    while (master.getMaster().getServerManager() == null) {
+      continue;
+    }
+    final AtomicBoolean waiting=new AtomicBoolean(false);
+    if (master.getMaster().getServerManager() == null)     throw new NullPointerException("SM");
+    master.getMaster().getServerManager().registerListener(new ServerListener(){
+      @Override public void waiting(){
+        waiting.set(true);
+      }
+    }
+);
+    while (!waiting.get()) {
+      continue;
+    }
+    masterActive.set(true);
+    return master;
+  }
+  /** 
+ * A RegionServer that reports for duty and then immediately dies if it is the first to receive the response to a reportForDuty. When it dies, it clears its ephemeral znode which the master notices and so removes the region from its set of online regionservers.
+ */
+static class RegisterAndDieRegionServer extends MiniHBaseCluster.MiniHBaseClusterRegionServer {
+    public RegisterAndDieRegionServer(    Configuration conf) throws IOException, InterruptedException {
+      super(conf);
+    }
+    @Override protected void handleReportForDutyResponse(    RegionServerStartupResponse c) throws IOException {
+      if (killedRS.compareAndSet(null,getServerName())) {
+        while (!masterActive.get()) {
+          Threads.sleep(100);
+        }
+        super.kill();
+      }
+ else {
+        super.handleReportForDutyResponse(c);
+      }
+    }
+  }
+}

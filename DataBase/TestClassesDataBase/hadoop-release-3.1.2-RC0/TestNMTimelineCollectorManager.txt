@@ -1,0 +1,99 @@
+public class TestNMTimelineCollectorManager {
+  private NodeTimelineCollectorManager collectorManager;
+  @Before public void setup() throws Exception {
+    collectorManager=createCollectorManager();
+    Configuration conf=new YarnConfiguration();
+    conf.setClass(YarnConfiguration.TIMELINE_SERVICE_WRITER_CLASS,FileSystemTimelineWriterImpl.class,TimelineWriter.class);
+    collectorManager.init(conf);
+    collectorManager.start();
+  }
+  @After public void tearDown() throws Exception {
+    if (collectorManager != null) {
+      collectorManager.stop();
+    }
+  }
+  @Test public void testStartingWriterFlusher() throws Exception {
+    assertTrue(collectorManager.writerFlusherRunning());
+  }
+  @Test public void testStartWebApp() throws Exception {
+    assertNotNull(collectorManager.getRestServerBindAddress());
+    String address=collectorManager.getRestServerBindAddress();
+    String[] parts=address.split(":");
+    assertEquals(2,parts.length);
+    assertNotNull(parts[0]);
+    assertTrue(Integer.valueOf(parts[1]) > 0);
+  }
+  @Test(timeout=60000) public void testMultithreadedAdd() throws Exception {
+    final int numApps=5;
+    List<Callable<Boolean>> tasks=new ArrayList<Callable<Boolean>>();
+    for (int i=0; i < numApps; i++) {
+      final ApplicationId appId=ApplicationId.newInstance(0L,i);
+      Callable<Boolean> task=new Callable<Boolean>(){
+        public Boolean call(){
+          AppLevelTimelineCollector collector=new AppLevelTimelineCollectorWithAgg(appId,"user");
+          return (collectorManager.putIfAbsent(appId,collector) == collector);
+        }
+      }
+;
+      tasks.add(task);
+    }
+    ExecutorService executor=Executors.newFixedThreadPool(numApps);
+    try {
+      List<Future<Boolean>> futures=executor.invokeAll(tasks);
+      for (      Future<Boolean> future : futures) {
+        assertTrue(future.get());
+      }
+    }
+  finally {
+      executor.shutdownNow();
+    }
+    for (int i=0; i < numApps; i++) {
+      final ApplicationId appId=ApplicationId.newInstance(0L,i);
+      assertTrue(collectorManager.containsTimelineCollector(appId));
+    }
+  }
+  @Test public void testMultithreadedAddAndRemove() throws Exception {
+    final int numApps=5;
+    List<Callable<Boolean>> tasks=new ArrayList<Callable<Boolean>>();
+    for (int i=0; i < numApps; i++) {
+      final ApplicationId appId=ApplicationId.newInstance(0L,i);
+      Callable<Boolean> task=new Callable<Boolean>(){
+        public Boolean call(){
+          AppLevelTimelineCollector collector=new AppLevelTimelineCollectorWithAgg(appId,"user");
+          boolean successPut=(collectorManager.putIfAbsent(appId,collector) == collector);
+          return successPut && collectorManager.remove(appId);
+        }
+      }
+;
+      tasks.add(task);
+    }
+    ExecutorService executor=Executors.newFixedThreadPool(numApps);
+    try {
+      List<Future<Boolean>> futures=executor.invokeAll(tasks);
+      for (      Future<Boolean> future : futures) {
+        assertTrue(future.get());
+      }
+    }
+  finally {
+      executor.shutdownNow();
+    }
+    for (int i=0; i < numApps; i++) {
+      final ApplicationId appId=ApplicationId.newInstance(0L,i);
+      assertFalse(collectorManager.containsTimelineCollector(appId));
+    }
+  }
+  private NodeTimelineCollectorManager createCollectorManager(){
+    final NodeTimelineCollectorManager cm=spy(new NodeTimelineCollectorManager());
+    doReturn(new Configuration()).when(cm).getConfig();
+    CollectorNodemanagerProtocol nmCollectorService=mock(CollectorNodemanagerProtocol.class);
+    GetTimelineCollectorContextResponse response=GetTimelineCollectorContextResponse.newInstance(null,null,null,0L);
+    try {
+      when(nmCollectorService.getTimelineCollectorContext(any(GetTimelineCollectorContextRequest.class))).thenReturn(response);
+    }
+ catch (    YarnException|IOException e) {
+      fail();
+    }
+    doReturn(nmCollectorService).when(cm).getNMCollectorService();
+    return cm;
+  }
+}

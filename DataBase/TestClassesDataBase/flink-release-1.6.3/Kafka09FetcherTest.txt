@@ -1,0 +1,243 @@
+/** 
+ * Unit tests for the  {@link Kafka09Fetcher}.
+ */
+@RunWith(PowerMockRunner.class) @PrepareForTest(KafkaConsumerThread.class) public class Kafka09FetcherTest {
+  @Test public void testCommitDoesNotBlock() throws Exception {
+    final KafkaTopicPartition testPartition=new KafkaTopicPartition("test",42);
+    final Map<KafkaTopicPartition,Long> testCommitData=new HashMap<>();
+    testCommitData.put(testPartition,11L);
+    final OneShotLatch sync=new OneShotLatch();
+    final MultiShotLatch blockerLatch=new MultiShotLatch();
+    KafkaConsumer<?,?> mockConsumer=mock(KafkaConsumer.class);
+    when(mockConsumer.poll(anyLong())).thenAnswer(new Answer<ConsumerRecords<?,?>>(){
+      @Override public ConsumerRecords<?,?> answer(      InvocationOnMock invocation) throws InterruptedException {
+        sync.trigger();
+        blockerLatch.await();
+        return ConsumerRecords.empty();
+      }
+    }
+);
+    doAnswer(new Answer<Void>(){
+      @Override public Void answer(      InvocationOnMock invocation){
+        blockerLatch.trigger();
+        return null;
+      }
+    }
+).when(mockConsumer).wakeup();
+    whenNew(KafkaConsumer.class).withAnyArguments().thenReturn(mockConsumer);
+    @SuppressWarnings("unchecked") SourceContext<String> sourceContext=mock(SourceContext.class);
+    Map<KafkaTopicPartition,Long> partitionsWithInitialOffsets=Collections.singletonMap(new KafkaTopicPartition("test",42),KafkaTopicPartitionStateSentinel.GROUP_OFFSET);
+    KeyedDeserializationSchema<String> schema=new KeyedDeserializationSchemaWrapper<>(new SimpleStringSchema());
+    final Kafka09Fetcher<String> fetcher=new Kafka09Fetcher<>(sourceContext,partitionsWithInitialOffsets,null,null,new TestProcessingTimeService(),10,this.getClass().getClassLoader(),"task_name",schema,new Properties(),0L,new UnregisteredMetricsGroup(),new UnregisteredMetricsGroup(),false);
+    final AtomicReference<Throwable> error=new AtomicReference<>();
+    final Thread fetcherRunner=new Thread("fetcher runner"){
+      @Override public void run(){
+        try {
+          fetcher.runFetchLoop();
+        }
+ catch (        Throwable t) {
+          error.set(t);
+        }
+      }
+    }
+;
+    fetcherRunner.start();
+    sync.await();
+    final AtomicReference<Throwable> commitError=new AtomicReference<>();
+    final Thread committer=new Thread("committer runner"){
+      @Override public void run(){
+        try {
+          fetcher.commitInternalOffsetsToKafka(testCommitData,mock(KafkaCommitCallback.class));
+        }
+ catch (        Throwable t) {
+          commitError.set(t);
+        }
+      }
+    }
+;
+    committer.start();
+    committer.join(30000);
+    assertFalse("The committer did not finish in time",committer.isAlive());
+    fetcher.cancel();
+    fetcherRunner.join();
+    final Throwable fetcherError=error.get();
+    if (fetcherError != null && !(fetcherError instanceof Handover.ClosedException)) {
+      throw new Exception("Exception in the fetcher",fetcherError);
+    }
+    final Throwable committerError=commitError.get();
+    if (committerError != null) {
+      throw new Exception("Exception in the committer",committerError);
+    }
+  }
+  @Test public void ensureOffsetsGetCommitted() throws Exception {
+    final KafkaTopicPartition testPartition1=new KafkaTopicPartition("test",42);
+    final KafkaTopicPartition testPartition2=new KafkaTopicPartition("another",99);
+    final Map<KafkaTopicPartition,Long> testCommitData1=new HashMap<>();
+    testCommitData1.put(testPartition1,11L);
+    testCommitData1.put(testPartition2,18L);
+    final Map<KafkaTopicPartition,Long> testCommitData2=new HashMap<>();
+    testCommitData2.put(testPartition1,19L);
+    testCommitData2.put(testPartition2,28L);
+    final BlockingQueue<Map<TopicPartition,OffsetAndMetadata>> commitStore=new LinkedBlockingQueue<>();
+    final MultiShotLatch blockerLatch=new MultiShotLatch();
+    KafkaConsumer<?,?> mockConsumer=mock(KafkaConsumer.class);
+    when(mockConsumer.poll(anyLong())).thenAnswer(new Answer<ConsumerRecords<?,?>>(){
+      @Override public ConsumerRecords<?,?> answer(      InvocationOnMock invocation) throws InterruptedException {
+        blockerLatch.await();
+        return ConsumerRecords.empty();
+      }
+    }
+);
+    doAnswer(new Answer<Void>(){
+      @Override public Void answer(      InvocationOnMock invocation){
+        blockerLatch.trigger();
+        return null;
+      }
+    }
+).when(mockConsumer).wakeup();
+    doAnswer(new Answer<Void>(){
+      @Override public Void answer(      InvocationOnMock invocation){
+        @SuppressWarnings("unchecked") Map<TopicPartition,OffsetAndMetadata> offsets=(Map<TopicPartition,OffsetAndMetadata>)invocation.getArguments()[0];
+        OffsetCommitCallback callback=(OffsetCommitCallback)invocation.getArguments()[1];
+        commitStore.add(offsets);
+        callback.onComplete(offsets,null);
+        return null;
+      }
+    }
+).when(mockConsumer).commitAsync(Mockito.<Map<TopicPartition,OffsetAndMetadata>>any(),any(OffsetCommitCallback.class));
+    whenNew(KafkaConsumer.class).withAnyArguments().thenReturn(mockConsumer);
+    @SuppressWarnings("unchecked") SourceContext<String> sourceContext=mock(SourceContext.class);
+    Map<KafkaTopicPartition,Long> partitionsWithInitialOffsets=Collections.singletonMap(new KafkaTopicPartition("test",42),KafkaTopicPartitionStateSentinel.GROUP_OFFSET);
+    KeyedDeserializationSchema<String> schema=new KeyedDeserializationSchemaWrapper<>(new SimpleStringSchema());
+    final Kafka09Fetcher<String> fetcher=new Kafka09Fetcher<>(sourceContext,partitionsWithInitialOffsets,null,null,new TestProcessingTimeService(),10,this.getClass().getClassLoader(),"task_name",schema,new Properties(),0L,new UnregisteredMetricsGroup(),new UnregisteredMetricsGroup(),false);
+    final AtomicReference<Throwable> error=new AtomicReference<>();
+    final Thread fetcherRunner=new Thread("fetcher runner"){
+      @Override public void run(){
+        try {
+          fetcher.runFetchLoop();
+        }
+ catch (        Throwable t) {
+          error.set(t);
+        }
+      }
+    }
+;
+    fetcherRunner.start();
+    fetcher.commitInternalOffsetsToKafka(testCommitData1,mock(KafkaCommitCallback.class));
+    Map<TopicPartition,OffsetAndMetadata> result1=commitStore.take();
+    for (    Entry<TopicPartition,OffsetAndMetadata> entry : result1.entrySet()) {
+      TopicPartition partition=entry.getKey();
+      if (partition.topic().equals("test")) {
+        assertEquals(42,partition.partition());
+        assertEquals(12L,entry.getValue().offset());
+      }
+ else       if (partition.topic().equals("another")) {
+        assertEquals(99,partition.partition());
+        assertEquals(17L,entry.getValue().offset());
+      }
+    }
+    fetcher.commitInternalOffsetsToKafka(testCommitData2,mock(KafkaCommitCallback.class));
+    Map<TopicPartition,OffsetAndMetadata> result2=commitStore.take();
+    for (    Entry<TopicPartition,OffsetAndMetadata> entry : result2.entrySet()) {
+      TopicPartition partition=entry.getKey();
+      if (partition.topic().equals("test")) {
+        assertEquals(42,partition.partition());
+        assertEquals(20L,entry.getValue().offset());
+      }
+ else       if (partition.topic().equals("another")) {
+        assertEquals(99,partition.partition());
+        assertEquals(27L,entry.getValue().offset());
+      }
+    }
+    fetcher.cancel();
+    fetcherRunner.join();
+    final Throwable caughtError=error.get();
+    if (caughtError != null && !(caughtError instanceof Handover.ClosedException)) {
+      throw new Exception("Exception in the fetcher",caughtError);
+    }
+  }
+  @Test public void testCancellationWhenEmitBlocks() throws Exception {
+    final String topic="test-topic";
+    final int partition=3;
+    final byte[] payload=new byte[]{1,2,3,4};
+    final List<ConsumerRecord<byte[],byte[]>> records=Arrays.asList(new ConsumerRecord<>(topic,partition,15,payload,payload),new ConsumerRecord<>(topic,partition,16,payload,payload),new ConsumerRecord<>(topic,partition,17,payload,payload));
+    final Map<TopicPartition,List<ConsumerRecord<byte[],byte[]>>> data=new HashMap<>();
+    data.put(new TopicPartition(topic,partition),records);
+    final ConsumerRecords<byte[],byte[]> consumerRecords=new ConsumerRecords<>(data);
+    final KafkaConsumer<?,?> mockConsumer=mock(KafkaConsumer.class);
+    when(mockConsumer.poll(anyLong())).thenAnswer(new Answer<ConsumerRecords<?,?>>(){
+      @Override public ConsumerRecords<?,?> answer(      InvocationOnMock invocation){
+        return consumerRecords;
+      }
+    }
+);
+    whenNew(KafkaConsumer.class).withAnyArguments().thenReturn(mockConsumer);
+    BlockingSourceContext<String> sourceContext=new BlockingSourceContext<>();
+    Map<KafkaTopicPartition,Long> partitionsWithInitialOffsets=Collections.singletonMap(new KafkaTopicPartition(topic,partition),KafkaTopicPartitionStateSentinel.GROUP_OFFSET);
+    KeyedDeserializationSchema<String> schema=new KeyedDeserializationSchemaWrapper<>(new SimpleStringSchema());
+    final Kafka09Fetcher<String> fetcher=new Kafka09Fetcher<>(sourceContext,partitionsWithInitialOffsets,null,null,new TestProcessingTimeService(),10,this.getClass().getClassLoader(),"task_name",schema,new Properties(),0L,new UnregisteredMetricsGroup(),new UnregisteredMetricsGroup(),false);
+    final AtomicReference<Throwable> error=new AtomicReference<>();
+    final Thread fetcherRunner=new Thread("fetcher runner"){
+      @Override public void run(){
+        try {
+          fetcher.runFetchLoop();
+        }
+ catch (        Throwable t) {
+          error.set(t);
+        }
+      }
+    }
+;
+    fetcherRunner.start();
+    sourceContext.waitTillHasBlocker();
+    fetcher.cancel();
+    fetcherRunner.interrupt();
+    fetcherRunner.join();
+    assertFalse("fetcher threads did not properly finish",sourceContext.isStillBlocking());
+  }
+private static final class BlockingSourceContext<T> implements SourceContext<T> {
+    private final ReentrantLock lock=new ReentrantLock();
+    private final OneShotLatch inBlocking=new OneShotLatch();
+    @Override public void collect(    T element){
+      block();
+    }
+    @Override public void collectWithTimestamp(    T element,    long timestamp){
+      block();
+    }
+    @Override public void emitWatermark(    Watermark mark){
+      block();
+    }
+    @Override public void markAsTemporarilyIdle(){
+      throw new UnsupportedOperationException();
+    }
+    @Override public Object getCheckpointLock(){
+      return new Object();
+    }
+    @Override public void close(){
+    }
+    void waitTillHasBlocker() throws InterruptedException {
+      inBlocking.await();
+    }
+    boolean isStillBlocking(){
+      return lock.isLocked();
+    }
+    @SuppressWarnings({"InfiniteLoopStatement","SynchronizationOnLocalVariableOrMethodParameter"}) private void block(){
+      lock.lock();
+      try {
+        inBlocking.trigger();
+        final Object o=new Object();
+        while (true) {
+synchronized (o) {
+            o.wait();
+          }
+        }
+      }
+ catch (      InterruptedException e) {
+        Thread.currentThread().interrupt();
+      }
+ finally {
+        lock.unlock();
+      }
+    }
+  }
+}

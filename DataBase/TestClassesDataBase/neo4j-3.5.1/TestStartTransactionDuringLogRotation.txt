@@ -1,0 +1,72 @@
+public class TestStartTransactionDuringLogRotation {
+  @Rule public DatabaseRule db=new EmbeddedDatabaseRule(){
+    @Override protected GraphDatabaseBuilder newBuilder(    GraphDatabaseFactory factory){
+      return super.newBuilder(factory).setConfig(GraphDatabaseSettings.logical_log_rotation_threshold,"1M");
+    }
+  }
+;
+  @Rule public final OtherThreadRule<Void> t2=new OtherThreadRule<>("T2-" + getClass().getName());
+  private ExecutorService executor;
+  private CountDownLatch startLogRotationLatch;
+  private CountDownLatch completeLogRotationLatch;
+  private AtomicBoolean writerStopped;
+  private Monitors monitors;
+  private LogRotation.Monitor rotationListener;
+  private Label label;
+  private Future<Void> rotationFuture;
+  @Before public void setUp() throws InterruptedException {
+    executor=Executors.newCachedThreadPool();
+    startLogRotationLatch=new CountDownLatch(1);
+    completeLogRotationLatch=new CountDownLatch(1);
+    writerStopped=new AtomicBoolean();
+    monitors=db.getDependencyResolver().resolveDependency(Monitors.class);
+    rotationListener=new LogRotation.Monitor(){
+      @Override public void startedRotating(      long currentVersion){
+        startLogRotationLatch.countDown();
+        try {
+          completeLogRotationLatch.await();
+        }
+ catch (        InterruptedException e) {
+          throw new RuntimeException(e);
+        }
+      }
+      @Override public void finishedRotating(      long currentVersion){
+      }
+    }
+;
+    monitors.addMonitorListener(rotationListener);
+    label=Label.label("Label");
+    rotationFuture=t2.execute(forceLogRotation(db));
+    startLogRotationLatch.await();
+  }
+  private WorkerCommand<Void,Void> forceLogRotation(  GraphDatabaseAPI db){
+    return state -> {
+      try (Transaction tx=db.beginTx()){
+        db.createNode(label).setProperty("a",1);
+        tx.success();
+      }
+       db.getDependencyResolver().resolveDependency(LogRotation.class).rotateLogFile();
+      return null;
+    }
+;
+  }
+  @After public void tearDown() throws Exception {
+    rotationFuture.get();
+    writerStopped.set(true);
+    executor.shutdown();
+  }
+  @Test(timeout=10000) public void logRotationMustNotObstructStartingReadTransaction(){
+    try (Transaction tx=db.beginTx()){
+      db.getNodeById(0);
+      tx.success();
+      completeLogRotationLatch.countDown();
+    }
+   }
+  @Test(timeout=10000) public void logRotationMustNotObstructStartingWriteTransaction(){
+    try (Transaction tx=db.beginTx()){
+      db.createNode();
+      tx.success();
+      completeLogRotationLatch.countDown();
+    }
+   }
+}

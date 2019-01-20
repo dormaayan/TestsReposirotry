@@ -1,0 +1,23 @@
+/** 
+ * Checks that a plan with consecutive UNIONs followed by broadcast-fwd JOIN is correctly translated. The program can be illustrated as follows: Src1 -\ >-> Union12--< Src2 -/              \ >-> Union123 --> bc-fwd-Join -> Output Src3 ----------------/             / / Src4 ----------------------------/ In the resulting plan, the broadcasting must be pushed to the inputs of the unions (Src1, Src2, Src3).
+ */
+@Test public void testConsecutiveUnionsWithBroadcast() throws Exception {
+  ExecutionEnvironment env=ExecutionEnvironment.getExecutionEnvironment();
+  env.setParallelism(DEFAULT_PARALLELISM);
+  DataSet<Tuple2<Long,Long>> src1=env.fromElements(new Tuple2<>(0L,0L));
+  DataSet<Tuple2<Long,Long>> src2=env.fromElements(new Tuple2<>(0L,0L));
+  DataSet<Tuple2<Long,Long>> src3=env.fromElements(new Tuple2<>(0L,0L));
+  DataSet<Tuple2<Long,Long>> src4=env.fromElements(new Tuple2<>(0L,0L));
+  DataSet<Tuple2<Long,Long>> union12=src1.union(src2);
+  DataSet<Tuple2<Long,Long>> union123=union12.union(src3);
+  union123.join(src4,JoinOperatorBase.JoinHint.BROADCAST_HASH_FIRST).where(0).equalTo(0).name("join").output(new DiscardingOutputFormat<Tuple2<Tuple2<Long,Long>,Tuple2<Long,Long>>>()).name("out");
+  OptimizedPlan optimizedPlan=compileNoStats(env.createProgramPlan());
+  OptimizerPlanNodeResolver resolver=getOptimizerPlanNodeResolver(optimizedPlan);
+  DualInputPlanNode join=resolver.getNode("join");
+  assertEquals("First join input should be fully replicated.",PartitioningProperty.FULL_REPLICATION,join.getInput1().getGlobalProperties().getPartitioning());
+  NAryUnionPlanNode union=(NAryUnionPlanNode)join.getInput1().getSource();
+  for (  Channel c : union.getInputs()) {
+    assertEquals("Union input should be fully replicated",PartitioningProperty.FULL_REPLICATION,c.getGlobalProperties().getPartitioning());
+    assertEquals("Union input channel should be broadcasting",ShipStrategyType.BROADCAST,c.getShipStrategy());
+  }
+}

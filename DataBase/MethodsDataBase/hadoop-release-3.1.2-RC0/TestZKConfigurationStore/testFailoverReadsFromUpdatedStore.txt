@@ -1,0 +1,44 @@
+/** 
+ * When failing over, new active RM should read from current state of store, including any updates when the new active RM was in standby.
+ * @throws Exception
+ */
+@Test public void testFailoverReadsFromUpdatedStore() throws Exception {
+  HAServiceProtocol.StateChangeRequestInfo req=new HAServiceProtocol.StateChangeRequestInfo(HAServiceProtocol.RequestSource.REQUEST_BY_USER);
+  Configuration conf1=createRMHAConf("rm1,rm2","rm1",1234);
+  ResourceManager rm1=new MockRM(conf1);
+  rm1.start();
+  rm1.getRMContext().getRMAdminService().transitionToActive(req);
+  assertEquals("RM with ZKStore didn't start",Service.STATE.STARTED,rm1.getServiceState());
+  assertEquals("RM should be Active",HAServiceProtocol.HAServiceState.ACTIVE,rm1.getRMContext().getRMAdminService().getServiceStatus().getState());
+  assertNull(((MutableConfScheduler)rm1.getResourceScheduler()).getConfiguration().get("key"));
+  Configuration conf2=createRMHAConf("rm1,rm2","rm2",5678);
+  ResourceManager rm2=new MockRM(conf2);
+  rm2.start();
+  assertEquals("RM should be Standby",HAServiceProtocol.HAServiceState.STANDBY,rm2.getRMContext().getRMAdminService().getServiceStatus().getState());
+  SchedConfUpdateInfo schedConfUpdateInfo=new SchedConfUpdateInfo();
+  schedConfUpdateInfo.getGlobalParams().put("key","val");
+  MutableConfigurationProvider confProvider=((MutableConfScheduler)rm1.getResourceScheduler()).getMutableConfProvider();
+  UserGroupInformation user=UserGroupInformation.createUserForTesting(TEST_USER,new String[0]);
+  confProvider.logAndApplyMutation(user,schedConfUpdateInfo);
+  rm1.getResourceScheduler().reinitialize(conf1,rm1.getRMContext());
+  assertEquals("val",((MutableConfScheduler)rm1.getResourceScheduler()).getConfiguration().get("key"));
+  confProvider.confirmPendingMutation(true);
+  assertEquals("val",((MutableCSConfigurationProvider)confProvider).getConfStore().retrieve().get("key"));
+  schedConfUpdateInfo.getGlobalParams().put("key","badVal");
+  confProvider.logAndApplyMutation(user,schedConfUpdateInfo);
+  rm2.getRMContext().getRMAdminService().transitionToActive(req);
+  assertEquals("RM with ZKStore didn't start",Service.STATE.STARTED,rm2.getServiceState());
+  assertEquals("RM should be Active",HAServiceProtocol.HAServiceState.ACTIVE,rm2.getRMContext().getRMAdminService().getServiceStatus().getState());
+  for (int i=0; i < ZK_TIMEOUT_MS / 50; i++) {
+    if (HAServiceProtocol.HAServiceState.ACTIVE == rm1.getRMContext().getRMAdminService().getServiceStatus().getState()) {
+      Thread.sleep(100);
+    }
+  }
+  assertEquals("RM should have been fenced",HAServiceProtocol.HAServiceState.STANDBY,rm1.getRMContext().getRMAdminService().getServiceStatus().getState());
+  assertEquals("RM should be Active",HAServiceProtocol.HAServiceState.ACTIVE,rm2.getRMContext().getRMAdminService().getServiceStatus().getState());
+  assertEquals("val",((MutableCSConfigurationProvider)((CapacityScheduler)rm2.getResourceScheduler()).getMutableConfProvider()).getConfStore().retrieve().get("key"));
+  assertEquals("val",((MutableConfScheduler)rm2.getResourceScheduler()).getConfiguration().get("key"));
+  Thread.sleep(10000);
+  rm1.close();
+  rm2.close();
+}

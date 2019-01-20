@@ -1,0 +1,33 @@
+/** 
+ * Test that a failing schedule or update consumers call leads to the failing of the respective task. <p>IMPORTANT: We have to make sure that the invokable's cancel method is called, because only then the future is completed. We do this by not eagerly deploy consumer tasks and requiring the invokable to fill one memory segment. The completed memory segment will trigger the scheduling of the downstream operator since it is in pipeline mode. After we've filled the memory segment, we'll block the invokable and wait for the task failure due to the failed schedule or update consumers call.
+ */
+@Test(timeout=10000L) public void testFailingScheduleOrUpdateConsumersMessage() throws Exception {
+  new JavaTestKit(system){
+{
+      final Configuration configuration=new Configuration();
+      configuration.setString(TaskManagerOptions.MEMORY_SEGMENT_SIZE,"4096");
+      final JobID jid=new JobID();
+      final JobVertexID vid=new JobVertexID();
+      final ExecutionAttemptID eid=new ExecutionAttemptID();
+      final SerializedValue<ExecutionConfig> executionConfig=new SerializedValue<>(new ExecutionConfig());
+      final ResultPartitionDeploymentDescriptor resultPartitionDeploymentDescriptor=new ResultPartitionDeploymentDescriptor(new IntermediateDataSetID(),new IntermediateResultPartitionID(),ResultPartitionType.PIPELINED,1,1,true);
+      final TaskDeploymentDescriptor tdd=createTaskDeploymentDescriptor(jid,"TestJob",vid,eid,executionConfig,"TestTask",1,0,1,0,new Configuration(),new Configuration(),TestInvokableRecordCancel.class.getName(),Collections.singletonList(resultPartitionDeploymentDescriptor),Collections.<InputGateDeploymentDescriptor>emptyList(),new ArrayList<>(),Collections.emptyList(),0);
+      ActorRef jmActorRef=system.actorOf(Props.create(FailingScheduleOrUpdateConsumersJobManager.class,LEADER_SESSION_ID),"jobmanager");
+      ActorGateway jobManager=new AkkaActorGateway(jmActorRef,LEADER_SESSION_ID);
+      highAvailabilityServices.setJobMasterLeaderRetriever(HighAvailabilityServices.DEFAULT_JOB_ID,new StandaloneLeaderRetrievalService(jobManager.path(),jobManager.leaderSessionID()));
+      final ActorGateway taskManager=TestingUtils.createTaskManager(system,highAvailabilityServices,configuration,true,true);
+      try {
+        TestInvokableRecordCancel.resetGotCanceledFuture();
+        Future<Object> result=taskManager.ask(new SubmitTask(tdd),timeout);
+        Await.result(result,timeout);
+        CompletableFuture<Boolean> cancelFuture=TestInvokableRecordCancel.gotCanceled();
+        assertEquals(true,cancelFuture.get());
+      }
+  finally {
+        TestingUtils.stopActor(taskManager);
+        TestingUtils.stopActor(jobManager);
+      }
+    }
+  }
+;
+}

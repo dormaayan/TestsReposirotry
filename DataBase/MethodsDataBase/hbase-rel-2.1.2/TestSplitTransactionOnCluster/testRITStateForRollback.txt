@@ -1,0 +1,31 @@
+@Test public void testRITStateForRollback() throws Exception {
+  final TableName tableName=TableName.valueOf(name.getMethodName());
+  final HMaster master=cluster.getMaster();
+  try {
+    Table t=createTableAndWait(tableName,Bytes.toBytes("cf"));
+    final List<HRegion> regions=cluster.getRegions(tableName);
+    final RegionInfo hri=getAndCheckSingleTableRegion(regions);
+    insertData(tableName,admin,t);
+    t.close();
+    this.admin.setBalancerRunning(false,true);
+    master.setCatalogJanitorEnabled(false);
+    final HRegion region=findSplittableRegion(regions);
+    assertTrue("not able to find a splittable region",region != null);
+    master.getMasterCoprocessorHost().load(FailingSplitMasterObserver.class,Coprocessor.PRIORITY_USER,master.getConfiguration());
+    this.admin.splitRegion(region.getRegionInfo().getRegionName(),new byte[]{42});
+    FailingSplitMasterObserver observer=master.getMasterCoprocessorHost().findCoprocessor(FailingSplitMasterObserver.class);
+    assertNotNull(observer);
+    observer.latch.await();
+    LOG.info("Waiting for region to come out of RIT");
+    while (!cluster.getMaster().getAssignmentManager().getRegionStates().isRegionOnline(hri)) {
+      Threads.sleep(100);
+    }
+    assertTrue(cluster.getMaster().getAssignmentManager().getRegionStates().isRegionOnline(hri));
+  }
+  finally {
+    admin.setBalancerRunning(true,false);
+    master.setCatalogJanitorEnabled(true);
+    abortAndWaitForMaster();
+    TESTING_UTIL.deleteTable(tableName);
+  }
+}

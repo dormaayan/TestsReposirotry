@@ -1,0 +1,70 @@
+/** 
+ * @version 
+ */
+public class JpaTest extends Assert {
+  private static final Logger LOG=LoggerFactory.getLogger(JpaTest.class);
+  protected CamelContext camelContext=new DefaultCamelContext();
+  protected ProducerTemplate template;
+  protected JpaEndpoint endpoint;
+  protected EntityManager entityManager;
+  protected TransactionTemplate transactionTemplate;
+  protected Consumer consumer;
+  protected Exchange receivedExchange;
+  protected CountDownLatch latch=new CountDownLatch(1);
+  protected String entityName=SendEmail.class.getName();
+  protected String queryText="select o from " + entityName + " o";
+  @Test public void testProducerInsertsIntoDatabaseThenConsumerFiresMessageExchange() throws Exception {
+    transactionTemplate.execute(new TransactionCallback<Object>(){
+      public Object doInTransaction(      TransactionStatus status){
+        entityManager.joinTransaction();
+        entityManager.createQuery("delete from " + entityName).executeUpdate();
+        return null;
+      }
+    }
+);
+    List<?> results=entityManager.createQuery(queryText).getResultList();
+    assertEquals("Should have no results: " + results,0,results.size());
+    template.send(endpoint,new Processor(){
+      public void process(      Exchange exchange){
+        exchange.getIn().setBody(new SendEmail("foo@bar.com"));
+      }
+    }
+);
+    results=entityManager.createQuery(queryText).getResultList();
+    assertEquals("Should have results: " + results,1,results.size());
+    SendEmail mail=(SendEmail)results.get(0);
+    assertEquals("address property","foo@bar.com",mail.getAddress());
+    consumer=endpoint.createConsumer(new Processor(){
+      public void process(      Exchange e){
+        LOG.info("Received exchange: " + e.getIn());
+        receivedExchange=e;
+        EntityManager entityManager=e.getIn().getHeader(JpaConstants.ENTITY_MANAGER,EntityManager.class);
+        assertNotNull("Should have a EntityManager as header",entityManager);
+        latch.countDown();
+      }
+    }
+);
+    consumer.start();
+    assertTrue(latch.await(50,TimeUnit.SECONDS));
+    assertNotNull(receivedExchange);
+    SendEmail result=receivedExchange.getIn().getBody(SendEmail.class);
+    assertNotNull("Received a POJO",result);
+    assertEquals("address property","foo@bar.com",result.getAddress());
+  }
+  @Before public void setUp() throws Exception {
+    template=camelContext.createProducerTemplate();
+    startServices(template,camelContext);
+    Endpoint value=camelContext.getEndpoint(getEndpointUri());
+    assertNotNull("Could not find endpoint!",value);
+    assertTrue("Should be a JPA endpoint but was: " + value,value instanceof JpaEndpoint);
+    endpoint=(JpaEndpoint)value;
+    transactionTemplate=endpoint.createTransactionTemplate();
+    entityManager=endpoint.createEntityManager();
+  }
+  protected String getEndpointUri(){
+    return "jpa://" + SendEmail.class.getName();
+  }
+  @After public void tearDown() throws Exception {
+    stopServices(consumer,template,camelContext);
+  }
+}

@@ -1,0 +1,356 @@
+/** 
+ * To check the previous behavior you can use: <pre> {@link org.kohsuke.stapler.MetaClass#LEGACY_WEB_METHOD_MODE} = true;{@link org.kohsuke.stapler.MetaClass#LEGACY_GETTER_MODE} = true;</pre>
+ */
+@Issue("SECURITY-400") public class Security400Test {
+  @Rule public JenkinsRule j=new JenkinsRule();
+  private static boolean filteredDoActionTriggered=false;
+  @Before public void prepareFilterListener(){
+    WebApp webApp=WebApp.get(j.jenkins.servletContext);
+    webApp.setFilteredDoActionTriggerListener((f,req,rsp,node) -> {
+      filteredDoActionTriggered=true;
+      return false;
+    }
+);
+    webApp.setFilteredGetterTriggerListener((f,req,rsp,node,expression) -> {
+      filteredDoActionTriggered=true;
+      return false;
+    }
+);
+  }
+  @After public void resetFilter(){
+    filteredDoActionTriggered=false;
+  }
+  private void assertRequestWasBlockedAndResetFlag(){
+    assertTrue("No request was blocked",filteredDoActionTriggered);
+    filteredDoActionTriggered=false;
+  }
+  private void assertRequestWasNotBlocked(){
+    assertFalse("There was at least a request that was blocked",filteredDoActionTriggered);
+  }
+  @Test @Issue("SECURITY-391") public void asyncDoRun() throws Exception {
+    j.createWebClient().assertFails("extensionList/" + AsyncPeriodicWork.class.getName() + "/"+ Work.class.getName()+ "/run",HttpURLConnection.HTTP_NOT_FOUND);
+    Thread.sleep(1000);
+    assertFalse("should never have run",ran);
+  }
+  private static boolean ran;
+@TestExtension("asyncDoRun") public static class Work extends AsyncPeriodicWork {
+    public Work(){
+      super("Test");
+    }
+    @Override public long getRecurrencePeriod(){
+      return Long.MAX_VALUE;
+    }
+    @Override protected void execute(    TaskListener listener) throws IOException, InterruptedException {
+      ran=true;
+    }
+  }
+  @Test @Issue("SECURITY-397") public void folderCronDoRun() throws Exception {
+    j.createWebClient().assertFails("extensionList/" + PeriodicWork.class.getName() + "/"+ FolderCron.class.getName()+ "/run",HttpURLConnection.HTTP_NOT_FOUND);
+    assertRequestWasBlockedAndResetFlag();
+  }
+  /** 
+ * replacement of "computers/0/executors/0/contextClassLoader/context/handlers/0/sessionManager/stop" attack
+ */
+  @Test @Issue("SECURITY-404") public void avoidDangerousAccessToSession() throws Exception {
+    j.jenkins.setCrumbIssuer(null);
+    j.jenkins.setSecurityRealm(j.createDummySecurityRealm());
+    j.jenkins.setAuthorizationStrategy(new MockAuthorizationStrategy().grant(Jenkins.ADMINISTER).everywhere().to("admin").grant(Jenkins.READ).everywhere().to("user"));
+    JenkinsRule.WebClient wc=j.createWebClient();
+    wc.getOptions().setThrowExceptionOnFailingStatusCode(false);
+    wc.login("admin");
+    JenkinsRule.WebClient wc2=j.createWebClient();
+    wc2.getOptions().setThrowExceptionOnFailingStatusCode(false);
+    wc2.login("user");
+    Page page;
+    page=wc.goTo("whoAmI/api/xml/",null);
+    System.out.println(page.getWebResponse().getContentAsString());
+    assertThat(page.getWebResponse().getContentAsString(),containsString("<anonymous>false</anonymous>"));
+    page=wc2.goTo("whoAmI/api/xml/",null);
+    System.out.println(page.getWebResponse().getContentAsString());
+    assertThat(page.getWebResponse().getContentAsString(),containsString("<anonymous>false</anonymous>"));
+    assertRequestWasNotBlocked();
+    page=wc2.goTo("adjuncts/<randomString>/webApp/context/contextHandler/beans/0/beans/0/stop",null);
+    assertEquals(403,page.getWebResponse().getStatusCode());
+    page=wc.goTo("whoAmI/api/xml/",null);
+    System.out.println(page.getWebResponse().getContentAsString());
+    assertThat(page.getWebResponse().getContentAsString(),containsString("<anonymous>false</anonymous>"));
+    page=wc2.goTo("whoAmI/api/xml/",null);
+    System.out.println(page.getWebResponse().getContentAsString());
+    assertThat(page.getWebResponse().getContentAsString(),containsString("<anonymous>false</anonymous>"));
+    assertRequestWasNotBlocked();
+  }
+  @Test @Issue("SECURITY-404") public void ensureDoStopStillReachable() throws Exception {
+    j.jenkins.setCrumbIssuer(null);
+    JenkinsRule.WebClient wc=j.createWebClient();
+    wc.getOptions().setThrowExceptionOnFailingStatusCode(false);
+    AtomicInteger atomicResult=new AtomicInteger(0);
+    FreeStyleProject p=j.createFreeStyleProject();
+    final Semaphore semaphore=new Semaphore(0);
+    p.getBuildersList().add(new SemaphoredBuilder(semaphore,atomicResult));
+    j.jenkins.setNumExecutors(1);
+{
+      WebRequest request=new WebRequest(new URL(j.getURL() + "computers/0/executors/0/stop"),HttpMethod.POST);
+      Page page=wc.getPage(request);
+      assertEquals(404,page.getWebResponse().getStatusCode());
+      assertRequestWasNotBlocked();
+    }
+{
+      QueueTaskFuture<FreeStyleBuild> futureBuild=p.scheduleBuild2(0);
+      futureBuild.waitForStart();
+      semaphore.release(1);
+      j.assertBuildStatus(Result.SUCCESS,futureBuild);
+      assertEquals(1,atomicResult.get());
+    }
+{
+      atomicResult.set(0);
+      assertEquals(0,atomicResult.get());
+      QueueTaskFuture<FreeStyleBuild> futureBuild=p.scheduleBuild2(0);
+      futureBuild.waitForStart();
+      WebRequest request=new WebRequest(new URL(j.getURL() + "computers/0/executors/0/stop"),HttpMethod.POST);
+      Page page=wc.getPage(request);
+      assertEquals(404,page.getWebResponse().getStatusCode());
+      assertRequestWasNotBlocked();
+      j.assertBuildStatus(Result.FAILURE,futureBuild);
+      assertEquals(3,atomicResult.get());
+    }
+  }
+  @Test @Issue("SECURITY-404") public void anonCannotReadTextConsole() throws Exception {
+    j.jenkins.setSecurityRealm(j.createDummySecurityRealm());
+    FullControlOnceLoggedInAuthorizationStrategy authorizationStrategy=new FullControlOnceLoggedInAuthorizationStrategy();
+    authorizationStrategy.setAllowAnonymousRead(false);
+    j.jenkins.setAuthorizationStrategy(authorizationStrategy);
+    JenkinsRule.WebClient wc=j.createWebClient();
+    wc.getOptions().setThrowExceptionOnFailingStatusCode(false);
+    FreeStyleProject p=j.createFreeStyleProject();
+    Semaphore semaphore=new Semaphore(0);
+    p.getBuildersList().add(new SemaphoredBuilder(semaphore,new AtomicInteger(0)));
+    j.jenkins.setNumExecutors(1);
+{
+      Page page=wc.goTo("computers/0/executors/0/currentExecutable/consoleText",null);
+      checkPageIsRedirectedToLogin(page);
+      assertRequestWasNotBlocked();
+    }
+{
+      wc.login("foo");
+      QueueTaskFuture<FreeStyleBuild> futureBuild=p.scheduleBuild2(0);
+      futureBuild.waitForStart();
+      Page page=wc.goTo("computers/0/executors/0/currentExecutable/consoleText",null);
+      assertEquals(200,page.getWebResponse().getStatusCode());
+      assertThat(page.getWebResponse().getContentAsString(),containsString(SemaphoredBuilder.START_MESSAGE));
+      assertRequestWasNotBlocked();
+      semaphore.release(1);
+      j.assertBuildStatus(Result.SUCCESS,futureBuild);
+    }
+{
+      wc=j.createWebClient();
+      wc.getOptions().setThrowExceptionOnFailingStatusCode(false);
+      QueueTaskFuture<FreeStyleBuild> futureBuild=p.scheduleBuild2(0);
+      futureBuild.waitForStart();
+      Page page=wc.goTo("computers/0/executors/0/currentExecutable/consoleText",null);
+      checkPageIsRedirectedToLogin(page);
+      assertThat(page.getWebResponse().getContentAsString(),not(containsString(SemaphoredBuilder.START_MESSAGE)));
+      assertRequestWasNotBlocked();
+      semaphore.release(1);
+      j.assertBuildStatus(Result.SUCCESS,futureBuild);
+    }
+  }
+  @Test @Issue("SECURITY-404") public void anonCannotAccessExecutorApi() throws Exception {
+    j.jenkins.setSecurityRealm(j.createDummySecurityRealm());
+    FullControlOnceLoggedInAuthorizationStrategy authorizationStrategy=new FullControlOnceLoggedInAuthorizationStrategy();
+    authorizationStrategy.setAllowAnonymousRead(false);
+    j.jenkins.setAuthorizationStrategy(authorizationStrategy);
+    JenkinsRule.WebClient wc=j.createWebClient();
+    wc.getOptions().setThrowExceptionOnFailingStatusCode(false);
+    FreeStyleProject p=j.createFreeStyleProject();
+    Semaphore semaphore=new Semaphore(0);
+    p.getBuildersList().add(new SemaphoredBuilder(semaphore,new AtomicInteger(0)));
+    j.jenkins.setNumExecutors(1);
+{
+      Page page=wc.goTo("computers/0/executors/0/api/xml",null);
+      checkPageIsRedirectedToLogin(page);
+      assertRequestWasNotBlocked();
+    }
+{
+      QueueTaskFuture<FreeStyleBuild> futureBuild=p.scheduleBuild2(0);
+      futureBuild.waitForStart();
+      wc.login("foo");
+      Page page=wc.goTo("computers/0/executors/0/api/xml",null);
+      assertEquals(200,page.getWebResponse().getStatusCode());
+      assertThat(page.getWebResponse().getContentAsString(),containsString(p.getUrl()));
+      assertRequestWasNotBlocked();
+      semaphore.release(1);
+      j.assertBuildStatus(Result.SUCCESS,futureBuild);
+      wc=j.createWebClient();
+      wc.getOptions().setThrowExceptionOnFailingStatusCode(false);
+    }
+{
+      QueueTaskFuture<FreeStyleBuild> futureBuild=p.scheduleBuild2(0);
+      futureBuild.waitForStart();
+      Page page=wc.goTo("computers/0/executors/0/api/xml",null);
+      checkPageIsRedirectedToLogin(page);
+      assertThat(page.getWebResponse().getContentAsString(),not(containsString(p.getUrl())));
+      assertRequestWasNotBlocked();
+      semaphore.release(1);
+      j.assertBuildStatus(Result.SUCCESS,futureBuild);
+    }
+  }
+  @Test @Issue("SECURITY-404") public void anonCannotAccessJenkinsItemMap() throws Exception {
+    JenkinsRule.WebClient wc=j.createWebClient();
+    wc.getOptions().setThrowExceptionOnFailingStatusCode(false);
+    FreeStyleProject p=j.createFreeStyleProject();
+{
+      wc.login("foo");
+      Page page=wc.goTo("itemMap/" + p.getName() + "/api/xml",null);
+      assertEquals(404,page.getWebResponse().getStatusCode());
+      assertThat(page.getWebResponse().getContentAsString(),not(containsString("<freeStyleProject")));
+      assertRequestWasBlockedAndResetFlag();
+    }
+  }
+public static class SemaphoredBuilder extends Builder {
+    private static final String START_MESSAGE="job started, will try to acquire one permit";
+    private transient Semaphore semaphore;
+    private transient AtomicInteger atomicInteger;
+    SemaphoredBuilder(    Semaphore semaphore,    AtomicInteger atomicInteger){
+      this.semaphore=semaphore;
+      this.atomicInteger=atomicInteger;
+    }
+    @Override public boolean perform(    AbstractBuild<?,?> build,    Launcher launcher,    BuildListener listener) throws InterruptedException, IOException {
+      try {
+        listener.getLogger().println(START_MESSAGE);
+        boolean result=semaphore.tryAcquire(20,TimeUnit.SECONDS);
+        if (result) {
+          listener.getLogger().println("permit acquired");
+          atomicInteger.set(1);
+          return true;
+        }
+ else {
+          atomicInteger.set(2);
+          return false;
+        }
+      }
+ catch (      InterruptedException e) {
+        atomicInteger.set(3);
+        return false;
+      }
+    }
+@TestExtension public static class DescriptorImpl extends Descriptor<Builder> {
+    }
+  }
+  @Test @Issue("SECURITY-471") public void ensureLogRecordManagerAccessibleOnlyByAdmin() throws Exception {
+    j.jenkins.setCrumbIssuer(null);
+    j.jenkins.setSecurityRealm(j.createDummySecurityRealm());
+    j.jenkins.setAuthorizationStrategy(new MockAuthorizationStrategy().grant(Jenkins.ADMINISTER).everywhere().to("admin").grant(Jenkins.READ).everywhere().to("user"));
+    String logNameForAdmin="testLoggerAdmin";
+    String logNameForUser="testLoggerUser";
+{
+      JenkinsRule.WebClient wc=j.createWebClient();
+      wc.login("admin");
+      wc.getOptions().setThrowExceptionOnFailingStatusCode(false);
+      assertEquals(404,wc.goTo("log/" + logNameForAdmin + "/autoCompleteLoggerName/?value=a",null).getWebResponse().getStatusCode());
+      assertRequestWasNotBlocked();
+      WebRequest request=new WebRequest(new URL(j.getURL() + "log/newLogRecorder/?name=" + logNameForAdmin),HttpMethod.POST);
+      wc.getOptions().setRedirectEnabled(false);
+      Page page=wc.getPage(request);
+      assertEquals(302,page.getWebResponse().getStatusCode());
+      assertRequestWasNotBlocked();
+      j.assertGoodStatus(wc.goTo("log/" + logNameForAdmin + "/autoCompleteLoggerName/?value=a",null));
+      assertRequestWasNotBlocked();
+      assertEquals(404,wc.goTo("log/" + "nonExistingName" + "/autoCompleteLoggerName/?value=a",null).getWebResponse().getStatusCode());
+      assertRequestWasNotBlocked();
+    }
+{
+      JenkinsRule.WebClient wc=j.createWebClient();
+      wc.login("user");
+      wc.getOptions().setThrowExceptionOnFailingStatusCode(false);
+      assertEquals(403,wc.goTo("log/" + logNameForUser + "/autoCompleteLoggerName/?value=a",null).getWebResponse().getStatusCode());
+      assertRequestWasNotBlocked();
+      WebRequest request=new WebRequest(new URL(j.getURL() + "log/newLogRecorder/?name=" + logNameForUser),HttpMethod.POST);
+      wc.getOptions().setRedirectEnabled(false);
+      Page page=wc.getPage(request);
+      assertEquals(403,page.getWebResponse().getStatusCode());
+      assertRequestWasNotBlocked();
+      assertEquals(403,wc.goTo("log/" + logNameForUser + "/autoCompleteLoggerName/?value=a",null).getWebResponse().getStatusCode());
+      assertRequestWasNotBlocked();
+    }
+{
+      JenkinsRule.WebClient wc=j.createWebClient();
+      wc.login("admin");
+      wc.getOptions().setThrowExceptionOnFailingStatusCode(false);
+      assertEquals(404,wc.goTo("log/" + logNameForUser + "/autoCompleteLoggerName/?value=a",null).getWebResponse().getStatusCode());
+      assertRequestWasNotBlocked();
+    }
+  }
+  @Test public void anonCannotHaveTheListOfUsers() throws Exception {
+    j.jenkins.setCrumbIssuer(null);
+    FullControlOnceLoggedInAuthorizationStrategy authorizationStrategy=new FullControlOnceLoggedInAuthorizationStrategy();
+    j.jenkins.setAuthorizationStrategy(authorizationStrategy);
+    HudsonPrivateSecurityRealm securityRealm=new HudsonPrivateSecurityRealm(false,false,null);
+    j.jenkins.setSecurityRealm(securityRealm);
+    securityRealm.createAccount("admin","admin");
+    securityRealm.createAccount("secretUser","secretUser");
+{
+      JenkinsRule.WebClient wc=j.createWebClient();
+      wc.login("admin");
+      wc.getOptions().setThrowExceptionOnFailingStatusCode(false);
+      Page page=wc.goTo("securityRealm");
+      assertEquals(200,page.getWebResponse().getStatusCode());
+      assertThat(page.getWebResponse().getContentAsString(),containsString("secretUser"));
+      assertRequestWasNotBlocked();
+    }
+    authorizationStrategy.setAllowAnonymousRead(true);
+{
+      JenkinsRule.WebClient wc=j.createWebClient();
+      wc.getOptions().setThrowExceptionOnFailingStatusCode(false);
+      wc.getOptions().setRedirectEnabled(false);
+      Page page=wc.goTo("securityRealm/",null);
+      checkPageIsRedirectedToLogin(page);
+      assertThat(page.getWebResponse().getContentAsString(),not(containsString("secretUser")));
+      assertRequestWasNotBlocked();
+      page=wc.goTo("asynchPeople/",null);
+      assertEquals(200,page.getWebResponse().getStatusCode());
+      assertThat(page.getWebResponse().getContentAsString(),containsString("Includes all known"));
+      assertRequestWasNotBlocked();
+    }
+    authorizationStrategy.setAllowAnonymousRead(false);
+{
+      JenkinsRule.WebClient wc=j.createWebClient();
+      wc.getOptions().setThrowExceptionOnFailingStatusCode(false);
+      wc.getOptions().setRedirectEnabled(false);
+      Page page=wc.goTo("securityRealm/",null);
+      checkPageIsRedirectedToLogin(page);
+      assertThat(page.getWebResponse().getContentAsString(),not(containsString("secretUser")));
+      assertRequestWasNotBlocked();
+      page=wc.goTo("asynchPeople/",null);
+      checkPageIsRedirectedToLogin(page);
+      assertThat(page.getWebResponse().getContentAsString(),not(containsString("secretUser")));
+      assertRequestWasNotBlocked();
+    }
+  }
+  @Test @Issue("SECURITY-722") public void noAccessToAllUsers() throws Exception {
+    j.jenkins.setCrumbIssuer(null);
+    HudsonPrivateSecurityRealm securityRealm=new HudsonPrivateSecurityRealm(false,false,null);
+    j.jenkins.setSecurityRealm(securityRealm);
+    securityRealm.createAccount("admin","admin");
+    j.jenkins.setAuthorizationStrategy(new MockAuthorizationStrategy().grant(Jenkins.ADMINISTER).everywhere().to("admin"));
+{
+      JenkinsRule.WebClient wc=j.createWebClient();
+      wc.getOptions().setThrowExceptionOnFailingStatusCode(false);
+      Page page=wc.goTo("securityRealm/allUsers/" + 0 + "/descriptorByName/jenkins.security.ApiTokenProperty/help/apiToken/");
+      assertEquals(404,page.getWebResponse().getStatusCode());
+      assertRequestWasBlockedAndResetFlag();
+    }
+{
+      JenkinsRule.WebClient wc=j.createWebClient();
+      wc.login("admin");
+      wc.getOptions().setThrowExceptionOnFailingStatusCode(false);
+      Page page=wc.goTo("securityRealm/allUsers/" + 0 + "/descriptorByName/jenkins.security.ApiTokenProperty/help/apiToken/");
+      assertEquals(404,page.getWebResponse().getStatusCode());
+      assertRequestWasBlockedAndResetFlag();
+    }
+  }
+  private void checkPageIsRedirectedToLogin(  Page page){
+    assertEquals(200,page.getWebResponse().getStatusCode());
+    assertThat(page.getUrl().getPath(),containsString("login"));
+    assertThat(page.getUrl().getQuery(),containsString("from"));
+  }
+}

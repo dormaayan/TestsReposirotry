@@ -1,0 +1,59 @@
+class TransactionReadyStateIT extends BoltStateMachineStateTestBase {
+  @Test void shouldMoveToStreamingOnRun_succ() throws Throwable {
+    BoltStateMachineV3 machine=getBoltStateMachineInTxReadyState();
+    BoltResponseRecorder recorder=new BoltResponseRecorder();
+    machine.process(new RunMessage("CREATE (n {k:'k'}) RETURN n.k",EMPTY_PARAMS),recorder);
+    RecordedBoltResponse response=recorder.nextResponse();
+    assertTrue(response.hasMetadata("fields"));
+    assertTrue(response.hasMetadata("t_first"));
+    assertThat(machine.state(),instanceOf(TransactionStreamingState.class));
+  }
+  @Test void shouldMoveToReadyOnCommit_succ() throws Throwable {
+    BoltStateMachineV3 machine=getBoltStateMachineInTxReadyState();
+    BoltResponseRecorder recorder=new BoltResponseRecorder();
+    machine.process(COMMIT_MESSAGE,recorder);
+    RecordedBoltResponse response=recorder.nextResponse();
+    assertThat(response,succeeded());
+    assertTrue(response.hasMetadata("bookmark"));
+    assertThat(machine.state(),instanceOf(ReadyState.class));
+  }
+  @Test void shouldMoveToReadyOnRollback_succ() throws Throwable {
+    BoltStateMachineV3 machine=getBoltStateMachineInTxReadyState();
+    BoltResponseRecorder recorder=new BoltResponseRecorder();
+    machine.process(ROLLBACK_MESSAGE,recorder);
+    assertThat(recorder.nextResponse(),succeeded());
+    assertThat(machine.state(),instanceOf(ReadyState.class));
+  }
+  @Test void shouldMoveToFailedOnRun_fail() throws Throwable {
+    BoltStateMachineV3 machine=getBoltStateMachineInTxReadyState();
+    BoltResponseHandler handler=mock(BoltResponseHandler.class);
+    doThrow(new RuntimeException("Error!")).when(handler).onRecords(any(),anyBoolean());
+    machine.process(new RunMessage("A cypher query"),handler);
+    assertThat(machine.state(),instanceOf(FailedState.class));
+  }
+  @Test void shouldMoveToInterruptedOnInterrupt() throws Throwable {
+    BoltStateMachineV3 machine=getBoltStateMachineInTxReadyState();
+    BoltResponseRecorder recorder=new BoltResponseRecorder();
+    machine.process(InterruptSignal.INSTANCE,recorder);
+    assertThat(machine.state(),instanceOf(InterruptedState.class));
+  }
+  @ParameterizedTest @MethodSource("illegalV3Messages") void shouldCloseConnectionOnIllegalV3Messages(  RequestMessage message) throws Throwable {
+    shouldCloseConnectionOnIllegalMessages(message);
+  }
+  private void shouldCloseConnectionOnIllegalMessages(  RequestMessage message) throws Throwable {
+    BoltStateMachineV3 machine=getBoltStateMachineInTxReadyState();
+    BoltResponseRecorder recorder=new BoltResponseRecorder();
+    verifyKillsConnection(() -> machine.process(message,recorder));
+    assertThat(recorder.nextResponse(),failedWithStatus(Status.Request.Invalid));
+    assertNull(machine.state());
+  }
+  private static Stream<RequestMessage> illegalV3Messages() throws BoltIOException {
+    return Stream.of(newHelloMessage(),DiscardAllMessage.INSTANCE,PullAllMessage.INSTANCE,new BeginMessage(),GOODBYE_MESSAGE);
+  }
+  private BoltStateMachineV3 getBoltStateMachineInTxReadyState() throws BoltConnectionFatality, BoltIOException {
+    BoltStateMachineV3 machine=newStateMachine();
+    machine.process(newHelloMessage(),nullResponseHandler());
+    machine.process(new BeginMessage(),nullResponseHandler());
+    return machine;
+  }
+}

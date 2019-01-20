@@ -1,0 +1,36 @@
+@Category({MasterTests.class,LargeTests.class}) public class TestServerCrashProcedureCarryingMetaStuck {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestServerCrashProcedureCarryingMetaStuck.class);
+  private static final HBaseTestingUtility UTIL=new HBaseTestingUtility();
+  @BeforeClass public static void setUp() throws Exception {
+    UTIL.startMiniCluster(3);
+    UTIL.getAdmin().balancerSwitch(false,true);
+  }
+  @AfterClass public static void tearDown() throws Exception {
+    UTIL.shutdownMiniCluster();
+  }
+  @Test public void test() throws Exception {
+    RegionServerThread rsThread=null;
+    for (    RegionServerThread t : UTIL.getMiniHBaseCluster().getRegionServerThreads()) {
+      if (!t.getRegionServer().getRegions(TableName.META_TABLE_NAME).isEmpty()) {
+        rsThread=t;
+        break;
+      }
+    }
+    HRegionServer rs=rsThread.getRegionServer();
+    RegionInfo hri=rs.getRegions(TableName.META_TABLE_NAME).get(0).getRegionInfo();
+    HMaster master=UTIL.getMiniHBaseCluster().getMaster();
+    ProcedureExecutor<MasterProcedureEnv> executor=master.getMasterProcedureExecutor();
+    DummyRegionProcedure proc=new DummyRegionProcedure(executor.getEnvironment(),hri);
+    long procId=master.getMasterProcedureExecutor().submitProcedure(proc);
+    proc.waitUntilArrive();
+    try (AsyncConnection conn=ConnectionFactory.createAsyncConnection(UTIL.getConfiguration()).get()){
+      AsyncAdmin admin=conn.getAdmin();
+      CompletableFuture<Void> future=admin.move(hri.getRegionName());
+      rs.abort("For testing!");
+      UTIL.waitFor(30000,() -> executor.getProcedures().stream().filter(p -> p instanceof AssignProcedure).map(p -> (AssignProcedure)p).anyMatch(p -> Bytes.equals(hri.getRegionName(),p.getRegionInfo().getRegionName())));
+      proc.resume();
+      UTIL.waitFor(30000,() -> executor.isFinished(procId));
+      future.get(30,TimeUnit.SECONDS);
+    }
+   }
+}

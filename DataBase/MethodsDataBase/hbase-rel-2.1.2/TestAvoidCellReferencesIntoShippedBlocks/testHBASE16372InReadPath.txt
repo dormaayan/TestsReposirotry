@@ -1,0 +1,135 @@
+@Test public void testHBASE16372InReadPath() throws Exception {
+  final TableName tableName=TableName.valueOf(name.getMethodName());
+  final Table table=TEST_UTIL.createTable(tableName,FAMILIES_1,1,1024,null);
+  try {
+    RegionLocator locator=TEST_UTIL.getConnection().getRegionLocator(tableName);
+    String regionName=locator.getAllRegionLocations().get(0).getRegion().getEncodedName();
+    HRegion region=(HRegion)TEST_UTIL.getRSForFirstRegionInTable(tableName).getRegion(regionName);
+    HStore store=region.getStores().iterator().next();
+    CacheConfig cacheConf=store.getCacheConfig();
+    cacheConf.setCacheDataOnWrite(true);
+    cacheConf.setEvictOnClose(true);
+    final BlockCache cache=cacheConf.getBlockCache();
+    Put put=new Put(ROW);
+    put.addColumn(FAMILY,QUALIFIER,data);
+    table.put(put);
+    put=new Put(ROW);
+    put.addColumn(FAMILY,QUALIFIER1,data);
+    table.put(put);
+    put=new Put(ROW1);
+    put.addColumn(FAMILY,QUALIFIER,data);
+    table.put(put);
+    put=new Put(ROW1);
+    put.addColumn(FAMILY,QUALIFIER1,data);
+    table.put(put);
+    put=new Put(ROW2);
+    put.addColumn(FAMILY,QUALIFIER,data);
+    table.put(put);
+    put=new Put(ROW2);
+    put.addColumn(FAMILY,QUALIFIER1,data);
+    table.put(put);
+    put=new Put(ROW3);
+    put.addColumn(FAMILY,QUALIFIER,data);
+    table.put(put);
+    put=new Put(ROW3);
+    put.addColumn(FAMILY,QUALIFIER1,data);
+    table.put(put);
+    put=new Put(ROW4);
+    put.addColumn(FAMILY,QUALIFIER,data);
+    table.put(put);
+    put=new Put(ROW4);
+    put.addColumn(FAMILY,QUALIFIER1,data);
+    table.put(put);
+    put=new Put(ROW5);
+    put.addColumn(FAMILY,QUALIFIER,data);
+    table.put(put);
+    put=new Put(ROW5);
+    put.addColumn(FAMILY,QUALIFIER1,data);
+    table.put(put);
+    region.flush(true);
+    Scan s=new Scan();
+    s.setMaxResultSize(1000);
+    int count;
+    try (ResultScanner scanner=table.getScanner(s)){
+      count=Iterables.size(scanner);
+    }
+     assertEquals("Count all the rows ",6,count);
+    s=new Scan();
+    s.setCaching(1);
+    s.withStartRow(ROW1);
+    s.setAllowPartialResults(true);
+    s.setMaxResultSize(1000);
+    try (ResultScanner scanner=table.getScanner(s)){
+      Thread evictorThread=new Thread(){
+        @Override public void run(){
+          List<BlockCacheKey> cacheList=new ArrayList<>();
+          Iterator<CachedBlock> iterator=cache.iterator();
+          while (iterator.hasNext()) {
+            CachedBlock next=iterator.next();
+            BlockCacheKey cacheKey=new BlockCacheKey(next.getFilename(),next.getOffset());
+            cacheList.add(cacheKey);
+            cache.evictBlock(cacheKey);
+          }
+          try {
+            Thread.sleep(1);
+          }
+ catch (          InterruptedException e1) {
+          }
+          iterator=cache.iterator();
+          int refBlockCount=0;
+          while (iterator.hasNext()) {
+            iterator.next();
+            refBlockCount++;
+          }
+          assertEquals("One block should be there ",1,refBlockCount);
+          Scan s1=new Scan();
+          s1.withStartRow(ROW3);
+          s1.withStopRow(ROW5);
+          s1.setCaching(1);
+          ResultScanner scanner;
+          try {
+            scanner=table.getScanner(s1);
+            int count=Iterables.size(scanner);
+            assertEquals("Count the rows",2,count);
+            int newBlockRefCount=0;
+            List<BlockCacheKey> newCacheList=new ArrayList<>();
+            while (true) {
+              newBlockRefCount=0;
+              newCacheList.clear();
+              iterator=cache.iterator();
+              while (iterator.hasNext()) {
+                CachedBlock next=iterator.next();
+                BlockCacheKey cacheKey=new BlockCacheKey(next.getFilename(),next.getOffset());
+                newCacheList.add(cacheKey);
+              }
+              for (              BlockCacheKey key : cacheList) {
+                if (newCacheList.contains(key)) {
+                  newBlockRefCount++;
+                }
+              }
+              if (newBlockRefCount == 6) {
+                break;
+              }
+            }
+            latch.countDown();
+          }
+ catch (          IOException e) {
+          }
+        }
+      }
+;
+      count=0;
+      while (scanner.next() != null) {
+        count++;
+        if (count == 2) {
+          evictorThread.start();
+          latch.await();
+        }
+      }
+    }
+     assertEquals("Count should give all rows ",10,count);
+  }
+  finally {
+    table.close();
+  }
+}

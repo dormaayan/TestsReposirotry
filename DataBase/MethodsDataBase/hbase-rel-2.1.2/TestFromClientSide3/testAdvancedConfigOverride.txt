@@ -1,0 +1,84 @@
+@Test public void testAdvancedConfigOverride() throws Exception {
+  TEST_UTIL.getConfiguration().setInt("hbase.hstore.compaction.min",3);
+  final TableName tableName=TableName.valueOf(name.getMethodName());
+  Table hTable=TEST_UTIL.createTable(tableName,FAMILY,10);
+  Admin admin=TEST_UTIL.getAdmin();
+  ClusterConnection connection=(ClusterConnection)TEST_UTIL.getConnection();
+  byte[] row=Bytes.toBytes(random.nextInt());
+  performMultiplePutAndFlush((HBaseAdmin)admin,hTable,row,FAMILY,3,100);
+  try (RegionLocator locator=TEST_UTIL.getConnection().getRegionLocator(tableName)){
+    HRegionLocation loc=locator.getRegionLocation(row,true);
+    byte[] regionName=loc.getRegionInfo().getRegionName();
+    AdminProtos.AdminService.BlockingInterface server=connection.getAdmin(loc.getServerName());
+    assertTrue(ProtobufUtil.getStoreFiles(server,regionName,FAMILY).size() > 1);
+    admin.compact(tableName);
+    for (int i=0; i < 10 * 1000 / 40; ++i) {
+      loc=locator.getRegionLocation(row,true);
+      if (!loc.getRegionInfo().isOffline()) {
+        regionName=loc.getRegionInfo().getRegionName();
+        server=connection.getAdmin(loc.getServerName());
+        if (ProtobufUtil.getStoreFiles(server,regionName,FAMILY).size() <= 1) {
+          break;
+        }
+      }
+      Thread.sleep(40);
+    }
+    assertTrue(ProtobufUtil.getStoreFiles(server,regionName,FAMILY).size() <= 1);
+    LOG.info("hbase.hstore.compaction.min should now be 5");
+    HTableDescriptor htd=new HTableDescriptor(hTable.getTableDescriptor());
+    htd.setValue("hbase.hstore.compaction.min",String.valueOf(5));
+    admin.modifyTable(tableName,htd);
+    Pair<Integer,Integer> st;
+    while (null != (st=admin.getAlterStatus(tableName)) && st.getFirst() > 0) {
+      LOG.debug(st.getFirst() + " regions left to update");
+      Thread.sleep(40);
+    }
+    LOG.info("alter status finished");
+    performMultiplePutAndFlush((HBaseAdmin)admin,hTable,row,FAMILY,3,10);
+    admin.compact(tableName);
+    Thread.sleep(10 * 1000);
+    loc=locator.getRegionLocation(row,true);
+    regionName=loc.getRegionInfo().getRegionName();
+    server=connection.getAdmin(loc.getServerName());
+    int sfCount=ProtobufUtil.getStoreFiles(server,regionName,FAMILY).size();
+    assertTrue(sfCount > 1);
+    LOG.info("hbase.hstore.compaction.min should now be 2");
+    HColumnDescriptor hcd=new HColumnDescriptor(htd.getFamily(FAMILY));
+    hcd.setValue("hbase.hstore.compaction.min",String.valueOf(2));
+    htd.modifyFamily(hcd);
+    admin.modifyTable(tableName,htd);
+    while (null != (st=admin.getAlterStatus(tableName)) && st.getFirst() > 0) {
+      LOG.debug(st.getFirst() + " regions left to update");
+      Thread.sleep(40);
+    }
+    LOG.info("alter status finished");
+    admin.compact(tableName);
+    for (int i=0; i < 10 * 1000 / 40; ++i) {
+      loc=locator.getRegionLocation(row,true);
+      regionName=loc.getRegionInfo().getRegionName();
+      try {
+        server=connection.getAdmin(loc.getServerName());
+        if (ProtobufUtil.getStoreFiles(server,regionName,FAMILY).size() < sfCount) {
+          break;
+        }
+      }
+ catch (      Exception e) {
+        LOG.debug("Waiting for region to come online: " + Bytes.toString(regionName));
+      }
+      Thread.sleep(40);
+    }
+    assertTrue(ProtobufUtil.getStoreFiles(server,regionName,FAMILY).size() < sfCount);
+    LOG.info("Removing CF config value");
+    LOG.info("hbase.hstore.compaction.min should now be 5");
+    hcd=new HColumnDescriptor(htd.getFamily(FAMILY));
+    hcd.setValue("hbase.hstore.compaction.min",null);
+    htd.modifyFamily(hcd);
+    admin.modifyTable(tableName,htd);
+    while (null != (st=admin.getAlterStatus(tableName)) && st.getFirst() > 0) {
+      LOG.debug(st.getFirst() + " regions left to update");
+      Thread.sleep(40);
+    }
+    LOG.info("alter status finished");
+    assertNull(hTable.getTableDescriptor().getFamily(FAMILY).getValue("hbase.hstore.compaction.min"));
+  }
+ }

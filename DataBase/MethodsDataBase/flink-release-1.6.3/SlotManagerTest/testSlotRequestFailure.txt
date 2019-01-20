@@ -1,0 +1,38 @@
+/** 
+ * Tests that the SlotManager retries allocating a slot if the TaskExecutor#requestSlot call fails.
+ */
+@Test public void testSlotRequestFailure() throws Exception {
+  try (final SlotManager slotManager=createSlotManager(ResourceManagerId.generate(),new TestingResourceActionsBuilder().createTestingResourceActions())){
+    final SlotRequest slotRequest=new SlotRequest(new JobID(),new AllocationID(),ResourceProfile.UNKNOWN,"foobar");
+    slotManager.registerSlotRequest(slotRequest);
+    final BlockingQueue<Tuple5<SlotID,JobID,AllocationID,String,ResourceManagerId>> requestSlotQueue=new ArrayBlockingQueue<>(1);
+    final BlockingQueue<CompletableFuture<Acknowledge>> responseQueue=new ArrayBlockingQueue<>(1);
+    final TestingTaskExecutorGateway testingTaskExecutorGateway=new TestingTaskExecutorGatewayBuilder().setRequestSlotFunction(slotIDJobIDAllocationIDStringResourceManagerIdTuple5 -> {
+      requestSlotQueue.offer(slotIDJobIDAllocationIDStringResourceManagerIdTuple5);
+      try {
+        return responseQueue.take();
+      }
+ catch (      InterruptedException ignored) {
+        return FutureUtils.completedExceptionally(new FlinkException("Response queue was interrupted."));
+      }
+    }
+).createTestingTaskExecutorGateway();
+    final ResourceID taskExecutorResourceId=ResourceID.generate();
+    final TaskExecutorConnection taskExecutionConnection=new TaskExecutorConnection(taskExecutorResourceId,testingTaskExecutorGateway);
+    final SlotReport slotReport=new SlotReport(new SlotStatus(new SlotID(taskExecutorResourceId,0),ResourceProfile.UNKNOWN));
+    final CompletableFuture<Acknowledge> firstManualSlotRequestResponse=new CompletableFuture<>();
+    responseQueue.offer(firstManualSlotRequestResponse);
+    slotManager.registerTaskManager(taskExecutionConnection,slotReport);
+    final Tuple5<SlotID,JobID,AllocationID,String,ResourceManagerId> firstRequest=requestSlotQueue.take();
+    final CompletableFuture<Acknowledge> secondManualSlotRequestResponse=new CompletableFuture<>();
+    responseQueue.offer(secondManualSlotRequestResponse);
+    firstManualSlotRequestResponse.completeExceptionally(new SlotAllocationException("Test exception"));
+    final Tuple5<SlotID,JobID,AllocationID,String,ResourceManagerId> secondRequest=requestSlotQueue.take();
+    assertThat(secondRequest.f2,equalTo(firstRequest.f2));
+    assertThat(secondRequest.f0,equalTo(firstRequest.f0));
+    secondManualSlotRequestResponse.complete(Acknowledge.get());
+    final TaskManagerSlot slot=slotManager.getSlot(secondRequest.f0);
+    assertThat(slot.getState(),equalTo(TaskManagerSlot.State.ALLOCATED));
+    assertThat(slot.getAllocationId(),equalTo(secondRequest.f2));
+  }
+ }

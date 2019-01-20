@@ -1,0 +1,88 @@
+/** 
+ * Reproduce locking up that happens when we get an inopportune sync during setup for zigzaglatch wait. See HBASE-14317. If below is broken, we will see this test timeout because it is locked up. <p>First I need to set up some mocks for Server and RegionServerServices. I also need to set up a dodgy WAL that will throw an exception when we go to append to it.
+ */
+@Test public void testLockupWhenSyncInMiddleOfZigZagSetup() throws IOException {
+  Server server=Mockito.mock(Server.class);
+  Mockito.when(server.getConfiguration()).thenReturn(CONF);
+  Mockito.when(server.isStopped()).thenReturn(false);
+  Mockito.when(server.isAborted()).thenReturn(false);
+  RegionServerServices services=Mockito.mock(RegionServerServices.class);
+  FileSystem fs=FileSystem.get(CONF);
+  Path rootDir=new Path(dir + getName());
+  DodgyFSLog dodgyWAL=new DodgyFSLog(fs,rootDir,getName(),CONF);
+  Path originalWAL=dodgyWAL.getCurrentFileName();
+  LogRoller logRoller=new LogRoller(server,services);
+  logRoller.addWAL(dodgyWAL);
+  logRoller.start();
+  final HRegion region=initHRegion(tableName,null,null,dodgyWAL);
+  byte[] bytes=Bytes.toBytes(getName());
+  NavigableMap<byte[],Integer> scopes=new TreeMap<>(Bytes.BYTES_COMPARATOR);
+  scopes.put(COLUMN_FAMILY_BYTES,0);
+  MultiVersionConcurrencyControl mvcc=new MultiVersionConcurrencyControl();
+  try {
+    Put put=new Put(bytes);
+    put.addColumn(COLUMN_FAMILY_BYTES,Bytes.toBytes("1"),bytes);
+    WALKeyImpl key=new WALKeyImpl(region.getRegionInfo().getEncodedNameAsBytes(),TableName.META_TABLE_NAME,System.currentTimeMillis(),mvcc,scopes);
+    WALEdit edit=new WALEdit();
+    CellScanner CellScanner=put.cellScanner();
+    assertTrue(CellScanner.advance());
+    edit.add(CellScanner.current());
+    for (int i=0; i < 1000; i++) {
+      region.put(put);
+    }
+    LOG.info("SET throwing of exception on append");
+    dodgyWAL.throwException=true;
+    dodgyWAL.append(region.getRegionInfo(),key,edit,true);
+    boolean exception=false;
+    try {
+      dodgyWAL.sync(false);
+    }
+ catch (    Exception e) {
+      exception=true;
+    }
+    assertTrue("Did not get sync exception",exception);
+    Thread t=new Thread("Flusher"){
+      @Override public void run(){
+        try {
+          if (region.getMemStoreDataSize() <= 0) {
+            throw new IOException("memstore size=" + region.getMemStoreDataSize());
+          }
+          region.flush(false);
+        }
+ catch (        IOException e) {
+          LOG.info("In flush",e);
+        }
+        LOG.info("Exiting");
+      }
+    }
+;
+    t.setDaemon(true);
+    t.start();
+    while (dodgyWAL.latch.getCount() > 0) {
+      Threads.sleep(1);
+    }
+    assertTrue(originalWAL != dodgyWAL.getCurrentFileName());
+    dodgyWAL.throwException=false;
+    try {
+      region.put(put);
+    }
+ catch (    Exception e) {
+      LOG.info("In the put",e);
+    }
+  }
+  finally {
+    Mockito.when(server.isStopped()).thenReturn(true);
+    Closeables.close(logRoller,true);
+    try {
+      if (region != null) {
+        region.close();
+      }
+      if (dodgyWAL != null) {
+        dodgyWAL.close();
+      }
+    }
+ catch (    Exception e) {
+      LOG.info("On way out",e);
+    }
+  }
+}

@@ -1,0 +1,80 @@
+@Category({RPCTests.class,LargeTests.class}) public class TestFifoRpcScheduler {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestFifoRpcScheduler.class);
+  private static final Logger LOG=LoggerFactory.getLogger(TestFifoRpcScheduler.class);
+  private AtomicInteger callExecutionCount;
+  private final RpcScheduler.Context CONTEXT=new RpcScheduler.Context(){
+    @Override public InetSocketAddress getListenerAddress(){
+      return InetSocketAddress.createUnresolved("127.0.0.1",1000);
+    }
+  }
+;
+  private Configuration conf;
+  @Before public void setUp(){
+    conf=HBaseConfiguration.create();
+    callExecutionCount=new AtomicInteger(0);
+  }
+  private ThreadPoolExecutor disableHandlers(  RpcScheduler scheduler){
+    ThreadPoolExecutor rpcExecutor=null;
+    try {
+      Field ExecutorField=scheduler.getClass().getDeclaredField("executor");
+      ExecutorField.setAccessible(true);
+      scheduler.start();
+      rpcExecutor=(ThreadPoolExecutor)ExecutorField.get(scheduler);
+      rpcExecutor.setMaximumPoolSize(1);
+      rpcExecutor.allowCoreThreadTimeOut(true);
+      rpcExecutor.setCorePoolSize(0);
+      rpcExecutor.setKeepAliveTime(1,TimeUnit.MICROSECONDS);
+      Thread.sleep(2000);
+    }
+ catch (    NoSuchFieldException e) {
+      LOG.error("No such field exception:" + e);
+    }
+catch (    IllegalAccessException e) {
+      LOG.error("Illegal access exception:" + e);
+    }
+catch (    InterruptedException e) {
+      LOG.error("Interrupted exception:" + e);
+    }
+    return rpcExecutor;
+  }
+  @Test public void testCallQueueInfo() throws IOException, InterruptedException {
+    ThreadPoolExecutor rpcExecutor;
+    RpcScheduler scheduler=new FifoRpcScheduler(conf,1);
+    scheduler.init(CONTEXT);
+    disableHandlers(scheduler);
+    int totalCallMethods=30;
+    int unableToDispatch=0;
+    for (int i=totalCallMethods; i > 0; i--) {
+      CallRunner task=createMockTask();
+      task.setStatus(new MonitoredRPCHandlerImpl());
+      if (!scheduler.dispatch(task)) {
+        unableToDispatch++;
+      }
+      Thread.sleep(10);
+    }
+    CallQueueInfo callQueueInfo=scheduler.getCallQueueInfo();
+    int executionCount=callExecutionCount.get();
+    int callQueueSize=0;
+    for (    String callQueueName : callQueueInfo.getCallQueueNames()) {
+      for (      String calledMethod : callQueueInfo.getCalledMethodNames(callQueueName)) {
+        callQueueSize+=callQueueInfo.getCallMethodCount(callQueueName,calledMethod);
+      }
+    }
+    assertEquals(totalCallMethods - unableToDispatch,callQueueSize + executionCount);
+    scheduler.stop();
+  }
+  private CallRunner createMockTask(){
+    ServerCall call=mock(ServerCall.class);
+    CallRunner task=mock(CallRunner.class);
+    when(task.getRpcCall()).thenReturn(call);
+    doAnswer(new Answer<Void>(){
+      @Override public Void answer(      InvocationOnMock invocation) throws Throwable {
+        callExecutionCount.incrementAndGet();
+        Thread.sleep(1000);
+        return null;
+      }
+    }
+).when(task).run();
+    return task;
+  }
+}

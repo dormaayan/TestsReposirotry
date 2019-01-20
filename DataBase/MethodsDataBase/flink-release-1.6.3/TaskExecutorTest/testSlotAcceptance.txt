@@ -1,0 +1,55 @@
+/** 
+ * Tests that accepted slots go into state assigned and the others are returned to the resource manager.
+ */
+@Test public void testSlotAcceptance() throws Exception {
+  final TaskSlotTable taskSlotTable=new TaskSlotTable(Arrays.asList(mock(ResourceProfile.class),mock(ResourceProfile.class)),timerService);
+  final JobManagerTable jobManagerTable=new JobManagerTable();
+  final JobLeaderService jobLeaderService=new JobLeaderService(taskManagerLocation);
+  final String resourceManagerAddress="rm";
+  final UUID resourceManagerLeaderId=UUID.randomUUID();
+  final String jobManagerAddress="jm";
+  final UUID jobManagerLeaderId=UUID.randomUUID();
+  resourceManagerLeaderRetriever.notifyListener(resourceManagerAddress,resourceManagerLeaderId);
+  jobManagerLeaderRetriever.notifyListener(jobManagerAddress,jobManagerLeaderId);
+  final TestingResourceManagerGateway resourceManagerGateway=new TestingResourceManagerGateway();
+  final ResourceID resourceManagerResourceId=resourceManagerGateway.getOwnResourceId();
+  final InstanceID registrationId=new InstanceID();
+  final CompletableFuture<ResourceID> registrationFuture=new CompletableFuture<>();
+  resourceManagerGateway.setRegisterTaskExecutorFunction(stringResourceIDIntegerHardwareDescriptionTuple4 -> {
+    registrationFuture.complete(stringResourceIDIntegerHardwareDescriptionTuple4.f1);
+    return CompletableFuture.completedFuture(new TaskExecutorRegistrationSuccess(registrationId,resourceManagerResourceId,1000L,new ClusterInformation("localhost",1234)));
+  }
+);
+  final CompletableFuture<Tuple3<InstanceID,SlotID,AllocationID>> availableSlotFuture=new CompletableFuture<>();
+  resourceManagerGateway.setNotifySlotAvailableConsumer(availableSlotFuture::complete);
+  final ResourceID jmResourceId=new ResourceID(jobManagerAddress);
+  final AllocationID allocationId1=new AllocationID();
+  final AllocationID allocationId2=new AllocationID();
+  final SlotOffer offer1=new SlotOffer(allocationId1,0,ResourceProfile.UNKNOWN);
+  final JobMasterGateway jobMasterGateway=mock(JobMasterGateway.class);
+  when(jobMasterGateway.registerTaskManager(any(String.class),eq(taskManagerLocation),any(Time.class))).thenReturn(CompletableFuture.completedFuture(new JMTMRegistrationSuccess(jmResourceId)));
+  when(jobMasterGateway.getHostname()).thenReturn(jobManagerAddress);
+  when(jobMasterGateway.offerSlots(any(ResourceID.class),any(Collection.class),any(Time.class))).thenReturn(CompletableFuture.completedFuture((Collection<SlotOffer>)Collections.singleton(offer1)));
+  rpc.registerGateway(resourceManagerAddress,resourceManagerGateway);
+  rpc.registerGateway(jobManagerAddress,jobMasterGateway);
+  TaskExecutorLocalStateStoresManager localStateStoresManager=new TaskExecutorLocalStateStoresManager(false,new File[]{tmp.newFolder()},Executors.directExecutor());
+  final TaskManagerServices taskManagerServices=new TaskManagerServicesBuilder().setTaskManagerLocation(taskManagerLocation).setTaskSlotTable(taskSlotTable).setJobManagerTable(jobManagerTable).setJobLeaderService(jobLeaderService).setTaskStateManager(localStateStoresManager).build();
+  TaskExecutor taskManager=new TaskExecutor(rpc,taskManagerConfiguration,haServices,taskManagerServices,new HeartbeatServices(1000L,1000L),UnregisteredMetricGroups.createUnregisteredTaskManagerMetricGroup(),dummyBlobCacheService,testingFatalErrorHandler);
+  try {
+    taskManager.start();
+    assertThat(registrationFuture.get(),equalTo(taskManagerLocation.getResourceID()));
+    taskSlotTable.allocateSlot(0,jobId,allocationId1,Time.milliseconds(10000L));
+    taskSlotTable.allocateSlot(1,jobId,allocationId2,Time.milliseconds(10000L));
+    jobLeaderService.addJob(jobId,jobManagerAddress);
+    final Tuple3<InstanceID,SlotID,AllocationID> instanceIDSlotIDAllocationIDTuple3=availableSlotFuture.get();
+    final Tuple3<InstanceID,SlotID,AllocationID> expectedResult=Tuple3.of(registrationId,new SlotID(taskManagerLocation.getResourceID(),1),allocationId2);
+    assertThat(instanceIDSlotIDAllocationIDTuple3,equalTo(expectedResult));
+    assertTrue(taskSlotTable.tryMarkSlotActive(jobId,allocationId1));
+    assertFalse(taskSlotTable.tryMarkSlotActive(jobId,allocationId2));
+    assertTrue(taskSlotTable.isSlotFree(1));
+  }
+  finally {
+    taskManager.shutDown();
+    taskManager.getTerminationFuture().get(timeout.toMilliseconds(),TimeUnit.MILLISECONDS);
+  }
+}

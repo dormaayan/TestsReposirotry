@@ -1,0 +1,27 @@
+/** 
+ * Checks that a plan with consecutive UNIONs followed by REBALANCE is correctly translated. The program can be illustrated as follows: Src1 -\ >-> Union12--< Src2 -/              \ >-> Union123 -> Rebalance -> Output Src3 ----------------/ In the resulting plan, the Rebalance (ShippingStrategy.PARTITION_FORCED_REBALANCE) must be pushed to the inputs of the unions (Src1, Src2, Src3).
+ */
+@Test public void testConsecutiveUnionsWithRebalance() throws Exception {
+  ExecutionEnvironment env=ExecutionEnvironment.getExecutionEnvironment();
+  env.setParallelism(DEFAULT_PARALLELISM);
+  DataSet<Tuple2<Long,Long>> src1=env.fromElements(new Tuple2<>(0L,0L));
+  DataSet<Tuple2<Long,Long>> src2=env.fromElements(new Tuple2<>(0L,0L));
+  DataSet<Tuple2<Long,Long>> src3=env.fromElements(new Tuple2<>(0L,0L));
+  DataSet<Tuple2<Long,Long>> union12=src1.union(src2);
+  DataSet<Tuple2<Long,Long>> union123=union12.union(src3);
+  union123.rebalance().output(new DiscardingOutputFormat<Tuple2<Long,Long>>()).name("out");
+  OptimizedPlan optimizedPlan=compileNoStats(env.createProgramPlan());
+  OptimizerPlanNodeResolver resolver=getOptimizerPlanNodeResolver(optimizedPlan);
+  SingleInputPlanNode sink=resolver.getNode("out");
+  assertEquals("Sink input should be force rebalanced.",PartitioningProperty.FORCED_REBALANCED,sink.getInput().getGlobalProperties().getPartitioning());
+  SingleInputPlanNode partitioner=(SingleInputPlanNode)sink.getInput().getSource();
+  assertTrue(partitioner.getDriverStrategy() == DriverStrategy.UNARY_NO_OP);
+  assertEquals("Partitioner input should be force rebalanced.",PartitioningProperty.FORCED_REBALANCED,partitioner.getInput().getGlobalProperties().getPartitioning());
+  assertEquals("Partitioner input channel should be forwarding",ShipStrategyType.FORWARD,partitioner.getInput().getShipStrategy());
+  NAryUnionPlanNode union=(NAryUnionPlanNode)partitioner.getInput().getSource();
+  for (  Channel c : union.getInputs()) {
+    assertEquals("Union input should be force rebalanced",PartitioningProperty.FORCED_REBALANCED,c.getGlobalProperties().getPartitioning());
+    assertEquals("Union input channel should be rebalancing",ShipStrategyType.PARTITION_FORCED_REBALANCE,c.getShipStrategy());
+    assertTrue("Union input should be data source",c.getSource() instanceof SourcePlanNode);
+  }
+}

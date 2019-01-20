@@ -1,0 +1,171 @@
+@Category({SecurityTests.class,MediumTests.class}) public class TestScanEarlyTermination extends SecureTestUtil {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestScanEarlyTermination.class);
+  private static final Logger LOG=LoggerFactory.getLogger(TestScanEarlyTermination.class);
+  @Rule public TestTableName TEST_TABLE=new TestTableName();
+  private static final HBaseTestingUtility TEST_UTIL=new HBaseTestingUtility();
+  private static final byte[] TEST_FAMILY1=Bytes.toBytes("f1");
+  private static final byte[] TEST_FAMILY2=Bytes.toBytes("f2");
+  private static final byte[] TEST_ROW=Bytes.toBytes("testrow");
+  private static final byte[] TEST_Q1=Bytes.toBytes("q1");
+  private static final byte[] TEST_Q2=Bytes.toBytes("q2");
+  private static final byte[] ZERO=Bytes.toBytes(0L);
+  private static Configuration conf;
+  private static User USER_OWNER;
+  private static User USER_OTHER;
+  @BeforeClass public static void setupBeforeClass() throws Exception {
+    conf=TEST_UTIL.getConfiguration();
+    conf.setInt(HConstants.REGION_SERVER_HIGH_PRIORITY_HANDLER_COUNT,10);
+    enableSecurity(conf);
+    verifyConfiguration(conf);
+    TEST_UTIL.startMiniCluster();
+    MasterCoprocessorHost cpHost=TEST_UTIL.getMiniHBaseCluster().getMaster().getMasterCoprocessorHost();
+    cpHost.load(AccessController.class,Coprocessor.PRIORITY_HIGHEST,conf);
+    AccessController ac=(AccessController)cpHost.findCoprocessor(AccessController.class.getName());
+    cpHost.createEnvironment(ac,Coprocessor.PRIORITY_HIGHEST,1,conf);
+    RegionServerCoprocessorHost rsHost=TEST_UTIL.getMiniHBaseCluster().getRegionServer(0).getRegionServerCoprocessorHost();
+    rsHost.createEnvironment(ac,Coprocessor.PRIORITY_HIGHEST,1,conf);
+    TEST_UTIL.waitTableEnabled(AccessControlLists.ACL_TABLE_NAME);
+    USER_OWNER=User.createUserForTesting(conf,"owner",new String[0]);
+    USER_OTHER=User.createUserForTesting(conf,"other",new String[0]);
+  }
+  @AfterClass public static void tearDownAfterClass() throws Exception {
+    TEST_UTIL.shutdownMiniCluster();
+  }
+  @Before public void setUp() throws Exception {
+    Admin admin=TEST_UTIL.getAdmin();
+    HTableDescriptor htd=new HTableDescriptor(TEST_TABLE.getTableName());
+    htd.setOwner(USER_OWNER);
+    HColumnDescriptor hcd=new HColumnDescriptor(TEST_FAMILY1);
+    hcd.setMaxVersions(10);
+    htd.addFamily(hcd);
+    hcd=new HColumnDescriptor(TEST_FAMILY2);
+    hcd.setMaxVersions(10);
+    htd.addFamily(hcd);
+    htd.setConfiguration(AccessControlConstants.CF_ATTRIBUTE_EARLY_OUT,"true");
+    admin.createTable(htd);
+    TEST_UTIL.waitUntilAllRegionsAssigned(TEST_TABLE.getTableName());
+  }
+  @After public void tearDown() throws Exception {
+    try {
+      TEST_UTIL.deleteTable(TEST_TABLE.getTableName());
+    }
+ catch (    TableNotFoundException ex) {
+      LOG.info("Test deleted table " + TEST_TABLE.getTableName());
+    }
+    assertEquals(0,AccessControlLists.getTablePermissions(conf,TEST_TABLE.getTableName()).size());
+  }
+  @Test public void testEarlyScanTermination() throws Exception {
+    grantOnTable(TEST_UTIL,USER_OTHER.getShortName(),TEST_TABLE.getTableName(),TEST_FAMILY1,null,Action.READ);
+    verifyAllowed(new AccessTestAction(){
+      @Override public Object run() throws Exception {
+        conf.set("testkey",TEST_UTIL.getRandomUUID().toString());
+        Connection connection=ConnectionFactory.createConnection(conf);
+        Table t=connection.getTable(TEST_TABLE.getTableName());
+        try {
+          Put put=new Put(TEST_ROW).addColumn(TEST_FAMILY1,TEST_Q1,ZERO);
+          t.put(put);
+          put=new Put(TEST_ROW).addColumn(TEST_FAMILY2,TEST_Q1,ZERO);
+          put.setACL(USER_OTHER.getShortName(),new Permission(Action.READ));
+          t.put(put);
+          put=new Put(TEST_ROW).addColumn(TEST_FAMILY2,TEST_Q2,ZERO);
+          put.setACL(USER_OTHER.getShortName(),new Permission());
+          t.put(put);
+        }
+  finally {
+          t.close();
+          connection.close();
+        }
+        return null;
+      }
+    }
+,USER_OWNER);
+    verifyAllowed(new AccessTestAction(){
+      @Override public Object run() throws Exception {
+        conf.set("testkey",TEST_UTIL.getRandomUUID().toString());
+        Connection connection=ConnectionFactory.createConnection(conf);
+        Table t=connection.getTable(TEST_TABLE.getTableName());
+        try {
+          Scan scan=new Scan().addFamily(TEST_FAMILY1);
+          Result result=t.getScanner(scan).next();
+          if (result != null) {
+            assertTrue("Improper exclusion",result.containsColumn(TEST_FAMILY1,TEST_Q1));
+            assertFalse("Improper inclusion",result.containsColumn(TEST_FAMILY2,TEST_Q1));
+            return result.listCells();
+          }
+          return null;
+        }
+  finally {
+          t.close();
+          connection.close();
+        }
+      }
+    }
+,USER_OTHER);
+    verifyAllowed(new AccessTestAction(){
+      @Override public Object run() throws Exception {
+        conf.set("testkey",TEST_UTIL.getRandomUUID().toString());
+        Connection connection=ConnectionFactory.createConnection(conf);
+        Table t=connection.getTable(TEST_TABLE.getTableName());
+        try {
+          Scan scan=new Scan();
+          Result result=t.getScanner(scan).next();
+          if (result != null) {
+            assertTrue("Improper exclusion",result.containsColumn(TEST_FAMILY1,TEST_Q1));
+            assertFalse("Improper inclusion",result.containsColumn(TEST_FAMILY2,TEST_Q1));
+            return result.listCells();
+          }
+          return null;
+        }
+  finally {
+          t.close();
+          connection.close();
+        }
+      }
+    }
+,USER_OTHER);
+    verifyDenied(new AccessTestAction(){
+      @Override public Object run() throws Exception {
+        conf.set("testkey",TEST_UTIL.getRandomUUID().toString());
+        Connection connection=ConnectionFactory.createConnection(conf);
+        Table t=connection.getTable(TEST_TABLE.getTableName());
+        try {
+          Scan scan=new Scan().addFamily(TEST_FAMILY2);
+          Result result=t.getScanner(scan).next();
+          if (result != null) {
+            return result.listCells();
+          }
+          return null;
+        }
+  finally {
+          t.close();
+          connection.close();
+        }
+      }
+    }
+,USER_OTHER);
+    grantOnTable(TEST_UTIL,USER_OTHER.getShortName(),TEST_TABLE.getTableName(),TEST_FAMILY2,TEST_Q2,Action.READ);
+    verifyAllowed(new AccessTestAction(){
+      @Override public Object run() throws Exception {
+        conf.set("testkey",TEST_UTIL.getRandomUUID().toString());
+        Connection connection=ConnectionFactory.createConnection(conf);
+        Table t=connection.getTable(TEST_TABLE.getTableName());
+        try {
+          Scan scan=new Scan();
+          Result result=t.getScanner(scan).next();
+          if (result != null) {
+            assertTrue("Improper exclusion",result.containsColumn(TEST_FAMILY1,TEST_Q1));
+            assertFalse("Improper inclusion",result.containsColumn(TEST_FAMILY2,TEST_Q1));
+            assertTrue("Improper exclusion",result.containsColumn(TEST_FAMILY2,TEST_Q2));
+            return result.listCells();
+          }
+          return null;
+        }
+  finally {
+          t.close();
+          connection.close();
+        }
+      }
+    }
+,USER_OTHER);
+  }
+}

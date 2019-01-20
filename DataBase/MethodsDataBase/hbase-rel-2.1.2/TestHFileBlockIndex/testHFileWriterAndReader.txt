@@ -1,0 +1,82 @@
+/** 
+ * Testing block index through the HFile writer/reader APIs. Allows to test setting index block size through configuration, intermediate-level index blocks, and caching index blocks on write.
+ * @throws IOException
+ */
+@Test public void testHFileWriterAndReader() throws IOException {
+  Path hfilePath=new Path(TEST_UTIL.getDataTestDir(),"hfile_for_block_index");
+  CacheConfig.instantiateBlockCache(conf);
+  CacheConfig cacheConf=new CacheConfig(conf);
+  BlockCache blockCache=cacheConf.getBlockCache();
+  for (int testI=0; testI < INDEX_CHUNK_SIZES.length; ++testI) {
+    int indexBlockSize=INDEX_CHUNK_SIZES[testI];
+    int expectedNumLevels=EXPECTED_NUM_LEVELS[testI];
+    LOG.info("Index block size: " + indexBlockSize + ", compression: "+ compr);
+    blockCache.evictBlocksByHfileName(hfilePath.getName());
+    conf.setInt(HFileBlockIndex.MAX_CHUNK_SIZE_KEY,indexBlockSize);
+    Set<String> keyStrSet=new HashSet<>();
+    byte[][] keys=new byte[NUM_KV][];
+    byte[][] values=new byte[NUM_KV][];
+{
+      HFileContext meta=new HFileContextBuilder().withBlockSize(SMALL_BLOCK_SIZE).withCompression(compr).build();
+      HFile.Writer writer=HFile.getWriterFactory(conf,cacheConf).withPath(fs,hfilePath).withFileContext(meta).create();
+      Random rand=new Random(19231737);
+      byte[] family=Bytes.toBytes("f");
+      byte[] qualifier=Bytes.toBytes("q");
+      for (int i=0; i < NUM_KV; ++i) {
+        byte[] row=RandomKeyValueUtil.randomOrderedKey(rand,i);
+        KeyValue kv=new KeyValue(row,family,qualifier,EnvironmentEdgeManager.currentTime(),RandomKeyValueUtil.randomValue(rand));
+        byte[] k=kv.getKey();
+        writer.append(kv);
+        keys[i]=k;
+        values[i]=CellUtil.cloneValue(kv);
+        keyStrSet.add(Bytes.toStringBinary(k));
+        if (i > 0) {
+          assertTrue((PrivateCellUtil.compare(CellComparatorImpl.COMPARATOR,kv,keys[i - 1],0,keys[i - 1].length)) > 0);
+        }
+      }
+      writer.close();
+    }
+    HFile.Reader reader=HFile.createReader(fs,hfilePath,cacheConf,true,conf);
+    assertEquals(expectedNumLevels,reader.getTrailer().getNumDataIndexLevels());
+    assertTrue(Bytes.equals(keys[0],((KeyValue)reader.getFirstKey().get()).getKey()));
+    assertTrue(Bytes.equals(keys[NUM_KV - 1],((KeyValue)reader.getLastKey().get()).getKey()));
+    LOG.info("Last key: " + Bytes.toStringBinary(keys[NUM_KV - 1]));
+    for (    boolean pread : new boolean[]{false,true}) {
+      HFileScanner scanner=reader.getScanner(true,pread);
+      for (int i=0; i < NUM_KV; ++i) {
+        checkSeekTo(keys,scanner,i);
+        checkKeyValue("i=" + i,keys[i],values[i],ByteBuffer.wrap(((KeyValue)scanner.getKey()).getKey()),scanner.getValue());
+      }
+      assertTrue(scanner.seekTo());
+      for (int i=NUM_KV - 1; i >= 0; --i) {
+        checkSeekTo(keys,scanner,i);
+        checkKeyValue("i=" + i,keys[i],values[i],ByteBuffer.wrap(((KeyValue)scanner.getKey()).getKey()),scanner.getValue());
+      }
+    }
+    HFile.Reader reader2=reader;
+    HFileBlock.FSReader fsReader=reader2.getUncachedBlockReader();
+    HFileBlock.BlockIterator iter=fsReader.blockRange(0,reader.getTrailer().getLoadOnOpenDataOffset());
+    HFileBlock block;
+    List<byte[]> blockKeys=new ArrayList<>();
+    while ((block=iter.nextBlock()) != null) {
+      if (block.getBlockType() != BlockType.LEAF_INDEX)       return;
+      ByteBuff b=block.getBufferReadOnly();
+      int n=b.getIntAfterPosition(0);
+      int entriesOffset=Bytes.SIZEOF_INT * (n + 2);
+      for (int i=0; i < n; ++i) {
+        int keyRelOffset=b.getIntAfterPosition(Bytes.SIZEOF_INT * (i + 1));
+        int nextKeyRelOffset=b.getIntAfterPosition(Bytes.SIZEOF_INT * (i + 2));
+        int keyLen=nextKeyRelOffset - keyRelOffset;
+        int keyOffset=b.arrayOffset() + entriesOffset + keyRelOffset+ HFileBlockIndex.SECONDARY_INDEX_ENTRY_OVERHEAD;
+        byte[] blockKey=Arrays.copyOfRange(b.array(),keyOffset,keyOffset + keyLen);
+        String blockKeyStr=Bytes.toString(blockKey);
+        blockKeys.add(blockKey);
+        assertTrue("Invalid block key from leaf-level block: " + blockKeyStr,keyStrSet.contains(blockKeyStr));
+      }
+    }
+    assertEquals(Bytes.toStringBinary(blockKeys.get((blockKeys.size() - 1) / 2)),reader.midKey());
+    assertEquals(UNCOMPRESSED_INDEX_SIZES[testI],reader.getTrailer().getUncompressedDataIndexSize());
+    reader.close();
+    reader2.close();
+  }
+}

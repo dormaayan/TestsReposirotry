@@ -1,0 +1,135 @@
+/** 
+ * Integration test for retry behavior. Useful because retrying relies on the way that the rest of Elasticsearch throws exceptions and unit tests won't verify that.
+ */
+public class RetryTests extends ESIntegTestCase {
+  private static final int DOC_COUNT=20;
+  private List<CyclicBarrier> blockedExecutors=new ArrayList<>();
+  @After public void forceUnblockAllExecutors(){
+    for (    CyclicBarrier barrier : blockedExecutors) {
+      barrier.reset();
+    }
+  }
+  @Override protected Collection<Class<? extends Plugin>> nodePlugins(){
+    return Arrays.asList(ReindexPlugin.class,Netty4Plugin.class);
+  }
+  @Override protected Collection<Class<? extends Plugin>> transportClientPlugins(){
+    return Arrays.asList(ReindexPlugin.class,Netty4Plugin.class);
+  }
+  /** 
+ * Lower the queue sizes to be small enough that both bulk and searches will time out and have to be retried.
+ */
+  @Override protected Settings nodeSettings(  int nodeOrdinal){
+    return Settings.builder().put(super.nodeSettings(nodeOrdinal)).put(nodeSettings()).build();
+  }
+  final Settings nodeSettings(){
+    return Settings.builder().put(NetworkModule.HTTP_ENABLED.getKey(),true).put(TransportReindexAction.REMOTE_CLUSTER_WHITELIST.getKey(),"127.0.0.1:*").build();
+  }
+  public void testReindex() throws Exception {
+    testCase(ReindexAction.NAME,client -> ReindexAction.INSTANCE.newRequestBuilder(client).source("source").destination("dest"),matcher().created(DOC_COUNT));
+  }
+  public void testReindexFromRemote() throws Exception {
+    Function<Client,AbstractBulkByScrollRequestBuilder<?,?>> function=client -> {
+      NodeInfo masterNode=null;
+      for (      NodeInfo candidate : client.admin().cluster().prepareNodesInfo().get().getNodes()) {
+        if (candidate.getNode().isMasterNode()) {
+          masterNode=candidate;
+        }
+      }
+      assertNotNull(masterNode);
+      TransportAddress address=masterNode.getHttp().getAddress().publishAddress();
+      RemoteInfo remote=new RemoteInfo("http",address.getAddress(),address.getPort(),null,new BytesArray("{\"match_all\":{}}"),null,null,emptyMap(),RemoteInfo.DEFAULT_SOCKET_TIMEOUT,RemoteInfo.DEFAULT_CONNECT_TIMEOUT);
+      ReindexRequestBuilder request=ReindexAction.INSTANCE.newRequestBuilder(client).source("source").destination("dest").setRemoteInfo(remote);
+      return request;
+    }
+;
+    testCase(ReindexAction.NAME,function,matcher().created(DOC_COUNT));
+  }
+  public void testUpdateByQuery() throws Exception {
+    testCase(UpdateByQueryAction.NAME,client -> UpdateByQueryAction.INSTANCE.newRequestBuilder(client).source("source"),matcher().updated(DOC_COUNT));
+  }
+  public void testDeleteByQuery() throws Exception {
+    testCase(DeleteByQueryAction.NAME,client -> DeleteByQueryAction.INSTANCE.newRequestBuilder(client).source("source").filter(QueryBuilders.matchAllQuery()),matcher().deleted(DOC_COUNT));
+  }
+  private void testCase(  String action,  Function<Client,AbstractBulkByScrollRequestBuilder<?,?>> request,  BulkIndexByScrollResponseMatcher matcher) throws Exception {
+    final Settings nodeSettings=Settings.builder().put("thread_pool.write.size",1).put("thread_pool.search.size",1).put("thread_pool.write.queue_size",1).put("thread_pool.search.queue_size",1).put("node.attr.color","blue").build();
+    final String node=internalCluster().startDataOnlyNode(nodeSettings);
+    final Settings indexSettings=Settings.builder().put("index.number_of_shards",1).put("index.number_of_replicas",0).put("index.routing.allocation.include.color","blue").build();
+    client().admin().indices().prepareCreate("source").setSettings(indexSettings).execute().actionGet();
+    client().admin().indices().prepareCreate("dest").setSettings(indexSettings).execute().actionGet();
+    BulkRequestBuilder bulk=client().prepareBulk();
+    for (int i=0; i < DOC_COUNT; i++) {
+      bulk.add(client().prepareIndex("source","test").setSource("foo","bar " + i));
+    }
+    Retry retry=new Retry(BackoffPolicy.exponentialBackoff(),client().threadPool());
+    BulkResponse initialBulkResponse=retry.withBackoff(client()::bulk,bulk.request()).actionGet();
+    assertFalse(initialBulkResponse.buildFailureMessage(),initialBulkResponse.hasFailures());
+    client().admin().indices().prepareRefresh("source").get();
+    logger.info("Blocking search");
+    CyclicBarrier initialSearchBlock=blockExecutor(ThreadPool.Names.SEARCH,node);
+    AbstractBulkByScrollRequestBuilder<?,?> builder=request.apply(internalCluster().masterClient());
+    builder.source().setSize(DOC_COUNT / randomIntBetween(2,10));
+    logger.info("Starting request");
+    ActionFuture<BulkByScrollResponse> responseListener=builder.execute();
+    try {
+      logger.info("Waiting for search rejections on the initial search");
+      assertBusy(() -> assertThat(taskStatus(action).getSearchRetries(),greaterThan(0L)));
+      logger.info("Blocking bulk and unblocking search so we start to get bulk rejections");
+      CyclicBarrier bulkBlock=blockExecutor(ThreadPool.Names.WRITE,node);
+      initialSearchBlock.await();
+      logger.info("Waiting for bulk rejections");
+      assertBusy(() -> assertThat(taskStatus(action).getBulkRetries(),greaterThan(0L)));
+      long initialSearchRejections=taskStatus(action).getSearchRetries();
+      logger.info("Blocking search and unblocking bulk so we should get search rejections for the scroll");
+      CyclicBarrier scrollBlock=blockExecutor(ThreadPool.Names.SEARCH,node);
+      bulkBlock.await();
+      logger.info("Waiting for search rejections for the scroll");
+      assertBusy(() -> assertThat(taskStatus(action).getSearchRetries(),greaterThan(initialSearchRejections)));
+      logger.info("Unblocking the scroll");
+      scrollBlock.await();
+      logger.info("Waiting for the request to finish");
+      BulkByScrollResponse response=responseListener.get();
+      assertThat(response,matcher);
+      assertThat(response.getBulkRetries(),greaterThan(0L));
+      assertThat(response.getSearchRetries(),greaterThan(initialSearchRejections));
+    }
+  finally {
+      BulkByScrollResponse response=responseListener.get();
+      assertThat(response.getSearchFailures(),empty());
+      assertThat(response.getBulkFailures(),empty());
+    }
+  }
+  /** 
+ * Blocks the named executor by getting its only thread running a task blocked on a CyclicBarrier and fills the queue with a noop task. So requests to use this queue should get  {@link EsRejectedExecutionException}s.
+ */
+  private CyclicBarrier blockExecutor(  String name,  String node) throws Exception {
+    ThreadPool threadPool=internalCluster().getInstance(ThreadPool.class,node);
+    CyclicBarrier barrier=new CyclicBarrier(2);
+    logger.info("Blocking the [{}] executor",name);
+    threadPool.executor(name).execute(() -> {
+      try {
+        threadPool.executor(name).execute(() -> {
+        }
+);
+        barrier.await();
+        logger.info("Blocked the [{}] executor",name);
+        barrier.await();
+        logger.info("Unblocking the [{}] executor",name);
+      }
+ catch (      Exception e) {
+        throw new RuntimeException(e);
+      }
+    }
+);
+    barrier.await();
+    blockedExecutors.add(barrier);
+    return barrier;
+  }
+  /** 
+ * Fetch the status for a task of type "action". Fails if there aren't exactly one of that type of task running.
+ */
+  private BulkByScrollTask.Status taskStatus(  String action){
+    ListTasksResponse response=client().admin().cluster().prepareListTasks().setActions(action).setDetailed(true).get();
+    assertThat(response.getTasks(),hasSize(1));
+    return (BulkByScrollTask.Status)response.getTasks().get(0).getStatus();
+  }
+}

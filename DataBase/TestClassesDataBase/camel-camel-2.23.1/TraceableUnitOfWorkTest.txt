@@ -1,0 +1,52 @@
+/** 
+ * @version 
+ */
+public class TraceableUnitOfWorkTest extends ContextTestSupport {
+  @Test public void testSendingSomeMessages() throws Exception {
+    Object out=template.requestBody("direct:start","Hello London");
+    assertEquals("Failed at: sendTo(bean://bar)",out);
+  }
+  @Override protected JndiRegistry createRegistry() throws Exception {
+    JndiRegistry jndi=super.createRegistry();
+    jndi.bind("foo",new MyFooBean());
+    jndi.bind("bar",new MyBarBean());
+    return jndi;
+  }
+  protected RouteBuilder createRouteBuilder() throws Exception {
+    return new RouteBuilder(){
+      public void configure() throws Exception {
+        errorHandler(deadLetterChannel("mock:error").redeliveryDelay(0).maximumRedeliveries(3));
+        context.setTracing(true);
+        onException(Exception.class).handled(true).process(new MyErrorProcessor());
+        from("direct:start").to("bean:foo").to("bean:bar");
+      }
+    }
+;
+  }
+private static class MyErrorProcessor implements Processor {
+    public void process(    Exchange exchange) throws Exception {
+      TracedRouteNodes traced=exchange.getUnitOfWork().getTracedRouteNodes();
+      List<RouteNode> list=traced.getNodes();
+      Processor last=list.get(list.size() - 3).getProcessor();
+      if (last instanceof InstrumentationProcessor) {
+        InstrumentationProcessor ip=(InstrumentationProcessor)last;
+        last=ip.getProcessor();
+      }
+      exchange.getOut().setFault(true);
+      exchange.getOut().setBody("Failed at: " + last.toString());
+    }
+    public String toString(){
+      return "MyErrorProcessor";
+    }
+  }
+public class MyFooBean {
+    public void process(    Exchange exchange) throws Exception {
+      exchange.getOut().setBody("Foo okay");
+    }
+  }
+public class MyBarBean {
+    public void process(    Exchange exchange) throws Exception {
+      throw new IllegalArgumentException("Damm Bar");
+    }
+  }
+}

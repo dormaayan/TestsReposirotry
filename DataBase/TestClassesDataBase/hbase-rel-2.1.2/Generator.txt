@@ -1,0 +1,420 @@
+/** 
+ * A Map only job that generates random linked list and stores them.
+ */
+static class Generator extends Configured implements Tool {
+  private static final Logger LOG=LoggerFactory.getLogger(Generator.class);
+  /** 
+ * Set this configuration if you want to test single-column family flush works. If set, we will add a big column family and a small column family on either side of the usual ITBLL 'meta' column family. When we write out the ITBLL, we will also add to the big column family a value bigger than that for ITBLL and for small, something way smaller. The idea is that when flush-by-column family rather than by region is enabled, we can see if ITBLL is broke in any way. Here is how you would pass it: <p> $ ./bin/hbase org.apache.hadoop.hbase.test.IntegrationTestBigLinkedList -Dgenerator.multiple.columnfamilies=true generator 1 10 g
+ */
+  public static final String MULTIPLE_UNEVEN_COLUMNFAMILIES_KEY="generator.multiple.columnfamilies";
+  public static enum Counts {  SUCCESS,   TERMINATING,   UNDEFINED,   IOEXCEPTION}
+  public static final String USAGE="Usage : " + Generator.class.getSimpleName() + " <num mappers> <num nodes per map> <tmp output dir> [<width> <wrap multiplier>"+ " <num walker threads>] \n"+ "where <num nodes per map> should be a multiple of width*wrap multiplier, 25M by default \n"+ "walkers will verify random flushed loop during Generation.";
+  public Job job;
+static class GeneratorInputFormat extends InputFormat<BytesWritable,NullWritable> {
+static class GeneratorInputSplit extends InputSplit implements Writable {
+      @Override public long getLength() throws IOException, InterruptedException {
+        return 1;
+      }
+      @Override public String[] getLocations() throws IOException, InterruptedException {
+        return new String[0];
+      }
+      @Override public void readFields(      DataInput arg0) throws IOException {
+      }
+      @Override public void write(      DataOutput arg0) throws IOException {
+      }
+    }
+static class GeneratorRecordReader extends RecordReader<BytesWritable,NullWritable> {
+      private long count;
+      private long numNodes;
+      private Random rand;
+      @Override public void close() throws IOException {
+      }
+      @Override public BytesWritable getCurrentKey() throws IOException, InterruptedException {
+        byte[] bytes=new byte[ROWKEY_LENGTH];
+        rand.nextBytes(bytes);
+        return new BytesWritable(bytes);
+      }
+      @Override public NullWritable getCurrentValue() throws IOException, InterruptedException {
+        return NullWritable.get();
+      }
+      @Override public float getProgress() throws IOException, InterruptedException {
+        return (float)(count / (double)numNodes);
+      }
+      @Override public void initialize(      InputSplit arg0,      TaskAttemptContext context) throws IOException, InterruptedException {
+        numNodes=context.getConfiguration().getLong(GENERATOR_NUM_ROWS_PER_MAP_KEY,25000000);
+        rand=new SecureRandom();
+      }
+      @Override public boolean nextKeyValue() throws IOException, InterruptedException {
+        return count++ < numNodes;
+      }
+    }
+    @Override public RecordReader<BytesWritable,NullWritable> createRecordReader(    InputSplit split,    TaskAttemptContext context) throws IOException, InterruptedException {
+      GeneratorRecordReader rr=new GeneratorRecordReader();
+      rr.initialize(split,context);
+      return rr;
+    }
+    @Override public List<InputSplit> getSplits(    JobContext job) throws IOException, InterruptedException {
+      int numMappers=job.getConfiguration().getInt(GENERATOR_NUM_MAPPERS_KEY,1);
+      ArrayList<InputSplit> splits=new ArrayList<>(numMappers);
+      for (int i=0; i < numMappers; i++) {
+        splits.add(new GeneratorInputSplit());
+      }
+      return splits;
+    }
+  }
+  /** 
+ * Ensure output files from prev-job go to map inputs for current job 
+ */
+static class OneFilePerMapperSFIF<K,V> extends SequenceFileInputFormat<K,V> {
+    @Override protected boolean isSplitable(    JobContext context,    Path filename){
+      return false;
+    }
+  }
+  /** 
+ * Some ASCII art time: <p> [ . . . ] represents one batch of random longs of length WIDTH <pre> _________________________ |                  ______ | |                 |      || .-+-----------------+-----.|| | |                 |     ||| first   = [ . . . . . . . . . . . ]   ||| ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^     ||| | | | | | | | | | | |     ||| prev    = [ . . . . . . . . . . . ]   ||| ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^     ||| | | | | | | | | | | |     ||| current = [ . . . . . . . . . . . ]   ||| ||| ...                                   ||| ||| last    = [ . . . . . . . . . . . ]   ||| ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^_____||| |                 |________|| |___________________________| </pre>
+ */
+static class GeneratorMapper extends Mapper<BytesWritable,NullWritable,NullWritable,NullWritable> {
+    byte[][] first=null;
+    byte[][] prev=null;
+    byte[][] current=null;
+    byte[] id;
+    long count=0;
+    int i;
+    BufferedMutator mutator;
+    Connection connection;
+    long numNodes;
+    long wrap;
+    int width;
+    boolean multipleUnevenColumnFamilies;
+    byte[] tinyValue=new byte[]{'t'};
+    byte[] bigValue=null;
+    Configuration conf;
+    volatile boolean walkersStop;
+    int numWalkers;
+    volatile List<Long> flushedLoops=new ArrayList<>();
+    List<Thread> walkers=new ArrayList<>();
+    @Override protected void setup(    Context context) throws IOException, InterruptedException {
+      id=Bytes.toBytes("Job: " + context.getJobID() + " Task: "+ context.getTaskAttemptID());
+      this.connection=ConnectionFactory.createConnection(context.getConfiguration());
+      instantiateHTable();
+      this.width=context.getConfiguration().getInt(GENERATOR_WIDTH_KEY,WIDTH_DEFAULT);
+      current=new byte[this.width][];
+      int wrapMultiplier=context.getConfiguration().getInt(GENERATOR_WRAP_KEY,WRAP_DEFAULT);
+      this.wrap=(long)wrapMultiplier * width;
+      this.numNodes=context.getConfiguration().getLong(GENERATOR_NUM_ROWS_PER_MAP_KEY,(long)WIDTH_DEFAULT * WRAP_DEFAULT);
+      if (this.numNodes < this.wrap) {
+        this.wrap=this.numNodes;
+      }
+      this.multipleUnevenColumnFamilies=isMultiUnevenColumnFamilies(context.getConfiguration());
+      this.numWalkers=context.getConfiguration().getInt(CONCURRENT_WALKER_KEY,CONCURRENT_WALKER_DEFAULT);
+      this.walkersStop=false;
+      this.conf=context.getConfiguration();
+    }
+    protected void instantiateHTable() throws IOException {
+      mutator=connection.getBufferedMutator(new BufferedMutatorParams(getTableName(connection.getConfiguration())).writeBufferSize(4 * 1024 * 1024));
+    }
+    @Override protected void cleanup(    Context context) throws IOException, InterruptedException {
+      joinWalkers();
+      mutator.close();
+      connection.close();
+    }
+    @Override protected void map(    BytesWritable key,    NullWritable value,    Context output) throws IOException {
+      current[i]=new byte[key.getLength()];
+      System.arraycopy(key.getBytes(),0,current[i],0,key.getLength());
+      if (++i == current.length) {
+        LOG.info("Persisting current.length=" + current.length + ", count="+ count+ ", id="+ Bytes.toStringBinary(id)+ ", current="+ Bytes.toStringBinary(current[0])+ ", i="+ i);
+        persist(output,count,prev,current,id);
+        i=0;
+        if (first == null) {
+          first=current;
+        }
+        prev=current;
+        current=new byte[this.width][];
+        count+=current.length;
+        output.setStatus("Count " + count);
+        if (count % wrap == 0) {
+          circularLeftShift(first);
+          persist(output,-1,prev,first,null);
+          if (numWalkers > 0) {
+            addFlushed(key.getBytes());
+            if (walkers.isEmpty()) {
+              startWalkers(numWalkers,conf,output);
+            }
+          }
+          first=null;
+          prev=null;
+        }
+      }
+    }
+    private static <T>void circularLeftShift(    T[] first){
+      T ez=first[0];
+      System.arraycopy(first,1,first,0,first.length - 1);
+      first[first.length - 1]=ez;
+    }
+    private void addFlushed(    byte[] rowKey){
+synchronized (flushedLoops) {
+        flushedLoops.add(Bytes.toLong(rowKey));
+        flushedLoops.notifyAll();
+      }
+    }
+    protected void persist(    Context output,    long count,    byte[][] prev,    byte[][] current,    byte[] id) throws IOException {
+      for (int i=0; i < current.length; i++) {
+        if (i % 100 == 0) {
+          output.progress();
+        }
+        Put put=new Put(current[i]);
+        put.addColumn(FAMILY_NAME,COLUMN_PREV,prev == null ? NO_KEY : prev[i]);
+        if (count >= 0) {
+          put.addColumn(FAMILY_NAME,COLUMN_COUNT,Bytes.toBytes(count + i));
+        }
+        if (id != null) {
+          put.addColumn(FAMILY_NAME,COLUMN_CLIENT,id);
+        }
+        if (this.multipleUnevenColumnFamilies) {
+          put.addColumn(TINY_FAMILY_NAME,TINY_FAMILY_NAME,this.tinyValue);
+          if (this.bigValue == null) {
+            this.bigValue=new byte[current[i].length * 10];
+            ThreadLocalRandom.current().nextBytes(this.bigValue);
+          }
+          put.addColumn(BIG_FAMILY_NAME,BIG_FAMILY_NAME,this.bigValue);
+        }
+        mutator.mutate(put);
+      }
+      mutator.flush();
+    }
+    private void startWalkers(    int numWalkers,    Configuration conf,    Context context){
+      LOG.info("Starting " + numWalkers + " concurrent walkers");
+      for (int i=0; i < numWalkers; i++) {
+        Thread walker=new Thread(new ContinuousConcurrentWalker(conf,context));
+        walker.start();
+        walkers.add(walker);
+      }
+    }
+    private void joinWalkers(){
+      walkersStop=true;
+synchronized (flushedLoops) {
+        flushedLoops.notifyAll();
+      }
+      for (      Thread walker : walkers) {
+        try {
+          walker.join();
+        }
+ catch (        InterruptedException e) {
+        }
+      }
+    }
+    /** 
+ * Randomly selects and walks a random flushed loop concurrently with the Generator Mapper by spawning ConcurrentWalker's with specified StartNodes. These ConcurrentWalker's are configured to only log erroneous nodes.
+ */
+public class ContinuousConcurrentWalker implements Runnable {
+      ConcurrentWalker walker;
+      Configuration conf;
+      Context context;
+      Random rand;
+      public ContinuousConcurrentWalker(      Configuration conf,      Context context){
+        this.conf=conf;
+        this.context=context;
+        rand=new Random();
+      }
+      @Override public void run(){
+        while (!walkersStop) {
+          try {
+            long node=selectLoop();
+            try {
+              walkLoop(node);
+            }
+ catch (            IOException e) {
+              context.getCounter(Counts.IOEXCEPTION).increment(1l);
+              return;
+            }
+          }
+ catch (          InterruptedException e) {
+            return;
+          }
+        }
+      }
+      private void walkLoop(      long node) throws IOException {
+        walker=new ConcurrentWalker(context);
+        walker.setConf(conf);
+        walker.run(node,wrap);
+      }
+      private long selectLoop() throws InterruptedException {
+synchronized (flushedLoops) {
+          while (flushedLoops.isEmpty() && !walkersStop) {
+            flushedLoops.wait();
+          }
+          if (walkersStop) {
+            throw new InterruptedException();
+          }
+          return flushedLoops.get(rand.nextInt(flushedLoops.size()));
+        }
+      }
+    }
+public static class ConcurrentWalker extends WalkerBase {
+      Context context;
+      public ConcurrentWalker(      Context context){
+        this.context=context;
+      }
+      public void run(      long startKeyIn,      long maxQueriesIn) throws IOException {
+        long maxQueries=maxQueriesIn > 0 ? maxQueriesIn : Long.MAX_VALUE;
+        byte[] startKey=Bytes.toBytes(startKeyIn);
+        Connection connection=ConnectionFactory.createConnection(getConf());
+        Table table=connection.getTable(getTableName(getConf()));
+        long numQueries=0;
+        CINode node=findStartNode(table,startKey);
+        if (node == null) {
+          LOG.error("Start node not found: " + Bytes.toStringBinary(startKey));
+          throw new IOException("Start node not found: " + startKeyIn);
+        }
+        while (numQueries < maxQueries) {
+          numQueries++;
+          byte[] prev=node.prev;
+          long t1=System.currentTimeMillis();
+          node=getNode(prev,table,node);
+          long t2=System.currentTimeMillis();
+          if (node == null) {
+            LOG.error("ConcurrentWalker found UNDEFINED NODE: " + Bytes.toStringBinary(prev));
+            context.getCounter(Counts.UNDEFINED).increment(1l);
+          }
+ else           if (node.prev.length == NO_KEY.length) {
+            LOG.error("ConcurrentWalker found TERMINATING NODE: " + Bytes.toStringBinary(node.key));
+            context.getCounter(Counts.TERMINATING).increment(1l);
+          }
+ else {
+            context.getCounter(Counts.SUCCESS).increment(1l);
+          }
+        }
+        table.close();
+        connection.close();
+      }
+    }
+  }
+  @Override public int run(  String[] args) throws Exception {
+    if (args.length < 3) {
+      System.err.println(USAGE);
+      return 1;
+    }
+    try {
+      int numMappers=Integer.parseInt(args[0]);
+      long numNodes=Long.parseLong(args[1]);
+      Path tmpOutput=new Path(args[2]);
+      Integer width=(args.length < 4) ? null : Integer.parseInt(args[3]);
+      Integer wrapMultiplier=(args.length < 5) ? null : Integer.parseInt(args[4]);
+      Integer numWalkers=(args.length < 6) ? null : Integer.parseInt(args[5]);
+      return run(numMappers,numNodes,tmpOutput,width,wrapMultiplier,numWalkers);
+    }
+ catch (    NumberFormatException e) {
+      System.err.println("Parsing generator arguments failed: " + e.getMessage());
+      System.err.println(USAGE);
+      return 1;
+    }
+  }
+  protected void createSchema() throws IOException {
+    Configuration conf=getConf();
+    TableName tableName=getTableName(conf);
+    try (Connection conn=ConnectionFactory.createConnection(conf);Admin admin=conn.getAdmin()){
+      if (!admin.tableExists(tableName)) {
+        HTableDescriptor htd=new HTableDescriptor(getTableName(getConf()));
+        htd.addFamily(new HColumnDescriptor(FAMILY_NAME));
+        htd.addFamily(new HColumnDescriptor(BIG_FAMILY_NAME));
+        htd.addFamily(new HColumnDescriptor(TINY_FAMILY_NAME));
+        if (conf.getBoolean("useMob",false)) {
+          for (          HColumnDescriptor hcd : htd.getColumnFamilies()) {
+            hcd.setMobEnabled(true);
+            hcd.setMobThreshold(4);
+          }
+        }
+        if (conf.getBoolean(HBaseTestingUtility.PRESPLIT_TEST_TABLE_KEY,HBaseTestingUtility.PRESPLIT_TEST_TABLE)) {
+          int numberOfServers=admin.getClusterMetrics(EnumSet.of(Option.LIVE_SERVERS)).getLiveServerMetrics().size();
+          if (numberOfServers == 0) {
+            throw new IllegalStateException("No live regionservers");
+          }
+          int regionsPerServer=conf.getInt(HBaseTestingUtility.REGIONS_PER_SERVER_KEY,HBaseTestingUtility.DEFAULT_REGIONS_PER_SERVER);
+          int totalNumberOfRegions=numberOfServers * regionsPerServer;
+          LOG.info("Number of live regionservers: " + numberOfServers + ", "+ "pre-splitting table into "+ totalNumberOfRegions+ " regions "+ "(default regions per server: "+ regionsPerServer+ ")");
+          byte[][] splits=new RegionSplitter.UniformSplit().split(totalNumberOfRegions);
+          admin.createTable(htd,splits);
+        }
+ else {
+          admin.createTable(htd);
+        }
+      }
+    }
+ catch (    MasterNotRunningException e) {
+      LOG.error("Master not running",e);
+      throw new IOException(e);
+    }
+  }
+  public int runRandomInputGenerator(  int numMappers,  long numNodes,  Path tmpOutput,  Integer width,  Integer wrapMultiplier,  Integer numWalkers) throws Exception {
+    LOG.info("Running RandomInputGenerator with numMappers=" + numMappers + ", numNodes="+ numNodes);
+    Job job=Job.getInstance(getConf());
+    job.setJobName("Random Input Generator");
+    job.setNumReduceTasks(0);
+    job.setJarByClass(getClass());
+    job.setInputFormatClass(GeneratorInputFormat.class);
+    job.setOutputKeyClass(BytesWritable.class);
+    job.setOutputValueClass(NullWritable.class);
+    setJobConf(job,numMappers,numNodes,width,wrapMultiplier,numWalkers);
+    job.setMapperClass(Mapper.class);
+    FileOutputFormat.setOutputPath(job,tmpOutput);
+    job.setOutputFormatClass(SequenceFileOutputFormat.class);
+    boolean success=jobCompletion(job);
+    return success ? 0 : 1;
+  }
+  public int runGenerator(  int numMappers,  long numNodes,  Path tmpOutput,  Integer width,  Integer wrapMultiplier,  Integer numWalkers) throws Exception {
+    LOG.info("Running Generator with numMappers=" + numMappers + ", numNodes="+ numNodes);
+    createSchema();
+    job=Job.getInstance(getConf());
+    job.setJobName("Link Generator");
+    job.setNumReduceTasks(0);
+    job.setJarByClass(getClass());
+    FileInputFormat.setInputPaths(job,tmpOutput);
+    job.setInputFormatClass(OneFilePerMapperSFIF.class);
+    job.setOutputKeyClass(NullWritable.class);
+    job.setOutputValueClass(NullWritable.class);
+    setJobConf(job,numMappers,numNodes,width,wrapMultiplier,numWalkers);
+    setMapperForGenerator(job);
+    job.setOutputFormatClass(NullOutputFormat.class);
+    job.getConfiguration().setBoolean("mapreduce.map.speculative",false);
+    TableMapReduceUtil.addDependencyJars(job);
+    TableMapReduceUtil.addDependencyJarsForClasses(job.getConfiguration(),AbstractHBaseTool.class);
+    TableMapReduceUtil.initCredentials(job);
+    boolean success=jobCompletion(job);
+    return success ? 0 : 1;
+  }
+  protected boolean jobCompletion(  Job job) throws IOException, InterruptedException, ClassNotFoundException {
+    boolean success=job.waitForCompletion(true);
+    return success;
+  }
+  protected void setMapperForGenerator(  Job job){
+    job.setMapperClass(GeneratorMapper.class);
+  }
+  public int run(  int numMappers,  long numNodes,  Path tmpOutput,  Integer width,  Integer wrapMultiplier,  Integer numWalkers) throws Exception {
+    int ret=runRandomInputGenerator(numMappers,numNodes,tmpOutput,width,wrapMultiplier,numWalkers);
+    if (ret > 0) {
+      return ret;
+    }
+    return runGenerator(numMappers,numNodes,tmpOutput,width,wrapMultiplier,numWalkers);
+  }
+  public boolean verify(){
+    try {
+      Counters counters=job.getCounters();
+      if (counters == null) {
+        LOG.info("Counters object was null, Generator verification cannot be performed." + " This is commonly a result of insufficient YARN configuration.");
+        return false;
+      }
+      if (counters.findCounter(Counts.TERMINATING).getValue() > 0 || counters.findCounter(Counts.UNDEFINED).getValue() > 0 || counters.findCounter(Counts.IOEXCEPTION).getValue() > 0) {
+        LOG.error("Concurrent walker failed to verify during Generation phase");
+        LOG.error("TERMINATING nodes: " + counters.findCounter(Counts.TERMINATING).getValue());
+        LOG.error("UNDEFINED nodes: " + counters.findCounter(Counts.UNDEFINED).getValue());
+        LOG.error("IOEXCEPTION nodes: " + counters.findCounter(Counts.IOEXCEPTION).getValue());
+        return false;
+      }
+    }
+ catch (    IOException e) {
+      LOG.info("Generator verification could not find counter");
+      return false;
+    }
+    return true;
+  }
+}

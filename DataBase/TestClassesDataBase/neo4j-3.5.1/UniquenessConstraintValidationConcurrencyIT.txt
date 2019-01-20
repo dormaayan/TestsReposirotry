@@ -1,0 +1,61 @@
+public class UniquenessConstraintValidationConcurrencyIT {
+  @Rule public final DatabaseRule database=new ImpermanentDatabaseRule();
+  @Rule public final OtherThreadRule<Void> otherThread=new OtherThreadRule<>();
+  @Test public void shouldAllowConcurrentCreationOfNonConflictingData() throws Exception {
+    database.executeAndCommit(createUniquenessConstraint("Label1","key1"));
+    Future<Boolean> created=database.executeAndCommit(db -> {
+      db.createNode(label("Label1")).setProperty("key1","value1");
+      return otherThread.execute(createNode(db,"Label1","key1","value2"));
+    }
+);
+    assertTrue("Node creation should succeed",created.get());
+  }
+  @Test public void shouldPreventConcurrentCreationOfConflictingData() throws Exception {
+    database.executeAndCommit(createUniquenessConstraint("Label1","key1"));
+    Future<Boolean> created=database.executeAndCommit(db -> {
+      db.createNode(label("Label1")).setProperty("key1","value1");
+      try {
+        return otherThread.execute(createNode(db,"Label1","key1","value1"));
+      }
+  finally {
+        assertThat(otherThread,isWaiting());
+      }
+    }
+);
+    assertFalse("node creation should fail",created.get());
+  }
+  @Test public void shouldAllowOtherTransactionToCompleteIfFirstTransactionRollsBack() throws Exception {
+    database.executeAndCommit(createUniquenessConstraint("Label1","key1"));
+    Future<Boolean> created=database.executeAndRollback(db -> {
+      db.createNode(label("Label1")).setProperty("key1","value1");
+      try {
+        return otherThread.execute(createNode(db,"Label1","key1","value1"));
+      }
+  finally {
+        assertThat(otherThread,isWaiting());
+      }
+    }
+);
+    assertTrue("Node creation should succeed",created.get());
+  }
+  private static Function<GraphDatabaseService,Void> createUniquenessConstraint(  final String label,  final String propertyKey){
+    return db -> {
+      db.schema().constraintFor(label(label)).assertPropertyIsUnique(propertyKey).create();
+      return null;
+    }
+;
+  }
+  public static OtherThreadExecutor.WorkerCommand<Void,Boolean> createNode(  final GraphDatabaseService db,  final String label,  final String propertyKey,  final Object propertyValue){
+    return nothing -> {
+      try (Transaction tx=db.beginTx()){
+        db.createNode(label(label)).setProperty(propertyKey,propertyValue);
+        tx.success();
+        return true;
+      }
+ catch (      ConstraintViolationException e) {
+        return false;
+      }
+    }
+;
+  }
+}

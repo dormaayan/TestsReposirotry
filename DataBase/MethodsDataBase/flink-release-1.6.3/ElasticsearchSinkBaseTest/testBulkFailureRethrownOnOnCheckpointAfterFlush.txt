@@ -1,0 +1,35 @@
+/** 
+ * Tests that any bulk failure in the listener callbacks due to flushing on an immediately following checkpoint is rethrown; we set a timeout because the test will not finish if the logic is broken.
+ */
+@Test(timeout=5000) public void testBulkFailureRethrownOnOnCheckpointAfterFlush() throws Throwable {
+  final DummyElasticsearchSink<String> sink=new DummyElasticsearchSink<>(new HashMap<String,String>(),new SimpleSinkFunction<String>(),new NoOpFailureHandler());
+  final OneInputStreamOperatorTestHarness<String,Object> testHarness=new OneInputStreamOperatorTestHarness<>(new StreamSink<>(sink));
+  testHarness.open();
+  sink.setMockItemFailuresListForNextBulkItemResponses(Collections.singletonList((Exception)null));
+  testHarness.processElement(new StreamRecord<>("msg-1"));
+  verify(sink.getMockBulkProcessor(),times(1)).add(any(IndexRequest.class));
+  sink.manualBulkRequestWithAllPendingRequests();
+  testHarness.processElement(new StreamRecord<>("msg-2"));
+  testHarness.processElement(new StreamRecord<>("msg-3"));
+  verify(sink.getMockBulkProcessor(),times(3)).add(any(IndexRequest.class));
+  CheckedThread snapshotThread=new CheckedThread(){
+    @Override public void go() throws Exception {
+      testHarness.snapshot(1L,1000L);
+    }
+  }
+;
+  snapshotThread.start();
+  while (snapshotThread.getState() != Thread.State.WAITING) {
+    Thread.sleep(10);
+  }
+  sink.setFailNextBulkRequestCompletely(new Exception("artificial failure for bulk request"));
+  sink.continueFlush();
+  try {
+    snapshotThread.sync();
+  }
+ catch (  Exception e) {
+    Assert.assertTrue(e.getCause().getCause().getMessage().contains("artificial failure for bulk request"));
+    return;
+  }
+  Assert.fail();
+}

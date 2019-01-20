@@ -1,0 +1,282 @@
+@Category({SecurityTests.class,LargeTests.class}) public class TestCellACLs extends SecureTestUtil {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestCellACLs.class);
+  private static final Logger LOG=LoggerFactory.getLogger(TestCellACLs.class);
+  @Rule public TestTableName TEST_TABLE=new TestTableName();
+  private static final HBaseTestingUtility TEST_UTIL=new HBaseTestingUtility();
+  private static final byte[] TEST_FAMILY=Bytes.toBytes("f1");
+  private static final byte[] TEST_ROW=Bytes.toBytes("cellpermtest");
+  private static final byte[] TEST_Q1=Bytes.toBytes("q1");
+  private static final byte[] TEST_Q2=Bytes.toBytes("q2");
+  private static final byte[] TEST_Q3=Bytes.toBytes("q3");
+  private static final byte[] TEST_Q4=Bytes.toBytes("q4");
+  private static final byte[] ZERO=Bytes.toBytes(0L);
+  private static final byte[] ONE=Bytes.toBytes(1L);
+  private static Configuration conf;
+  private static final String GROUP="group";
+  private static User GROUP_USER;
+  private static User USER_OWNER;
+  private static User USER_OTHER;
+  private static String[] usersAndGroups;
+  @BeforeClass public static void setupBeforeClass() throws Exception {
+    conf=TEST_UTIL.getConfiguration();
+    conf.setInt(HConstants.REGION_SERVER_HIGH_PRIORITY_HANDLER_COUNT,10);
+    enableSecurity(conf);
+    verifyConfiguration(conf);
+    conf.setBoolean(AccessControlConstants.CF_ATTRIBUTE_EARLY_OUT,false);
+    TEST_UTIL.startMiniCluster();
+    MasterCoprocessorHost cpHost=TEST_UTIL.getMiniHBaseCluster().getMaster().getMasterCoprocessorHost();
+    cpHost.load(AccessController.class,Coprocessor.PRIORITY_HIGHEST,conf);
+    AccessController ac=cpHost.findCoprocessor(AccessController.class);
+    cpHost.createEnvironment(ac,Coprocessor.PRIORITY_HIGHEST,1,conf);
+    RegionServerCoprocessorHost rsHost=TEST_UTIL.getMiniHBaseCluster().getRegionServer(0).getRegionServerCoprocessorHost();
+    rsHost.createEnvironment(ac,Coprocessor.PRIORITY_HIGHEST,1,conf);
+    TEST_UTIL.waitTableEnabled(AccessControlLists.ACL_TABLE_NAME);
+    USER_OWNER=User.createUserForTesting(conf,"owner",new String[0]);
+    USER_OTHER=User.createUserForTesting(conf,"other",new String[0]);
+    GROUP_USER=User.createUserForTesting(conf,"group_user",new String[]{GROUP});
+    usersAndGroups=new String[]{USER_OTHER.getShortName(),AuthUtil.toGroupEntry(GROUP)};
+  }
+  @AfterClass public static void tearDownAfterClass() throws Exception {
+    TEST_UTIL.shutdownMiniCluster();
+  }
+  @Before public void setUp() throws Exception {
+    Admin admin=TEST_UTIL.getAdmin();
+    HTableDescriptor htd=new HTableDescriptor(TEST_TABLE.getTableName());
+    HColumnDescriptor hcd=new HColumnDescriptor(TEST_FAMILY);
+    hcd.setMaxVersions(4);
+    htd.setOwner(USER_OWNER);
+    htd.addFamily(hcd);
+    admin.createTable(htd,new byte[][]{Bytes.toBytes("s")});
+    TEST_UTIL.waitTableEnabled(TEST_TABLE.getTableName());
+    LOG.info("Sleeping a second because of HBASE-12581");
+    Threads.sleep(1000);
+  }
+  @Test public void testCellPermissions() throws Exception {
+    verifyAllowed(new AccessTestAction(){
+      @Override public Object run() throws Exception {
+        try (Connection connection=ConnectionFactory.createConnection(conf);Table t=connection.getTable(TEST_TABLE.getTableName())){
+          Put p;
+          p=new Put(TEST_ROW).addColumn(TEST_FAMILY,TEST_Q1,ZERO);
+          p.setACL(prepareCellPermissions(usersAndGroups,Action.READ));
+          t.put(p);
+          p=new Put(TEST_ROW).addColumn(TEST_FAMILY,TEST_Q2,ZERO);
+          p.setACL(prepareCellPermissions(usersAndGroups,Action.READ,Action.WRITE));
+          t.put(p);
+          p=new Put(TEST_ROW).addColumn(TEST_FAMILY,TEST_Q3,ZERO).addColumn(TEST_FAMILY,TEST_Q4,ZERO);
+          t.put(p);
+        }
+         return null;
+      }
+    }
+,USER_OWNER);
+    AccessTestAction getQ1=new AccessTestAction(){
+      @Override public Object run() throws Exception {
+        Get get=new Get(TEST_ROW).addColumn(TEST_FAMILY,TEST_Q1);
+        try (Connection connection=ConnectionFactory.createConnection(conf);Table t=connection.getTable(TEST_TABLE.getTableName())){
+          return t.get(get).listCells();
+        }
+       }
+    }
+;
+    AccessTestAction getQ2=new AccessTestAction(){
+      @Override public Object run() throws Exception {
+        Get get=new Get(TEST_ROW).addColumn(TEST_FAMILY,TEST_Q2);
+        try (Connection connection=ConnectionFactory.createConnection(conf);Table t=connection.getTable(TEST_TABLE.getTableName())){
+          return t.get(get).listCells();
+        }
+       }
+    }
+;
+    AccessTestAction getQ3=new AccessTestAction(){
+      @Override public Object run() throws Exception {
+        Get get=new Get(TEST_ROW).addColumn(TEST_FAMILY,TEST_Q3);
+        try (Connection connection=ConnectionFactory.createConnection(conf);Table t=connection.getTable(TEST_TABLE.getTableName())){
+          return t.get(get).listCells();
+        }
+       }
+    }
+;
+    AccessTestAction getQ4=new AccessTestAction(){
+      @Override public Object run() throws Exception {
+        Get get=new Get(TEST_ROW).addColumn(TEST_FAMILY,TEST_Q4);
+        try (Connection connection=ConnectionFactory.createConnection(conf);Table t=connection.getTable(TEST_TABLE.getTableName())){
+          return t.get(get).listCells();
+        }
+       }
+    }
+;
+    verifyAllowed(getQ1,USER_OTHER,GROUP_USER);
+    verifyAllowed(getQ2,USER_OTHER,GROUP_USER);
+    verifyIfNull(getQ3,USER_OTHER,GROUP_USER);
+    verifyIfNull(getQ4,USER_OTHER,GROUP_USER);
+    final List<Cell> scanResults=Lists.newArrayList();
+    AccessTestAction scanAction=new AccessTestAction(){
+      @Override public List<Cell> run() throws Exception {
+        Scan scan=new Scan();
+        scan.setStartRow(TEST_ROW);
+        scan.setStopRow(Bytes.add(TEST_ROW,new byte[]{0}));
+        scan.addFamily(TEST_FAMILY);
+        Connection connection=ConnectionFactory.createConnection(conf);
+        Table t=connection.getTable(TEST_TABLE.getTableName());
+        try {
+          ResultScanner scanner=t.getScanner(scan);
+          Result result=null;
+          do {
+            result=scanner.next();
+            if (result != null) {
+              scanResults.addAll(result.listCells());
+            }
+          }
+ while (result != null);
+        }
+  finally {
+          t.close();
+          connection.close();
+        }
+        return scanResults;
+      }
+    }
+;
+    scanResults.clear();
+    verifyAllowed(scanAction,USER_OWNER);
+    assertEquals(4,scanResults.size());
+    scanResults.clear();
+    verifyAllowed(scanAction,USER_OTHER);
+    assertEquals(2,scanResults.size());
+    scanResults.clear();
+    verifyAllowed(scanAction,GROUP_USER);
+    assertEquals(2,scanResults.size());
+    AccessTestAction incrementQ1=new AccessTestAction(){
+      @Override public Object run() throws Exception {
+        Increment i=new Increment(TEST_ROW).addColumn(TEST_FAMILY,TEST_Q1,1L);
+        try (Connection connection=ConnectionFactory.createConnection(conf);Table t=connection.getTable(TEST_TABLE.getTableName())){
+          t.increment(i);
+        }
+         return null;
+      }
+    }
+;
+    AccessTestAction incrementQ2=new AccessTestAction(){
+      @Override public Object run() throws Exception {
+        Increment i=new Increment(TEST_ROW).addColumn(TEST_FAMILY,TEST_Q2,1L);
+        try (Connection connection=ConnectionFactory.createConnection(conf);Table t=connection.getTable(TEST_TABLE.getTableName())){
+          t.increment(i);
+        }
+         return null;
+      }
+    }
+;
+    AccessTestAction incrementQ2newDenyACL=new AccessTestAction(){
+      @Override public Object run() throws Exception {
+        Increment i=new Increment(TEST_ROW).addColumn(TEST_FAMILY,TEST_Q2,1L);
+        i.setACL(prepareCellPermissions(usersAndGroups,Action.READ));
+        try (Connection connection=ConnectionFactory.createConnection(conf);Table t=connection.getTable(TEST_TABLE.getTableName())){
+          t.increment(i);
+        }
+         return null;
+      }
+    }
+;
+    AccessTestAction incrementQ3=new AccessTestAction(){
+      @Override public Object run() throws Exception {
+        Increment i=new Increment(TEST_ROW).addColumn(TEST_FAMILY,TEST_Q3,1L);
+        try (Connection connection=ConnectionFactory.createConnection(conf);Table t=connection.getTable(TEST_TABLE.getTableName())){
+          t.increment(i);
+        }
+         return null;
+      }
+    }
+;
+    verifyDenied(incrementQ1,USER_OTHER,GROUP_USER);
+    verifyDenied(incrementQ3,USER_OTHER,GROUP_USER);
+    verifyAllowed(incrementQ2,USER_OTHER,GROUP_USER);
+    verifyAllowed(incrementQ2newDenyACL,USER_OTHER);
+    verifyDenied(incrementQ2,USER_OTHER,GROUP_USER);
+    AccessTestAction deleteFamily=new AccessTestAction(){
+      @Override public Object run() throws Exception {
+        Delete delete=new Delete(TEST_ROW).addFamily(TEST_FAMILY);
+        try (Connection connection=ConnectionFactory.createConnection(conf);Table t=connection.getTable(TEST_TABLE.getTableName())){
+          t.delete(delete);
+        }
+         return null;
+      }
+    }
+;
+    AccessTestAction deleteQ1=new AccessTestAction(){
+      @Override public Object run() throws Exception {
+        Delete delete=new Delete(TEST_ROW).addColumn(TEST_FAMILY,TEST_Q1);
+        try (Connection connection=ConnectionFactory.createConnection(conf);Table t=connection.getTable(TEST_TABLE.getTableName())){
+          t.delete(delete);
+        }
+         return null;
+      }
+    }
+;
+    verifyDenied(deleteFamily,USER_OTHER,GROUP_USER);
+    verifyDenied(deleteQ1,USER_OTHER,GROUP_USER);
+    verifyAllowed(deleteQ1,USER_OWNER);
+  }
+  /** 
+ * Insure we are not granting access in the absence of any cells found when scanning for covered cells.
+ */
+  @Test public void testCoveringCheck() throws Exception {
+    grantOnTable(TEST_UTIL,USER_OTHER.getShortName(),TEST_TABLE.getTableName(),TEST_FAMILY,null,Action.READ);
+    grantOnTable(TEST_UTIL,AuthUtil.toGroupEntry(GROUP),TEST_TABLE.getTableName(),TEST_FAMILY,null,Action.READ);
+    verifyUserDeniedForWrite(USER_OTHER,ZERO);
+    verifyUserDeniedForWrite(GROUP_USER,ZERO);
+    verifyAllowed(new AccessTestAction(){
+      @Override public Object run() throws Exception {
+        try (Connection connection=ConnectionFactory.createConnection(conf);Table t=connection.getTable(TEST_TABLE.getTableName())){
+          Put p;
+          p=new Put(TEST_ROW).addColumn(TEST_FAMILY,TEST_Q1,ZERO);
+          t.put(p);
+        }
+         return null;
+      }
+    }
+,USER_OWNER);
+    verifyUserDeniedForWrite(USER_OTHER,ONE);
+    verifyUserDeniedForWrite(GROUP_USER,ONE);
+    verifyUserAllowedForRead(USER_OTHER);
+    verifyUserAllowedForRead(GROUP_USER);
+  }
+  private void verifyUserDeniedForWrite(  final User user,  final byte[] value) throws Exception {
+    verifyDenied(new AccessTestAction(){
+      @Override public Object run() throws Exception {
+        try (Connection connection=ConnectionFactory.createConnection(conf);Table t=connection.getTable(TEST_TABLE.getTableName())){
+          Put p;
+          p=new Put(TEST_ROW).addColumn(TEST_FAMILY,TEST_Q1,value);
+          t.put(p);
+        }
+         return null;
+      }
+    }
+,user);
+  }
+  private void verifyUserAllowedForRead(  final User user) throws Exception {
+    verifyAllowed(new AccessTestAction(){
+      @Override public Object run() throws Exception {
+        try (Connection connection=ConnectionFactory.createConnection(conf);Table t=connection.getTable(TEST_TABLE.getTableName())){
+          return t.get(new Get(TEST_ROW).addColumn(TEST_FAMILY,TEST_Q1));
+        }
+       }
+    }
+,user);
+  }
+  private Map<String,Permission> prepareCellPermissions(  String[] users,  Action... action){
+    Map<String,Permission> perms=new HashMap<>(2);
+    for (    String user : users) {
+      perms.put(user,new Permission(action));
+    }
+    return perms;
+  }
+  @After public void tearDown() throws Exception {
+    try {
+      TEST_UTIL.deleteTable(TEST_TABLE.getTableName());
+    }
+ catch (    TableNotFoundException ex) {
+      LOG.info("Test deleted table " + TEST_TABLE.getTableName());
+    }
+    assertEquals(0,AccessControlLists.getTablePermissions(conf,TEST_TABLE.getTableName()).size());
+  }
+}

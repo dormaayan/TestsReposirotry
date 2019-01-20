@@ -1,0 +1,61 @@
+public class ImportLogicTest {
+  @Rule public final PageCacheAndDependenciesRule storage=new PageCacheAndDependenciesRule();
+  @Rule public final RandomRule random=new RandomRule();
+  @Test public void closeImporterWithoutDiagnosticState() throws IOException {
+    ExecutionMonitor monitor=mock(ExecutionMonitor.class);
+    try (BatchingNeoStores stores=batchingNeoStoresWithExternalPageCache(storage.fileSystem(),storage.pageCache(),NULL,storage.directory().directory(),defaultFormat(),DEFAULT,getInstance(),EMPTY,defaults())){
+      try (ImportLogic ignored=new ImportLogic(storage.directory().directory(),storage.fileSystem(),stores,DEFAULT,getInstance(),monitor,defaultFormat(),NO_MONITOR)){
+      }
+     }
+     verify(monitor).done(anyLong(),contains("Data statistics is not available."));
+  }
+  @Test public void shouldSplitUpRelationshipTypesInBatches(){
+    int denseNodeThreshold=5;
+    int numberOfNodes=100;
+    int numberOfTypes=10;
+    NodeRelationshipCache cache=new NodeRelationshipCache(NumberArrayFactory.HEAP,denseNodeThreshold);
+    cache.setNodeCount(numberOfNodes + 1);
+    Direction[] directions=Direction.values();
+    for (int i=0; i < numberOfNodes; i++) {
+      int count=random.nextInt(1,denseNodeThreshold * 2);
+      cache.setCount(i,count,random.nextInt(numberOfTypes),random.among(directions));
+    }
+    cache.countingCompleted();
+    List<RelationshipTypeCount> types=new ArrayList<>();
+    int numberOfRelationships=0;
+    for (int i=0; i < numberOfTypes; i++) {
+      int count=random.nextInt(1,100);
+      types.add(new RelationshipTypeCount(i,count));
+      numberOfRelationships+=count;
+    }
+    types.sort((t1,t2) -> Long.compare(t2.getCount(),t1.getCount()));
+    DataStatistics typeDistribution=new DataStatistics(0,0,types.toArray(new RelationshipTypeCount[types.size()]));
+{
+      long memory=cache.calculateMaxMemoryUsage(numberOfRelationships) * numberOfTypes;
+      int upToType=ImportLogic.nextSetOfTypesThatFitInMemory(typeDistribution,0,memory,cache.getNumberOfDenseNodes());
+      assertEquals(types.size(),upToType);
+    }
+{
+      long memory=cache.calculateMaxMemoryUsage(numberOfRelationships) * numberOfTypes / 3;
+      int startingFromType=0;
+      int rounds=0;
+      while (startingFromType < types.size()) {
+        rounds++;
+        startingFromType=ImportLogic.nextSetOfTypesThatFitInMemory(typeDistribution,startingFromType,memory,cache.getNumberOfDenseNodes());
+      }
+      assertEquals(types.size(),startingFromType);
+      assertThat(rounds,greaterThan(1));
+    }
+  }
+  @Test public void shouldUseDataStatisticsCountsForPrintingFinalStats() throws IOException {
+    ExecutionMonitor monitor=mock(ExecutionMonitor.class);
+    try (BatchingNeoStores stores=batchingNeoStoresWithExternalPageCache(storage.fileSystem(),storage.pageCache(),NULL,storage.directory().directory(),defaultFormat(),DEFAULT,getInstance(),EMPTY,defaults())){
+      RelationshipTypeCount[] relationshipTypeCounts=new RelationshipTypeCount[]{new RelationshipTypeCount(0,33),new RelationshipTypeCount(1,66)};
+      DataStatistics dataStatistics=new DataStatistics(100123,100456,relationshipTypeCounts);
+      try (ImportLogic logic=new ImportLogic(storage.directory().directory(),storage.fileSystem(),stores,DEFAULT,getInstance(),monitor,defaultFormat(),NO_MONITOR)){
+        logic.putState(dataStatistics);
+      }
+       verify(monitor).done(anyLong(),contains(dataStatistics.toString()));
+    }
+   }
+}

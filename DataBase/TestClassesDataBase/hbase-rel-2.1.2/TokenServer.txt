@@ -1,0 +1,172 @@
+/** 
+ * Basic server process for RPC authentication testing
+ */
+private static class TokenServer extends TokenProvider implements AuthenticationProtos.AuthenticationService.BlockingInterface, Runnable, Server {
+  private static final Logger LOG=LoggerFactory.getLogger(TokenServer.class);
+  private Configuration conf;
+  private HBaseTestingUtility TEST_UTIL;
+  private RpcServerInterface rpcServer;
+  private InetSocketAddress isa;
+  private ZKWatcher zookeeper;
+  private Sleeper sleeper;
+  private boolean started=false;
+  private boolean aborted=false;
+  private boolean stopped=false;
+  private long startcode;
+  public TokenServer(  Configuration conf,  HBaseTestingUtility TEST_UTIL) throws IOException {
+    this.conf=conf;
+    this.TEST_UTIL=TEST_UTIL;
+    this.startcode=EnvironmentEdgeManager.currentTime();
+    String hostname=Strings.domainNamePointerToHostName(DNS.getDefaultHost("default","default"));
+    int port=0;
+    InetSocketAddress initialIsa=new InetSocketAddress(hostname,port);
+    if (initialIsa.getAddress() == null) {
+      throw new IllegalArgumentException("Failed resolve of " + initialIsa);
+    }
+    final List<BlockingServiceAndInterface> sai=new ArrayList<>(1);
+    final BlockingService service=AuthenticationProtos.AuthenticationService.newReflectiveBlockingService(this);
+    final org.apache.hbase.thirdparty.com.google.protobuf.BlockingService proxy=new org.apache.hbase.thirdparty.com.google.protobuf.BlockingService(){
+      @Override public Message callBlockingMethod(      MethodDescriptor md,      org.apache.hbase.thirdparty.com.google.protobuf.RpcController controller,      Message param) throws org.apache.hbase.thirdparty.com.google.protobuf.ServiceException {
+        com.google.protobuf.Descriptors.MethodDescriptor methodDescriptor=service.getDescriptorForType().findMethodByName(md.getName());
+        com.google.protobuf.Message request=service.getRequestPrototype(methodDescriptor);
+        com.google.protobuf.Message response=null;
+        try {
+          response=service.callBlockingMethod(methodDescriptor,null,request);
+        }
+ catch (        ServiceException e) {
+          throw new org.apache.hbase.thirdparty.com.google.protobuf.ServiceException(e);
+        }
+        return null;
+      }
+      @Override public ServiceDescriptor getDescriptorForType(){
+        return null;
+      }
+      @Override public Message getRequestPrototype(      MethodDescriptor arg0){
+        return null;
+      }
+      @Override public Message getResponsePrototype(      MethodDescriptor arg0){
+        return null;
+      }
+    }
+;
+    sai.add(new BlockingServiceAndInterface(proxy,AuthenticationProtos.AuthenticationService.BlockingInterface.class));
+    this.rpcServer=RpcServerFactory.createRpcServer(this,"tokenServer",sai,initialIsa,conf,new FifoRpcScheduler(conf,1));
+    InetSocketAddress address=rpcServer.getListenerAddress();
+    if (address == null) {
+      throw new IOException("Listener channel is closed");
+    }
+    this.isa=address;
+    this.sleeper=new Sleeper(1000,this);
+  }
+  @Override public Configuration getConfiguration(){
+    return conf;
+  }
+  @Override public ClusterConnection getConnection(){
+    return null;
+  }
+  @Override public MetaTableLocator getMetaTableLocator(){
+    return null;
+  }
+  @Override public ZKWatcher getZooKeeper(){
+    return zookeeper;
+  }
+  @Override public CoordinatedStateManager getCoordinatedStateManager(){
+    return null;
+  }
+  @Override public boolean isAborted(){
+    return aborted;
+  }
+  @Override public ServerName getServerName(){
+    return ServerName.valueOf(isa.getHostName(),isa.getPort(),startcode);
+  }
+  @Override public FileSystem getFileSystem(){
+    return null;
+  }
+  @Override public boolean isStopping(){
+    return this.stopped;
+  }
+  @Override public void abort(  String reason,  Throwable error){
+    LOG.error(HBaseMarkers.FATAL,"Aborting on: " + reason,error);
+    this.aborted=true;
+    this.stopped=true;
+    sleeper.skipSleepCycle();
+  }
+  private void initialize() throws IOException {
+    Configuration zkConf=new Configuration(conf);
+    zkConf.set(User.HBASE_SECURITY_CONF_KEY,"simple");
+    this.zookeeper=new ZKWatcher(zkConf,TokenServer.class.getSimpleName(),this,true);
+    this.rpcServer.start();
+    RegionCoprocessorEnvironment mockRegionCpEnv=mock(RegionCoprocessorEnvironment.class,Mockito.withSettings().extraInterfaces(HasRegionServerServices.class));
+    when(mockRegionCpEnv.getConfiguration()).thenReturn(conf);
+    when(mockRegionCpEnv.getClassLoader()).then((var1) -> Thread.currentThread().getContextClassLoader());
+    RegionServerServices mockRss=mock(RegionServerServices.class);
+    when(mockRss.getRpcServer()).thenReturn(rpcServer);
+    when(((HasRegionServerServices)mockRegionCpEnv).getRegionServerServices()).thenReturn(mockRss);
+    super.start(mockRegionCpEnv);
+    started=true;
+  }
+  @Override public void run(){
+    try {
+      initialize();
+      while (!stopped) {
+        this.sleeper.sleep();
+      }
+    }
+ catch (    Exception e) {
+      abort(e.getMessage(),e);
+    }
+    this.rpcServer.stop();
+  }
+  public boolean isStarted(){
+    return started;
+  }
+  @Override public void stop(  String reason){
+    LOG.info("Stopping due to: " + reason);
+    this.stopped=true;
+    sleeper.skipSleepCycle();
+  }
+  @Override public boolean isStopped(){
+    return stopped;
+  }
+  public InetSocketAddress getAddress(){
+    return isa;
+  }
+  public SecretManager<? extends TokenIdentifier> getSecretManager(){
+    return ((RpcServer)rpcServer).getSecretManager();
+  }
+  @Override public AuthenticationProtos.GetAuthenticationTokenResponse getAuthenticationToken(  RpcController controller,  AuthenticationProtos.GetAuthenticationTokenRequest request) throws ServiceException {
+    LOG.debug("Authentication token request from " + RpcServer.getRequestUserName().orElse(null));
+    ServerRpcController serverController=new ServerRpcController();
+    final NonShadedBlockingRpcCallback<AuthenticationProtos.GetAuthenticationTokenResponse> callback=new NonShadedBlockingRpcCallback<>();
+    getAuthenticationToken(null,request,callback);
+    try {
+      serverController.checkFailed();
+      return callback.get();
+    }
+ catch (    IOException ioe) {
+      throw new ServiceException(ioe);
+    }
+  }
+  @Override public AuthenticationProtos.WhoAmIResponse whoAmI(  RpcController controller,  AuthenticationProtos.WhoAmIRequest request) throws ServiceException {
+    LOG.debug("whoAmI() request from " + RpcServer.getRequestUserName().orElse(null));
+    ServerRpcController serverController=new ServerRpcController();
+    NonShadedBlockingRpcCallback<AuthenticationProtos.WhoAmIResponse> callback=new NonShadedBlockingRpcCallback<>();
+    whoAmI(null,request,callback);
+    try {
+      serverController.checkFailed();
+      return callback.get();
+    }
+ catch (    IOException ioe) {
+      throw new ServiceException(ioe);
+    }
+  }
+  @Override public ChoreService getChoreService(){
+    return null;
+  }
+  @Override public ClusterConnection getClusterConnection(){
+    return null;
+  }
+  @Override public Connection createConnection(  Configuration conf) throws IOException {
+    return null;
+  }
+}

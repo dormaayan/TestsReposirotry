@@ -1,0 +1,146 @@
+/** 
+ * Unit tests for the S3 file system support via Hadoop's  {@link org.apache.hadoop.fs.s3a.S3AFileSystem}. <p><strong>BEWARE</strong>: tests must take special care of S3's <a href="https://docs.aws.amazon.com/AmazonS3/latest/dev/Introduction.html#ConsistencyModel">consistency guarantees</a> and what the  {@link org.apache.hadoop.fs.s3a.S3AFileSystem} offers.
+ */
+@RunWith(Parameterized.class) public class HadoopS3FileSystemITCase extends TestLogger {
+  @Parameterized.Parameter public String scheme;
+  @Parameterized.Parameters(name="Scheme = {0}") public static List<String> parameters(){
+    return Arrays.asList("s3","s3a");
+  }
+  private static final String TEST_DATA_DIR="tests-" + UUID.randomUUID();
+  private static final String BUCKET=System.getenv("ARTIFACTS_AWS_BUCKET");
+  private static final String ACCESS_KEY=System.getenv("ARTIFACTS_AWS_ACCESS_KEY");
+  private static final String SECRET_KEY=System.getenv("ARTIFACTS_AWS_SECRET_KEY");
+  /** 
+ * Will be updated by  {@link #checkCredentialsAndSetup()} if the test is not skipped.
+ */
+  private static boolean skipTest=true;
+  @BeforeClass public static void checkCredentialsAndSetup() throws IOException {
+    Assume.assumeTrue("AWS S3 bucket not configured, skipping test...",BUCKET != null);
+    Assume.assumeTrue("AWS S3 access key not configured, skipping test...",ACCESS_KEY != null);
+    Assume.assumeTrue("AWS S3 secret key not configured, skipping test...",SECRET_KEY != null);
+    final Configuration conf=new Configuration();
+    conf.setString("s3.access.key",ACCESS_KEY);
+    conf.setString("s3.secret.key",SECRET_KEY);
+    FileSystem.initialize(conf);
+    final Path directory=new Path("s3://" + BUCKET + '/'+ TEST_DATA_DIR);
+    final FileSystem fs=directory.getFileSystem();
+    assertFalse(fs.exists(directory));
+    FileSystem.initialize(new Configuration());
+    skipTest=false;
+  }
+  @AfterClass public static void cleanUp() throws IOException, InterruptedException {
+    if (!skipTest) {
+      final long deadline=System.nanoTime() + 30_000_000_000L;
+      final Configuration conf=new Configuration();
+      conf.setString("s3.access.key",ACCESS_KEY);
+      conf.setString("s3.secret.key",SECRET_KEY);
+      FileSystem.initialize(conf);
+      final Path directory=new Path("s3://" + BUCKET + '/'+ TEST_DATA_DIR);
+      final FileSystem fs=directory.getFileSystem();
+      fs.delete(directory,true);
+      checkPathEventualExistence(fs,directory,false,deadline);
+      FileSystem.initialize(new Configuration());
+    }
+  }
+  private String getBasePath(){
+    return scheme + "://" + BUCKET+ '/'+ TEST_DATA_DIR+ "/"+ scheme;
+  }
+  @Test public void testConfigKeysForwarding() throws Exception {
+    final Path path=new Path(getBasePath());
+{
+      FileSystem.initialize(new Configuration());
+      try {
+        path.getFileSystem();
+        fail("should fail with an exception");
+      }
+ catch (      IOException ignored) {
+      }
+    }
+{
+      Configuration conf=new Configuration();
+      conf.setString("fs.s3a.access.key",ACCESS_KEY);
+      conf.setString("fs.s3a.secret.key",SECRET_KEY);
+      FileSystem.initialize(conf);
+      path.getFileSystem();
+    }
+{
+      Configuration conf=new Configuration();
+      conf.setString("s3.access.key",ACCESS_KEY);
+      conf.setString("s3.secret.key",SECRET_KEY);
+      FileSystem.initialize(conf);
+      path.getFileSystem();
+    }
+{
+      Configuration conf=new Configuration();
+      conf.setString("s3.access-key",ACCESS_KEY);
+      conf.setString("s3.secret-key",SECRET_KEY);
+      FileSystem.initialize(conf);
+      path.getFileSystem();
+    }
+    FileSystem.initialize(new Configuration());
+    try {
+      path.getFileSystem();
+      fail("should fail with an exception");
+    }
+ catch (    IOException ignored) {
+    }
+  }
+  @Test public void testSimpleFileWriteAndRead() throws Exception {
+    final long deadline=System.nanoTime() + 30_000_000_000L;
+    final Configuration conf=new Configuration();
+    conf.setString("s3.access.key",ACCESS_KEY);
+    conf.setString("s3.secret.key",SECRET_KEY);
+    final String testLine="Hello Upload!";
+    FileSystem.initialize(conf);
+    final Path path=new Path(getBasePath() + "/test.txt");
+    final FileSystem fs=path.getFileSystem();
+    try {
+      try (FSDataOutputStream out=fs.create(path,WriteMode.OVERWRITE);OutputStreamWriter writer=new OutputStreamWriter(out,StandardCharsets.UTF_8)){
+        writer.write(testLine);
+      }
+       checkPathEventualExistence(fs,path,true,deadline);
+      try (FSDataInputStream in=fs.open(path);InputStreamReader ir=new InputStreamReader(in,StandardCharsets.UTF_8);BufferedReader reader=new BufferedReader(ir)){
+        String line=reader.readLine();
+        assertEquals(testLine,line);
+      }
+     }
+  finally {
+      fs.delete(path,false);
+    }
+    checkPathEventualExistence(fs,path,false,deadline);
+  }
+  @Test public void testDirectoryListing() throws Exception {
+    final long deadline=System.nanoTime() + 30_000_000_000L;
+    final Configuration conf=new Configuration();
+    conf.setString("s3.access.key",ACCESS_KEY);
+    conf.setString("s3.secret.key",SECRET_KEY);
+    FileSystem.initialize(conf);
+    final Path directory=new Path(getBasePath() + "/testdir/");
+    final FileSystem fs=directory.getFileSystem();
+    assertFalse(fs.exists(directory));
+    try {
+      assertTrue(fs.mkdirs(directory));
+      checkPathEventualExistence(fs,directory,true,deadline);
+      assertEquals(0,fs.listStatus(directory).length);
+      final int numFiles=3;
+      for (int i=0; i < numFiles; i++) {
+        Path file=new Path(directory,"/file-" + i);
+        try (FSDataOutputStream out=fs.create(file,WriteMode.OVERWRITE);OutputStreamWriter writer=new OutputStreamWriter(out,StandardCharsets.UTF_8)){
+          writer.write("hello-" + i + "\n");
+        }
+         checkPathEventualExistence(fs,file,true,deadline);
+      }
+      FileStatus[] files=fs.listStatus(directory);
+      assertNotNull(files);
+      assertEquals(3,files.length);
+      for (      FileStatus status : files) {
+        assertFalse(status.isDir());
+      }
+      assertTrue(fs.exists(directory));
+    }
+  finally {
+      fs.delete(directory,true);
+    }
+    checkPathEventualExistence(fs,directory,false,deadline);
+  }
+}

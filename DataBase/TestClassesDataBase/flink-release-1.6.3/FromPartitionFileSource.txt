@@ -1,0 +1,72 @@
+private static class FromPartitionFileSource extends RichParallelSourceFunction<Tuple2<Integer,Integer>> implements CheckpointedFunction, CheckpointListener {
+  private static final long serialVersionUID=1L;
+  private List<File> allPartitions;
+  private DataInputStream din;
+  private volatile boolean running;
+  private long position;
+  private transient ListState<Long> positionState;
+  private transient boolean isRestored;
+  private transient volatile boolean canFail;
+  public FromPartitionFileSource(  List<File> allPartitions){
+    this.allPartitions=allPartitions;
+  }
+  @Override public void open(  Configuration parameters) throws Exception {
+    super.open(parameters);
+    int subtaskIdx=getRuntimeContext().getIndexOfThisSubtask();
+    din=new DataInputStream(new BufferedInputStream(new FileInputStream(allPartitions.get(subtaskIdx))));
+    long toSkip=position;
+    while (toSkip > 0L) {
+      toSkip-=din.skip(toSkip);
+    }
+  }
+  @Override public void close() throws Exception {
+    super.close();
+    din.close();
+  }
+  @Override public void run(  SourceContext<Tuple2<Integer,Integer>> out) throws Exception {
+    this.running=true;
+    try {
+      while (running) {
+        checkFail();
+synchronized (out.getCheckpointLock()) {
+          Integer key=din.readInt();
+          Integer val=din.readInt();
+          out.collect(new Tuple2<>(key,val));
+          position+=2 * Integer.BYTES;
+        }
+      }
+    }
+ catch (    EOFException ignore) {
+      if (!isRestored) {
+        while (true) {
+          checkFail();
+        }
+      }
+    }
+  }
+  private void checkFail() throws Exception {
+    if (canFail) {
+      throw new Exception("Artificial failure.");
+    }
+  }
+  @Override public void cancel(){
+    this.running=false;
+  }
+  @Override public void notifyCheckpointComplete(  long checkpointId){
+    canFail=!isRestored;
+  }
+  @Override public void snapshotState(  FunctionSnapshotContext context) throws Exception {
+    positionState.add(position);
+  }
+  @Override public void initializeState(  FunctionInitializationContext context) throws Exception {
+    canFail=false;
+    position=0L;
+    isRestored=context.isRestored();
+    positionState=context.getOperatorStateStore().getListState(new ListStateDescriptor<>("posState",Long.class));
+    if (isRestored) {
+      for (      Long value : positionState.get()) {
+        position+=value;
+      }
+    }
+  }
+}

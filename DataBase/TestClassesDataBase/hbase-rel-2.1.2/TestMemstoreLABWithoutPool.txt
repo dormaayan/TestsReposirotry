@@ -1,0 +1,97 @@
+@Ignore @Category({RegionServerTests.class,SmallTests.class}) public class TestMemstoreLABWithoutPool {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestMemstoreLABWithoutPool.class);
+  private final static Configuration conf=new Configuration();
+  private static final byte[] rk=Bytes.toBytes("r1");
+  private static final byte[] cf=Bytes.toBytes("f");
+  private static final byte[] q=Bytes.toBytes("q");
+  @BeforeClass public static void setUpBeforeClass() throws Exception {
+    long globalMemStoreLimit=(long)(ManagementFactory.getMemoryMXBean().getHeapMemoryUsage().getMax() * 0.8);
+    ChunkCreator.initialize(MemStoreLABImpl.CHUNK_SIZE_DEFAULT + Bytes.SIZEOF_LONG,false,globalMemStoreLimit,0.0f,MemStoreLAB.POOL_INITIAL_SIZE_DEFAULT,null);
+  }
+  /** 
+ * Test a bunch of random allocations
+ */
+  @Test public void testLABRandomAllocation(){
+    Random rand=new Random();
+    MemStoreLAB mslab=new MemStoreLABImpl();
+    int expectedOff=0;
+    ByteBuffer lastBuffer=null;
+    int lastChunkId=-1;
+    for (int i=0; i < 100000; i++) {
+      int valSize=rand.nextInt(1000);
+      KeyValue kv=new KeyValue(rk,cf,q,new byte[valSize]);
+      int size=KeyValueUtil.length(kv);
+      ByteBufferKeyValue newKv=(ByteBufferKeyValue)mslab.copyCellInto(kv);
+      if (newKv.getBuffer() != lastBuffer) {
+        expectedOff=Bytes.SIZEOF_INT;
+        lastBuffer=newKv.getBuffer();
+        int chunkId=newKv.getBuffer().getInt(0);
+        assertTrue("chunkid should be different",chunkId != lastChunkId);
+        lastChunkId=chunkId;
+      }
+      assertEquals(expectedOff,newKv.getOffset());
+      assertTrue("Allocation overruns buffer",newKv.getOffset() + size <= newKv.getBuffer().capacity());
+      expectedOff+=size;
+    }
+  }
+  /** 
+ * Test frequent chunk retirement with chunk pool triggered by lots of threads, making sure there's no memory leak (HBASE-16195)
+ * @throws Exception if any error occurred
+ */
+  @Test public void testLABChunkQueueWithMultipleMSLABs() throws Exception {
+    Configuration conf=HBaseConfiguration.create();
+    MemStoreLABImpl[] mslab=new MemStoreLABImpl[10];
+    for (int i=0; i < 10; i++) {
+      mslab[i]=new MemStoreLABImpl(conf);
+    }
+    List<Thread> threads=new ArrayList<>();
+    final KeyValue kv=new KeyValue(Bytes.toBytes("r"),Bytes.toBytes("f"),Bytes.toBytes("q"),new byte[0]);
+    for (int i=0; i < 10; i++) {
+      for (int j=0; j < 10; j++) {
+        threads.add(getChunkQueueTestThread(mslab[i],"testLABChunkQueue-" + j,kv));
+      }
+    }
+    for (    Thread thread : threads) {
+      thread.start();
+    }
+    Thread.sleep(3000);
+    for (    Thread thread : threads) {
+      thread.interrupt();
+    }
+    boolean threadsRunning=true;
+    boolean alive=false;
+    while (threadsRunning) {
+      alive=false;
+      for (      Thread thread : threads) {
+        if (thread.isAlive()) {
+          alive=true;
+          break;
+        }
+      }
+      if (!alive) {
+        threadsRunning=false;
+      }
+    }
+    for (int i=0; i < 10; i++) {
+      mslab[i].close();
+    }
+    assertTrue("All the chunks must have been cleared",ChunkCreator.instance.numberOfMappedChunks() == 0);
+  }
+  private Thread getChunkQueueTestThread(  final MemStoreLABImpl mslab,  String threadName,  Cell cellToCopyInto){
+    Thread thread=new Thread(){
+      volatile boolean stopped=false;
+      @Override public void run(){
+        while (!stopped) {
+          mslab.copyCellInto(cellToCopyInto);
+        }
+      }
+      @Override public void interrupt(){
+        this.stopped=true;
+      }
+    }
+;
+    thread.setName(threadName);
+    thread.setDaemon(true);
+    return thread;
+  }
+}

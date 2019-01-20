@@ -1,0 +1,105 @@
+@Category({MasterTests.class,SmallTests.class}) public class TestForceUpdateProcedure {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestForceUpdateProcedure.class);
+  private static HBaseCommonTestingUtility UTIL=new HBaseCommonTestingUtility();
+  private static WALProcedureStore STORE;
+  private static ProcedureExecutor<Void> EXEC;
+  private static Exchanger<Boolean> EXCHANGER=new Exchanger<>();
+  private static int WAL_COUNT=5;
+  @Rule public final TestName name=new TestName();
+  private void createStoreAndExecutor() throws IOException {
+    UTIL.getConfiguration().setInt(CompletedProcedureCleaner.CLEANER_INTERVAL_CONF_KEY,1000);
+    Path logDir=UTIL.getDataTestDir(name.getMethodName());
+    STORE=ProcedureTestingUtility.createWalStore(UTIL.getConfiguration(),logDir);
+    STORE.start(1);
+    EXEC=new ProcedureExecutor<Void>(UTIL.getConfiguration(),null,STORE);
+    ProcedureTestingUtility.initAndStartWorkers(EXEC,1,true);
+  }
+  @BeforeClass public static void setUpBeforeClass() throws IOException {
+    UTIL.getConfiguration().setInt(WALProcedureStore.WAL_COUNT_WARN_THRESHOLD_CONF_KEY,WAL_COUNT);
+  }
+  private void stopStoreAndExecutor(){
+    EXEC.stop();
+    STORE.stop(false);
+    EXEC=null;
+    STORE=null;
+  }
+  @AfterClass public static void tearDownAfterClass() throws IOException {
+    UTIL.cleanupTestDir();
+  }
+  @Before public void setUp() throws IOException {
+    createStoreAndExecutor();
+  }
+  @After public void tearDown(){
+    stopStoreAndExecutor();
+  }
+public static final class WaitingProcedure extends NoopProcedure<Void> {
+    @Override protected Procedure<Void>[] execute(    Void env) throws ProcedureYieldException, ProcedureSuspendedException, InterruptedException {
+      EXCHANGER.exchange(Boolean.TRUE);
+      setState(ProcedureState.WAITING_TIMEOUT);
+      setTimeout(Integer.MAX_VALUE);
+      throw new ProcedureSuspendedException();
+    }
+  }
+public static final class ParentProcedure extends NoopProcedure<Void> {
+    @SuppressWarnings("unchecked") @Override protected Procedure<Void>[] execute(    Void env) throws ProcedureYieldException, ProcedureSuspendedException, InterruptedException {
+      return new Procedure[]{new NoopProcedure<>(),new WaitingProcedure()};
+    }
+  }
+public static final class ExchangeProcedure extends NoopProcedure<Void> {
+    @SuppressWarnings("unchecked") @Override protected Procedure<Void>[] execute(    Void env) throws ProcedureYieldException, ProcedureSuspendedException, InterruptedException {
+      if (EXCHANGER.exchange(Boolean.TRUE)) {
+        return new Procedure[]{this};
+      }
+ else {
+        return null;
+      }
+    }
+  }
+public static final class NoopNoAckProcedure extends NoopProcedure<Void> {
+    @Override protected boolean shouldWaitClientAck(    Void env){
+      return false;
+    }
+  }
+  @Test public void testProcedureStuck() throws IOException, InterruptedException {
+    EXEC.submitProcedure(new ParentProcedure());
+    EXCHANGER.exchange(Boolean.TRUE);
+    UTIL.waitFor(10000,() -> EXEC.getActiveExecutorCount() == 0);
+    long procId=EXEC.submitProcedure(new ExchangeProcedure());
+    assertEquals(1,STORE.getActiveLogs().size());
+    for (int i=0; i < WAL_COUNT - 1; i++) {
+      assertTrue(STORE.rollWriterForTesting());
+      assertEquals(2 + i,STORE.getActiveLogs().size());
+      EXCHANGER.exchange(Boolean.TRUE);
+      Thread.sleep(1000);
+    }
+    STORE.rollWriterForTesting();
+    EXCHANGER.exchange(Boolean.FALSE);
+    UTIL.waitFor(10000,() -> STORE.getActiveLogs().size() <= 2);
+    UTIL.waitFor(10000,() -> EXEC.isFinished(procId));
+    stopStoreAndExecutor();
+    createStoreAndExecutor();
+    Map<Class<?>,Procedure<Void>> procMap=new HashMap<>();
+    EXEC.getActiveProceduresNoCopy().forEach(p -> procMap.put(p.getClass(),p));
+    assertEquals(3,procMap.size());
+    ParentProcedure parentProc=(ParentProcedure)procMap.get(ParentProcedure.class);
+    assertEquals(ProcedureState.WAITING,parentProc.getState());
+    WaitingProcedure waitingProc=(WaitingProcedure)procMap.get(WaitingProcedure.class);
+    assertEquals(ProcedureState.WAITING_TIMEOUT,waitingProc.getState());
+    NoopProcedure<Void> noopProc=(NoopProcedure<Void>)procMap.get(NoopProcedure.class);
+    assertEquals(ProcedureState.SUCCESS,noopProc.getState());
+  }
+  @Test public void testCompletedProcedure() throws InterruptedException, IOException {
+    long procId=EXEC.submitProcedure(new ExchangeProcedure());
+    EXCHANGER.exchange(Boolean.FALSE);
+    UTIL.waitFor(10000,() -> EXEC.isFinished(procId));
+    for (int i=0; i < WAL_COUNT - 1; i++) {
+      assertTrue(STORE.rollWriterForTesting());
+      long pid=EXEC.submitProcedure(new NoopNoAckProcedure());
+      assertEquals(2 + i,STORE.getActiveLogs().size());
+      UTIL.waitFor(10000,() -> EXEC.isFinished(pid));
+    }
+    UTIL.waitFor(10000,() -> EXEC.getCompletedSize() == 1);
+    STORE.rollWriterForTesting();
+    UTIL.waitFor(10000,() -> STORE.getActiveLogs().size() <= 1);
+  }
+}

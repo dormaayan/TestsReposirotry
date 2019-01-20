@@ -1,0 +1,43 @@
+/** 
+ * CellChunkMap Segment index requires all cell data to be written in the MSLAB Chunks. Even though MSLAB is enabled, cells bigger than maxAlloc (even if smaller than the size of a chunk) are not written in the MSLAB Chunks. If such cells are found in the process of flattening into CellChunkMap (in-memory-flush) they need to be copied into MSLAB. testFlatteningToBigCellChunkMap checks that the process of flattening into CellChunkMap succeeds, even when such big cells are allocated.
+ */
+@Test public void testFlatteningToBigCellChunkMap() throws IOException {
+  if (toCellChunkMap == false) {
+    return;
+  }
+  MemoryCompactionPolicy compactionType=MemoryCompactionPolicy.BASIC;
+  memstore.getConfiguration().set(CompactingMemStore.COMPACTING_MEMSTORE_TYPE_KEY,String.valueOf(compactionType));
+  ((MyCompactingMemStore)memstore).initiateType(compactionType,memstore.getConfiguration());
+  ((CompactingMemStore)memstore).setIndexType(CompactingMemStore.IndexType.CHUNK_MAP);
+  int numOfCells=4;
+  char[] chars=new char[MemStoreLAB.MAX_ALLOC_DEFAULT];
+  for (int i=0; i < chars.length; i++) {
+    chars[i]='A';
+  }
+  String bigVal=new String(chars);
+  String[] keys1={"A","B","C","D"};
+  byte[] row=Bytes.toBytes(keys1[0]);
+  byte[] val=Bytes.toBytes(bigVal);
+  KeyValue kv=new KeyValue(row,Bytes.toBytes("testfamily"),Bytes.toBytes("testqualifier"),System.currentTimeMillis(),val);
+  int totalCellsLen=addRowsByKeys(memstore,keys1,val);
+  long oneCellOnCSLMHeapSize=ClassSize.align(ClassSize.CONCURRENT_SKIPLISTMAP_ENTRY + kv.heapSize());
+  long totalHeapSize=numOfCells * oneCellOnCSLMHeapSize + MutableSegment.DEEP_OVERHEAD;
+  assertEquals(totalCellsLen,regionServicesForStores.getMemStoreSize());
+  assertEquals(totalHeapSize,((CompactingMemStore)memstore).heapSize());
+  ((CompactingMemStore)memstore).flushInMemory();
+  while (((CompactingMemStore)memstore).isMemStoreFlushingInMemory()) {
+    Threads.sleep(10);
+  }
+  assertEquals(0,memstore.getSnapshot().getCellsCount());
+  long oneCellOnCCMHeapSize=ClassSize.CELL_CHUNK_MAP_ENTRY + ClassSize.align(KeyValueUtil.length(kv));
+  totalHeapSize=MutableSegment.DEEP_OVERHEAD + CellChunkImmutableSegment.DEEP_OVERHEAD_CCM + numOfCells * oneCellOnCCMHeapSize;
+  assertEquals(totalCellsLen,regionServicesForStores.getMemStoreSize());
+  assertEquals(totalHeapSize,((CompactingMemStore)memstore).heapSize());
+  MemStoreSize mss=memstore.getFlushableSize();
+  MemStoreSnapshot snapshot=memstore.snapshot();
+  region.decrMemStoreSize(mss);
+  ImmutableSegment s=memstore.getSnapshot();
+  assertEquals(numOfCells,s.getCellsCount());
+  assertEquals(0,regionServicesForStores.getMemStoreSize());
+  memstore.clearSnapshot(snapshot.getId());
+}

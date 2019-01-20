@@ -1,0 +1,59 @@
+/** 
+ * Tests that the internal time of a CEP operator advances only given watermarks. See FLINK-5033
+ */
+@Test public void testKeyedAdvancingTimeWithoutElements() throws Exception {
+  final Event startEvent=new Event(42,"start",1.0);
+  final long watermarkTimestamp1=5L;
+  final long watermarkTimestamp2=13L;
+  final Map<String,List<Event>> expectedSequence=new HashMap<>(2);
+  expectedSequence.put("start",Collections.<Event>singletonList(startEvent));
+  final OutputTag<Tuple2<Map<String,List<Event>>,Long>> timedOut=new OutputTag<Tuple2<Map<String,List<Event>>,Long>>("timedOut"){
+  }
+;
+  final KeyedOneInputStreamOperatorTestHarness<Integer,Event,Map<String,List<Event>>> harness=new KeyedOneInputStreamOperatorTestHarness<>(new SelectTimeoutCepOperator<>(Event.createTypeSerializer(),false,new NFAFactory(true),null,null,new PatternSelectFunction<Event,Map<String,List<Event>>>(){
+    private static final long serialVersionUID=-5768297287711394420L;
+    @Override public Map<String,List<Event>> select(    Map<String,List<Event>> pattern) throws Exception {
+      return pattern;
+    }
+  }
+,new PatternTimeoutFunction<Event,Tuple2<Map<String,List<Event>>,Long>>(){
+    private static final long serialVersionUID=2843329425823093249L;
+    @Override public Tuple2<Map<String,List<Event>>,Long> timeout(    Map<String,List<Event>> pattern,    long timeoutTimestamp) throws Exception {
+      return Tuple2.of(pattern,timeoutTimestamp);
+    }
+  }
+,timedOut,null),new KeySelector<Event,Integer>(){
+    private static final long serialVersionUID=7219185117566268366L;
+    @Override public Integer getKey(    Event value) throws Exception {
+      return value.getId();
+    }
+  }
+,BasicTypeInfo.INT_TYPE_INFO);
+  try {
+    String rocksDbPath=tempFolder.newFolder().getAbsolutePath();
+    RocksDBStateBackend rocksDBStateBackend=new RocksDBStateBackend(new MemoryStateBackend());
+    rocksDBStateBackend.setDbStoragePath(rocksDbPath);
+    harness.setStateBackend(rocksDBStateBackend);
+    harness.setup(new KryoSerializer<>((Class<Map<String,List<Event>>>)(Object)Map.class,new ExecutionConfig()));
+    harness.open();
+    harness.processElement(new StreamRecord<>(startEvent,3L));
+    harness.processWatermark(new Watermark(watermarkTimestamp1));
+    harness.processWatermark(new Watermark(watermarkTimestamp2));
+    Queue<Object> result=harness.getOutput();
+    Queue<StreamRecord<Tuple2<Map<String,List<Event>>,Long>>> sideOutput=harness.getSideOutput(timedOut);
+    assertEquals(2L,result.size());
+    assertEquals(1L,sideOutput.size());
+    Object watermark1=result.poll();
+    assertTrue(watermark1 instanceof Watermark);
+    assertEquals(watermarkTimestamp1,((Watermark)watermark1).getTimestamp());
+    Tuple2<Map<String,List<Event>>,Long> leftResult=sideOutput.poll().getValue();
+    assertEquals(watermarkTimestamp2,(long)leftResult.f1);
+    assertEquals(expectedSequence,leftResult.f0);
+    Object watermark2=result.poll();
+    assertTrue(watermark2 instanceof Watermark);
+    assertEquals(watermarkTimestamp2,((Watermark)watermark2).getTimestamp());
+  }
+  finally {
+    harness.close();
+  }
+}

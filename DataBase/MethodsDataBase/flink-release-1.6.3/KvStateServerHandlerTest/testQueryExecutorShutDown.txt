@@ -1,0 +1,36 @@
+/** 
+ * Tests the failure response on a rejected execution, because the query executor has been closed.
+ */
+@Test public void testQueryExecutorShutDown() throws Throwable {
+  KvStateRegistry registry=new KvStateRegistry();
+  AtomicKvStateRequestStats stats=new AtomicKvStateRequestStats();
+  KvStateServerImpl localTestServer=new KvStateServerImpl(InetAddress.getLocalHost(),Collections.singletonList(0).iterator(),1,1,new KvStateRegistry(),new DisabledKvStateRequestStats());
+  localTestServer.start();
+  localTestServer.shutdown();
+  assertTrue(localTestServer.getQueryExecutor().isTerminated());
+  MessageSerializer<KvStateInternalRequest,KvStateResponse> serializer=new MessageSerializer<>(new KvStateInternalRequest.KvStateInternalRequestDeserializer(),new KvStateResponse.KvStateResponseDeserializer());
+  KvStateServerHandler handler=new KvStateServerHandler(localTestServer,registry,serializer,stats);
+  EmbeddedChannel channel=new EmbeddedChannel(getFrameDecoder(),handler);
+  int numKeyGroups=1;
+  AbstractStateBackend abstractBackend=new MemoryStateBackend();
+  DummyEnvironment dummyEnv=new DummyEnvironment("test",1,0);
+  dummyEnv.setKvStateRegistry(registry);
+  KeyedStateBackend<Integer> backend=createKeyedStateBackend(registry,numKeyGroups,abstractBackend,dummyEnv);
+  final TestRegistryListener registryListener=new TestRegistryListener();
+  registry.registerListener(dummyEnv.getJobID(),registryListener);
+  ValueStateDescriptor<Integer> desc=new ValueStateDescriptor<>("any",IntSerializer.INSTANCE);
+  desc.setQueryable("vanilla");
+  backend.getPartitionedState(VoidNamespace.INSTANCE,VoidNamespaceSerializer.INSTANCE,desc);
+  assertTrue(registryListener.registrationName.equals("vanilla"));
+  KvStateInternalRequest request=new KvStateInternalRequest(registryListener.kvStateId,new byte[0]);
+  ByteBuf serRequest=MessageSerializer.serializeRequest(channel.alloc(),282872L,request);
+  channel.writeInbound(serRequest);
+  ByteBuf buf=(ByteBuf)readInboundBlocking(channel);
+  buf.skipBytes(4);
+  assertEquals(MessageType.REQUEST_FAILURE,MessageSerializer.deserializeHeader(buf));
+  RequestFailure response=MessageSerializer.deserializeRequestFailure(buf);
+  assertTrue(response.getCause().getMessage().contains("RejectedExecutionException"));
+  assertEquals(1L,stats.getNumRequests());
+  assertEquals(1L,stats.getNumFailed());
+  localTestServer.shutdown();
+}

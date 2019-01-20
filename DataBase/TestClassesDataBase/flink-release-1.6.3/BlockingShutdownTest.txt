@@ -1,0 +1,110 @@
+/** 
+ * Test that verifies the behavior of blocking shutdown hooks and of the {@link JvmShutdownSafeguard} that guards against it.
+ */
+public class BlockingShutdownTest {
+  @Test public void testProcessShutdownBlocking() throws Exception {
+    assumeTrue(OperatingSystem.isLinux());
+    final File markerFile=new File(EnvironmentInformation.getTemporaryFileDirectory(),UUID.randomUUID() + ".marker");
+    final BlockingShutdownProcess blockingProcess=new BlockingShutdownProcess(markerFile.getAbsolutePath(),0,false);
+    try {
+      blockingProcess.startProcess();
+      long pid=blockingProcess.getProcessId();
+      assertTrue("Cannot determine process ID",pid != -1);
+      TestJvmProcess.waitForMarkerFile(markerFile,30000);
+      Process kill=Runtime.getRuntime().exec("kill " + pid);
+      kill.waitFor();
+      assertEquals("failed to send SIG_TERM to process",0,kill.exitValue());
+      Thread.sleep(50);
+      assertTrue("Test broken, process shutdown blocking does not work",blockingProcess.isAlive());
+    }
+  finally {
+      blockingProcess.destroy();
+      markerFile.delete();
+    }
+  }
+  @Test public void testProcessExitsDespiteBlockingShutdownHook() throws Exception {
+    assumeTrue(OperatingSystem.isLinux());
+    final File markerFile=new File(EnvironmentInformation.getTemporaryFileDirectory(),UUID.randomUUID() + ".marker");
+    final BlockingShutdownProcess blockingProcess=new BlockingShutdownProcess(markerFile.getAbsolutePath(),100,true);
+    try {
+      blockingProcess.startProcess();
+      long pid=blockingProcess.getProcessId();
+      assertTrue("Cannot determine process ID",pid != -1);
+      TestJvmProcess.waitForMarkerFile(markerFile,30000);
+      Process kill=Runtime.getRuntime().exec("kill " + pid);
+      kill.waitFor();
+      assertEquals("failed to send SIG_TERM to process",0,kill.exitValue());
+      final long deadline=System.nanoTime() + 30_000_000_000L;
+      while (blockingProcess.isAlive() && System.nanoTime() < deadline) {
+        Thread.sleep(50);
+      }
+      assertFalse("shutdown blocking process does not properly terminate itself",blockingProcess.isAlive());
+    }
+  finally {
+      blockingProcess.destroy();
+      markerFile.delete();
+    }
+  }
+  static void parkForever(){
+    final Object lock=new Object();
+    while (true) {
+      try {
+synchronized (lock) {
+          lock.wait();
+        }
+      }
+ catch (      InterruptedException ignored) {
+      }
+    }
+  }
+private static final class BlockingShutdownProcess extends TestJvmProcess {
+    private final String tempFilePath;
+    private final long selfKillDelay;
+    private final boolean installSignalHandler;
+    public BlockingShutdownProcess(    String tempFilePath,    long selfKillDelay,    boolean installSignalHandler) throws Exception {
+      this.tempFilePath=tempFilePath;
+      this.selfKillDelay=selfKillDelay;
+      this.installSignalHandler=installSignalHandler;
+    }
+    @Override public String getName(){
+      return "BlockingShutdownProcess";
+    }
+    @Override public String[] getJvmArgs(){
+      return new String[]{tempFilePath,String.valueOf(installSignalHandler),String.valueOf(selfKillDelay)};
+    }
+    @Override public String getEntryPointClassName(){
+      return BlockingShutdownProcessEntryPoint.class.getName();
+    }
+  }
+public static final class BlockingShutdownProcessEntryPoint {
+    private static final Logger LOG=LoggerFactory.getLogger(BlockingShutdownProcessEntryPoint.class);
+    public static void main(    String[] args) throws Exception {
+      File touchFile=new File(args[0]);
+      boolean installHandler=Boolean.parseBoolean(args[1]);
+      long killDelay=Long.parseLong(args[2]);
+      Thread shutdownHook=new Thread(new BlockingRunnable(),"Blocking ShutdownHook");
+      try {
+        Runtime.getRuntime().addShutdownHook(shutdownHook);
+      }
+ catch (      IllegalStateException ignored) {
+      }
+catch (      Throwable t) {
+        System.err.println("Cannot register process cleanup shutdown hook.");
+        t.printStackTrace();
+      }
+      if (installHandler) {
+        JvmShutdownSafeguard.installAsShutdownHook(LOG,killDelay);
+      }
+      System.err.println("signaling process started");
+      TestJvmProcess.touchFile(touchFile);
+      System.err.println("parking the main thread");
+      parkForever();
+    }
+  }
+static final class BlockingRunnable implements Runnable {
+    @Override public void run(){
+      System.err.println("starting shutdown hook");
+      parkForever();
+    }
+  }
+}

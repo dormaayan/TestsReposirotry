@@ -1,0 +1,45 @@
+@Test public void shouldBeAbleToShutdownWhenThereAreTransactionsWaitingForLocks() throws Exception {
+  final Node node;
+  try (Transaction tx=db.beginTx()){
+    node=db.createNode();
+    tx.success();
+  }
+   final CountDownLatch nodeLockedLatch=new CountDownLatch(1);
+  final CountDownLatch shutdownCalled=new CountDownLatch(1);
+  Future<Void> shutdownFuture=t2.execute(state -> {
+    try (Transaction tx=db.beginTx()){
+      node.addLabel(label("ABC"));
+      nodeLockedLatch.countDown();
+      t3.get().waitUntilWaiting(details -> details.isAt(CommunityLockClient.class,"acquireExclusive"));
+      db.shutdown();
+      shutdownCalled.countDown();
+      tx.success();
+    }
+     return null;
+  }
+);
+  Future<Void> secondTxResult=t3.execute(state -> {
+    try (Transaction tx=db.beginTx()){
+      nodeLockedLatch.await();
+      node.addLabel(label("DEF"));
+      shutdownCalled.await();
+      tx.success();
+    }
+     return null;
+  }
+);
+  try {
+    secondTxResult.get(60,SECONDS);
+    fail("Exception expected");
+  }
+ catch (  Exception e) {
+    assertThat(rootCause(e),instanceOf(TransactionTerminatedException.class));
+  }
+  try {
+    shutdownFuture.get();
+    fail("Should thrown exception since transaction should be canceled.");
+  }
+ catch (  Exception e) {
+    assertThat(rootCause(e),instanceOf(TransactionTerminatedException.class));
+  }
+}

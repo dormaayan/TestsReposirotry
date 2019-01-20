@@ -1,0 +1,50 @@
+@Test(timeout=3000000) public void testBlockReadOpWhileMovingBlock() throws IOException {
+  MiniDFSCluster cluster=null;
+  try {
+    conf.setInt(DFSConfigKeys.DFS_REPLICATION_KEY,1);
+    cluster=new MiniDFSCluster.Builder(conf).numDataNodes(1).storageTypes(new StorageType[]{StorageType.DISK,StorageType.DISK}).storagesPerDatanode(2).build();
+    FileSystem fs=cluster.getFileSystem();
+    DataNode dataNode=cluster.getDataNodes().get(0);
+    Path filePath=new Path("/tmp/testData");
+    String blockData=RandomStringUtils.randomAscii(512 * 4);
+    FSDataOutputStream fout=fs.create(filePath);
+    fout.writeBytes(blockData);
+    fout.close();
+    assertEquals(blockData,DFSTestUtil.readFile(fs,filePath));
+    ExtendedBlock block=DFSTestUtil.getFirstBlock(fs,filePath);
+    BlockReaderTestUtil util=new BlockReaderTestUtil(cluster,new HdfsConfiguration(conf));
+    LocatedBlock blk=util.getFileBlocks(filePath,512 * 2).get(0);
+    File[] blkFiles=cluster.getAllBlockFiles(block);
+    LOG.info("Reading partial data for block {} before moving it: ",blk.getBlock().toString());
+    BlockReader blkReader=BlockReaderTestUtil.getBlockReader((DistributedFileSystem)fs,blk,0,512 * 2);
+    byte[] buf=new byte[512 * 2];
+    blkReader.read(buf,0,512);
+    assertEquals(blockData.substring(0,512),new String(buf,StandardCharsets.US_ASCII).substring(0,512));
+    FsDatasetImpl fsDataSetImpl=(FsDatasetImpl)dataNode.getFSDataset();
+    ReplicaInfo replicaInfo=fsDataSetImpl.getReplicaInfo(block);
+    FsVolumeSpi destVolume=getDestinationVolume(block,fsDataSetImpl);
+    assertNotNull("Destination volume should not be null.",destVolume);
+    fsDataSetImpl.moveBlock(block,replicaInfo,destVolume.obtainReference());
+    cluster.triggerBlockReports();
+    blkReader.read(buf,512,512);
+    assertEquals(blockData.substring(0,512 * 2),new String(buf,StandardCharsets.US_ASCII).substring(0,512 * 2));
+    blkReader=BlockReaderTestUtil.getBlockReader((DistributedFileSystem)fs,blk,0,blockData.length());
+    buf=new byte[512 * 4];
+    blkReader.read(buf,0,512 * 4);
+    assertEquals(blockData,new String(buf,StandardCharsets.US_ASCII));
+    blkReader.close();
+    ExtendedBlock block2=DFSTestUtil.getFirstBlock(fs,filePath);
+    File[] blkFiles2=cluster.getAllBlockFiles(block2);
+    blk=util.getFileBlocks(filePath,512 * 4).get(0);
+    blkReader=BlockReaderTestUtil.getBlockReader((DistributedFileSystem)fs,blk,0,blockData.length());
+    blkReader.read(buf,0,512 * 4);
+    assertFalse(Files.exists(Paths.get(blkFiles[0].getAbsolutePath())));
+    assertNotEquals(blkFiles[0],blkFiles2[0]);
+    assertEquals(blockData,new String(buf,StandardCharsets.US_ASCII));
+  }
+  finally {
+    if (cluster.isClusterUp()) {
+      cluster.shutdown();
+    }
+  }
+}

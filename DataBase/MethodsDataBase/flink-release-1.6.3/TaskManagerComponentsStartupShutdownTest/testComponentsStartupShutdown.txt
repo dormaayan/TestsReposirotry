@@ -1,0 +1,63 @@
+/** 
+ * Makes sure that all components are shut down when the TaskManager actor is shut down.
+ */
+@Test public void testComponentsStartupShutdown() throws Exception {
+  final Time timeout=Time.seconds(100);
+  final int BUFFER_SIZE=32 * 1024;
+  Configuration config=new Configuration();
+  config.setString(AkkaOptions.WATCH_HEARTBEAT_INTERVAL,"200 ms");
+  config.setString(AkkaOptions.WATCH_HEARTBEAT_PAUSE,"1 s");
+  config.setInteger(AkkaOptions.WATCH_THRESHOLD,1);
+  final String[] TMP_DIR=ConfigurationUtils.parseTempDirectories(config);
+  ActorSystem actorSystem=null;
+  HighAvailabilityServices highAvailabilityServices=new EmbeddedHaServices(TestingUtils.defaultExecutor());
+  ActorRef jobManager=null;
+  ActorRef taskManager=null;
+  try {
+    actorSystem=AkkaUtils.createLocalActorSystem(config);
+    jobManager=JobManager.startJobManagerActors(config,actorSystem,TestingUtils.defaultExecutor(),TestingUtils.defaultExecutor(),highAvailabilityServices,NoOpMetricRegistry.INSTANCE,Option.empty(),JobManager.class,MemoryArchivist.class)._1();
+    FlinkResourceManager.startResourceManagerActors(config,actorSystem,highAvailabilityServices.getJobManagerLeaderRetriever(HighAvailabilityServices.DEFAULT_JOB_ID),StandaloneResourceManager.class);
+    final int numberOfSlots=1;
+    final TaskManagerConfiguration tmConfig=new TaskManagerConfiguration(numberOfSlots,TMP_DIR,timeout,null,Time.milliseconds(500),Time.seconds(30),Time.seconds(10),config,false,FlinkUserCodeClassLoaders.ResolveOrder.CHILD_FIRST,new String[0],null,null);
+    final int networkBufNum=32;
+    final NetworkEnvironmentConfiguration netConf=new NetworkEnvironmentConfiguration(0.1f,networkBufNum * BUFFER_SIZE,networkBufNum * BUFFER_SIZE,BUFFER_SIZE,IOManager.IOMode.SYNC,0,0,2,8,null);
+    ResourceID taskManagerId=ResourceID.generate();
+    final TaskManagerLocation connectionInfo=new TaskManagerLocation(taskManagerId,InetAddress.getLocalHost(),10000);
+    final MemoryManager memManager=new MemoryManager(networkBufNum * BUFFER_SIZE,1,BUFFER_SIZE,MemoryType.HEAP,false);
+    final IOManager ioManager=new IOManagerAsync(TMP_DIR);
+    final NetworkEnvironment network=new NetworkEnvironment(32,netConf.networkBufferSize(),netConf.partitionRequestInitialBackoff(),netConf.partitionRequestMaxBackoff(),netConf.networkBuffersPerChannel(),netConf.floatingNetworkBuffersPerGate(),true);
+    network.start();
+    TaskExecutorLocalStateStoresManager storesManager=new TaskExecutorLocalStateStoresManager(false,ioManager.getSpillingDirectories(),Executors.directExecutor());
+    MetricRegistryConfiguration metricRegistryConfiguration=MetricRegistryConfiguration.fromConfiguration(config);
+    final Props tmProps=Props.create(TaskManager.class,tmConfig,taskManagerId,connectionInfo,memManager,ioManager,network,storesManager,numberOfSlots,highAvailabilityServices,new TaskManagerMetricGroup(NoOpMetricRegistry.INSTANCE,connectionInfo.getHostname(),connectionInfo.getResourceID().getResourceIdString()));
+    taskManager=actorSystem.actorOf(tmProps);
+    final ActorRef finalTaskManager=taskManager;
+    new JavaTestKit(actorSystem){
+{
+        new Within(new FiniteDuration(5000L,TimeUnit.SECONDS)){
+          @Override protected void run(){
+            finalTaskManager.tell(TaskManagerMessages.getNotifyWhenRegisteredAtJobManagerMessage(),getTestActor());
+            expectMsgClass(TaskManagerMessages.RegisteredAtJobManager.class);
+          }
+        }
+;
+      }
+    }
+;
+    taskManager.tell(Kill.getInstance(),ActorRef.noSender());
+    jobManager.tell(Kill.getInstance(),ActorRef.noSender());
+    actorSystem.shutdown();
+    actorSystem.awaitTermination();
+    actorSystem=null;
+    assertTrue(network.isShutdown());
+    assertTrue(ioManager.isProperlyShutDown());
+    assertTrue(memManager.isShutdown());
+  }
+  finally {
+    if (actorSystem != null) {
+      actorSystem.shutdown();
+      actorSystem.awaitTermination(TestingUtils.TESTING_TIMEOUT());
+    }
+    highAvailabilityServices.closeAndCleanupAllData();
+  }
+}

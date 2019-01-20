@@ -1,0 +1,64 @@
+/** 
+ * Kafka 0.10 specific test, ensuring Timestamps are properly written to and read from Kafka.
+ */
+@Ignore("This test is disabled because of: https://issues.apache.org/jira/browse/FLINK-9217") @Test(timeout=60000) public void testTimestamps() throws Exception {
+  final String topic="tstopic";
+  createTestTopic(topic,3,1);
+  StreamExecutionEnvironment env=StreamExecutionEnvironment.getExecutionEnvironment();
+  env.setParallelism(1);
+  env.getConfig().setRestartStrategy(RestartStrategies.noRestart());
+  env.getConfig().disableSysoutLogging();
+  env.setStreamTimeCharacteristic(TimeCharacteristic.EventTime);
+  DataStream<Long> streamWithTimestamps=env.addSource(new SourceFunction<Long>(){
+    private static final long serialVersionUID=-2255105836471289626L;
+    boolean running=true;
+    @Override public void run(    SourceContext<Long> ctx) throws Exception {
+      long i=0;
+      while (running) {
+        ctx.collectWithTimestamp(i,i * 2);
+        if (i++ == 1000L) {
+          running=false;
+        }
+      }
+    }
+    @Override public void cancel(){
+      running=false;
+    }
+  }
+);
+  final TypeInformationSerializationSchema<Long> longSer=new TypeInformationSerializationSchema<>(Types.LONG,env.getConfig());
+  FlinkKafkaProducer010.FlinkKafkaProducer010Configuration prod=FlinkKafkaProducer010.writeToKafkaWithTimestamps(streamWithTimestamps,topic,new KeyedSerializationSchemaWrapper<>(longSer),standardProps,new FlinkKafkaPartitioner<Long>(){
+    private static final long serialVersionUID=-6730989584364230617L;
+    @Override public int partition(    Long next,    byte[] key,    byte[] value,    String targetTopic,    int[] partitions){
+      return (int)(next % 3);
+    }
+  }
+);
+  prod.setParallelism(3);
+  prod.setWriteTimestampToKafka(true);
+  env.execute("Produce some");
+  env=StreamExecutionEnvironment.getExecutionEnvironment();
+  env.setParallelism(1);
+  env.getConfig().setRestartStrategy(RestartStrategies.noRestart());
+  env.getConfig().disableSysoutLogging();
+  env.setStreamTimeCharacteristic(TimeCharacteristic.EventTime);
+  FlinkKafkaConsumer010<Long> kafkaSource=new FlinkKafkaConsumer010<>(topic,new LimitedLongDeserializer(),standardProps);
+  kafkaSource.assignTimestampsAndWatermarks(new AssignerWithPunctuatedWatermarks<Long>(){
+    private static final long serialVersionUID=-4834111073247835189L;
+    @Nullable @Override public Watermark checkAndGetNextWatermark(    Long lastElement,    long extractedTimestamp){
+      if (lastElement % 10 == 0) {
+        return new Watermark(lastElement);
+      }
+      return null;
+    }
+    @Override public long extractTimestamp(    Long element,    long previousElementTimestamp){
+      return previousElementTimestamp;
+    }
+  }
+);
+  DataStream<Long> stream=env.addSource(kafkaSource);
+  GenericTypeInfo<Object> objectTypeInfo=new GenericTypeInfo<>(Object.class);
+  stream.transform("timestamp validating operator",objectTypeInfo,new TimestampValidatingOperator()).setParallelism(1);
+  env.execute("Consume again");
+  deleteTestTopic(topic);
+}

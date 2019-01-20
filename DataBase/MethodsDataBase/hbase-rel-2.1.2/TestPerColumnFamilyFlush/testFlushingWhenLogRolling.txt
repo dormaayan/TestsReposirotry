@@ -1,0 +1,69 @@
+/** 
+ * When a log roll is about to happen, we do a flush of the regions who will be affected by the log roll. These flushes cannot be a selective flushes, otherwise we cannot roll the logs. This test ensures that we do a full-flush in that scenario.
+ * @throws IOException
+ */
+@Test public void testFlushingWhenLogRolling() throws Exception {
+  TableName tableName=TableName.valueOf("testFlushingWhenLogRolling");
+  Configuration conf=TEST_UTIL.getConfiguration();
+  conf.setLong(HConstants.HREGION_MEMSTORE_FLUSH_SIZE,128 * 1024 * 1024);
+  conf.set(FlushPolicyFactory.HBASE_FLUSH_POLICY_KEY,FlushAllLargeStoresPolicy.class.getName());
+  long cfFlushSizeLowerBound=2048;
+  conf.setLong(FlushLargeStoresPolicy.HREGION_COLUMNFAMILY_FLUSH_SIZE_LOWER_BOUND_MIN,cfFlushSizeLowerBound);
+  conf.setLong("hbase.regionserver.logroll.period",60L * 60 * 1000);
+  conf.setLong("hbase.regionserver.hlog.blocksize",128L * 1024 * 1024);
+  final int maxLogs=10;
+  conf.setInt("hbase.regionserver.maxlogs",maxLogs);
+  final int numRegionServers=1;
+  TEST_UTIL.startMiniCluster(numRegionServers);
+  try {
+    Table table=TEST_UTIL.createTable(tableName,FAMILIES);
+    try (Admin admin=TEST_UTIL.getConnection().getAdmin()){
+      admin.flush(TableName.NAMESPACE_TABLE_NAME);
+    }
+     Pair<HRegion,HRegionServer> desiredRegionAndServer=getRegionWithName(tableName);
+    final HRegion desiredRegion=desiredRegionAndServer.getFirst();
+    assertTrue("Could not find a region which hosts the new region.",desiredRegion != null);
+    LOG.info("Writing to region=" + desiredRegion);
+    for (int i=1; i <= 3; i++) {
+      table.put(createPut(i,0));
+    }
+    for (int i=0; i < maxLogs; i++) {
+      for (int j=0; j < 100; j++) {
+        table.put(createPut(1,i * 100 + j));
+      }
+      int currentNumRolledLogFiles=getNumRolledLogFiles(desiredRegion);
+      assertNull(getWAL(desiredRegion).rollWriter());
+      while (getNumRolledLogFiles(desiredRegion) <= currentNumRolledLogFiles) {
+        Thread.sleep(100);
+      }
+    }
+    assertEquals(maxLogs,getNumRolledLogFiles(desiredRegion));
+    assertTrue(desiredRegion.getStore(FAMILY1).getMemStoreSize().getHeapSize() > cfFlushSizeLowerBound);
+    assertTrue(desiredRegion.getStore(FAMILY2).getMemStoreSize().getHeapSize() < cfFlushSizeLowerBound);
+    assertTrue(desiredRegion.getStore(FAMILY3).getMemStoreSize().getHeapSize() < cfFlushSizeLowerBound);
+    table.put(createPut(1,12345678));
+    desiredRegionAndServer.getSecond().walRoller.requestRollAll();
+    TEST_UTIL.waitFor(30000,new Waiter.ExplainingPredicate<Exception>(){
+      @Override public boolean evaluate() throws Exception {
+        return desiredRegion.getMemStoreDataSize() == 0;
+      }
+      @Override public String explainFailure() throws Exception {
+        long memstoreSize=desiredRegion.getMemStoreDataSize();
+        if (memstoreSize > 0) {
+          return "Still have unflushed entries in memstore, memstore size is " + memstoreSize;
+        }
+        return "Unknown";
+      }
+    }
+);
+    LOG.info("Finished waiting on flush after too many WALs...");
+    assertEquals(MutableSegment.DEEP_OVERHEAD,desiredRegion.getStore(FAMILY1).getMemStoreSize().getHeapSize());
+    assertEquals(MutableSegment.DEEP_OVERHEAD,desiredRegion.getStore(FAMILY2).getMemStoreSize().getHeapSize());
+    assertEquals(MutableSegment.DEEP_OVERHEAD,desiredRegion.getStore(FAMILY3).getMemStoreSize().getHeapSize());
+    assertNull(getWAL(desiredRegion).rollWriter(true));
+    assertTrue(getNumRolledLogFiles(desiredRegion) < maxLogs);
+  }
+  finally {
+    TEST_UTIL.shutdownMiniCluster();
+  }
+}

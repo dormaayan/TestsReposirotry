@@ -1,0 +1,44 @@
+/** 
+ * Tests that the JobMaster retries the scheduling of a job in case of a missing slot offering from a registered TaskExecutor
+ */
+@Test public void testSlotRequestTimeoutWhenNoSlotOffering() throws Exception {
+  final JobGraph restartingJobGraph=createSingleVertexJobWithRestartStrategy();
+  final long slotRequestTimeout=10L;
+  configuration.setLong(JobManagerOptions.SLOT_REQUEST_TIMEOUT,slotRequestTimeout);
+  final JobMaster jobMaster=createJobMaster(configuration,restartingJobGraph,haServices,new TestingJobManagerSharedServicesBuilder().build(),heartbeatServices);
+  final JobMasterGateway jobMasterGateway=jobMaster.getSelfGateway(JobMasterGateway.class);
+  try {
+    final long start=System.nanoTime();
+    jobMaster.start(JobMasterId.generate(),testingTimeout).get();
+    final TestingResourceManagerGateway resourceManagerGateway=new TestingResourceManagerGateway();
+    final ArrayBlockingQueue<SlotRequest> blockingQueue=new ArrayBlockingQueue<>(2);
+    resourceManagerGateway.setRequestSlotConsumer(blockingQueue::offer);
+    rpcService.registerGateway(resourceManagerGateway.getAddress(),resourceManagerGateway);
+    rmLeaderRetrievalService.notifyListener(resourceManagerGateway.getAddress(),resourceManagerGateway.getFencingToken().toUUID());
+    blockingQueue.take();
+    final CompletableFuture<TaskDeploymentDescriptor> submittedTaskFuture=new CompletableFuture<>();
+    final LocalTaskManagerLocation taskManagerLocation=new LocalTaskManagerLocation();
+    final TestingTaskExecutorGateway taskExecutorGateway=new TestingTaskExecutorGatewayBuilder().setSubmitTaskConsumer((tdd,ignored) -> {
+      submittedTaskFuture.complete(tdd);
+      return CompletableFuture.completedFuture(Acknowledge.get());
+    }
+).createTestingTaskExecutorGateway();
+    rpcService.registerGateway(taskExecutorGateway.getAddress(),taskExecutorGateway);
+    jobMasterGateway.registerTaskManager(taskExecutorGateway.getAddress(),taskManagerLocation,testingTimeout).get();
+    final SlotRequest slotRequest=blockingQueue.take();
+    final long end=System.nanoTime();
+    assertThat((end - start) / 1_000_000L,Matchers.greaterThanOrEqualTo(slotRequestTimeout));
+    assertThat(submittedTaskFuture.isDone(),is(false));
+    final SlotOffer slotOffer=new SlotOffer(slotRequest.getAllocationId(),0,ResourceProfile.UNKNOWN);
+    final CompletableFuture<Collection<SlotOffer>> acceptedSlotsFuture=jobMasterGateway.offerSlots(taskManagerLocation.getResourceID(),Collections.singleton(slotOffer),testingTimeout);
+    final Collection<SlotOffer> acceptedSlots=acceptedSlotsFuture.get();
+    assertThat(acceptedSlots,hasSize(1));
+    final SlotOffer acceptedSlot=acceptedSlots.iterator().next();
+    assertThat(acceptedSlot.getAllocationId(),equalTo(slotRequest.getAllocationId()));
+    final TaskDeploymentDescriptor taskDeploymentDescriptor=submittedTaskFuture.get();
+    assertThat(taskDeploymentDescriptor.getAllocationId(),equalTo(slotRequest.getAllocationId()));
+  }
+  finally {
+    RpcUtils.terminateRpcEndpoint(jobMaster,testingTimeout);
+  }
+}

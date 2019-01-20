@@ -1,0 +1,51 @@
+@Test public void hashPartitionerBalancesAtScale(){
+  LinearCongruentialGenerator r=new LinearCongruentialGenerator(10000);
+  List<String> elements=new ArrayList<String>();
+  for (int i=0; i < 10000; i++) {
+    if (r.nextDouble() < ((double)i / 10000D))     elements.add("red");
+    if (r.nextDouble() < (1 - (double)i / 10000D))     elements.add("blue");
+  }
+  Integer countRed=0;
+  Integer countBlue=0;
+  for (  String elem : elements) {
+    if (elem.equals("red"))     countRed++;
+ else     countBlue++;
+  }
+  JavaRDD<String> rdd=sc.parallelize(elements);
+  JavaPairRDD<Tuple2<Long,Integer>,String> indexedRDD=rdd.zipWithUniqueId().mapToPair(new PairFunction<Tuple2<String,Long>,Tuple2<Long,Integer>,String>(){
+    @Override public Tuple2<Tuple2<Long,Integer>,String> call(    Tuple2<String,Long> stringLongTuple2) throws Exception {
+      Integer elemClass=stringLongTuple2._1().equals("red") ? 0 : 1;
+      return new Tuple2<Tuple2<Long,Integer>,String>(new Tuple2<Long,Integer>(stringLongTuple2._2(),elemClass),stringLongTuple2._1());
+    }
+  }
+);
+  Integer numPartitions=indexedRDD.getNumPartitions();
+  List<Tuple2<Integer,Integer>> partitionTuples=rdd.mapPartitionsWithIndex(new CountRedBluePartitionsFunction(),true).collect();
+  List<Double> redWeights=new ArrayList<Double>();
+  List<Double> blueWeights=new ArrayList<Double>();
+  Float avgRed=(float)countRed / numPartitions;
+  Float avgBlue=(float)countBlue / numPartitions;
+  for (int i=0; i < partitionTuples.size(); i++) {
+    Tuple2<Integer,Integer> counts=partitionTuples.get(i);
+    redWeights.add((double)counts._1() / avgRed);
+    blueWeights.add((double)counts._2() / avgBlue);
+  }
+  List<List<Double>> partitionWeights=Arrays.asList(redWeights,blueWeights);
+  HashingBalancedPartitioner hbp=new HashingBalancedPartitioner(partitionWeights);
+  List<Tuple2<Tuple2<Long,Integer>,String>> testList=indexedRDD.collect();
+  int[][] colorCountsByPartition=new int[numPartitions][2];
+  for (  final Tuple2<Tuple2<Long,Integer>,String> val : testList) {
+    Integer partition=hbp.getPartition(val._1());
+    if (val._2().equals("red"))     colorCountsByPartition[partition][0]+=1;
+ else     colorCountsByPartition[partition][1]+=1;
+  }
+  for (int i=0; i < numPartitions; i++) {
+    System.out.println(Arrays.toString(colorCountsByPartition[i]));
+  }
+  System.out.println("Ideal red # per partition: " + avgRed);
+  System.out.println("Ideal blue # per partition: " + avgBlue);
+  for (int i=0; i < numPartitions; i++) {
+    assertTrue(colorCountsByPartition[i][0] >= Math.round(avgRed * .99) && colorCountsByPartition[i][0] < Math.round(avgRed * 1.01) + 1);
+    assertTrue(colorCountsByPartition[i][1] >= Math.round(avgBlue * .99) && colorCountsByPartition[i][1] < Math.round(avgBlue * 1.01) + 1);
+  }
+}

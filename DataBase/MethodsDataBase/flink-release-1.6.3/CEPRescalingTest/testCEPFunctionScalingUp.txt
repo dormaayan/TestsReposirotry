@@ -1,0 +1,62 @@
+@Test public void testCEPFunctionScalingUp() throws Exception {
+  int maxParallelism=10;
+  KeySelector<Event,Integer> keySelector=new KeySelector<Event,Integer>(){
+    private static final long serialVersionUID=-4873366487571254798L;
+    @Override public Integer getKey(    Event value) throws Exception {
+      return value.getId();
+    }
+  }
+;
+  Event startEvent1=new Event(7,"start",1.0);
+  SubEvent middleEvent1=new SubEvent(7,"foo",1.0,10.0);
+  Event endEvent1=new Event(7,"end",1.0);
+  int keygroup=KeyGroupRangeAssignment.assignToKeyGroup(keySelector.getKey(startEvent1),maxParallelism);
+  assertEquals(1,keygroup);
+  assertEquals(0,KeyGroupRangeAssignment.computeOperatorIndexForKeyGroup(maxParallelism,2,keygroup));
+  Event startEvent2=new Event(10,"start",1.0);
+  SubEvent middleEvent2=new SubEvent(10,"foo",1.0,10.0);
+  Event endEvent2=new Event(10,"end",1.0);
+  keygroup=KeyGroupRangeAssignment.assignToKeyGroup(keySelector.getKey(startEvent2),maxParallelism);
+  assertEquals(9,keygroup);
+  assertEquals(1,KeyGroupRangeAssignment.computeOperatorIndexForKeyGroup(maxParallelism,2,keygroup));
+  OneInputStreamOperatorTestHarness<Event,Map<String,List<Event>>> harness=null;
+  OneInputStreamOperatorTestHarness<Event,Map<String,List<Event>>> harness1=null;
+  OneInputStreamOperatorTestHarness<Event,Map<String,List<Event>>> harness2=null;
+  try {
+    harness=getTestHarness(maxParallelism,1,0);
+    harness.open();
+    harness.processElement(new StreamRecord<>(startEvent1,1));
+    harness.processElement(new StreamRecord<>(new Event(7,"foobar",1.0),2));
+    harness.processElement(new StreamRecord<>(startEvent2,3));
+    harness.processElement(new StreamRecord<Event>(middleEvent2,4));
+    OperatorSubtaskState snapshot=harness.snapshot(0,0);
+    harness.close();
+    harness1=getTestHarness(maxParallelism,2,0);
+    harness1.setup();
+    harness1.initializeState(snapshot);
+    harness1.open();
+    harness1.processWatermark(new Watermark(2));
+    harness1.processElement(new StreamRecord<Event>(middleEvent1,3));
+    harness1.processElement(new StreamRecord<>(endEvent1,5));
+    harness1.processWatermark(new Watermark(Long.MAX_VALUE));
+    assertEquals(3,harness1.getOutput().size());
+    verifyWatermark(harness1.getOutput().poll(),2);
+    verifyPattern(harness1.getOutput().poll(),startEvent1,middleEvent1,endEvent1);
+    harness2=getTestHarness(maxParallelism,2,1);
+    harness2.setup();
+    harness2.initializeState(snapshot);
+    harness2.open();
+    harness2.processWatermark(new Watermark(2));
+    harness2.processElement(new StreamRecord<>(endEvent2,5));
+    harness2.processElement(new StreamRecord<>(new Event(42,"start",1.0),4));
+    harness2.processWatermark(new Watermark(Long.MAX_VALUE));
+    assertEquals(3,harness2.getOutput().size());
+    verifyWatermark(harness2.getOutput().poll(),2);
+    verifyPattern(harness2.getOutput().poll(),startEvent2,middleEvent2,endEvent2);
+  }
+  finally {
+    closeSilently(harness);
+    closeSilently(harness1);
+    closeSilently(harness2);
+  }
+}

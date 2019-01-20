@@ -1,0 +1,80 @@
+public class NativeLabelScanStoreStartupIT {
+  private static final Label LABEL=Label.label("testLabel");
+  @Rule public final DatabaseRule dbRule=new EmbeddedDatabaseRule();
+  @Rule public final RandomRule random=new RandomRule();
+  private int labelId;
+  @Test public void scanStoreStartWithoutExistentIndex() throws Throwable {
+    LabelScanStore labelScanStore=getLabelScanStore();
+    GroupingRecoveryCleanupWorkCollector workCollector=getGroupingRecoveryCleanupWorkCollector();
+    labelScanStore.shutdown();
+    workCollector.shutdown();
+    deleteLabelScanStoreFiles(dbRule.databaseLayout());
+    workCollector.init();
+    labelScanStore.init();
+    workCollector.start();
+    labelScanStore.start();
+    checkLabelScanStoreAccessible(labelScanStore);
+  }
+  @Test public void scanStoreRecreateCorruptedIndexOnStartup() throws Throwable {
+    LabelScanStore labelScanStore=getLabelScanStore();
+    GroupingRecoveryCleanupWorkCollector workCollector=getGroupingRecoveryCleanupWorkCollector();
+    createTestNode();
+    long[] labels=readNodesForLabel(labelScanStore);
+    assertEquals("Label scan store see 1 label for node",1,labels.length);
+    labelScanStore.force(IOLimiter.UNLIMITED);
+    labelScanStore.shutdown();
+    workCollector.shutdown();
+    corruptLabelScanStoreFiles(dbRule.databaseLayout());
+    workCollector.init();
+    labelScanStore.init();
+    workCollector.start();
+    labelScanStore.start();
+    long[] rebuildLabels=readNodesForLabel(labelScanStore);
+    assertArrayEquals("Store should rebuild corrupted index",labels,rebuildLabels);
+  }
+  private LabelScanStore getLabelScanStore(){
+    return getDependency(LabelScanStore.class);
+  }
+  private GroupingRecoveryCleanupWorkCollector getGroupingRecoveryCleanupWorkCollector(){
+    return dbRule.getDependencyResolver().resolveDependency(GroupingRecoveryCleanupWorkCollector.class);
+  }
+  private <T>T getDependency(  Class<T> clazz){
+    return dbRule.getDependencyResolver().resolveDependency(clazz);
+  }
+  private long[] readNodesForLabel(  LabelScanStore labelScanStore){
+    try (LabelScanReader reader=labelScanStore.newReader()){
+      return PrimitiveLongCollections.asArray(reader.nodesWithLabel(labelId));
+    }
+   }
+  private Node createTestNode(){
+    Node node;
+    try (Transaction transaction=dbRule.beginTx()){
+      node=dbRule.createNode(LABEL);
+      KernelTransaction ktx=dbRule.getDependencyResolver().resolveDependency(ThreadToStatementContextBridge.class).getKernelTransactionBoundToThisThread(true);
+      labelId=ktx.tokenRead().nodeLabel(LABEL.name());
+      transaction.success();
+    }
+     return node;
+  }
+  private void scrambleFile(  File file) throws IOException {
+    LabelScanStoreTest.scrambleFile(random.random(),file);
+  }
+  private static File storeFile(  DatabaseLayout databaseLayout){
+    return databaseLayout.labelScanStore();
+  }
+  private void corruptLabelScanStoreFiles(  DatabaseLayout databaseLayout) throws IOException {
+    scrambleFile(storeFile(databaseLayout));
+  }
+  private static void deleteLabelScanStoreFiles(  DatabaseLayout databaseLayout){
+    assertTrue(storeFile(databaseLayout).delete());
+  }
+  private static void checkLabelScanStoreAccessible(  LabelScanStore labelScanStore) throws IOException {
+    int labelId=1;
+    try (LabelScanWriter labelScanWriter=labelScanStore.newWriter()){
+      labelScanWriter.write(NodeLabelUpdate.labelChanges(1,new long[]{},new long[]{labelId}));
+    }
+     try (LabelScanReader labelScanReader=labelScanStore.newReader()){
+      assertEquals(1,labelScanReader.nodesWithLabel(labelId).next());
+    }
+   }
+}

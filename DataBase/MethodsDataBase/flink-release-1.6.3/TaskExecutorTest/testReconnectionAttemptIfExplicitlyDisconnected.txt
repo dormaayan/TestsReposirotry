@@ -1,0 +1,33 @@
+/** 
+ * Tests that the TaskExecutor tries to reconnect to a ResourceManager from which it was explicitly disconnected.
+ */
+@Test public void testReconnectionAttemptIfExplicitlyDisconnected() throws Exception {
+  final long heartbeatInterval=1000L;
+  final TaskSlotTable taskSlotTable=new TaskSlotTable(Collections.singleton(ResourceProfile.UNKNOWN),timerService);
+  final TaskManagerLocation taskManagerLocation=new LocalTaskManagerLocation();
+  final TaskExecutor taskExecutor=new TaskExecutor(rpc,TaskManagerConfiguration.fromConfiguration(configuration),haServices,new TaskManagerServicesBuilder().setTaskSlotTable(taskSlotTable).setTaskManagerLocation(taskManagerLocation).build(),new HeartbeatServices(heartbeatInterval,1000L),UnregisteredMetricGroups.createUnregisteredTaskManagerMetricGroup(),dummyBlobCacheService,testingFatalErrorHandler);
+  taskExecutor.start();
+  try {
+    final TestingResourceManagerGateway testingResourceManagerGateway=new TestingResourceManagerGateway();
+    final ClusterInformation clusterInformation=new ClusterInformation("foobar",1234);
+    final CompletableFuture<RegistrationResponse> registrationResponseFuture=CompletableFuture.completedFuture(new TaskExecutorRegistrationSuccess(new InstanceID(),ResourceID.generate(),heartbeatInterval,clusterInformation));
+    final BlockingQueue<ResourceID> registrationQueue=new ArrayBlockingQueue<>(1);
+    testingResourceManagerGateway.setRegisterTaskExecutorFunction(stringResourceIDSlotReportIntegerHardwareDescriptionTuple5 -> {
+      registrationQueue.offer(stringResourceIDSlotReportIntegerHardwareDescriptionTuple5.f1);
+      return registrationResponseFuture;
+    }
+);
+    rpc.registerGateway(testingResourceManagerGateway.getAddress(),testingResourceManagerGateway);
+    resourceManagerLeaderRetriever.notifyListener(testingResourceManagerGateway.getAddress(),testingResourceManagerGateway.getFencingToken().toUUID());
+    final ResourceID firstRegistrationAttempt=registrationQueue.take();
+    assertThat(firstRegistrationAttempt,equalTo(taskManagerLocation.getResourceID()));
+    final TaskExecutorGateway taskExecutorGateway=taskExecutor.getSelfGateway(TaskExecutorGateway.class);
+    assertThat(registrationQueue,is(empty()));
+    taskExecutorGateway.disconnectResourceManager(new FlinkException("Test exception"));
+    final ResourceID secondRegistrationAttempt=registrationQueue.take();
+    assertThat(secondRegistrationAttempt,equalTo(taskManagerLocation.getResourceID()));
+  }
+  finally {
+    RpcUtils.terminateRpcEndpoint(taskExecutor,timeout);
+  }
+}

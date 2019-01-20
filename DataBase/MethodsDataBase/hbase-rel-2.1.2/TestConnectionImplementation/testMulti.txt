@@ -1,0 +1,64 @@
+@Test public void testMulti() throws Exception {
+  Table table=TEST_UTIL.createMultiRegionTable(TABLE_NAME3,FAM_NAM);
+  try {
+    ConnectionImplementation conn=(ConnectionImplementation)TEST_UTIL.getConnection();
+    conn.clearRegionCache(TABLE_NAME3);
+    Assert.assertEquals(0,conn.getNumberOfCachedRegionLocations(TABLE_NAME3));
+    TEST_UTIL.getAdmin().setBalancerRunning(false,false);
+    HMaster master=TEST_UTIL.getMiniHBaseCluster().getMaster();
+    TEST_UTIL.waitUntilNoRegionsInTransition();
+    Put put=new Put(ROW_X);
+    put.addColumn(FAM_NAM,ROW_X,ROW_X);
+    table.put(put);
+    HRegionLocation toMove=conn.getCachedLocation(TABLE_NAME3,ROW_X).getRegionLocation();
+    byte[] regionName=toMove.getRegionInfo().getRegionName();
+    byte[] encodedRegionNameBytes=toMove.getRegionInfo().getEncodedNameAsBytes();
+    int curServerId=TEST_UTIL.getHBaseCluster().getServerWith(regionName);
+    int destServerId=(curServerId == 0 ? 1 : 0);
+    HRegionServer curServer=TEST_UTIL.getHBaseCluster().getRegionServer(curServerId);
+    HRegionServer destServer=TEST_UTIL.getHBaseCluster().getRegionServer(destServerId);
+    ServerName destServerName=destServer.getServerName();
+    ServerName metaServerName=TEST_UTIL.getHBaseCluster().getServerHoldingMeta();
+    List<HRegion> regions=curServer.getRegions(TABLE_NAME3);
+    byte[] otherRow=null;
+    for (    Region region : regions) {
+      if (!region.getRegionInfo().getEncodedName().equals(toMove.getRegionInfo().getEncodedName()) && Bytes.BYTES_COMPARATOR.compare(region.getRegionInfo().getStartKey(),ROW_X) < 0) {
+        otherRow=region.getRegionInfo().getStartKey();
+        break;
+      }
+    }
+    assertNotNull(otherRow);
+    if (otherRow.length <= 0)     otherRow=Bytes.toBytes("aaa");
+    Put put2=new Put(otherRow);
+    put2.addColumn(FAM_NAM,otherRow,otherRow);
+    table.put(put2);
+    Assert.assertTrue(curServer != destServer);
+    Assert.assertNotEquals(curServer.getServerName(),destServer.getServerName());
+    Assert.assertNotEquals(toMove.getPort(),destServerName.getPort());
+    Assert.assertNotNull(curServer.getOnlineRegion(regionName));
+    Assert.assertNull(destServer.getOnlineRegion(regionName));
+    Assert.assertFalse(TEST_UTIL.getMiniHBaseCluster().getMaster().getAssignmentManager().hasRegionsInTransition());
+    LOG.info("Move starting region=" + toMove.getRegionInfo().getRegionNameAsString());
+    TEST_UTIL.getAdmin().move(toMove.getRegionInfo().getEncodedNameAsBytes(),destServerName.getServerName().getBytes());
+    while (destServer.getOnlineRegion(regionName) == null || destServer.getRegionsInTransitionInRS().containsKey(encodedRegionNameBytes) || curServer.getRegionsInTransitionInRS().containsKey(encodedRegionNameBytes) || master.getAssignmentManager().hasRegionsInTransition()) {
+      Thread.sleep(1);
+    }
+    LOG.info("Move finished for region=" + toMove.getRegionInfo().getRegionNameAsString());
+    Assert.assertNull(curServer.getOnlineRegion(regionName));
+    Assert.assertNotNull(destServer.getOnlineRegion(regionName));
+    Assert.assertFalse(destServer.getRegionsInTransitionInRS().containsKey(encodedRegionNameBytes));
+    Assert.assertFalse(curServer.getRegionsInTransitionInRS().containsKey(encodedRegionNameBytes));
+    Assert.assertFalse(conn.getCachedLocation(TABLE_NAME3,ROW_X).getRegionLocation().getPort() == destServerName.getPort());
+    final int prevNumRetriesVal=setNumTries(conn,2);
+    Put put3=new Put(ROW_X);
+    put3.addColumn(FAM_NAM,ROW_X,ROW_X);
+    Put put4=new Put(otherRow);
+    put4.addColumn(FAM_NAM,otherRow,otherRow);
+    ArrayList<Put> actions=Lists.newArrayList(put4,put3);
+    table.batch(actions,null);
+    setNumTries(conn,prevNumRetriesVal);
+  }
+  finally {
+    table.close();
+  }
+}

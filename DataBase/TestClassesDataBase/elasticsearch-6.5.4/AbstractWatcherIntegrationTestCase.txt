@@ -1,0 +1,387 @@
+@ClusterScope(scope=SUITE,numClientNodes=0,transportClientRatio=0,maxNumDataNodes=3) public abstract class AbstractWatcherIntegrationTestCase extends ESIntegTestCase {
+  public static final String WATCHER_LANG=Script.DEFAULT_SCRIPT_LANG;
+  private TimeWarp timeWarp;
+  @Override protected Settings nodeSettings(  int nodeOrdinal){
+    return Settings.builder().put(super.nodeSettings(nodeOrdinal)).put(XPackSettings.MONITORING_ENABLED.getKey(),false).put(XPackSettings.SECURITY_ENABLED.getKey(),false).put(LicenseService.SELF_GENERATED_LICENSE_TYPE.getKey(),"trial").put("index.store.mock.check_index_on_close",false).put("xpack.watcher.execution.scroll.size",randomIntBetween(1,100)).put("xpack.watcher.watch.scroll.size",randomIntBetween(1,100)).put(WatcherLifeCycleService.SETTING_REQUIRE_MANUAL_START.getKey(),true).build();
+  }
+  @Override protected Settings transportClientSettings(){
+    return Settings.builder().put("client.transport.sniff",false).put(NetworkModule.TRANSPORT_TYPE_KEY,SecurityField.NAME4).put(NetworkModule.HTTP_TYPE_KEY,SecurityField.NAME4).build();
+  }
+  @Override protected Set<String> excludeTemplates(){
+    Set<String> excludes=new HashSet<>();
+    excludes.addAll(Arrays.asList(WatcherIndexTemplateRegistryField.TEMPLATE_NAMES));
+    return Collections.unmodifiableSet(excludes);
+  }
+  @Override protected Collection<Class<? extends Plugin>> getMockPlugins(){
+    Set<Class<? extends Plugin>> plugins=new HashSet<>(super.getMockPlugins());
+    plugins.remove(MockTransportService.TestPlugin.class);
+    plugins.add(MockFSIndexStore.TestPlugin.class);
+    plugins.add(MockMustacheScriptEngine.TestPlugin.class);
+    return plugins;
+  }
+  @Override protected Collection<Class<? extends Plugin>> nodePlugins(){
+    return pluginTypes();
+  }
+  @Override protected Collection<Class<? extends Plugin>> transportClientPlugins(){
+    return nodePlugins();
+  }
+  protected List<Class<? extends Plugin>> pluginTypes(){
+    List<Class<? extends Plugin>> types=new ArrayList<>();
+    if (timeWarped()) {
+      types.add(TimeWarpedWatcher.class);
+    }
+ else {
+      types.add(LocalStateWatcher.class);
+    }
+    types.add(CommonAnalysisPlugin.class);
+    return types;
+  }
+  /** 
+ * @return  whether the test suite should run in time warp mode. By default this will be determined globallyto all test suites based on  {@code -Dtests.timewarp} system property (when missing, defaults to{@code true}). If a test suite requires to force the mode or force not running under this mode this method can be overridden.
+ */
+  protected boolean timeWarped(){
+    return true;
+  }
+  @Before public void _setup() throws Exception {
+    if (timeWarped()) {
+      timeWarp=new TimeWarp(internalCluster().getInstances(ScheduleTriggerEngineMock.class),(ClockMock)getInstanceFromMaster(Clock.class),logger);
+    }
+    if (internalCluster().size() > 0) {
+      ensureLicenseEnabled();
+      if (timeWarped()) {
+        logger.info("[{}#{}]: freezing time on nodes",getTestClass().getSimpleName(),getTestName());
+        TimeFreezeDisruption ice=new TimeFreezeDisruption();
+        internalCluster().setDisruptionScheme(ice);
+        ice.startDisrupting();
+      }
+      createWatcherIndicesOrAliases();
+      startWatcher();
+    }
+  }
+  @After public void _cleanup() throws Exception {
+    logger.info("[#{}]: clearing watcher state",getTestName());
+    stopWatcher();
+  }
+  /** 
+ * In order to test, that .watches and .triggered-watches indices can also point to an alias, we will rarely create those after starting watcher The idea behind this is the possible use of the migration helper for upgrades, see https://github.com/elastic/elasticsearch-migration/
+ */
+  private void createWatcherIndicesOrAliases() throws Exception {
+    if (internalCluster().size() > 0) {
+      ensureWatcherTemplatesAdded();
+      String watchIndexName;
+      String triggeredWatchIndexName;
+      if (rarely()) {
+        watchIndexName=".watches-alias-index";
+        CreateIndexResponse response=client().admin().indices().prepareCreate(watchIndexName).setCause("Index to test aliases with .watches index").addAlias(new Alias(Watch.INDEX)).get();
+        assertAcked(response);
+        logger.info("set alias for .watches index to [{}]",watchIndexName);
+      }
+ else {
+        watchIndexName=Watch.INDEX;
+        Settings.Builder builder=Settings.builder();
+        if (randomBoolean()) {
+          builder.put("index.number_of_shards",scaledRandomIntBetween(1,5));
+        }
+        assertAcked(client().admin().indices().prepareCreate(watchIndexName).setSettings(builder));
+      }
+      if (rarely()) {
+        triggeredWatchIndexName=".triggered_watches-alias-index";
+        CreateIndexResponse response=client().admin().indices().prepareCreate(triggeredWatchIndexName).setCause("Index to test aliases with .triggered-watches index").addAlias(new Alias(TriggeredWatchStoreField.INDEX_NAME)).get();
+        assertAcked(response);
+        logger.info("set alias for .triggered-watches index to [{}]",triggeredWatchIndexName);
+      }
+ else {
+        triggeredWatchIndexName=TriggeredWatchStoreField.INDEX_NAME;
+        assertAcked(client().admin().indices().prepareCreate(triggeredWatchIndexName));
+      }
+      String historyIndex=HistoryStoreField.getHistoryIndexNameForTime(DateTime.now(DateTimeZone.UTC));
+      assertAcked(client().admin().indices().prepareCreate(historyIndex));
+      logger.info("creating watch history index [{}]",historyIndex);
+      ensureGreen(historyIndex,watchIndexName,triggeredWatchIndexName);
+    }
+  }
+  protected TimeWarp timeWarp(){
+    assert timeWarped() : "cannot access TimeWarp when test context is not time warped";
+    return timeWarp;
+  }
+  public boolean randomizeNumberOfShardsAndReplicas(){
+    return false;
+  }
+  protected long docCount(  String index,  String type,  QueryBuilder query){
+    refresh();
+    return docCount(index,type,SearchSourceBuilder.searchSource().query(query));
+  }
+  protected long watchRecordCount(  QueryBuilder query){
+    refresh();
+    return docCount(HistoryStoreField.INDEX_PREFIX_WITH_TEMPLATE + "*",HistoryStoreField.DOC_TYPE,SearchSourceBuilder.searchSource().query(query));
+  }
+  protected long docCount(  String index,  String type,  SearchSourceBuilder source){
+    SearchRequestBuilder builder=client().prepareSearch(index).setSource(source).setSize(0);
+    if (type != null) {
+      builder.setTypes(type);
+    }
+    return builder.get().getHits().getTotalHits();
+  }
+  protected SearchResponse searchHistory(  SearchSourceBuilder builder){
+    return client().prepareSearch(HistoryStoreField.INDEX_PREFIX_WITH_TEMPLATE + "*").setSource(builder).get();
+  }
+  protected <T>T getInstanceFromMaster(  Class<T> type){
+    return internalCluster().getInstance(type,internalCluster().getMasterName());
+  }
+  protected WatchParser watchParser(){
+    return getInstanceFromMaster(WatchParser.class);
+  }
+  public AbstractWatcherIntegrationTestCase(){
+    super();
+  }
+  protected WatcherClient watcherClient(){
+    return randomBoolean() ? new XPackClient(client()).watcher() : new WatcherClient(client());
+  }
+  private IndexNameExpressionResolver indexNameExpressionResolver(){
+    return internalCluster().getInstance(IndexNameExpressionResolver.class);
+  }
+  protected void assertValue(  XContentSource source,  String path,  Matcher<?> matcher){
+    WatcherTestUtils.assertValue(source,path,matcher);
+  }
+  protected void assertValue(  Map<String,Object> map,  String path,  Matcher<?> matcher){
+    WatcherTestUtils.assertValue(map,path,matcher);
+  }
+  protected void assertWatchWithMinimumPerformedActionsCount(  final String watchName,  final long minimumExpectedWatchActionsWithActionPerformed) throws Exception {
+    assertWatchWithMinimumPerformedActionsCount(watchName,minimumExpectedWatchActionsWithActionPerformed,true);
+  }
+  protected void assertWatchWithMinimumPerformedActionsCount(  final String watchName,  final long minimumExpectedWatchActionsWithActionPerformed,  final boolean assertConditionMet) throws Exception {
+    final AtomicReference<SearchResponse> lastResponse=new AtomicReference<>();
+    try {
+      assertBusy(() -> {
+        ClusterState state=client().admin().cluster().prepareState().get().getState();
+        String[] watchHistoryIndices=indexNameExpressionResolver().concreteIndexNames(state,IndicesOptions.lenientExpandOpen(),HistoryStoreField.INDEX_PREFIX_WITH_TEMPLATE + "*");
+        assertThat(watchHistoryIndices,not(emptyArray()));
+        for (        String index : watchHistoryIndices) {
+          IndexRoutingTable routingTable=state.getRoutingTable().index(index);
+          assertThat(routingTable,notNullValue());
+          assertThat(routingTable.allPrimaryShardsActive(),is(true));
+        }
+        refresh();
+        SearchResponse searchResponse=client().prepareSearch(HistoryStoreField.INDEX_PREFIX_WITH_TEMPLATE + "*").setIndicesOptions(IndicesOptions.lenientExpandOpen()).setQuery(boolQuery().must(matchQuery("watch_id",watchName)).must(matchQuery("state",ExecutionState.EXECUTED.id()))).get();
+        lastResponse.set(searchResponse);
+        assertThat("could not find executed watch record for watch " + watchName,searchResponse.getHits().getTotalHits(),greaterThanOrEqualTo(minimumExpectedWatchActionsWithActionPerformed));
+        if (assertConditionMet) {
+          assertThat((Integer)XContentMapValues.extractValue("result.input.payload.hits.total",searchResponse.getHits().getAt(0).getSourceAsMap()),greaterThanOrEqualTo(1));
+        }
+      }
+);
+    }
+ catch (    AssertionError error) {
+      SearchResponse searchResponse=lastResponse.get();
+      logger.info("Found [{}] records for watch [{}]",searchResponse.getHits().getTotalHits(),watchName);
+      int counter=1;
+      for (      SearchHit hit : searchResponse.getHits().getHits()) {
+        logger.info("hit [{}]=\n {}",counter++,XContentHelper.convertToJson(hit.getSourceRef(),true,true));
+      }
+      throw error;
+    }
+  }
+  protected SearchResponse searchWatchRecords(  Consumer<SearchRequestBuilder> requestBuilderCallback){
+    SearchRequestBuilder builder=client().prepareSearch(HistoryStoreField.INDEX_PREFIX_WITH_TEMPLATE + "*").setTypes(HistoryStoreField.DOC_TYPE);
+    requestBuilderCallback.accept(builder);
+    return builder.get();
+  }
+  protected long findNumberOfPerformedActions(  String watchName){
+    refresh();
+    SearchResponse searchResponse=client().prepareSearch(HistoryStoreField.INDEX_PREFIX_WITH_TEMPLATE + "*").setIndicesOptions(IndicesOptions.lenientExpandOpen()).setQuery(boolQuery().must(matchQuery("watch_id",watchName)).must(matchQuery("state",ExecutionState.EXECUTED.id()))).get();
+    return searchResponse.getHits().getTotalHits();
+  }
+  protected void assertWatchWithNoActionNeeded(  final String watchName,  final long expectedWatchActionsWithNoActionNeeded) throws Exception {
+    final AtomicReference<SearchResponse> lastResponse=new AtomicReference<>();
+    try {
+      assertBusy(() -> {
+        ClusterState state=client().admin().cluster().prepareState().get().getState();
+        String[] watchHistoryIndices=indexNameExpressionResolver().concreteIndexNames(state,IndicesOptions.lenientExpandOpen(),HistoryStoreField.INDEX_PREFIX_WITH_TEMPLATE + "*");
+        assertThat(watchHistoryIndices,not(emptyArray()));
+        for (        String index : watchHistoryIndices) {
+          IndexRoutingTable routingTable=state.getRoutingTable().index(index);
+          assertThat(routingTable,notNullValue());
+          assertThat(routingTable.allPrimaryShardsActive(),is(true));
+        }
+        refresh();
+        SearchResponse searchResponse=client().prepareSearch(HistoryStoreField.INDEX_PREFIX_WITH_TEMPLATE + "*").setIndicesOptions(IndicesOptions.lenientExpandOpen()).setQuery(boolQuery().must(matchQuery("watch_id",watchName)).must(matchQuery("state",ExecutionState.EXECUTION_NOT_NEEDED.id()))).get();
+        lastResponse.set(searchResponse);
+        assertThat(searchResponse.getHits().getTotalHits(),greaterThanOrEqualTo(expectedWatchActionsWithNoActionNeeded));
+      }
+);
+    }
+ catch (    AssertionError error) {
+      SearchResponse searchResponse=lastResponse.get();
+      logger.info("Found [{}] records for watch [{}]",searchResponse.getHits().getTotalHits(),watchName);
+      int counter=1;
+      for (      SearchHit hit : searchResponse.getHits().getHits()) {
+        logger.info("hit [{}]=\n {}",counter++,XContentHelper.convertToJson(hit.getSourceRef(),true,true));
+      }
+      throw error;
+    }
+  }
+  protected void assertWatchWithMinimumActionsCount(  final String watchName,  final ExecutionState recordState,  final long recordCount) throws Exception {
+    assertBusy(() -> {
+      ClusterState state=client().admin().cluster().prepareState().get().getState();
+      String[] watchHistoryIndices=indexNameExpressionResolver().concreteIndexNames(state,IndicesOptions.lenientExpandOpen(),HistoryStoreField.INDEX_PREFIX_WITH_TEMPLATE + "*");
+      assertThat(watchHistoryIndices,not(emptyArray()));
+      for (      String index : watchHistoryIndices) {
+        IndexRoutingTable routingTable=state.getRoutingTable().index(index);
+        assertThat(routingTable,notNullValue());
+        assertThat(routingTable.allPrimaryShardsActive(),is(true));
+      }
+      refresh();
+      SearchResponse searchResponse=client().prepareSearch(HistoryStoreField.INDEX_PREFIX_WITH_TEMPLATE + "*").setIndicesOptions(IndicesOptions.lenientExpandOpen()).setQuery(boolQuery().must(matchQuery("watch_id",watchName)).must(matchQuery("state",recordState.id()))).get();
+      assertThat("could not find executed watch record",searchResponse.getHits().getTotalHits(),greaterThanOrEqualTo(recordCount));
+    }
+);
+  }
+  private void ensureWatcherTemplatesAdded() throws Exception {
+    assertBusy(() -> {
+      GetIndexTemplatesResponse response=client().admin().indices().prepareGetTemplates(HISTORY_TEMPLATE_NAME).get();
+      assertThat("[" + HISTORY_TEMPLATE_NAME + "] is missing",response.getIndexTemplates().size(),equalTo(1));
+      response=client().admin().indices().prepareGetTemplates(TRIGGERED_TEMPLATE_NAME).get();
+      assertThat("[" + TRIGGERED_TEMPLATE_NAME + "] is missing",response.getIndexTemplates().size(),equalTo(1));
+      response=client().admin().indices().prepareGetTemplates(WATCHES_TEMPLATE_NAME).get();
+      assertThat("[" + WATCHES_TEMPLATE_NAME + "] is missing",response.getIndexTemplates().size(),equalTo(1));
+    }
+);
+  }
+  protected void startWatcher() throws Exception {
+    assertBusy(() -> {
+      WatcherStatsResponse watcherStatsResponse=watcherClient().prepareWatcherStats().get();
+      assertThat(watcherStatsResponse.hasFailures(),is(false));
+      List<Tuple<String,WatcherState>> currentStatesFromStatsRequest=watcherStatsResponse.getNodes().stream().map(response -> Tuple.tuple(response.getNode().getName(),response.getWatcherState())).collect(Collectors.toList());
+      List<WatcherState> states=currentStatesFromStatsRequest.stream().map(Tuple::v2).collect(Collectors.toList());
+      logger.info("waiting to start watcher, current states {}",currentStatesFromStatsRequest);
+      boolean isAllStateStarted=states.stream().allMatch(w -> w == WatcherState.STARTED);
+      if (isAllStateStarted) {
+        return;
+      }
+      boolean isAnyStopping=states.stream().anyMatch(w -> w == WatcherState.STOPPING);
+      if (isAnyStopping) {
+        throw new AssertionError("at least one node is in state stopping, waiting to be stopped");
+      }
+      boolean isAllStateStopped=states.stream().allMatch(w -> w == WatcherState.STOPPED);
+      if (isAllStateStopped) {
+        assertAcked(watcherClient().prepareWatchService().start().get());
+        throw new AssertionError("all nodes are stopped, restarting");
+      }
+      boolean isAnyStarting=states.stream().anyMatch(w -> w == WatcherState.STARTING);
+      if (isAnyStarting) {
+        throw new AssertionError("at least one node is in state starting, waiting to be stopped");
+      }
+      throw new AssertionError("unexpected state, retrying with next run");
+    }
+,30,TimeUnit.SECONDS);
+  }
+  protected void ensureLicenseEnabled() throws Exception {
+    assertBusy(() -> {
+      for (      XPackLicenseState licenseState : internalCluster().getInstances(XPackLicenseState.class)) {
+        assertThat(licenseState.isWatcherAllowed(),is(true));
+      }
+    }
+);
+  }
+  protected void stopWatcher() throws Exception {
+    assertBusy(() -> {
+      WatcherStatsResponse watcherStatsResponse=watcherClient().prepareWatcherStats().get();
+      assertThat(watcherStatsResponse.hasFailures(),is(false));
+      List<Tuple<String,WatcherState>> currentStatesFromStatsRequest=watcherStatsResponse.getNodes().stream().map(response -> Tuple.tuple(response.getNode().getName(),response.getWatcherState())).collect(Collectors.toList());
+      List<WatcherState> states=currentStatesFromStatsRequest.stream().map(Tuple::v2).collect(Collectors.toList());
+      logger.info("waiting to stop watcher, current states {}",currentStatesFromStatsRequest);
+      boolean isAllStateStarted=states.stream().allMatch(w -> w == WatcherState.STARTED);
+      if (isAllStateStarted) {
+        assertAcked(watcherClient().prepareWatchService().stop().get());
+        throw new AssertionError("all nodes are started, stopping");
+      }
+      boolean isAnyStopping=states.stream().anyMatch(w -> w == WatcherState.STOPPING);
+      if (isAnyStopping) {
+        throw new AssertionError("at least one node is in state stopping, waiting to be stopped");
+      }
+      boolean isAllStateStopped=states.stream().allMatch(w -> w == WatcherState.STOPPED);
+      if (isAllStateStopped) {
+        return;
+      }
+      boolean isAnyStarting=states.stream().anyMatch(w -> w == WatcherState.STARTING);
+      if (isAnyStarting) {
+        throw new AssertionError("at least one node is in state starting, waiting to be started before stopping");
+      }
+      throw new AssertionError("unexpected state, retrying with next run");
+    }
+);
+  }
+public static class NoopEmailService extends EmailService {
+    public NoopEmailService(){
+      super(Settings.EMPTY,null,new ClusterSettings(Settings.EMPTY,new HashSet<>(EmailService.getSettings())));
+    }
+    @Override public EmailSent send(    Email email,    Authentication auth,    Profile profile,    String accountName){
+      return new EmailSent(accountName,email);
+    }
+  }
+protected static class TimeWarp {
+    private final List<ScheduleTriggerEngineMock> schedulers;
+    private final ClockMock clock;
+    private final Logger logger;
+    TimeWarp(    Iterable<ScheduleTriggerEngineMock> schedulers,    ClockMock clock,    Logger logger){
+      this.schedulers=StreamSupport.stream(schedulers.spliterator(),false).collect(Collectors.toList());
+      this.clock=clock;
+      this.logger=logger;
+    }
+    public void trigger(    String jobName){
+      trigger(jobName,1,null);
+    }
+    public ClockMock clock(){
+      return clock;
+    }
+    public void trigger(    String watchId,    int times,    TimeValue timeValue){
+      boolean isTriggered=schedulers.stream().anyMatch(scheduler -> scheduler.trigger(watchId,times,timeValue));
+      String msg=String.format(Locale.ROOT,"could not find watch [%s] to trigger",watchId);
+      assertThat(msg,isTriggered,is(true));
+    }
+  }
+  /** 
+ * A disruption that prevents time from advancing on nodes. This is needed to allow time sensitive tests to have full control of time. This disruption requires  {@link ClockMock} being available on the nodes.
+ */
+private static class TimeFreezeDisruption implements ServiceDisruptionScheme {
+    private InternalTestCluster cluster;
+    private boolean frozen;
+    @Override public void applyToCluster(    InternalTestCluster cluster){
+      this.cluster=cluster;
+    }
+    @Override public void removeFromCluster(    InternalTestCluster cluster){
+      stopDisrupting();
+    }
+    @Override public void removeAndEnsureHealthy(    InternalTestCluster cluster){
+      stopDisrupting();
+    }
+    @Override public synchronized void applyToNode(    String node,    InternalTestCluster cluster){
+      if (frozen) {
+        ((ClockMock)cluster.getInstance(Clock.class,node)).freeze();
+      }
+    }
+    @Override public void removeFromNode(    String node,    InternalTestCluster cluster){
+      ((ClockMock)cluster.getInstance(Clock.class,node)).unfreeze();
+    }
+    @Override public synchronized void startDisrupting(){
+      frozen=true;
+      for (      String node : cluster.getNodeNames()) {
+        applyToNode(node,cluster);
+      }
+    }
+    @Override public void stopDisrupting(){
+      frozen=false;
+      for (      String node : cluster.getNodeNames()) {
+        removeFromNode(node,cluster);
+      }
+    }
+    @Override public void testClusterClosed(){
+    }
+    @Override public TimeValue expectedTimeToHeal(){
+      return TimeValue.ZERO;
+    }
+    @Override public String toString(){
+      return "time frozen";
+    }
+  }
+}

@@ -1,0 +1,92 @@
+@ExtendWith(TestDirectoryExtension.class) class UniqueSpatialIndexIT {
+  private static final String KEY="prop";
+  private static final TestLabels LABEL=TestLabels.LABEL_ONE;
+  @Inject private TestDirectory directory;
+  private GraphDatabaseService db;
+  private PointValue point1;
+  private PointValue point2;
+  @BeforeEach void setup(){
+    Pair<PointValue,PointValue> collidingPoints=SpatialIndexValueTestUtil.pointsWithSameValueOnSpaceFillingCurve(Config.defaults());
+    point1=collidingPoints.first();
+    point2=collidingPoints.other();
+  }
+  @AfterEach void tearDown(){
+    if (db != null) {
+      db.shutdown();
+    }
+  }
+  @ParameterizedTest @MethodSource("providerSettings") void shouldPopulateIndexWithUniquePointsThatCollideOnSpaceFillingCurve(  GraphDatabaseSettings.SchemaIndex schemaIndex){
+    setupDb(schemaIndex);
+    Pair<Long,Long> nodeIds=createUniqueNodes();
+    createUniquenessConstraint();
+    assertBothNodesArePresent(nodeIds);
+  }
+  @ParameterizedTest @MethodSource("providerSettings") void shouldAddPointsThatCollideOnSpaceFillingCurveToUniqueIndexInSameTx(  GraphDatabaseSettings.SchemaIndex schemaIndex){
+    setupDb(schemaIndex);
+    createUniquenessConstraint();
+    Pair<Long,Long> nodeIds=createUniqueNodes();
+    assertBothNodesArePresent(nodeIds);
+  }
+  @ParameterizedTest @MethodSource("providerSettings") void shouldThrowWhenPopulatingWithNonUniquePoints(  GraphDatabaseSettings.SchemaIndex schemaIndex){
+    setupDb(schemaIndex);
+    createNonUniqueNodes();
+    assertThrows(ConstraintViolationException.class,this::createUniquenessConstraint);
+  }
+  @ParameterizedTest @MethodSource("providerSettings") void shouldThrowWhenAddingNonUniquePoints(  GraphDatabaseSettings.SchemaIndex schemaIndex){
+    setupDb(schemaIndex);
+    createUniquenessConstraint();
+    assertThrows(ConstraintViolationException.class,this::createNonUniqueNodes);
+  }
+  private static Stream<GraphDatabaseSettings.SchemaIndex> providerSettings(){
+    return Arrays.stream(GraphDatabaseSettings.SchemaIndex.values());
+  }
+  private void createNonUniqueNodes(){
+    try (Transaction tx=db.beginTx()){
+      Node originNode=db.createNode(LABEL);
+      originNode.setProperty(KEY,point1);
+      Node centerNode=db.createNode(LABEL);
+      centerNode.setProperty(KEY,point1);
+      tx.success();
+    }
+   }
+  private Pair<Long,Long> createUniqueNodes(){
+    Pair<Long,Long> nodeIds;
+    try (Transaction tx=db.beginTx()){
+      Node originNode=db.createNode(LABEL);
+      originNode.setProperty(KEY,point1);
+      Node centerNode=db.createNode(LABEL);
+      centerNode.setProperty(KEY,point2);
+      nodeIds=Pair.of(originNode.getId(),centerNode.getId());
+      tx.success();
+    }
+     return nodeIds;
+  }
+  private void assertBothNodesArePresent(  Pair<Long,Long> nodeIds){
+    try (Transaction tx=db.beginTx()){
+      ResourceIterator<Node> origin=db.findNodes(LABEL,KEY,point1);
+      assertTrue(origin.hasNext());
+      assertEquals(nodeIds.first().longValue(),origin.next().getId());
+      assertFalse(origin.hasNext());
+      ResourceIterator<Node> center=db.findNodes(LABEL,KEY,point2);
+      assertTrue(center.hasNext());
+      assertEquals(nodeIds.other().longValue(),center.next().getId());
+      assertFalse(center.hasNext());
+      tx.success();
+    }
+   }
+  private void createUniquenessConstraint(){
+    try (Transaction tx=db.beginTx()){
+      db.schema().constraintFor(TestLabels.LABEL_ONE).assertPropertyIsUnique(KEY).create();
+      tx.success();
+    }
+     try (Transaction tx=db.beginTx()){
+      db.schema().awaitIndexesOnline(1,TimeUnit.MINUTES);
+      tx.success();
+    }
+   }
+  private void setupDb(  GraphDatabaseSettings.SchemaIndex schemaIndex){
+    TestGraphDatabaseFactory dbFactory=new TestGraphDatabaseFactory();
+    GraphDatabaseBuilder builder=dbFactory.newEmbeddedDatabaseBuilder(directory.storeDir()).setConfig(GraphDatabaseSettings.default_schema_provider,schemaIndex.providerName());
+    db=builder.newGraphDatabase();
+  }
+}

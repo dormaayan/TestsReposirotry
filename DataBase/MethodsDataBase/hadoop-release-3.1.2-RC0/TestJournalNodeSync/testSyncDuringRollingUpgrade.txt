@@ -1,0 +1,38 @@
+@Test(timeout=300_000) public void testSyncDuringRollingUpgrade() throws Exception {
+  DistributedFileSystem dfsActive;
+  int standbyNNindex;
+  if (dfsCluster.getNameNode(0).isActiveState()) {
+    activeNNindex=0;
+    standbyNNindex=1;
+  }
+ else {
+    activeNNindex=1;
+    standbyNNindex=0;
+  }
+  dfsActive=dfsCluster.getFileSystem(activeNNindex);
+  final RollingUpgradeInfo info=dfsActive.rollingUpgrade(HdfsConstants.RollingUpgradeAction.PREPARE);
+  Assert.assertEquals(info,dfsActive.rollingUpgrade(HdfsConstants.RollingUpgradeAction.QUERY));
+  dfsCluster.restartNameNode(standbyNNindex,true,"-rollingUpgrade","started");
+  Assert.assertEquals(info,dfsActive.rollingUpgrade(HdfsConstants.RollingUpgradeAction.QUERY));
+  List<File> missingLogs=deleteEditLogsFromRandomJN();
+  GenericTestUtils.waitFor(editLogExists(missingLogs),500,30000);
+  dfsCluster.transitionToStandby(activeNNindex);
+  Thread.sleep(30 * DFS_HA_TAILEDITS_PERIOD_SECONDS * 1000);
+  dfsCluster.transitionToActive(standbyNNindex);
+  dfsCluster.waitActive();
+  activeNNindex=standbyNNindex;
+  standbyNNindex=((activeNNindex + 1) % 2);
+  dfsActive=dfsCluster.getFileSystem(activeNNindex);
+  Assert.assertTrue(dfsCluster.getNameNode(activeNNindex).isActiveState());
+  Assert.assertFalse(dfsCluster.getNameNode(standbyNNindex).isActiveState());
+  dfsCluster.restartNameNode(standbyNNindex,true,"-rollingUpgrade","started");
+  Assert.assertEquals(info,dfsActive.rollingUpgrade(HdfsConstants.RollingUpgradeAction.QUERY));
+  dfsCluster.waitActive();
+  missingLogs.addAll(deleteEditLogsFromRandomJN());
+  GenericTestUtils.waitFor(editLogExists(missingLogs),500,30000);
+  final RollingUpgradeInfo finalize=dfsActive.rollingUpgrade(HdfsConstants.RollingUpgradeAction.FINALIZE);
+  Assert.assertTrue(finalize.isFinalized());
+  for (  File editLog : missingLogs) {
+    Assert.assertTrue("Edit log missing after finalizing rolling upgrade",editLog.exists());
+  }
+}

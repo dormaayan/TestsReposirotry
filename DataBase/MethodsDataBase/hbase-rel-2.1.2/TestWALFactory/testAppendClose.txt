@@ -1,0 +1,91 @@
+@Test public void testAppendClose() throws Exception {
+  TableName tableName=TableName.valueOf(currentTest.getMethodName());
+  RegionInfo regionInfo=RegionInfoBuilder.newBuilder(tableName).build();
+  WAL wal=wals.getWAL(regionInfo);
+  int total=20;
+  NavigableMap<byte[],Integer> scopes=new TreeMap<>(Bytes.BYTES_COMPARATOR);
+  scopes.put(tableName.getName(),0);
+  MultiVersionConcurrencyControl mvcc=new MultiVersionConcurrencyControl();
+  for (int i=0; i < total; i++) {
+    WALEdit kvs=new WALEdit();
+    kvs.add(new KeyValue(Bytes.toBytes(i),tableName.getName(),tableName.getName()));
+    wal.append(regionInfo,new WALKeyImpl(regionInfo.getEncodedNameAsBytes(),tableName,System.currentTimeMillis(),mvcc,scopes),kvs,true);
+  }
+  wal.sync();
+  int namenodePort=cluster.getNameNodePort();
+  final Path walPath=AbstractFSWALProvider.getCurrentFileName(wal);
+  try {
+    DistributedFileSystem dfs=cluster.getFileSystem();
+    dfs.setSafeMode(HdfsConstants.SafeModeAction.SAFEMODE_ENTER);
+    TEST_UTIL.shutdownMiniDFSCluster();
+    try {
+      wal.shutdown();
+    }
+ catch (    IOException e) {
+      LOG.info(e.toString(),e);
+    }
+    fs.close();
+    LOG.info("STOPPED first instance of the cluster");
+  }
+  finally {
+    while (cluster.isClusterUp()) {
+      LOG.error("Waiting for cluster to go down");
+      Thread.sleep(1000);
+    }
+    assertFalse(cluster.isClusterUp());
+    cluster=null;
+    for (int i=0; i < 100; i++) {
+      try {
+        cluster=TEST_UTIL.startMiniDFSClusterForTestWAL(namenodePort);
+        break;
+      }
+ catch (      BindException e) {
+        LOG.info("Sleeping.  BindException bringing up new cluster");
+        Threads.sleep(1000);
+      }
+    }
+    cluster.waitActive();
+    fs=cluster.getFileSystem();
+    LOG.info("STARTED second instance.");
+  }
+  Method setLeasePeriod=cluster.getClass().getDeclaredMethod("setLeasePeriod",new Class[]{Long.TYPE,Long.TYPE});
+  setLeasePeriod.setAccessible(true);
+  setLeasePeriod.invoke(cluster,1000L,1000L);
+  try {
+    Thread.sleep(1000);
+  }
+ catch (  InterruptedException e) {
+    LOG.info(e.toString(),e);
+  }
+  final FileSystem recoveredFs=fs;
+  final Configuration rlConf=conf;
+class RecoverLogThread extends Thread {
+    public Exception exception=null;
+    @Override public void run(){
+      try {
+        FSUtils.getInstance(fs,rlConf).recoverFileLease(recoveredFs,walPath,rlConf,null);
+      }
+ catch (      IOException e) {
+        exception=e;
+      }
+    }
+  }
+  RecoverLogThread t=new RecoverLogThread();
+  t.start();
+  t.join(60 * 1000);
+  if (t.isAlive()) {
+    t.interrupt();
+    throw new Exception("Timed out waiting for WAL.recoverLog()");
+  }
+  if (t.exception != null)   throw t.exception;
+  WAL.Reader reader=wals.createReader(fs,walPath);
+  int count=0;
+  WAL.Entry entry=new WAL.Entry();
+  while (reader.next(entry) != null) {
+    count++;
+    assertTrue("Should be one KeyValue per WALEdit",entry.getEdit().getCells().size() == 1);
+  }
+  assertEquals(total,count);
+  reader.close();
+  setLeasePeriod.invoke(cluster,new Object[]{60000L,3600000L});
+}

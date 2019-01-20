@@ -1,0 +1,38 @@
+/** 
+ * Tests that a slot request is retried if it times out on the task manager side.
+ */
+@Test @SuppressWarnings("unchecked") public void testTaskManagerSlotRequestTimeoutHandling() throws Exception {
+  final ResourceManagerId resourceManagerId=ResourceManagerId.generate();
+  final ResourceActions resourceManagerActions=mock(ResourceActions.class);
+  final JobID jobId=new JobID();
+  final AllocationID allocationId=new AllocationID();
+  final ResourceProfile resourceProfile=new ResourceProfile(42.0,1337);
+  final SlotRequest slotRequest=new SlotRequest(jobId,allocationId,resourceProfile,"foobar");
+  final CompletableFuture<Acknowledge> slotRequestFuture1=new CompletableFuture<>();
+  final CompletableFuture<Acknowledge> slotRequestFuture2=new CompletableFuture<>();
+  final TaskExecutorGateway taskExecutorGateway=mock(TaskExecutorGateway.class);
+  when(taskExecutorGateway.requestSlot(any(SlotID.class),any(JobID.class),eq(allocationId),anyString(),any(ResourceManagerId.class),any(Time.class))).thenReturn(slotRequestFuture1,slotRequestFuture2);
+  final ResourceID resourceId=ResourceID.generate();
+  final TaskExecutorConnection taskManagerConnection=new TaskExecutorConnection(resourceId,taskExecutorGateway);
+  final SlotID slotId1=new SlotID(resourceId,0);
+  final SlotID slotId2=new SlotID(resourceId,1);
+  final SlotStatus slotStatus1=new SlotStatus(slotId1,resourceProfile);
+  final SlotStatus slotStatus2=new SlotStatus(slotId2,resourceProfile);
+  final SlotReport slotReport=new SlotReport(Arrays.asList(slotStatus1,slotStatus2));
+  try (SlotManager slotManager=createSlotManager(resourceManagerId,resourceManagerActions)){
+    slotManager.registerTaskManager(taskManagerConnection,slotReport);
+    slotManager.registerSlotRequest(slotRequest);
+    ArgumentCaptor<SlotID> slotIdCaptor=ArgumentCaptor.forClass(SlotID.class);
+    verify(taskExecutorGateway,times(1)).requestSlot(slotIdCaptor.capture(),eq(jobId),eq(allocationId),anyString(),eq(resourceManagerId),any(Time.class));
+    TaskManagerSlot failedSlot=slotManager.getSlot(slotIdCaptor.getValue());
+    slotRequestFuture1.completeExceptionally(new SlotAllocationException("Test exception."));
+    verify(taskExecutorGateway,times(2)).requestSlot(slotIdCaptor.capture(),eq(jobId),eq(allocationId),anyString(),eq(resourceManagerId),any(Time.class));
+    slotRequestFuture2.complete(Acknowledge.get());
+    TaskManagerSlot slot=slotManager.getSlot(slotIdCaptor.getValue());
+    assertTrue(slot.getState() == TaskManagerSlot.State.ALLOCATED);
+    assertEquals(allocationId,slot.getAllocationId());
+    if (!failedSlot.getSlotId().equals(slot.getSlotId())) {
+      assertTrue(failedSlot.getState() == TaskManagerSlot.State.FREE);
+    }
+  }
+ }

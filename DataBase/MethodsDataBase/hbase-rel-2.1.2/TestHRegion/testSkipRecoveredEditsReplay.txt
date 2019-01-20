@@ -1,0 +1,43 @@
+@Test public void testSkipRecoveredEditsReplay() throws Exception {
+  byte[] family=Bytes.toBytes("family");
+  this.region=initHRegion(tableName,method,CONF,family);
+  final WALFactory wals=new WALFactory(CONF,method);
+  try {
+    Path regiondir=region.getRegionFileSystem().getRegionDir();
+    FileSystem fs=region.getRegionFileSystem().getFileSystem();
+    byte[] regionName=region.getRegionInfo().getEncodedNameAsBytes();
+    Path recoveredEditsDir=WALSplitter.getRegionDirRecoveredEditsDir(regiondir);
+    long maxSeqId=1050;
+    long minSeqId=1000;
+    for (long i=minSeqId; i <= maxSeqId; i+=10) {
+      Path recoveredEdits=new Path(recoveredEditsDir,String.format("%019d",i));
+      fs.create(recoveredEdits);
+      WALProvider.Writer writer=wals.createRecoveredEditsWriter(fs,recoveredEdits);
+      long time=System.nanoTime();
+      WALEdit edit=new WALEdit();
+      edit.add(new KeyValue(row,family,Bytes.toBytes(i),time,KeyValue.Type.Put,Bytes.toBytes(i)));
+      writer.append(new WAL.Entry(new WALKeyImpl(regionName,tableName,i,time,HConstants.DEFAULT_CLUSTER_ID),edit));
+      writer.close();
+    }
+    MonitoredTask status=TaskMonitor.get().createStatus(method);
+    Map<byte[],Long> maxSeqIdInStores=new TreeMap<>(Bytes.BYTES_COMPARATOR);
+    for (    HStore store : region.getStores()) {
+      maxSeqIdInStores.put(Bytes.toBytes(store.getColumnFamilyName()),minSeqId - 1);
+    }
+    long seqId=region.replayRecoveredEditsIfAny(maxSeqIdInStores,null,status);
+    assertEquals(maxSeqId,seqId);
+    region.getMVCC().advanceTo(seqId);
+    Get get=new Get(row);
+    Result result=region.get(get);
+    for (long i=minSeqId; i <= maxSeqId; i+=10) {
+      List<Cell> kvs=result.getColumnCells(family,Bytes.toBytes(i));
+      assertEquals(1,kvs.size());
+      assertArrayEquals(Bytes.toBytes(i),CellUtil.cloneValue(kvs.get(0)));
+    }
+  }
+  finally {
+    HBaseTestingUtility.closeRegionAndWAL(this.region);
+    this.region=null;
+    wals.close();
+  }
+}

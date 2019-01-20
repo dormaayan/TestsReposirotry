@@ -1,0 +1,34 @@
+@Test(timeout=30_000) public void terminatingTransactionMustEagerlyReleaseTheirLocks() throws Exception {
+  AtomicBoolean nodeLockAcquired=new AtomicBoolean();
+  AtomicBoolean lockerDone=new AtomicBoolean();
+  BinaryLatch lockerPause=new BinaryLatch();
+  long nodeId;
+  try (Transaction tx=database.beginTx()){
+    nodeId=database.createNode().getId();
+    tx.success();
+  }
+   Future<?> locker=executor.submit(() -> {
+    try (Transaction tx=database.beginTx()){
+      Node node=database.getNodeById(nodeId);
+      tx.acquireReadLock(node);
+      nodeLockAcquired.set(true);
+      lockerPause.await();
+    }
+     lockerDone.set(true);
+  }
+);
+  boolean proceed;
+  do {
+    proceed=nodeLockAcquired.get();
+  }
+ while (!proceed);
+  terminateOngoingTransaction();
+  assertFalse(lockerDone.get());
+  try (Transaction tx=database.beginTx()){
+    tx.acquireWriteLock(database.getNodeById(nodeId));
+    tx.success();
+  }
+   lockerPause.release();
+  locker.get();
+  assertTrue(lockerDone.get());
+}

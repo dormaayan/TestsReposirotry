@@ -1,0 +1,43 @@
+@RunWith(Parameterized.class) public class StoreUpgradeOnStartupTest {
+  private final TestDirectory testDir=TestDirectory.testDirectory();
+  private final PageCacheRule pageCacheRule=new PageCacheRule();
+  private final DefaultFileSystemRule fileSystemRule=new DefaultFileSystemRule();
+  @Rule public RuleChain ruleChain=RuleChain.outerRule(testDir).around(fileSystemRule).around(pageCacheRule);
+  @Parameterized.Parameter(0) public String version;
+  private FileSystemAbstraction fileSystem;
+  private DatabaseLayout workingDatabaseLayout;
+  private StoreVersionCheck check;
+  private File workingStoreDir;
+  @Parameterized.Parameters(name="{0}") public static Collection<String> versions(){
+    return Collections.singletonList(StandardV2_3.STORE_VERSION);
+  }
+  @Before public void setup() throws IOException {
+    fileSystem=fileSystemRule.get();
+    PageCache pageCache=pageCacheRule.getPageCache(fileSystem);
+    workingStoreDir=testDir.storeDir("working_" + version);
+    workingDatabaseLayout=testDir.databaseLayout(workingStoreDir);
+    check=new StoreVersionCheck(pageCache);
+    File prepareDirectory=testDir.directory("prepare_" + version);
+    prepareSampleLegacyDatabase(version,fileSystem,workingDatabaseLayout.databaseDirectory(),prepareDirectory);
+  }
+  @Test public void shouldUpgradeAutomaticallyOnDatabaseStartup() throws ConsistencyCheckIncompleteException {
+    GraphDatabaseService database=createGraphDatabaseService();
+    database.shutdown();
+    assertTrue("Some store files did not have the correct version",checkNeoStoreHasDefaultFormatVersion(check,workingDatabaseLayout));
+    assertConsistentStore(workingDatabaseLayout);
+  }
+  @Test public void shouldAbortOnNonCleanlyShutdown() throws Throwable {
+    removeCheckPointFromTxLog(fileSystem,workingDatabaseLayout.databaseDirectory());
+    try {
+      GraphDatabaseService database=createGraphDatabaseService();
+      database.shutdown();
+      fail("Should have been unable to start upgrade on old version");
+    }
+ catch (    RuntimeException e) {
+      assertThat(Exceptions.rootCause(e),Matchers.instanceOf(StoreUpgrader.UnableToUpgradeException.class));
+    }
+  }
+  private GraphDatabaseService createGraphDatabaseService(){
+    return new TestGraphDatabaseFactory().newEmbeddedDatabaseBuilder(workingDatabaseLayout.databaseDirectory()).setConfig(GraphDatabaseSettings.allow_upgrade,"true").newGraphDatabase();
+  }
+}

@@ -1,0 +1,51 @@
+@Category({MasterTests.class,MediumTests.class}) public class TestSplitRegionWhileRSCrash {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestSplitRegionWhileRSCrash.class);
+  private static final Logger LOG=LoggerFactory.getLogger(TestSplitRegionWhileRSCrash.class);
+  protected static final HBaseTestingUtility UTIL=new HBaseTestingUtility();
+  private static TableName TABLE_NAME=TableName.valueOf("test");
+  private static Admin admin;
+  private static byte[] CF=Bytes.toBytes("cf");
+  private static CountDownLatch mergeCommitArrive=new CountDownLatch(1);
+  private static Table TABLE;
+  @BeforeClass public static void setupCluster() throws Exception {
+    UTIL.startMiniCluster(1);
+    admin=UTIL.getHBaseAdmin();
+    TABLE=UTIL.createTable(TABLE_NAME,CF);
+    UTIL.waitTableAvailable(TABLE_NAME);
+  }
+  @AfterClass public static void cleanupTest() throws Exception {
+    try {
+      UTIL.shutdownMiniCluster();
+    }
+ catch (    Exception e) {
+      LOG.warn("failure shutting down cluster",e);
+    }
+  }
+  @Test public void test() throws Exception {
+    MasterProcedureEnv env=UTIL.getMiniHBaseCluster().getMaster().getMasterProcedureExecutor().getEnvironment();
+    final ProcedureExecutor<MasterProcedureEnv> executor=UTIL.getMiniHBaseCluster().getMaster().getMasterProcedureExecutor();
+    List<RegionInfo> regionInfos=admin.getRegions(TABLE_NAME);
+    SplitTableRegionProcedure splitProcedure=new SplitTableRegionProcedure(env,regionInfos.get(0),Bytes.toBytes("row5"));
+    LOG.info("Begin to put data");
+    for (int i=0; i < 10; i++) {
+      byte[] row=Bytes.toBytes("row" + i);
+      Put put=new Put(row);
+      put.addColumn(CF,CF,CF);
+      TABLE.put(put);
+    }
+    executor.submitProcedure(splitProcedure);
+    LOG.info("SplitProcedure submitted");
+    UTIL.waitFor(30000,() -> executor.getProcedures().stream().filter(p -> p instanceof UnassignProcedure).map(p -> (UnassignProcedure)p).anyMatch(p -> TABLE_NAME.equals(p.getTableName())));
+    UTIL.getMiniHBaseCluster().killRegionServer(UTIL.getMiniHBaseCluster().getRegionServer(0).getServerName());
+    UTIL.getMiniHBaseCluster().startRegionServer();
+    UTIL.waitUntilNoRegionsInTransition();
+    Scan scan=new Scan();
+    ResultScanner results=TABLE.getScanner(scan);
+    int count=0;
+    Result result=null;
+    while ((result=results.next()) != null) {
+      count++;
+    }
+    Assert.assertEquals("There should be 10 rows!",10,count);
+  }
+}

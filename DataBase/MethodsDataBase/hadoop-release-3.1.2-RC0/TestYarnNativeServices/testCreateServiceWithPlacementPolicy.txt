@@ -1,0 +1,83 @@
+@Test(timeout=200000) public void testCreateServiceWithPlacementPolicy() throws Exception {
+  YarnConfiguration conf=new YarnConfiguration();
+  conf.set(YarnConfiguration.RM_PLACEMENT_CONSTRAINTS_HANDLER,YarnConfiguration.SCHEDULER_RM_PLACEMENT_CONSTRAINTS_HANDLER);
+  setConf(conf);
+  setupInternal(3);
+  ServiceClient client=createClient(getConf());
+  Service exampleApp=new Service();
+  exampleApp.setName("example-app");
+  exampleApp.setVersion("v1");
+  Component comp=createComponent("compa",3L,"sleep 1000");
+  PlacementPolicy pp=new PlacementPolicy();
+  PlacementConstraint pc=new PlacementConstraint();
+  pc.setName("CA1");
+  pc.setTargetTags(Collections.singletonList("compa"));
+  pc.setScope(PlacementScope.NODE);
+  pc.setType(PlacementType.ANTI_AFFINITY);
+  pp.setConstraints(Collections.singletonList(pc));
+  comp.setPlacementPolicy(pp);
+  exampleApp.addComponent(comp);
+  client.actionCreate(exampleApp);
+  waitForServiceToBeStable(client,exampleApp);
+  Service service=client.getStatus(exampleApp.getName());
+  Component component=service.getComponent("compa");
+  Assert.assertEquals("Service state should be STABLE",ServiceState.STABLE,service.getState());
+  Assert.assertEquals("3 containers are expected to be running",3,component.getContainers().size());
+  Set<String> nonAMContainerIdSet=new HashSet<>();
+  for (  Container cont : component.getContainers()) {
+    nonAMContainerIdSet.add(cont.getId());
+  }
+  Set<String> hosts=new HashSet<>();
+  ApplicationReport report=client.getYarnClient().getApplicationReport(ApplicationId.fromString(exampleApp.getId()));
+  GetContainersRequest req=GetContainersRequest.newInstance(report.getCurrentApplicationAttemptId());
+  ResourceManager rm=getYarnCluster().getResourceManager();
+  for (  ContainerReport contReport : rm.getClientRMService().getContainers(req).getContainerList()) {
+    if (!nonAMContainerIdSet.contains(contReport.getContainerId().toString())) {
+      continue;
+    }
+    if (hosts.contains(contReport.getNodeHttpAddress())) {
+      Assert.fail("Container " + contReport.getContainerId() + " came up in the same host as another container.");
+    }
+ else {
+      hosts.add(contReport.getNodeHttpAddress());
+    }
+  }
+  Map<String,Long> compCounts=new HashMap<>();
+  compCounts.put("compa",5L);
+  exampleApp.getComponent("compa").setNumberOfContainers(5L);
+  client.flexByRestService(exampleApp.getName(),compCounts);
+  try {
+    waitForServiceToBeStable(client,exampleApp,10000);
+    Assert.fail("Service should not be in a stable state. It should throw " + "a timeout exception.");
+  }
+ catch (  Exception e) {
+    service=client.getStatus(exampleApp.getName());
+    component=service.getComponent("compa");
+    Assert.assertNotEquals("Service state should not be STABLE",ServiceState.STABLE,service.getState());
+    Assert.assertEquals("Component state should be FLEXING",ComponentState.FLEXING,component.getState());
+    Assert.assertEquals("3 containers are expected to be running",3,component.getContainers().size());
+  }
+  compCounts=new HashMap<>();
+  compCounts.put("compa",4L);
+  exampleApp.getComponent("compa").setNumberOfContainers(4L);
+  client.flexByRestService(exampleApp.getName(),compCounts);
+  try {
+    waitForServiceToBeStable(client,exampleApp,10000);
+    Assert.fail("Service should not be in a stable state. It should throw " + "a timeout exception.");
+  }
+ catch (  Exception e) {
+    service=client.getStatus(exampleApp.getName());
+    component=service.getComponent("compa");
+    Assert.assertNotEquals("Service state should not be STABLE",ServiceState.STABLE,service.getState());
+    Assert.assertEquals("Component state should be FLEXING",ComponentState.FLEXING,component.getState());
+    Assert.assertEquals("3 containers are expected to be running",3,component.getContainers().size());
+  }
+  compCounts=new HashMap<>();
+  compCounts.put("compa",3L);
+  exampleApp.getComponent("compa").setNumberOfContainers(3L);
+  client.flexByRestService(exampleApp.getName(),compCounts);
+  waitForServiceToBeStable(client,exampleApp);
+  LOG.info("Stop/destroy service {}",exampleApp);
+  client.actionStop(exampleApp.getName(),true);
+  client.actionDestroy(exampleApp.getName());
+}

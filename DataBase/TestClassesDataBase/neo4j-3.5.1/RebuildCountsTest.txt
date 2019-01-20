@@ -1,0 +1,109 @@
+public class RebuildCountsTest {
+  private static final int ALIENS=16;
+  private static final int HUMANS=16;
+  private static final Label ALIEN=label("Alien");
+  private static final Label HUMAN=label("Human");
+  @Rule public final EphemeralFileSystemRule fsRule=new EphemeralFileSystemRule();
+  @Rule public final TestDirectory testDirectory=TestDirectory.testDirectory();
+  private final AssertableLogProvider userLogProvider=new AssertableLogProvider();
+  private final AssertableLogProvider internalLogProvider=new AssertableLogProvider();
+  private GraphDatabaseService db;
+  private File storeDir;
+  @Before public void before() throws IOException {
+    storeDir=testDirectory.databaseDir();
+    restart(fsRule.get());
+  }
+  @After public void after(){
+    doCleanShutdown();
+  }
+  @Test public void shouldRebuildMissingCountsStoreOnStart() throws IOException, TransactionFailureException {
+    createAliensAndHumans();
+    FileSystemAbstraction fs=shutdown();
+    deleteCounts(fs);
+    restart(fs);
+    try (org.neo4j.internal.kernel.api.Transaction tx=((GraphDatabaseAPI)db).getDependencyResolver().resolveDependency(Kernel.class).beginTransaction(explicit,AUTH_DISABLED)){
+      assertEquals(ALIENS + HUMANS,tx.dataRead().countsForNode(-1));
+      assertEquals(ALIENS,tx.dataRead().countsForNode(labelId(ALIEN)));
+      assertEquals(HUMANS,tx.dataRead().countsForNode(labelId(HUMAN)));
+    }
+     LogMatcherBuilder matcherBuilder=inLog(MetaDataStore.class);
+    internalLogProvider.assertAtLeastOnce(matcherBuilder.warn("Missing counts store, rebuilding it."));
+    internalLogProvider.assertAtLeastOnce(matcherBuilder.warn("Counts store rebuild completed."));
+  }
+  @Test public void shouldRebuildMissingCountsStoreAfterRecovery() throws IOException, TransactionFailureException {
+    createAliensAndHumans();
+    rotateLog();
+    deleteHumans();
+    FileSystemAbstraction fs=crash();
+    deleteCounts(fs);
+    restart(fs);
+    try (org.neo4j.internal.kernel.api.Transaction tx=((GraphDatabaseAPI)db).getDependencyResolver().resolveDependency(Kernel.class).beginTransaction(explicit,AUTH_DISABLED)){
+      assertEquals(ALIENS,tx.dataRead().countsForNode(-1));
+      assertEquals(ALIENS,tx.dataRead().countsForNode(labelId(ALIEN)));
+      assertEquals(0,tx.dataRead().countsForNode(labelId(HUMAN)));
+    }
+     LogMatcherBuilder matcherBuilder=inLog(MetaDataStore.class);
+    internalLogProvider.assertAtLeastOnce(matcherBuilder.warn("Missing counts store, rebuilding it."));
+    internalLogProvider.assertAtLeastOnce(matcherBuilder.warn("Counts store rebuild completed."));
+  }
+  private void createAliensAndHumans(){
+    try (Transaction tx=db.beginTx()){
+      for (int i=0; i < ALIENS; i++) {
+        db.createNode(ALIEN);
+      }
+      for (int i=0; i < HUMANS; i++) {
+        db.createNode(HUMAN);
+      }
+      tx.success();
+    }
+   }
+  private void deleteHumans(){
+    try (Transaction tx=db.beginTx()){
+      try (ResourceIterator<Node> humans=db.findNodes(HUMAN)){
+        while (humans.hasNext()) {
+          humans.next().delete();
+        }
+      }
+       tx.success();
+    }
+   }
+  private int labelId(  Label alien){
+    ThreadToStatementContextBridge contextBridge=((GraphDatabaseAPI)db).getDependencyResolver().resolveDependency(ThreadToStatementContextBridge.class);
+    try (Transaction tx=db.beginTx()){
+      return contextBridge.getKernelTransactionBoundToThisThread(true).tokenRead().nodeLabel(alien.name());
+    }
+   }
+  private void deleteCounts(  FileSystemAbstraction snapshot){
+    DatabaseLayout databaseLayout=testDirectory.databaseLayout();
+    File alpha=databaseLayout.countStoreA();
+    File beta=databaseLayout.countStoreB();
+    assertTrue(snapshot.deleteFile(alpha));
+    assertTrue(snapshot.deleteFile(beta));
+  }
+  private FileSystemAbstraction shutdown(){
+    doCleanShutdown();
+    return fsRule.get().snapshot();
+  }
+  private void rotateLog() throws IOException {
+    ((GraphDatabaseAPI)db).getDependencyResolver().resolveDependency(CheckPointer.class).forceCheckPoint(new SimpleTriggerInfo("test"));
+  }
+  private FileSystemAbstraction crash(){
+    return fsRule.get().snapshot();
+  }
+  private void restart(  FileSystemAbstraction fs) throws IOException {
+    if (db != null) {
+      db.shutdown();
+    }
+    fs.mkdirs(storeDir);
+    TestGraphDatabaseFactory dbFactory=new TestGraphDatabaseFactory();
+    db=dbFactory.setUserLogProvider(userLogProvider).setInternalLogProvider(internalLogProvider).setFileSystem(new UncloseableDelegatingFileSystemAbstraction(fs)).newImpermanentDatabaseBuilder(storeDir).setConfig(index_background_sampling_enabled,"false").newGraphDatabase();
+  }
+  private void doCleanShutdown(){
+    try {
+      db.shutdown();
+    }
+  finally {
+      db=null;
+    }
+  }
+}

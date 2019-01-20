@@ -1,0 +1,154 @@
+@Test public void invalidation() throws Exception {
+  try {
+    String dbName="default";
+    String tableName="invalidation";
+    List<String> partVals1=Arrays.asList("today");
+    List<String> partVals2=Arrays.asList("yesterday");
+    List<String> partVals3=Arrays.asList("tomorrow");
+    long now=System.currentTimeMillis();
+    List<FieldSchema> cols=new ArrayList<>();
+    cols.add(new FieldSchema("col1","boolean","nocomment"));
+    SerDeInfo serde=new SerDeInfo("serde","seriallib",null);
+    StorageDescriptor sd=new StorageDescriptor(cols,"file:/tmp","input","output",false,0,serde,null,null,Collections.<String,String>emptyMap());
+    List<FieldSchema> partCols=new ArrayList<>();
+    partCols.add(new FieldSchema("ds","string",""));
+    Table table=new Table(tableName,dbName,"me",(int)now,(int)now,0,sd,partCols,Collections.<String,String>emptyMap(),null,null,null);
+    store.createTable(table);
+    for (    List<String> partVals : Arrays.asList(partVals1,partVals2,partVals3)) {
+      StorageDescriptor psd=new StorageDescriptor(sd);
+      psd.setLocation("file:/tmp/default/invalidation/ds=" + partVals.get(0));
+      Partition part=new Partition(partVals,dbName,tableName,(int)now,(int)now,psd,Collections.<String,String>emptyMap());
+      store.addPartition(part);
+      ColumnStatistics cs=new ColumnStatistics();
+      ColumnStatisticsDesc desc=new ColumnStatisticsDesc(false,dbName,tableName);
+      desc.setLastAnalyzed(now);
+      desc.setPartName("ds=" + partVals.get(0));
+      cs.setStatsDesc(desc);
+      ColumnStatisticsObj obj=new ColumnStatisticsObj();
+      obj.setColName("col1");
+      obj.setColType("boolean");
+      ColumnStatisticsData data=new ColumnStatisticsData();
+      BooleanColumnStatsData bcsd=new BooleanColumnStatsData();
+      bcsd.setNumFalses(10);
+      bcsd.setNumTrues(20);
+      bcsd.setNumNulls(30);
+      data.setBooleanStats(bcsd);
+      obj.setStatsData(data);
+      cs.addToStatsObj(obj);
+      store.updatePartitionColumnStatistics(cs,partVals);
+    }
+    Checker statChecker=new Checker(){
+      @Override public void checkStats(      AggrStats aggrStats) throws Exception {
+        Assert.assertEquals(2,aggrStats.getPartsFound());
+        Assert.assertEquals(1,aggrStats.getColStatsSize());
+        ColumnStatisticsObj cso=aggrStats.getColStats().get(0);
+        Assert.assertEquals("col1",cso.getColName());
+        Assert.assertEquals("boolean",cso.getColType());
+        BooleanColumnStatsData bcsd=cso.getStatsData().getBooleanStats();
+        Assert.assertEquals(20,bcsd.getNumFalses());
+        Assert.assertEquals(40,bcsd.getNumTrues());
+        Assert.assertEquals(60,bcsd.getNumNulls());
+      }
+    }
+;
+    AggrStats aggrStats=store.get_aggr_stats_for(dbName,tableName,Arrays.asList("ds=today","ds=yesterday"),Arrays.asList("col1"));
+    statChecker.checkStats(aggrStats);
+    Assert.assertEquals(0,store.backdoor().getStatsCache().hbaseHits.getCnt());
+    Assert.assertEquals(1,store.backdoor().getStatsCache().totalGets.getCnt());
+    Assert.assertEquals(1,store.backdoor().getStatsCache().misses.getCnt());
+    aggrStats=store.get_aggr_stats_for(dbName,tableName,Arrays.asList("ds=yesterday","ds=today"),Arrays.asList("col1"));
+    statChecker.checkStats(aggrStats);
+    Assert.assertEquals(0,store.backdoor().getStatsCache().hbaseHits.getCnt());
+    Assert.assertEquals(2,store.backdoor().getStatsCache().totalGets.getCnt());
+    Assert.assertEquals(1,store.backdoor().getStatsCache().misses.getCnt());
+    aggrStats=store.get_aggr_stats_for(dbName,tableName,Arrays.asList("ds=tomorrow","ds=today"),Arrays.asList("col1"));
+    statChecker.checkStats(aggrStats);
+    Assert.assertEquals(0,store.backdoor().getStatsCache().hbaseHits.getCnt());
+    Assert.assertEquals(3,store.backdoor().getStatsCache().totalGets.getCnt());
+    Assert.assertEquals(2,store.backdoor().getStatsCache().misses.getCnt());
+    aggrStats=store.get_aggr_stats_for(dbName,tableName,Arrays.asList("ds=tomorrow","ds=today"),Arrays.asList("col1"));
+    statChecker.checkStats(aggrStats);
+    Assert.assertEquals(0,store.backdoor().getStatsCache().hbaseHits.getCnt());
+    Assert.assertEquals(4,store.backdoor().getStatsCache().totalGets.getCnt());
+    Assert.assertEquals(2,store.backdoor().getStatsCache().misses.getCnt());
+    store.backdoor().getStatsCache().wakeInvalidator();
+    aggrStats=store.get_aggr_stats_for(dbName,tableName,Arrays.asList("ds=tomorrow","ds=today"),Arrays.asList("col1"));
+    statChecker.checkStats(aggrStats);
+    Assert.assertEquals(0,store.backdoor().getStatsCache().hbaseHits.getCnt());
+    Assert.assertEquals(5,store.backdoor().getStatsCache().totalGets.getCnt());
+    Assert.assertEquals(2,store.backdoor().getStatsCache().misses.getCnt());
+    ColumnStatistics cs=new ColumnStatistics();
+    ColumnStatisticsDesc desc=new ColumnStatisticsDesc(false,dbName,tableName);
+    desc.setLastAnalyzed(now);
+    desc.setPartName("ds=" + partVals3.get(0));
+    cs.setStatsDesc(desc);
+    ColumnStatisticsObj obj=new ColumnStatisticsObj();
+    obj.setColName("col1");
+    obj.setColType("boolean");
+    ColumnStatisticsData data=new ColumnStatisticsData();
+    BooleanColumnStatsData bcsd=new BooleanColumnStatsData();
+    bcsd.setNumFalses(100);
+    bcsd.setNumTrues(200);
+    bcsd.setNumNulls(300);
+    data.setBooleanStats(bcsd);
+    obj.setStatsData(data);
+    cs.addToStatsObj(obj);
+    Checker afterUpdate=new Checker(){
+      @Override public void checkStats(      AggrStats aggrStats) throws Exception {
+        Assert.assertEquals(2,aggrStats.getPartsFound());
+        Assert.assertEquals(1,aggrStats.getColStatsSize());
+        ColumnStatisticsObj cso=aggrStats.getColStats().get(0);
+        Assert.assertEquals("col1",cso.getColName());
+        Assert.assertEquals("boolean",cso.getColType());
+        BooleanColumnStatsData bcsd=cso.getStatsData().getBooleanStats();
+        Assert.assertEquals(110,bcsd.getNumFalses());
+        Assert.assertEquals(220,bcsd.getNumTrues());
+        Assert.assertEquals(330,bcsd.getNumNulls());
+      }
+    }
+;
+    store.updatePartitionColumnStatistics(cs,partVals3);
+    store.backdoor().getStatsCache().setRunInvalidatorEvery(100);
+    store.backdoor().getStatsCache().wakeInvalidator();
+    aggrStats=store.get_aggr_stats_for(dbName,tableName,Arrays.asList("ds=tomorrow","ds=today"),Arrays.asList("col1"));
+    afterUpdate.checkStats(aggrStats);
+    Assert.assertEquals(0,store.backdoor().getStatsCache().hbaseHits.getCnt());
+    Assert.assertEquals(6,store.backdoor().getStatsCache().totalGets.getCnt());
+    Assert.assertEquals(3,store.backdoor().getStatsCache().misses.getCnt());
+    aggrStats=store.get_aggr_stats_for(dbName,tableName,Arrays.asList("ds=yesterday","ds=today"),Arrays.asList("col1"));
+    statChecker.checkStats(aggrStats);
+    Assert.assertEquals(0,store.backdoor().getStatsCache().hbaseHits.getCnt());
+    Assert.assertEquals(7,store.backdoor().getStatsCache().totalGets.getCnt());
+    Assert.assertEquals(3,store.backdoor().getStatsCache().misses.getCnt());
+    store.dropPartition(dbName,tableName,partVals2);
+    store.backdoor().getStatsCache().wakeInvalidator();
+    aggrStats=store.get_aggr_stats_for(dbName,tableName,Arrays.asList("ds=yesterday","ds=today"),Arrays.asList("col1"));
+    new Checker(){
+      @Override public void checkStats(      AggrStats aggrStats) throws Exception {
+        Assert.assertEquals(1,aggrStats.getPartsFound());
+        Assert.assertEquals(1,aggrStats.getColStatsSize());
+        ColumnStatisticsObj cso=aggrStats.getColStats().get(0);
+        Assert.assertEquals("col1",cso.getColName());
+        Assert.assertEquals("boolean",cso.getColType());
+        BooleanColumnStatsData bcsd=cso.getStatsData().getBooleanStats();
+        Assert.assertEquals(10,bcsd.getNumFalses());
+        Assert.assertEquals(20,bcsd.getNumTrues());
+        Assert.assertEquals(30,bcsd.getNumNulls());
+      }
+    }
+.checkStats(aggrStats);
+    Assert.assertEquals(0,store.backdoor().getStatsCache().hbaseHits.getCnt());
+    Assert.assertEquals(8,store.backdoor().getStatsCache().totalGets.getCnt());
+    Assert.assertEquals(4,store.backdoor().getStatsCache().misses.getCnt());
+    aggrStats=store.get_aggr_stats_for(dbName,tableName,Arrays.asList("ds=tomorrow","ds=today"),Arrays.asList("col1"));
+    afterUpdate.checkStats(aggrStats);
+    Assert.assertEquals(0,store.backdoor().getStatsCache().hbaseHits.getCnt());
+    Assert.assertEquals(9,store.backdoor().getStatsCache().totalGets.getCnt());
+    Assert.assertEquals(4,store.backdoor().getStatsCache().misses.getCnt());
+  }
+  finally {
+    store.backdoor().getStatsCache().setRunInvalidatorEvery(5000);
+    store.backdoor().getStatsCache().setMaxTimeInCache(500000);
+    store.backdoor().getStatsCache().wakeInvalidator();
+  }
+}

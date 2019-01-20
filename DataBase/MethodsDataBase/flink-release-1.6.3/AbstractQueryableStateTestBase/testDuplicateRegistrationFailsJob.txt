@@ -1,0 +1,39 @@
+/** 
+ * Tests that duplicate query registrations fail the job at the JobManager.
+ */
+@Test(timeout=60_000) public void testDuplicateRegistrationFailsJob() throws Exception {
+  final int numKeys=256;
+  StreamExecutionEnvironment env=StreamExecutionEnvironment.getExecutionEnvironment();
+  env.setStateBackend(stateBackend);
+  env.setParallelism(maxParallelism);
+  env.setRestartStrategy(RestartStrategies.fixedDelayRestart(Integer.MAX_VALUE,1000L));
+  DataStream<Tuple2<Integer,Long>> source=env.addSource(new TestKeyRangeSource(numKeys));
+  ReducingStateDescriptor<Tuple2<Integer,Long>> reducingState=new ReducingStateDescriptor<>("any-name",new SumReduce(),source.getType());
+  final String queryName="duplicate-me";
+  final QueryableStateStream<Integer,Tuple2<Integer,Long>> queryableState=source.keyBy(new KeySelector<Tuple2<Integer,Long>,Integer>(){
+    private static final long serialVersionUID=-4126824763829132959L;
+    @Override public Integer getKey(    Tuple2<Integer,Long> value){
+      return value.f0;
+    }
+  }
+).asQueryableState(queryName,reducingState);
+  final QueryableStateStream<Integer,Tuple2<Integer,Long>> duplicate=source.keyBy(new KeySelector<Tuple2<Integer,Long>,Integer>(){
+    private static final long serialVersionUID=-6265024000462809436L;
+    @Override public Integer getKey(    Tuple2<Integer,Long> value){
+      return value.f0;
+    }
+  }
+).asQueryableState(queryName);
+  final JobGraph jobGraph=env.getStreamGraph().getJobGraph();
+  clusterClient.setDetached(false);
+  boolean caughtException=false;
+  try {
+    clusterClient.submitJob(jobGraph,AbstractQueryableStateTestBase.class.getClassLoader());
+  }
+ catch (  ProgramInvocationException e) {
+    String failureCause=ExceptionUtils.stringifyException(e);
+    assertThat(failureCause,containsString("KvState with name '" + queryName + "' has already been registered by another operator"));
+    caughtException=true;
+  }
+  assertTrue(caughtException);
+}

@@ -1,0 +1,353 @@
+/** 
+ * Tests ReplicationSource and ReplicationEndpoint interactions
+ */
+@Category({ReplicationTests.class,MediumTests.class}) public class TestReplicationEndpoint extends TestReplicationBase {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestReplicationEndpoint.class);
+  private static final Logger LOG=LoggerFactory.getLogger(TestReplicationEndpoint.class);
+  static int numRegionServers;
+  @BeforeClass public static void setUpBeforeClass() throws Exception {
+    TestReplicationBase.setUpBeforeClass();
+    numRegionServers=utility1.getHBaseCluster().getRegionServerThreads().size();
+  }
+  @AfterClass public static void tearDownAfterClass() throws Exception {
+    TestReplicationBase.tearDownAfterClass();
+    Assert.assertTrue(ReplicationEndpointForTest.stoppedCount.get() > 0);
+  }
+  @Before public void setup() throws Exception {
+    ReplicationEndpointForTest.contructedCount.set(0);
+    ReplicationEndpointForTest.startedCount.set(0);
+    ReplicationEndpointForTest.replicateCount.set(0);
+    ReplicationEndpointReturningFalse.replicated.set(false);
+    ReplicationEndpointForTest.lastEntries=null;
+    final List<RegionServerThread> rsThreads=utility1.getMiniHBaseCluster().getRegionServerThreads();
+    for (    RegionServerThread rs : rsThreads) {
+      utility1.getAdmin().rollWALWriter(rs.getRegionServer().getServerName());
+    }
+    utility1.waitFor(3000,new Waiter.ExplainingPredicate<Exception>(){
+      @Override public boolean evaluate() throws Exception {
+        for (        RegionServerThread rs : rsThreads) {
+          if (!rs.getRegionServer().walRollRequestFinished()) {
+            return false;
+          }
+        }
+        return true;
+      }
+      @Override public String explainFailure() throws Exception {
+        List<String> logRollInProgressRsList=new ArrayList<>();
+        for (        RegionServerThread rs : rsThreads) {
+          if (!rs.getRegionServer().walRollRequestFinished()) {
+            logRollInProgressRsList.add(rs.getRegionServer().toString());
+          }
+        }
+        return "Still waiting for log roll on regionservers: " + logRollInProgressRsList;
+      }
+    }
+);
+  }
+  @Test public void testCustomReplicationEndpoint() throws Exception {
+    admin.addPeer("testCustomReplicationEndpoint",new ReplicationPeerConfig().setClusterKey(ZKConfig.getZooKeeperClusterKey(conf1)).setReplicationEndpointImpl(ReplicationEndpointForTest.class.getName()),null);
+    Waiter.waitFor(conf1,60000,new Waiter.Predicate<Exception>(){
+      @Override public boolean evaluate() throws Exception {
+        return ReplicationEndpointForTest.contructedCount.get() >= numRegionServers;
+      }
+    }
+);
+    Waiter.waitFor(conf1,60000,new Waiter.Predicate<Exception>(){
+      @Override public boolean evaluate() throws Exception {
+        return ReplicationEndpointForTest.startedCount.get() >= numRegionServers;
+      }
+    }
+);
+    Assert.assertEquals(0,ReplicationEndpointForTest.replicateCount.get());
+    doPut(Bytes.toBytes("row42"));
+    Waiter.waitFor(conf1,60000,new Waiter.Predicate<Exception>(){
+      @Override public boolean evaluate() throws Exception {
+        return ReplicationEndpointForTest.replicateCount.get() >= 1;
+      }
+    }
+);
+    doAssert(Bytes.toBytes("row42"));
+    admin.removePeer("testCustomReplicationEndpoint");
+  }
+  @Test public void testReplicationEndpointReturnsFalseOnReplicate() throws Exception {
+    Assert.assertEquals(0,ReplicationEndpointForTest.replicateCount.get());
+    Assert.assertTrue(!ReplicationEndpointReturningFalse.replicated.get());
+    int peerCount=admin.getPeersCount();
+    final String id="testReplicationEndpointReturnsFalseOnReplicate";
+    admin.addPeer(id,new ReplicationPeerConfig().setClusterKey(ZKConfig.getZooKeeperClusterKey(conf1)).setReplicationEndpointImpl(ReplicationEndpointReturningFalse.class.getName()),null);
+    if (admin.getPeersCount() <= peerCount) {
+      LOG.info("Waiting on peercount to go up from " + peerCount);
+      Threads.sleep(100);
+    }
+    doPut(row);
+    Waiter.waitFor(conf1,60000,new Waiter.Predicate<Exception>(){
+      @Override public boolean evaluate() throws Exception {
+        int count=ReplicationEndpointForTest.replicateCount.get();
+        LOG.info("count=" + count);
+        return ReplicationEndpointReturningFalse.replicated.get();
+      }
+    }
+);
+    if (ReplicationEndpointReturningFalse.ex.get() != null) {
+      throw ReplicationEndpointReturningFalse.ex.get();
+    }
+    admin.removePeer("testReplicationEndpointReturnsFalseOnReplicate");
+  }
+  @Test public void testInterClusterReplication() throws Exception {
+    final String id="testInterClusterReplication";
+    List<HRegion> regions=utility1.getHBaseCluster().getRegions(tableName);
+    int totEdits=0;
+    for (    HRegion region : regions) {
+      RegionInfo hri=region.getRegionInfo();
+      byte[] row=hri.getStartKey();
+      for (int i=0; i < 100; i++) {
+        if (row.length > 0) {
+          Put put=new Put(row);
+          put.addColumn(famName,row,row);
+          region.put(put);
+          totEdits++;
+        }
+      }
+    }
+    admin.addPeer(id,new ReplicationPeerConfig().setClusterKey(ZKConfig.getZooKeeperClusterKey(conf2)).setReplicationEndpointImpl(InterClusterReplicationEndpointForTest.class.getName()),null);
+    final int numEdits=totEdits;
+    Waiter.waitFor(conf1,30000,new Waiter.ExplainingPredicate<Exception>(){
+      @Override public boolean evaluate() throws Exception {
+        return InterClusterReplicationEndpointForTest.replicateCount.get() == numEdits;
+      }
+      @Override public String explainFailure() throws Exception {
+        String failure="Failed to replicate all edits, expected = " + numEdits + " replicated = "+ InterClusterReplicationEndpointForTest.replicateCount.get();
+        return failure;
+      }
+    }
+);
+    admin.removePeer("testInterClusterReplication");
+    utility1.deleteTableData(tableName);
+  }
+  @Test public void testWALEntryFilterFromReplicationEndpoint() throws Exception {
+    ReplicationPeerConfig rpc=new ReplicationPeerConfig().setClusterKey(ZKConfig.getZooKeeperClusterKey(conf1)).setReplicationEndpointImpl(ReplicationEndpointWithWALEntryFilter.class.getName());
+    rpc.getConfiguration().put(BaseReplicationEndpoint.REPLICATION_WALENTRYFILTER_CONFIG_KEY,EverythingPassesWALEntryFilter.class.getName() + "," + EverythingPassesWALEntryFilterSubclass.class.getName());
+    admin.addPeer("testWALEntryFilterFromReplicationEndpoint",rpc);
+    try (Connection connection=ConnectionFactory.createConnection(conf1)){
+      doPut(connection,Bytes.toBytes("row1"));
+      doPut(connection,row);
+      doPut(connection,Bytes.toBytes("row2"));
+    }
+     Waiter.waitFor(conf1,60000,new Waiter.Predicate<Exception>(){
+      @Override public boolean evaluate() throws Exception {
+        return ReplicationEndpointForTest.replicateCount.get() >= 1;
+      }
+    }
+);
+    Assert.assertNull(ReplicationEndpointWithWALEntryFilter.ex.get());
+    Assert.assertTrue(EverythingPassesWALEntryFilter.hasPassedAnEntry());
+    admin.removePeer("testWALEntryFilterFromReplicationEndpoint");
+  }
+  @Test(expected=IOException.class) public void testWALEntryFilterAddValidation() throws Exception {
+    ReplicationPeerConfig rpc=new ReplicationPeerConfig().setClusterKey(ZKConfig.getZooKeeperClusterKey(conf1)).setReplicationEndpointImpl(ReplicationEndpointWithWALEntryFilter.class.getName());
+    rpc.getConfiguration().put(BaseReplicationEndpoint.REPLICATION_WALENTRYFILTER_CONFIG_KEY,"IAmNotARealWalEntryFilter");
+    admin.addPeer("testWALEntryFilterAddValidation",rpc);
+  }
+  @Test(expected=IOException.class) public void testWALEntryFilterUpdateValidation() throws Exception {
+    ReplicationPeerConfig rpc=new ReplicationPeerConfig().setClusterKey(ZKConfig.getZooKeeperClusterKey(conf1)).setReplicationEndpointImpl(ReplicationEndpointWithWALEntryFilter.class.getName());
+    rpc.getConfiguration().put(BaseReplicationEndpoint.REPLICATION_WALENTRYFILTER_CONFIG_KEY,"IAmNotARealWalEntryFilter");
+    admin.updatePeerConfig("testWALEntryFilterUpdateValidation",rpc);
+  }
+  @Test public void testMetricsSourceBaseSourcePassthrough(){
+    String id="id";
+    DynamicMetricsRegistry mockRegistry=mock(DynamicMetricsRegistry.class);
+    MetricsReplicationSourceImpl singleRms=mock(MetricsReplicationSourceImpl.class);
+    when(singleRms.getMetricsRegistry()).thenReturn(mockRegistry);
+    MetricsReplicationSourceImpl globalRms=mock(MetricsReplicationSourceImpl.class);
+    when(globalRms.getMetricsRegistry()).thenReturn(mockRegistry);
+    MetricsReplicationSourceSource singleSourceSource=new MetricsReplicationSourceSourceImpl(singleRms,id);
+    MetricsReplicationSourceSource globalSourceSource=new MetricsReplicationGlobalSourceSource(globalRms);
+    MetricsReplicationSourceSource spyglobalSourceSource=spy(globalSourceSource);
+    doNothing().when(spyglobalSourceSource).incrFailedRecoveryQueue();
+    Map<String,MetricsReplicationSourceSource> singleSourceSourceByTable=new HashMap<>();
+    MetricsSource source=new MetricsSource(id,singleSourceSource,spyglobalSourceSource,singleSourceSourceByTable);
+    String gaugeName="gauge";
+    String singleGaugeName="source.id." + gaugeName;
+    String globalGaugeName="source." + gaugeName;
+    long delta=1;
+    String counterName="counter";
+    String singleCounterName="source.id." + counterName;
+    String globalCounterName="source." + counterName;
+    long count=2;
+    source.decGauge(gaugeName,delta);
+    source.getMetricsContext();
+    source.getMetricsDescription();
+    source.getMetricsJmxContext();
+    source.getMetricsName();
+    source.incCounters(counterName,count);
+    source.incGauge(gaugeName,delta);
+    source.init();
+    source.removeMetric(gaugeName);
+    source.setGauge(gaugeName,delta);
+    source.updateHistogram(counterName,count);
+    source.incrFailedRecoveryQueue();
+    verify(singleRms).decGauge(singleGaugeName,delta);
+    verify(globalRms).decGauge(globalGaugeName,delta);
+    verify(globalRms).getMetricsContext();
+    verify(globalRms).getMetricsJmxContext();
+    verify(globalRms).getMetricsName();
+    verify(singleRms).incCounters(singleCounterName,count);
+    verify(globalRms).incCounters(globalCounterName,count);
+    verify(singleRms).incGauge(singleGaugeName,delta);
+    verify(globalRms).incGauge(globalGaugeName,delta);
+    verify(globalRms).init();
+    verify(singleRms).removeMetric(singleGaugeName);
+    verify(globalRms).removeMetric(globalGaugeName);
+    verify(singleRms).setGauge(singleGaugeName,delta);
+    verify(globalRms).setGauge(globalGaugeName,delta);
+    verify(singleRms).updateHistogram(singleCounterName,count);
+    verify(globalRms).updateHistogram(globalCounterName,count);
+    verify(spyglobalSourceSource).incrFailedRecoveryQueue();
+    boolean containsRandomNewTable=source.getSingleSourceSourceByTable().containsKey("RandomNewTable");
+    Assert.assertEquals(false,containsRandomNewTable);
+    source.setAgeOfLastShippedOpByTable(123L,"RandomNewTable");
+    containsRandomNewTable=source.getSingleSourceSourceByTable().containsKey("RandomNewTable");
+    Assert.assertEquals(true,containsRandomNewTable);
+    MetricsReplicationSourceSource msr=source.getSingleSourceSourceByTable().get("RandomNewTable");
+    Assert.assertTrue(msr.getLastShippedAge() > 0);
+  }
+  private void doPut(  byte[] row) throws IOException {
+    try (Connection connection=ConnectionFactory.createConnection(conf1)){
+      doPut(connection,row);
+    }
+   }
+  private void doPut(  final Connection connection,  final byte[] row) throws IOException {
+    try (Table t=connection.getTable(tableName)){
+      Put put=new Put(row);
+      put.addColumn(famName,row,row);
+      t.put(put);
+    }
+   }
+  private static void doAssert(  byte[] row) throws Exception {
+    if (ReplicationEndpointForTest.lastEntries == null) {
+      return;
+    }
+    Assert.assertEquals(1,ReplicationEndpointForTest.lastEntries.size());
+    List<Cell> cells=ReplicationEndpointForTest.lastEntries.get(0).getEdit().getCells();
+    Assert.assertEquals(1,cells.size());
+    Assert.assertTrue(Bytes.equals(cells.get(0).getRowArray(),cells.get(0).getRowOffset(),cells.get(0).getRowLength(),row,0,row.length));
+  }
+public static class ReplicationEndpointForTest extends BaseReplicationEndpoint {
+    static UUID uuid=utility1.getRandomUUID();
+    static AtomicInteger contructedCount=new AtomicInteger();
+    static AtomicInteger startedCount=new AtomicInteger();
+    static AtomicInteger stoppedCount=new AtomicInteger();
+    static AtomicInteger replicateCount=new AtomicInteger();
+    static volatile List<Entry> lastEntries=null;
+    public ReplicationEndpointForTest(){
+      replicateCount.set(0);
+      contructedCount.incrementAndGet();
+    }
+    @Override public UUID getPeerUUID(){
+      return uuid;
+    }
+    @Override public boolean replicate(    ReplicateContext replicateContext){
+      replicateCount.incrementAndGet();
+      lastEntries=new ArrayList<>(replicateContext.entries);
+      return true;
+    }
+    @Override public void start(){
+      startAsync();
+    }
+    @Override public void stop(){
+      stopAsync();
+    }
+    @Override protected void doStart(){
+      startedCount.incrementAndGet();
+      notifyStarted();
+    }
+    @Override protected void doStop(){
+      stoppedCount.incrementAndGet();
+      notifyStopped();
+    }
+  }
+public static class InterClusterReplicationEndpointForTest extends HBaseInterClusterReplicationEndpoint {
+    static AtomicInteger replicateCount=new AtomicInteger();
+    static boolean failedOnce;
+    public InterClusterReplicationEndpointForTest(){
+      replicateCount.set(0);
+    }
+    @Override public boolean replicate(    ReplicateContext replicateContext){
+      boolean success=super.replicate(replicateContext);
+      if (success) {
+        replicateCount.addAndGet(replicateContext.entries.size());
+      }
+      return success;
+    }
+    @Override protected Callable<Integer> createReplicator(    List<Entry> entries,    int ordinal){
+      if (failedOnce) {
+        return () -> ordinal;
+      }
+ else {
+        failedOnce=true;
+        return () -> {
+          throw new IOException("Sample Exception: Failed to replicate.");
+        }
+;
+      }
+    }
+  }
+public static class ReplicationEndpointReturningFalse extends ReplicationEndpointForTest {
+    static int COUNT=10;
+    static AtomicReference<Exception> ex=new AtomicReference<>(null);
+    static AtomicBoolean replicated=new AtomicBoolean(false);
+    @Override public boolean replicate(    ReplicateContext replicateContext){
+      try {
+        doAssert(row);
+      }
+ catch (      Exception e) {
+        ex.set(e);
+      }
+      super.replicate(replicateContext);
+      LOG.info("Replicated " + Bytes.toString(row) + ", count="+ replicateCount.get());
+      replicated.set(replicateCount.get() > COUNT);
+      return replicated.get();
+    }
+  }
+public static class ReplicationEndpointWithWALEntryFilter extends ReplicationEndpointForTest {
+    static AtomicReference<Exception> ex=new AtomicReference<>(null);
+    @Override public boolean replicate(    ReplicateContext replicateContext){
+      try {
+        super.replicate(replicateContext);
+        doAssert(row);
+      }
+ catch (      Exception e) {
+        ex.set(e);
+      }
+      return true;
+    }
+    @Override public WALEntryFilter getWALEntryfilter(){
+      return new ChainWALEntryFilter(super.getWALEntryfilter(),new WALEntryFilter(){
+        @Override public Entry filter(        Entry entry){
+          ArrayList<Cell> cells=entry.getEdit().getCells();
+          int size=cells.size();
+          for (int i=size - 1; i >= 0; i--) {
+            Cell cell=cells.get(i);
+            if (!Bytes.equals(cell.getRowArray(),cell.getRowOffset(),cell.getRowLength(),row,0,row.length)) {
+              cells.remove(i);
+            }
+          }
+          return entry;
+        }
+      }
+);
+    }
+  }
+public static class EverythingPassesWALEntryFilter implements WALEntryFilter {
+    private static boolean passedEntry=false;
+    @Override public Entry filter(    Entry entry){
+      passedEntry=true;
+      return entry;
+    }
+    public static boolean hasPassedAnEntry(){
+      return passedEntry;
+    }
+  }
+public static class EverythingPassesWALEntryFilterSubclass extends EverythingPassesWALEntryFilter {
+  }
+}

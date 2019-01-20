@@ -1,0 +1,71 @@
+/** 
+ * Tests responses to partition state requests.
+ */
+@Test public void testRequestPartitionState() throws Exception {
+  new JavaTestKit(system){
+{
+      new Within(duration("15 seconds")){
+        @Override protected void run(){
+          TestingCluster cluster=null;
+          try {
+            cluster=startTestingCluster(2,1,DEFAULT_AKKA_ASK_TIMEOUT());
+            final IntermediateDataSetID rid=new IntermediateDataSetID();
+            final JobVertex sender=new JobVertex("Sender");
+            sender.setParallelism(1);
+            sender.setInvokableClass(BlockingNoOpInvokable.class);
+            sender.createAndAddResultDataSet(rid,PIPELINED);
+            final JobGraph jobGraph=new JobGraph("Blocking test job",sender);
+            final JobID jid=jobGraph.getJobID();
+            final ActorGateway jobManagerGateway=cluster.getLeaderGateway(TestingUtils.TESTING_DURATION());
+            final ActorGateway testActorGateway=new AkkaActorGateway(getTestActor(),HighAvailabilityServices.DEFAULT_LEADER_ID);
+            jobManagerGateway.tell(new SubmitJob(jobGraph,ListeningBehaviour.EXECUTION_RESULT),testActorGateway);
+            expectMsgClass(JobSubmitSuccess.class);
+            jobManagerGateway.tell(new WaitForAllVerticesToBeRunningOrFinished(jid),testActorGateway);
+            expectMsgClass(AllVerticesRunning.class);
+            final ExecutionAttemptID receiver=new ExecutionAttemptID();
+            jobManagerGateway.tell(new RequestExecutionGraph(jid),testActorGateway);
+            final ExecutionGraph eg=(ExecutionGraph)expectMsgClass(ExecutionGraphFound.class).executionGraph();
+            final ExecutionVertex vertex=eg.getJobVertex(sender.getID()).getTaskVertices()[0];
+            final IntermediateResultPartition partition=vertex.getProducedPartitions().values().iterator().next();
+            final ResultPartitionID partitionId=new ResultPartitionID(partition.getPartitionId(),vertex.getCurrentExecutionAttempt().getAttemptId());
+            RequestPartitionProducerState request=new RequestPartitionProducerState(jid,rid,partitionId);
+            for (            ExecutionState state : ExecutionState.values()) {
+              ExecutionGraphTestUtils.setVertexState(vertex,state);
+              Future<ExecutionState> futurePartitionState=jobManagerGateway.ask(request,getRemainingTime()).mapTo(ClassTag$.MODULE$.<ExecutionState>apply(ExecutionState.class));
+              ExecutionState resp=Await.result(futurePartitionState,getRemainingTime());
+              assertEquals(state,resp);
+            }
+            request=new RequestPartitionProducerState(jid,rid,new ResultPartitionID());
+            Future<?> futurePartitionState=jobManagerGateway.ask(request,getRemainingTime());
+            try {
+              Await.result(futurePartitionState,getRemainingTime());
+              fail("Did not fail with expected RuntimeException");
+            }
+ catch (            RuntimeException e) {
+              assertEquals(IllegalArgumentException.class,e.getCause().getClass());
+            }
+            request=new RequestPartitionProducerState(new JobID(),rid,new ResultPartitionID());
+            futurePartitionState=jobManagerGateway.ask(request,getRemainingTime());
+            try {
+              Await.result(futurePartitionState,getRemainingTime());
+              fail("Did not fail with expected IllegalArgumentException");
+            }
+ catch (            IllegalArgumentException ignored) {
+            }
+          }
+ catch (          Exception e) {
+            e.printStackTrace();
+            fail(e.getMessage());
+          }
+ finally {
+            if (cluster != null) {
+              cluster.stop();
+            }
+          }
+        }
+      }
+;
+    }
+  }
+;
+}

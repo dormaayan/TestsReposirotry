@@ -1,0 +1,194 @@
+class LinkedQueuePoolTest {
+  @Test void shouldTimeoutGracefully(){
+    FakeClock clock=new FakeClock();
+    LinkedQueuePool.CheckStrategy timeStrategy=new LinkedQueuePool.CheckStrategy.TimeoutCheckStrategy(100,clock);
+    while (clock.getAsLong() <= 100) {
+      assertFalse(timeStrategy.shouldCheck());
+      clock.forward(10,TimeUnit.MILLISECONDS);
+    }
+    assertTrue(timeStrategy.shouldCheck());
+    clock.forward(1,TimeUnit.MILLISECONDS);
+    assertFalse(timeStrategy.shouldCheck());
+  }
+  @Test void shouldBuildUpGracefullyUntilReachedMinPoolSize(){
+    StatefulMonitor stateMonitor=new StatefulMonitor();
+    FakeClock clock=new FakeClock();
+    final LinkedQueuePool<Object> pool=getLinkedQueuePool(stateMonitor,clock,5);
+    List<FlyweightHolder<Object>> flyweightHolders=acquireFromPool(pool,5);
+    for (    FlyweightHolder<Object> flyweightHolder : flyweightHolders) {
+      flyweightHolder.release();
+    }
+    assertEquals(-1,stateMonitor.currentPeakSize.get());
+    assertEquals(-1,stateMonitor.targetSize.get());
+    assertEquals(0,stateMonitor.disposed.get());
+  }
+  @Test void shouldBuildUpGracefullyWhilePassingMinPoolSizeBeforeTimerRings(){
+    StatefulMonitor stateMonitor=new StatefulMonitor();
+    FakeClock clock=new FakeClock();
+    final LinkedQueuePool<Object> pool=getLinkedQueuePool(stateMonitor,clock,5);
+    List<FlyweightHolder<Object>> flyweightHolders=acquireFromPool(pool,15);
+    for (    FlyweightHolder<Object> flyweightHolder : flyweightHolders) {
+      flyweightHolder.release();
+    }
+    assertEquals(-1,stateMonitor.currentPeakSize.get());
+    assertEquals(-1,stateMonitor.targetSize.get());
+    assertEquals(15,stateMonitor.created.get());
+    assertEquals(10,stateMonitor.disposed.get());
+  }
+  @Test void shouldUpdateTargetSizeWhenSpikesOccur(){
+    final int MIN_SIZE=5;
+    final int MAX_SIZE=10;
+    StatefulMonitor stateMonitor=new StatefulMonitor();
+    FakeClock clock=new FakeClock();
+    final LinkedQueuePool<Object> pool=getLinkedQueuePool(stateMonitor,clock,MIN_SIZE);
+    List<FlyweightHolder<Object>> holders=acquireFromPool(pool,MAX_SIZE);
+    clock.forward(110,TimeUnit.MILLISECONDS);
+    holders.addAll(acquireFromPool(pool,1));
+    assertEquals(MAX_SIZE + 1,stateMonitor.currentPeakSize.get());
+    assertEquals(MAX_SIZE + 1,stateMonitor.targetSize.get());
+  }
+  @Test void shouldKeepSmallPeakAndNeverDisposeIfAcquireAndReleaseContinuously(){
+    final int MIN_SIZE=1;
+    StatefulMonitor stateMonitor=new StatefulMonitor();
+    FakeClock clock=new FakeClock();
+    final LinkedQueuePool<Object> pool=getLinkedQueuePool(stateMonitor,clock,MIN_SIZE);
+    for (int i=0; i < 200; i++) {
+      List<FlyweightHolder<Object>> newOnes=acquireFromPool(pool,1);
+      for (      FlyweightHolder newOne : newOnes) {
+        newOne.release();
+      }
+    }
+    assertEquals(-1,stateMonitor.currentPeakSize.get());
+    assertEquals(1,stateMonitor.created.get());
+    assertEquals(0,stateMonitor.disposed.get());
+  }
+  @Test void shouldSlowlyReduceTheNumberOfFlyweightsInThePoolWhenFlyweightsAreReleased(){
+    final int MIN_SIZE=50;
+    final int MAX_SIZE=200;
+    StatefulMonitor stateMonitor=new StatefulMonitor();
+    FakeClock clock=new FakeClock();
+    final LinkedQueuePool<Object> pool=getLinkedQueuePool(stateMonitor,clock,MIN_SIZE);
+    List<FlyweightHolder<Object>> holders=new LinkedList<>();
+    buildAPeakOfAcquiredFlyweightsAndTriggerAlarmWithSideEffects(MAX_SIZE,clock,pool,holders);
+    clock.forward(110,TimeUnit.MILLISECONDS);
+    for (int i=0; i < MAX_SIZE; i++) {
+      acquireFromPool(pool,1).get(0).release();
+    }
+    assertEquals(1,stateMonitor.currentPeakSize.get());
+    assertEquals(MIN_SIZE,stateMonitor.targetSize.get());
+    assertEquals(MAX_SIZE - MIN_SIZE + 1,stateMonitor.disposed.get());
+  }
+  @Test void shouldMaintainPoolAtHighWatermarkWhenConcurrentUsagePassesMinSize(){
+    final int MIN_SIZE=50;
+    final int MAX_SIZE=200;
+    final int MID_SIZE=90;
+    StatefulMonitor stateMonitor=new StatefulMonitor();
+    FakeClock clock=new FakeClock();
+    final LinkedQueuePool<Object> pool=getLinkedQueuePool(stateMonitor,clock,MIN_SIZE);
+    List<FlyweightHolder<Object>> holders=new LinkedList<>();
+    buildAPeakOfAcquiredFlyweightsAndTriggerAlarmWithSideEffects(MAX_SIZE,clock,pool,holders);
+    assertEquals(MAX_SIZE + 1,stateMonitor.currentPeakSize.get());
+    for (int i=0; i < 2; i++) {
+      clock.forward(110,TimeUnit.MILLISECONDS);
+      for (      FlyweightHolder holder : acquireFromPool(pool,MID_SIZE)) {
+        holder.release();
+      }
+      clock.forward(110,TimeUnit.MILLISECONDS);
+      for (      FlyweightHolder holder : acquireFromPool(pool,MID_SIZE)) {
+        holder.release();
+      }
+    }
+    assertEquals(MID_SIZE,stateMonitor.currentPeakSize.get());
+    assertEquals(MID_SIZE,stateMonitor.targetSize.get());
+    assertEquals(MAX_SIZE - MID_SIZE + 1,stateMonitor.disposed.get());
+  }
+  @Test void shouldReclaimAndRecreateWhenLullBetweenSpikesOccurs(){
+    final int MIN_SIZE=50;
+    final int BELOW_MIN_SIZE=MIN_SIZE / 5;
+    final int MAX_SIZE=200;
+    StatefulMonitor stateMonitor=new StatefulMonitor();
+    FakeClock clock=new FakeClock();
+    final LinkedQueuePool<Object> pool=getLinkedQueuePool(stateMonitor,clock,MIN_SIZE);
+    List<FlyweightHolder<Object>> holders=new LinkedList<>();
+    buildAPeakOfAcquiredFlyweightsAndTriggerAlarmWithSideEffects(MAX_SIZE,clock,pool,holders);
+    clock.forward(110,TimeUnit.MILLISECONDS);
+    for (int i=0; i < 30; i++) {
+      for (      FlyweightHolder holder : acquireFromPool(pool,BELOW_MIN_SIZE)) {
+        holder.release();
+      }
+      clock.forward(110,TimeUnit.MILLISECONDS);
+    }
+    assertTrue(stateMonitor.currentPeakSize.get() <= BELOW_MIN_SIZE,"Expected " + stateMonitor.currentPeakSize.get() + " <= "+ BELOW_MIN_SIZE);
+    assertEquals(MIN_SIZE,stateMonitor.targetSize.get());
+    assertEquals(MAX_SIZE - MIN_SIZE + 1,stateMonitor.disposed.get());
+    stateMonitor.created.set(0);
+    stateMonitor.disposed.set(0);
+    holders.addAll(acquireFromPool(pool,MAX_SIZE));
+    assertEquals(MAX_SIZE - MIN_SIZE,stateMonitor.created.get());
+    assertEquals(0,stateMonitor.disposed.get());
+  }
+  private void buildAPeakOfAcquiredFlyweightsAndTriggerAlarmWithSideEffects(  int MAX_SIZE,  FakeClock clock,  LinkedQueuePool<Object> pool,  List<FlyweightHolder<Object>> holders){
+    holders.addAll(acquireFromPool(pool,MAX_SIZE));
+    clock.forward(110,TimeUnit.MILLISECONDS);
+    holders.addAll(acquireFromPool(pool,1));
+    for (    FlyweightHolder holder : holders) {
+      holder.release();
+    }
+  }
+  private LinkedQueuePool<Object> getLinkedQueuePool(  StatefulMonitor stateMonitor,  FakeClock clock,  int minSize){
+    return new LinkedQueuePool<>(minSize,Object::new,new LinkedQueuePool.CheckStrategy.TimeoutCheckStrategy(100,clock),stateMonitor);
+  }
+  private <R>List<FlyweightHolder<R>> acquireFromPool(  final LinkedQueuePool<R> pool,  int times){
+    List<FlyweightHolder<R>> acquirers=new LinkedList<>();
+    for (int i=0; i < times; i++) {
+      FlyweightHolder<R> holder=new FlyweightHolder<>(pool);
+      acquirers.add(holder);
+      holder.run();
+    }
+    return acquirers;
+  }
+private static class FlyweightHolder<R> implements Runnable {
+    private final LinkedQueuePool<R> pool;
+    private R resource;
+    private FlyweightHolder(    LinkedQueuePool<R> pool){
+      this.pool=pool;
+    }
+    @Override public void run(){
+      resource=pool.acquire();
+    }
+    public void release(){
+      pool.release(resource);
+    }
+  }
+private static class StatefulMonitor implements LinkedQueuePool.Monitor<Object> {
+    AtomicInteger currentPeakSize=new AtomicInteger(-1);
+    AtomicInteger targetSize=new AtomicInteger(-1);
+    AtomicInteger created=new AtomicInteger(0);
+    AtomicInteger acquired=new AtomicInteger(0);
+    AtomicInteger disposed=new AtomicInteger(0);
+    @Override public void updatedCurrentPeakSize(    int currentPeakSize){
+      this.currentPeakSize.set(currentPeakSize);
+    }
+    @Override public void updatedTargetSize(    int targetSize){
+      this.targetSize.set(targetSize);
+    }
+    @Override public void created(    Object Object){
+      this.created.incrementAndGet();
+    }
+    @Override public void acquired(    Object Object){
+      this.acquired.incrementAndGet();
+    }
+    @Override public void disposed(    Object Object){
+      this.disposed.incrementAndGet();
+    }
+  }
+private static class FakeClock implements LongSupplier {
+    private long time;
+    @Override public long getAsLong(){
+      return time;
+    }
+    public void forward(    long amount,    TimeUnit timeUnit){
+      time=time + timeUnit.toMillis(amount);
+    }
+  }
+}

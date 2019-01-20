@@ -1,0 +1,141 @@
+public class VersionAwareLogEntryReaderTest {
+  private final LogEntryReader<ReadableClosablePositionAwareChannel> logEntryReader=new VersionAwareLogEntryReader<>();
+  @Test public void shouldReadAStartLogEntry() throws IOException {
+    LogEntryVersion version=LogEntryVersion.CURRENT;
+    final LogEntryStart start=new LogEntryStart(version,1,2,3,4,new byte[]{5},new LogPosition(0,31));
+    final InMemoryClosableChannel channel=new InMemoryClosableChannel();
+    channel.put(version.byteCode());
+    channel.put(LogEntryByteCodes.TX_START);
+    channel.putInt(start.getMasterId());
+    channel.putInt(start.getLocalId());
+    channel.putLong(start.getTimeWritten());
+    channel.putLong(start.getLastCommittedTxWhenTransactionStarted());
+    channel.putInt(start.getAdditionalHeader().length);
+    channel.put(start.getAdditionalHeader(),start.getAdditionalHeader().length);
+    final LogEntry logEntry=logEntryReader.readLogEntry(channel);
+    assertEquals(start,logEntry);
+  }
+  @Test public void shouldReadACommitLogEntry() throws IOException {
+    LogEntryVersion version=LogEntryVersion.CURRENT;
+    final LogEntryCommit commit=new LogEntryCommit(version,42,21);
+    final InMemoryClosableChannel channel=new InMemoryClosableChannel();
+    channel.put(version.byteCode());
+    channel.put(LogEntryByteCodes.TX_COMMIT);
+    channel.putLong(commit.getTxId());
+    channel.putLong(commit.getTimeWritten());
+    final LogEntry logEntry=logEntryReader.readLogEntry(channel);
+    assertEquals(commit,logEntry);
+  }
+  @Test public void shouldReadACommandLogEntry() throws IOException {
+    LogEntryVersion version=LogEntryVersion.CURRENT;
+    Command.NodeCommand nodeCommand=new Command.NodeCommand(new NodeRecord(11),new NodeRecord(11));
+    final LogEntryCommand command=new LogEntryCommand(version,nodeCommand);
+    final InMemoryClosableChannel channel=new InMemoryClosableChannel();
+    channel.put(version.byteCode());
+    channel.put(LogEntryByteCodes.COMMAND);
+    nodeCommand.serialize(channel);
+    final LogEntry logEntry=logEntryReader.readLogEntry(channel);
+    assertEquals(command,logEntry);
+  }
+  @Test public void shouldReadACheckPointLogEntry() throws IOException {
+    LogEntryVersion version=LogEntryVersion.CURRENT;
+    final LogPosition logPosition=new LogPosition(42,43);
+    final CheckPoint checkPoint=new CheckPoint(version,logPosition);
+    final InMemoryClosableChannel channel=new InMemoryClosableChannel();
+    channel.put(version.byteCode());
+    channel.put(LogEntryByteCodes.CHECK_POINT);
+    channel.putLong(logPosition.getLogVersion());
+    channel.putLong(logPosition.getByteOffset());
+    final LogEntry logEntry=logEntryReader.readLogEntry(channel);
+    assertEquals(checkPoint,logEntry);
+  }
+  @Test public void shouldReturnNullWhenThereIsNoCommand() throws IOException {
+    LogEntryVersion version=LogEntryVersion.CURRENT;
+    final InMemoryClosableChannel channel=new InMemoryClosableChannel();
+    channel.put(version.byteCode());
+    channel.put(LogEntryByteCodes.COMMAND);
+    channel.put(NeoCommandType.NONE);
+    final LogEntry logEntry=logEntryReader.readLogEntry(channel);
+    assertNull(logEntry);
+  }
+  @Test public void shouldReturnNullWhenNotEnoughDataInTheChannel() throws IOException {
+    final InMemoryClosableChannel channel=new InMemoryClosableChannel();
+    final LogEntry logEntry=logEntryReader.readLogEntry(channel);
+    assertNull(logEntry);
+  }
+  @Test public void shouldBeAbleToSkipBadVersionAndTypeBytesInBetweenLogEntries() throws Exception {
+    AcceptingInvalidLogEntryHandler invalidLogEntryHandler=new AcceptingInvalidLogEntryHandler();
+    VersionAwareLogEntryReader<ReadableClosablePositionAwareChannel> reader=new VersionAwareLogEntryReader<>(new RecordStorageCommandReaderFactory(),invalidLogEntryHandler);
+    InMemoryClosableChannel channel=new InMemoryClosableChannel(1_000);
+    LogEntryWriter writer=new LogEntryWriter(channel.writer());
+    long startTime=currentTimeMillis();
+    long commitTime=startTime + 10;
+    writer.writeStartEntry(1,2,startTime,3,new byte[0]);
+    writer.writeCommitEntry(4,commitTime);
+    channel.put((byte)127);
+    channel.put((byte)126);
+    channel.put((byte)125);
+    long secondStartTime=startTime + 100;
+    writer.writeStartEntry(1,2,secondStartTime,4,new byte[0]);
+    LogEntryStart readStartEntry=reader.readLogEntry(channel.reader()).as();
+    LogEntryCommit readCommitEntry=reader.readLogEntry(channel.reader()).as();
+    LogEntryStart readSecondStartEntry=reader.readLogEntry(channel.reader()).as();
+    assertEquals(1,readStartEntry.getMasterId());
+    assertEquals(2,readStartEntry.getLocalId());
+    assertEquals(startTime,readStartEntry.getTimeWritten());
+    assertEquals(4,readCommitEntry.getTxId());
+    assertEquals(commitTime,readCommitEntry.getTimeWritten());
+    assertEquals(3,invalidLogEntryHandler.bytesSkipped);
+    assertEquals(3,invalidLogEntryHandler.invalidEntryCalls);
+    assertEquals(1,readSecondStartEntry.getMasterId());
+    assertEquals(2,readSecondStartEntry.getLocalId());
+    assertEquals(secondStartTime,readSecondStartEntry.getTimeWritten());
+  }
+  @Test public void shouldBeAbleToSkipBadLogEntries() throws Exception {
+    AcceptingInvalidLogEntryHandler invalidLogEntryHandler=new AcceptingInvalidLogEntryHandler();
+    VersionAwareLogEntryReader<ReadableClosablePositionAwareChannel> reader=new VersionAwareLogEntryReader<>(new RecordStorageCommandReaderFactory(),invalidLogEntryHandler);
+    InMemoryClosableChannel channel=new InMemoryClosableChannel(1_000);
+    LogEntryWriter writer=new LogEntryWriter(channel.writer());
+    long startTime=currentTimeMillis();
+    long commitTime=startTime + 10;
+    writer.writeStartEntry(1,2,startTime,3,new byte[0]);
+    int posBefore=channel.writerPosition();
+    writer.serialize(singletonList(new Command.NodeCommand(new NodeRecord(1),new NodeRecord(1).initialize(true,1,false,2,0))));
+    int posAfter=channel.writerPosition();
+    channel.positionWriter(posBefore);
+    while (channel.writerPosition() < posAfter) {
+      channel.put((byte)0xFF);
+    }
+    writer.writeCommitEntry(4,commitTime);
+    long secondStartTime=startTime + 100;
+    writer.writeStartEntry(1,2,secondStartTime,4,new byte[0]);
+    LogEntryStart readStartEntry=reader.readLogEntry(channel.reader()).as();
+    LogEntryCommit readCommitEntry=reader.readLogEntry(channel.reader()).as();
+    LogEntryStart readSecondStartEntry=reader.readLogEntry(channel.reader()).as();
+    assertEquals(1,readStartEntry.getMasterId());
+    assertEquals(2,readStartEntry.getLocalId());
+    assertEquals(startTime,readStartEntry.getTimeWritten());
+    assertEquals(4,readCommitEntry.getTxId());
+    assertEquals(commitTime,readCommitEntry.getTimeWritten());
+    assertEquals(posAfter - posBefore,invalidLogEntryHandler.bytesSkipped);
+    assertEquals(posAfter - posBefore,invalidLogEntryHandler.invalidEntryCalls);
+    assertEquals(1,readSecondStartEntry.getMasterId());
+    assertEquals(2,readSecondStartEntry.getLocalId());
+    assertEquals(secondStartTime,readSecondStartEntry.getTimeWritten());
+  }
+static class AcceptingInvalidLogEntryHandler extends InvalidLogEntryHandler {
+    long bytesSkipped;
+    Exception e;
+    LogPosition position;
+    int invalidEntryCalls;
+    @Override public boolean handleInvalidEntry(    Exception e,    LogPosition position){
+      this.e=e;
+      this.position=position;
+      invalidEntryCalls++;
+      return true;
+    }
+    @Override public void bytesSkipped(    long bytesSkipped){
+      this.bytesSkipped+=bytesSkipped;
+    }
+  }
+}

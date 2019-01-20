@@ -1,0 +1,58 @@
+/** 
+ * Test that the connection to the dead server is cut immediately when we receive the notification.
+ * @throws Exception
+ */
+@Test public void testConnectionCut() throws Exception {
+  final TableName tableName=TableName.valueOf(name.getMethodName());
+  TEST_UTIL.createTable(tableName,FAM_NAM).close();
+  boolean previousBalance=TEST_UTIL.getAdmin().setBalancerRunning(false,true);
+  Configuration c2=new Configuration(TEST_UTIL.getConfiguration());
+  c2.set(HConstants.HBASE_CLIENT_INSTANCE_ID,String.valueOf(-1));
+  c2.setInt(HConstants.HBASE_CLIENT_RETRIES_NUMBER,0);
+  c2.setInt(HConstants.HBASE_RPC_TIMEOUT_KEY,30 * 1000);
+  final Connection connection=ConnectionFactory.createConnection(c2);
+  final Table table=connection.getTable(tableName);
+  Put p=new Put(FAM_NAM);
+  p.addColumn(FAM_NAM,FAM_NAM,FAM_NAM);
+  table.put(p);
+  final ConnectionImplementation hci=(ConnectionImplementation)connection;
+  final HRegionLocation loc;
+  try (RegionLocator rl=connection.getRegionLocator(tableName)){
+    loc=rl.getRegionLocation(FAM_NAM);
+  }
+   Get get=new Get(FAM_NAM);
+  Assert.assertNotNull(table.get(get));
+  get=new Get(FAM_NAM);
+  get.setFilter(new BlockingFilter());
+  Thread t=new Thread(){
+    @Override public void run(){
+synchronized (syncBlockingFilter) {
+        try {
+          syncBlockingFilter.wait();
+        }
+ catch (        InterruptedException e) {
+          throw new RuntimeException(e);
+        }
+      }
+      hci.clusterStatusListener.deadServerHandler.newDead(loc.getServerName());
+    }
+  }
+;
+  t.start();
+  try {
+    table.get(get);
+    Assert.fail();
+  }
+ catch (  IOException expected) {
+    LOG.debug("Received: " + expected);
+    Assert.assertFalse(expected instanceof SocketTimeoutException);
+    Assert.assertFalse(syncBlockingFilter.get());
+  }
+ finally {
+    syncBlockingFilter.set(true);
+    t.join();
+    TEST_UTIL.getAdmin().setBalancerRunning(previousBalance,true);
+  }
+  table.close();
+  connection.close();
+}

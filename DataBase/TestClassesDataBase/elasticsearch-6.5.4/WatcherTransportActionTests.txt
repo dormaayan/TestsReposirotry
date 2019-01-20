@@ -1,0 +1,76 @@
+public class WatcherTransportActionTests extends ESTestCase {
+  private MyTransportAction transportAction;
+  private ClusterService clusterService;
+  private TransportService transportService;
+  @Before public void createTransportAction(){
+    ThreadPool threadPool=mock(ThreadPool.class);
+    when(threadPool.executor(any())).thenReturn(EsExecutors.newDirectExecutorService());
+    clusterService=mock(ClusterService.class);
+    transportService=mock(TransportService.class);
+    transportAction=new MyTransportAction(transportService,threadPool,clusterService);
+  }
+  public void testThatRequestIsExecutedLocallyWithDistributedExecutionEnabled() throws Exception {
+    DiscoveryNodes nodes=new DiscoveryNodes.Builder().masterNodeId("master_node").localNodeId("data_node").add(newNode("master_node",Version.CURRENT)).add(newNode("data_node",Version.CURRENT)).build();
+    Index watchIndex=new Index(Watch.INDEX,"foo");
+    ShardId shardId=new ShardId(watchIndex,0);
+    IndexRoutingTable routingTable=IndexRoutingTable.builder(watchIndex).addShard(TestShardRouting.newShardRouting(shardId,"data_node",true,STARTED)).build();
+    ClusterState state=ClusterState.builder(new ClusterName("my-cluster")).nodes(nodes).routingTable(RoutingTable.builder().add(routingTable).build()).build();
+    when(clusterService.state()).thenReturn(state);
+    when(clusterService.localNode()).thenReturn(state.nodes().getLocalNode());
+    MyActionRequest request=new MyActionRequest();
+    PlainActionFuture<MyActionResponse> future=PlainActionFuture.newFuture();
+    Task task=request.createTask(1,"type","action",new TaskId("parent",0),Collections.emptyMap());
+    transportAction.doExecute(task,request,future);
+    MyActionResponse response=future.actionGet(1000);
+    assertThat(response.request,is(request));
+  }
+  public void testThatRequestIsExecutedByMasterWithDistributedExecutionDisabled() throws Exception {
+    DiscoveryNodes nodes=new DiscoveryNodes.Builder().masterNodeId("master_node").localNodeId("master_node").add(newNode("master_node",VersionUtils.randomVersionBetween(random(),Version.V_5_6_0,Version.V_6_0_0_alpha2))).build();
+    ClusterState state=ClusterState.builder(new ClusterName("my-cluster")).nodes(nodes).build();
+    when(clusterService.state()).thenReturn(state);
+    when(clusterService.localNode()).thenReturn(state.nodes().getLocalNode());
+    MyActionRequest request=new MyActionRequest();
+    PlainActionFuture<MyActionResponse> future=PlainActionFuture.newFuture();
+    Task task=request.createTask(1,"type","action",new TaskId("parent",0),Collections.emptyMap());
+    transportAction.doExecute(task,request,future);
+    MyActionResponse response=future.actionGet(1000);
+    assertThat(response.request,is(request));
+  }
+  public void testThatRequestIsForwardedToMasterWithDistributedExecutionDisabled() throws Exception {
+    DiscoveryNodes nodes=new DiscoveryNodes.Builder().masterNodeId("master_node").localNodeId("non_master_node").add(newNode("master_node",VersionUtils.randomVersionBetween(random(),Version.V_5_6_0,Version.V_6_0_0_alpha2))).add(newNode("non_master_node",Version.CURRENT)).build();
+    ClusterState state=ClusterState.builder(new ClusterName("my-cluster")).nodes(nodes).build();
+    when(clusterService.state()).thenReturn(state);
+    when(clusterService.localNode()).thenReturn(state.nodes().getLocalNode());
+    MyActionRequest request=new MyActionRequest();
+    Task task=request.createTask(1,"type","action",new TaskId("parent",0),Collections.emptyMap());
+    transportAction.doExecute(task,request,PlainActionFuture.newFuture());
+    ArgumentCaptor<DiscoveryNode> nodeArgumentCaptor=ArgumentCaptor.forClass(DiscoveryNode.class);
+    verify(transportService).sendRequest(nodeArgumentCaptor.capture(),eq("my_action_name"),eq(request),any());
+    assertThat(nodeArgumentCaptor.getValue().getId(),is("master_node"));
+  }
+  private static DiscoveryNode newNode(  String nodeName,  Version version){
+    return new DiscoveryNode(nodeName,ESTestCase.buildNewFakeTransportAddress(),Collections.emptyMap(),new HashSet<>(asList(DiscoveryNode.Role.values())),version);
+  }
+private final class MyTransportAction extends WatcherTransportAction<MyActionRequest,MyActionResponse> {
+    MyTransportAction(    TransportService transportService,    ThreadPool threadPool,    ClusterService clusterService){
+      super(Settings.EMPTY,"my_action_name",transportService,threadPool,new ActionFilters(Collections.emptySet()),new IndexNameExpressionResolver(Settings.EMPTY),new XPackLicenseState(Settings.EMPTY),clusterService,MyActionRequest::new,MyActionResponse::new);
+    }
+    @Override protected void masterOperation(    MyActionRequest request,    ClusterState state,    ActionListener<MyActionResponse> listener) throws Exception {
+      listener.onResponse(new MyActionResponse(request));
+    }
+  }
+private static final class MyActionResponse extends ActionResponse {
+    MyActionRequest request;
+    MyActionResponse(    MyActionRequest request){
+      super();
+      this.request=request;
+    }
+    MyActionResponse(){
+    }
+  }
+private static final class MyActionRequest extends MasterNodeRequest<MyActionRequest> {
+    @Override public ActionRequestValidationException validate(){
+      return null;
+    }
+  }
+}

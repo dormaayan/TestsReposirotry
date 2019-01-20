@@ -1,0 +1,63 @@
+@Test public void testBulkLoad() throws IOException {
+  LOG.debug("Creating test table");
+  HTableDescriptor hdt=HTU.createTableDescriptor("testBulkLoad");
+  hdt.setRegionReplication(NB_SERVERS);
+  hdt.addCoprocessor(SlowMeCopro.class.getName());
+  Table table=HTU.createTable(hdt,new byte[][]{f},null);
+  LOG.debug("Creating test data");
+  Path dir=HTU.getDataTestDirOnTestFS("testBulkLoad");
+  final int numRows=10;
+  final byte[] qual=Bytes.toBytes("qual");
+  final byte[] val=Bytes.toBytes("val");
+  final List<Pair<byte[],String>> famPaths=new ArrayList<>();
+  for (  HColumnDescriptor col : hdt.getColumnFamilies()) {
+    Path hfile=new Path(dir,col.getNameAsString());
+    TestHRegionServerBulkLoad.createHFile(HTU.getTestFileSystem(),hfile,col.getName(),qual,val,numRows);
+    famPaths.add(new Pair<>(col.getName(),hfile.toString()));
+  }
+  LOG.debug("Loading test data");
+  final ClusterConnection conn=(ClusterConnection)HTU.getAdmin().getConnection();
+  table=conn.getTable(hdt.getTableName());
+  final String bulkToken=new SecureBulkLoadClient(HTU.getConfiguration(),table).prepareBulkLoad(conn);
+  ClientServiceCallable<Void> callable=new ClientServiceCallable<Void>(conn,hdt.getTableName(),TestHRegionServerBulkLoad.rowkey(0),new RpcControllerFactory(HTU.getConfiguration()).newController(),HConstants.PRIORITY_UNSET){
+    @Override protected Void rpcCall() throws Exception {
+      LOG.debug("Going to connect to server " + getLocation() + " for row "+ Bytes.toStringBinary(getRow()));
+      SecureBulkLoadClient secureClient=null;
+      byte[] regionName=getLocation().getRegionInfo().getRegionName();
+      try (Table table=conn.getTable(getTableName())){
+        secureClient=new SecureBulkLoadClient(HTU.getConfiguration(),table);
+        secureClient.secureBulkLoadHFiles(getStub(),famPaths,regionName,true,null,bulkToken);
+      }
+       return null;
+    }
+  }
+;
+  RpcRetryingCallerFactory factory=new RpcRetryingCallerFactory(HTU.getConfiguration());
+  RpcRetryingCaller<Void> caller=factory.newCaller();
+  caller.callWithRetries(callable,10000);
+  LOG.debug("Verifying data load");
+  for (int i=0; i < numRows; i++) {
+    byte[] row=TestHRegionServerBulkLoad.rowkey(i);
+    Get g=new Get(row);
+    Result r=table.get(g);
+    Assert.assertFalse(r.isStale());
+  }
+  LOG.debug("Verifying replica queries");
+  try {
+    SlowMeCopro.cdl.set(new CountDownLatch(1));
+    for (int i=0; i < numRows; i++) {
+      byte[] row=TestHRegionServerBulkLoad.rowkey(i);
+      Get g=new Get(row);
+      g.setConsistency(Consistency.TIMELINE);
+      Result r=table.get(g);
+      Assert.assertTrue(r.isStale());
+    }
+    SlowMeCopro.cdl.get().countDown();
+  }
+  finally {
+    SlowMeCopro.cdl.get().countDown();
+    SlowMeCopro.sleepTime.set(0);
+  }
+  HTU.getAdmin().disableTable(hdt.getTableName());
+  HTU.deleteTable(hdt.getTableName());
+}

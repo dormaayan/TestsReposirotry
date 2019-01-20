@@ -1,0 +1,43 @@
+@Test public void testRejectedViaSemaphoreIsolation(){
+  final TestCircuitBreaker circuitBreaker=new TestCircuitBreaker();
+  final ArrayBlockingQueue<Boolean> results=new ArrayBlockingQueue<Boolean>(2);
+  final TryableSemaphoreActual semaphore=new TryableSemaphoreActual(HystrixProperty.Factory.asProperty(1));
+  final CountDownLatch startLatch=new CountDownLatch(2);
+  final CountDownLatch sharedLatch=new CountDownLatch(1);
+  final LatchedSemaphoreCommand command1=new LatchedSemaphoreCommand(circuitBreaker,semaphore,startLatch,sharedLatch);
+  final LatchedSemaphoreCommand command2=new LatchedSemaphoreCommand(circuitBreaker,semaphore,startLatch,sharedLatch);
+  Observable<Boolean> merged=Observable.merge(command1.toObservable(),command2.toObservable()).subscribeOn(Schedulers.computation());
+  final CountDownLatch terminal=new CountDownLatch(1);
+  merged.subscribe(new Subscriber<Boolean>(){
+    @Override public void onCompleted(){
+      System.out.println(Thread.currentThread().getName() + " OnCompleted");
+      terminal.countDown();
+    }
+    @Override public void onError(    Throwable e){
+      System.out.println(Thread.currentThread().getName() + " OnError : " + e);
+      terminal.countDown();
+    }
+    @Override public void onNext(    Boolean b){
+      System.out.println(Thread.currentThread().getName() + " OnNext : " + b);
+      results.offer(b);
+    }
+  }
+);
+  try {
+    assertTrue(startLatch.await(1000,TimeUnit.MILLISECONDS));
+    sharedLatch.countDown();
+    assertTrue(terminal.await(1000,TimeUnit.MILLISECONDS));
+  }
+ catch (  Throwable ex) {
+    ex.printStackTrace();
+    fail(ex.getMessage());
+  }
+  assertEquals(2,results.size());
+  assertTrue(results.contains(Boolean.TRUE));
+  assertTrue(results.contains(Boolean.FALSE));
+  System.out.println("REQ LOG : " + HystrixRequestLog.getCurrentRequest().getExecutedCommandsAsString());
+  assertCommandExecutionEvents(command1,HystrixEventType.EMIT,HystrixEventType.SUCCESS);
+  assertCommandExecutionEvents(command2,HystrixEventType.SEMAPHORE_REJECTED,HystrixEventType.FALLBACK_EMIT,HystrixEventType.FALLBACK_SUCCESS);
+  assertEquals(0,circuitBreaker.metrics.getCurrentConcurrentExecutionCount());
+  assertSaneHystrixRequestLog(2);
+}

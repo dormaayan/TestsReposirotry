@@ -1,0 +1,85 @@
+/** 
+ * Tests unhandled exceptions thrown by coprocessors running on a regionserver.. Expected result is that the regionserver will abort with an informative error message describing the set of its loaded coprocessors for crash diagnosis. (HBASE-4014).
+ */
+@Category({CoprocessorTests.class,MediumTests.class}) public class TestRegionServerCoprocessorExceptionWithAbort {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestRegionServerCoprocessorExceptionWithAbort.class);
+  private static final Logger LOG=LoggerFactory.getLogger(TestRegionServerCoprocessorExceptionWithAbort.class);
+  private static final HBaseTestingUtility TEST_UTIL=new HBaseTestingUtility();
+  private static final TableName TABLE_NAME=TableName.valueOf("observed_table");
+  @Test public void testExceptionDuringInitialization() throws Exception {
+    Configuration conf=TEST_UTIL.getConfiguration();
+    conf.setInt(HConstants.HBASE_CLIENT_RETRIES_NUMBER,2);
+    conf.setBoolean(CoprocessorHost.ABORT_ON_ERROR_KEY,true);
+    conf.set(CoprocessorHost.REGION_COPROCESSOR_CONF_KEY,"");
+    TEST_UTIL.startMiniCluster(2);
+    try {
+      MiniHBaseCluster cluster=TEST_UTIL.getHBaseCluster();
+      final HRegionServer regionServer=cluster.getRegionServer(0);
+      conf.set(CoprocessorHost.REGION_COPROCESSOR_CONF_KEY,FailedInitializationObserver.class.getName());
+      regionServer.getRegionServerCoprocessorHost().loadSystemCoprocessors(conf,CoprocessorHost.REGION_COPROCESSOR_CONF_KEY);
+      TEST_UTIL.waitFor(10000,1000,new Predicate<Exception>(){
+        @Override public boolean evaluate() throws Exception {
+          return regionServer.isAborted();
+        }
+      }
+);
+    }
+  finally {
+      TEST_UTIL.shutdownMiniCluster();
+    }
+  }
+  @Test public void testExceptionFromCoprocessorDuringPut() throws Exception {
+    Configuration conf=TEST_UTIL.getConfiguration();
+    conf.setInt(HConstants.HBASE_CLIENT_RETRIES_NUMBER,2);
+    conf.set(CoprocessorHost.REGION_COPROCESSOR_CONF_KEY,BuggyRegionObserver.class.getName());
+    conf.setBoolean(CoprocessorHost.ABORT_ON_ERROR_KEY,true);
+    TEST_UTIL.startMiniCluster(2);
+    try {
+      final byte[] TEST_FAMILY=Bytes.toBytes("aaa");
+      Table table=TEST_UTIL.createMultiRegionTable(TABLE_NAME,TEST_FAMILY);
+      TEST_UTIL.waitUntilAllRegionsAssigned(TABLE_NAME);
+      final HRegionServer regionServer=TEST_UTIL.getRSForFirstRegionInTable(TABLE_NAME);
+      try {
+        final byte[] ROW=Bytes.toBytes("aaa");
+        Put put=new Put(ROW);
+        put.addColumn(TEST_FAMILY,ROW,ROW);
+        table.put(put);
+      }
+ catch (      IOException e) {
+      }
+      boolean aborted=false;
+      for (int i=0; i < 10; i++) {
+        aborted=regionServer.isAborted();
+        if (aborted) {
+          break;
+        }
+        try {
+          Thread.sleep(1000);
+        }
+ catch (        InterruptedException e) {
+          fail("InterruptedException while waiting for regionserver " + "zk node to be deleted.");
+        }
+      }
+      Assert.assertTrue("The region server should have aborted",aborted);
+      table.close();
+    }
+  finally {
+      TEST_UTIL.shutdownMiniCluster();
+    }
+  }
+public static class FailedInitializationObserver implements RegionServerCoprocessor {
+    @SuppressWarnings("null") @Override public void start(    CoprocessorEnvironment e) throws IOException {
+      Integer i=null;
+      i=i + 1;
+    }
+  }
+public static class BuggyRegionObserver extends SimpleRegionObserver {
+    @SuppressWarnings("null") @Override public void prePut(    final ObserverContext<RegionCoprocessorEnvironment> c,    final Put put,    final WALEdit edit,    final Durability durability){
+      String tableName=c.getEnvironment().getRegion().getRegionInfo().getTable().getNameAsString();
+      if (tableName.equals("observed_table")) {
+        Integer i=null;
+        i=i + 1;
+      }
+    }
+  }
+}

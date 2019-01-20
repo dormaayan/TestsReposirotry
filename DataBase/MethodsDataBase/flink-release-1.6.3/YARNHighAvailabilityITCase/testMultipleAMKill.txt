@@ -1,0 +1,73 @@
+/** 
+ * Tests that the application master can be killed multiple times and that the surviving TaskManager successfully reconnects to the newly started JobManager.
+ * @throws Exception
+ */
+@Test public void testMultipleAMKill() throws Exception {
+  assumeTrue("This test only works with the old actor based code.",!isNewMode);
+  final int numberKillingAttempts=numberApplicationAttempts - 1;
+  String confDirPath=System.getenv(ConfigConstants.ENV_FLINK_CONF_DIR);
+  final Configuration configuration=GlobalConfiguration.loadConfiguration();
+  TestingYarnClusterDescriptor flinkYarnClient=new TestingYarnClusterDescriptor(configuration,getYarnConfiguration(),confDirPath,getYarnClient(),true);
+  Assert.assertNotNull("unable to get yarn client",flinkYarnClient);
+  flinkYarnClient.setLocalJarPath(new Path(flinkUberjar.getAbsolutePath()));
+  flinkYarnClient.addShipFiles(Arrays.asList(flinkLibFolder.listFiles()));
+  String fsStateHandlePath=temp.getRoot().getPath();
+  File configDirectory=new File(confDirPath);
+  GlobalConfiguration.loadConfiguration(configDirectory.getAbsolutePath());
+  flinkYarnClient.setDynamicPropertiesEncoded("recovery.mode=zookeeper@@recovery.zookeeper.quorum=" + zkServer.getConnectString() + "@@yarn.application-attempts="+ numberApplicationAttempts+ "@@"+ CheckpointingOptions.STATE_BACKEND.key()+ "=FILESYSTEM"+ "@@"+ CheckpointingOptions.CHECKPOINTS_DIRECTORY+ "="+ fsStateHandlePath+ "/checkpoints"+ "@@"+ HighAvailabilityOptions.HA_STORAGE_PATH.key()+ "="+ fsStateHandlePath+ "/recovery");
+  ClusterClient<ApplicationId> yarnClusterClient=null;
+  final FiniteDuration timeout=new FiniteDuration(2,TimeUnit.MINUTES);
+  HighAvailabilityServices highAvailabilityServices=null;
+  final ClusterSpecification clusterSpecification=new ClusterSpecification.ClusterSpecificationBuilder().setMasterMemoryMB(768).setTaskManagerMemoryMB(1024).setNumberTaskManagers(1).setSlotsPerTaskManager(1).createClusterSpecification();
+  try {
+    yarnClusterClient=flinkYarnClient.deploySessionCluster(clusterSpecification);
+    highAvailabilityServices=HighAvailabilityServicesUtils.createHighAvailabilityServices(yarnClusterClient.getFlinkConfiguration(),Executors.directExecutor(),HighAvailabilityServicesUtils.AddressResolution.TRY_ADDRESS_RESOLUTION);
+    final HighAvailabilityServices finalHighAvailabilityServices=highAvailabilityServices;
+    new JavaTestKit(actorSystem){
+{
+        for (int attempt=0; attempt < numberKillingAttempts; attempt++) {
+          new Within(timeout){
+            @Override protected void run(){
+              try {
+                ActorGateway gateway=LeaderRetrievalUtils.retrieveLeaderGateway(finalHighAvailabilityServices.getJobManagerLeaderRetriever(HighAvailabilityServices.DEFAULT_JOB_ID),actorSystem,timeout);
+                ActorGateway selfGateway=new AkkaActorGateway(getRef(),gateway.leaderSessionID());
+                gateway.tell(new TestingJobManagerMessages.NotifyWhenAtLeastNumTaskManagerAreRegistered(1),selfGateway);
+                expectMsgEquals(Acknowledge.get());
+                gateway.tell(PoisonPill.getInstance());
+              }
+ catch (              Exception e) {
+                throw new AssertionError("Could not complete test.",e);
+              }
+            }
+          }
+;
+        }
+        new Within(timeout){
+          @Override protected void run(){
+            try {
+              ActorGateway gateway=LeaderRetrievalUtils.retrieveLeaderGateway(finalHighAvailabilityServices.getJobManagerLeaderRetriever(HighAvailabilityServices.DEFAULT_JOB_ID),actorSystem,timeout);
+              ActorGateway selfGateway=new AkkaActorGateway(getRef(),gateway.leaderSessionID());
+              gateway.tell(new TestingJobManagerMessages.NotifyWhenAtLeastNumTaskManagerAreRegistered(1),selfGateway);
+              expectMsgEquals(Acknowledge.get());
+            }
+ catch (            Exception e) {
+              throw new AssertionError("Could not complete test.",e);
+            }
+          }
+        }
+;
+      }
+    }
+;
+  }
+  finally {
+    if (yarnClusterClient != null) {
+      log.info("Shutting down the Flink Yarn application.");
+      yarnClusterClient.shutDownCluster();
+      yarnClusterClient.shutdown();
+    }
+    if (highAvailabilityServices != null) {
+      highAvailabilityServices.closeAndCleanupAllData();
+    }
+  }
+}

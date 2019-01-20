@@ -1,0 +1,48 @@
+/** 
+ * Test the tuning task of  {@link PressureAwareCompactionThroughputController}
+ */
+@Test public void testThroughputTuning() throws Exception {
+  Configuration conf=TEST_UTIL.getConfiguration();
+  conf.set(StoreEngine.STORE_ENGINE_CLASS_KEY,DefaultStoreEngine.class.getName());
+  conf.setLong(PressureAwareCompactionThroughputController.HBASE_HSTORE_COMPACTION_MAX_THROUGHPUT_HIGHER_BOUND,20L * 1024 * 1024);
+  conf.setLong(PressureAwareCompactionThroughputController.HBASE_HSTORE_COMPACTION_MAX_THROUGHPUT_LOWER_BOUND,10L * 1024 * 1024);
+  conf.setInt(CompactionConfiguration.HBASE_HSTORE_COMPACTION_MIN_KEY,4);
+  conf.setInt(HStore.BLOCKING_STOREFILES_KEY,6);
+  conf.set(CompactionThroughputControllerFactory.HBASE_THROUGHPUT_CONTROLLER_KEY,PressureAwareCompactionThroughputController.class.getName());
+  conf.setInt(PressureAwareCompactionThroughputController.HBASE_HSTORE_COMPACTION_THROUGHPUT_TUNE_PERIOD,1000);
+  TEST_UTIL.startMiniCluster(1);
+  Connection conn=ConnectionFactory.createConnection(conf);
+  try {
+    TEST_UTIL.getAdmin().createTable(TableDescriptorBuilder.newBuilder(tableName).setColumnFamily(ColumnFamilyDescriptorBuilder.of(family)).setCompactionEnabled(false).build());
+    TEST_UTIL.waitTableAvailable(tableName);
+    HRegionServer regionServer=TEST_UTIL.getRSForFirstRegionInTable(tableName);
+    PressureAwareCompactionThroughputController throughputController=(PressureAwareCompactionThroughputController)regionServer.compactSplitThread.getCompactionThroughputController();
+    assertEquals(10L * 1024 * 1024,throughputController.getMaxThroughput(),EPSILON);
+    Table table=conn.getTable(tableName);
+    for (int i=0; i < 5; i++) {
+      byte[] value=new byte[0];
+      table.put(new Put(Bytes.toBytes(i)).addColumn(family,qualifier,value));
+      TEST_UTIL.flush(tableName);
+    }
+    Thread.sleep(2000);
+    assertEquals(15L * 1024 * 1024,throughputController.getMaxThroughput(),EPSILON);
+    byte[] value1=new byte[0];
+    table.put(new Put(Bytes.toBytes(5)).addColumn(family,qualifier,value1));
+    TEST_UTIL.flush(tableName);
+    Thread.sleep(2000);
+    assertEquals(20L * 1024 * 1024,throughputController.getMaxThroughput(),EPSILON);
+    byte[] value=new byte[0];
+    table.put(new Put(Bytes.toBytes(6)).addColumn(family,qualifier,value));
+    TEST_UTIL.flush(tableName);
+    Thread.sleep(2000);
+    assertEquals(Double.MAX_VALUE,throughputController.getMaxThroughput(),EPSILON);
+    conf.set(CompactionThroughputControllerFactory.HBASE_THROUGHPUT_CONTROLLER_KEY,NoLimitThroughputController.class.getName());
+    regionServer.compactSplitThread.onConfigurationChange(conf);
+    assertTrue(throughputController.isStopped());
+    assertTrue(regionServer.compactSplitThread.getCompactionThroughputController() instanceof NoLimitThroughputController);
+  }
+  finally {
+    conn.close();
+    TEST_UTIL.shutdownMiniCluster();
+  }
+}

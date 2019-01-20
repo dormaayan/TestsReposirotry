@@ -1,0 +1,42 @@
+@Test public void testCloseWithFailingFlush() throws Exception {
+  final Configuration conf=HBaseConfiguration.create(CONF);
+  final WAL wal=createWALCompatibleWithFaultyFileSystem(method,conf,tableName);
+  conf.setInt("hbase.hstore.flush.retries.number",1);
+  final User user=User.createUserForTesting(conf,this.method,new String[]{"foo"});
+  conf.setClass("fs.file.impl",FaultyFileSystem.class,FileSystem.class);
+  user.runAs(new PrivilegedExceptionAction<Object>(){
+    @Override public Object run() throws Exception {
+      FileSystem fs=FileSystem.get(conf);
+      Assert.assertEquals(FaultyFileSystem.class,fs.getClass());
+      FaultyFileSystem ffs=(FaultyFileSystem)fs;
+      HRegion region=null;
+      try {
+        region=initHRegion(tableName,null,null,false,Durability.SYNC_WAL,wal,COLUMN_FAMILY_BYTES);
+        long size=region.getMemStoreDataSize();
+        Assert.assertEquals(0,size);
+        Put p1=new Put(row);
+        p1.add(new KeyValue(row,COLUMN_FAMILY_BYTES,qual1,1,(byte[])null));
+        region.put(p1);
+        HStore store=region.getStore(COLUMN_FAMILY_BYTES);
+        StoreFlushContext storeFlushCtx=store.createFlushContext(12345,FlushLifeCycleTracker.DUMMY);
+        storeFlushCtx.prepare();
+        Put p2=new Put(row);
+        p2.add(new KeyValue(row,COLUMN_FAMILY_BYTES,qual2,2,(byte[])null));
+        p2.add(new KeyValue(row,COLUMN_FAMILY_BYTES,qual3,3,(byte[])null));
+        region.put(p2);
+        region.close();
+        fail();
+      }
+ catch (      DroppedSnapshotException dse) {
+        LOG.info("Expected DroppedSnapshotException");
+      }
+ finally {
+        ffs.fault.set(false);
+        HBaseTestingUtility.closeRegionAndWAL(region);
+      }
+      return null;
+    }
+  }
+);
+  FileSystem.closeAllForUGI(user.getUGI());
+}

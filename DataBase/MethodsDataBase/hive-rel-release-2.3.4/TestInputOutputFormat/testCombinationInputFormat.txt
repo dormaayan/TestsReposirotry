@@ -1,0 +1,44 @@
+@Test public void testCombinationInputFormat() throws Exception {
+  StructObjectInspector inspector;
+synchronized (TestOrcFile.class) {
+    inspector=(StructObjectInspector)ObjectInspectorFactory.getReflectionObjectInspector(MyRow.class,ObjectInspectorFactory.ObjectInspectorOptions.JAVA);
+  }
+  JobConf conf=createMockExecutionEnvironment(workDir,new Path("mock:///"),"combination",inspector,false,1);
+  Path partDir=new Path(conf.get("mapred.input.dir"));
+  Writer writer=OrcFile.createWriter(new Path(partDir,"0_0"),OrcFile.writerOptions(conf).blockPadding(false).bufferSize(1024).inspector(inspector));
+  for (int i=0; i < 10; ++i) {
+    writer.addRow(new MyRow(i,2 * i));
+  }
+  writer.close();
+  Path path=new Path("mock:/combination/p=0/0_0");
+  setBlocks(path,conf,new MockBlock("host0","host1"));
+  MockFileSystem mockFs=(MockFileSystem)partDir.getFileSystem(conf);
+  int length0=getLength(path,conf);
+  writer=OrcFile.createWriter(new Path(partDir,"1_0"),OrcFile.writerOptions(conf).blockPadding(false).bufferSize(1024).inspector(inspector));
+  for (int i=10; i < 20; ++i) {
+    writer.addRow(new MyRow(i,2 * i));
+  }
+  writer.close();
+  Path path1=new Path("mock:/combination/p=0/1_0");
+  setBlocks(path1,conf,new MockBlock("host1","host2"));
+  HiveInputFormat<?,?> inputFormat=new CombineHiveInputFormat<WritableComparable,Writable>();
+  InputSplit[] splits=inputFormat.getSplits(conf,1);
+  assertEquals(1,splits.length);
+  CombineHiveInputFormat.CombineHiveInputSplit split=(CombineHiveInputFormat.CombineHiveInputSplit)splits[0];
+  assertEquals(2,split.getNumPaths());
+  assertEquals(partDir.toString() + "/0_0",split.getPath(0).toString());
+  assertEquals(partDir.toString() + "/1_0",split.getPath(1).toString());
+  assertEquals(length0,split.getLength(0));
+  assertEquals(getLength(path1,conf),split.getLength(1));
+  assertEquals(0,split.getOffset(0));
+  assertEquals(0,split.getOffset(1));
+  assertTrue(3 >= split.getLocations().length);
+  org.apache.hadoop.mapred.RecordReader<CombineHiveKey,OrcStruct> reader=inputFormat.getRecordReader(split,conf,Reporter.NULL);
+  CombineHiveKey key=reader.createKey();
+  OrcStruct value=reader.createValue();
+  for (int i=0; i < 20; i++) {
+    assertEquals(true,reader.next(key,value));
+    assertEquals(i,((IntWritable)value.getFieldValue(0)).get());
+  }
+  assertEquals(false,reader.next(key,value));
+}

@@ -1,0 +1,34 @@
+@Test public void testConcurrentGlobalFailAndRestarts() throws Exception {
+  final OneShotLatch restartTrigger=new OneShotLatch();
+  final int parallelism=10;
+  final JobID jid=new JobID();
+  final JobVertex vertex=createNoOpVertex(parallelism);
+  final NotCancelAckingTaskGateway taskManagerGateway=new NotCancelAckingTaskGateway();
+  final SlotProvider slots=new SimpleSlotProvider(jid,parallelism,taskManagerGateway);
+  final TriggeredRestartStrategy restartStrategy=new TriggeredRestartStrategy(restartTrigger);
+  final ExecutionGraph eg=createSimpleTestGraph(jid,slots,restartStrategy,vertex);
+  WaitForTasks waitForTasks=new WaitForTasks(parallelism);
+  taskManagerGateway.setSubmitConsumer(waitForTasks);
+  eg.setScheduleMode(ScheduleMode.EAGER);
+  eg.scheduleForExecution();
+  waitForTasks.getFuture().get(1000,TimeUnit.MILLISECONDS);
+  switchToRunning(eg);
+  eg.failGlobal(new Exception("intended test failure 1"));
+  assertEquals(JobStatus.FAILING,eg.getState());
+  WaitForTasks waitForTasksRestart=new WaitForTasks(parallelism);
+  taskManagerGateway.setSubmitConsumer(waitForTasksRestart);
+  completeCancellingForAllVertices(eg);
+  waitUntilJobStatus(eg,JobStatus.RESTARTING,1000);
+  eg.failGlobal(new Exception("intended test failure 2"));
+  assertEquals(JobStatus.RESTARTING,eg.getState());
+  restartTrigger.trigger();
+  waitUntilJobStatus(eg,JobStatus.RUNNING,1000);
+  waitForTasksRestart.getFuture().get(1000,TimeUnit.MILLISECONDS);
+  switchToRunning(eg);
+  finishAllVertices(eg);
+  eg.waitUntilTerminal();
+  assertEquals(JobStatus.FINISHED,eg.getState());
+  if (eg.getNumberOfFullRestarts() > 2) {
+    fail("Too many restarts: " + eg.getNumberOfFullRestarts());
+  }
+}

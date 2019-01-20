@@ -1,0 +1,58 @@
+@SuppressWarnings("ConstantConditions") @Test public void rollsBackNewlyCreatedTransactionIfTerminationDetectedOnCloseDuringPeriodicCommit(){
+  InternalTransaction initialTransaction=mock(InternalTransaction.class,new ReturnsDeepStubs());
+  KernelTransaction.Type transactionType=KernelTransaction.Type.implicit;
+  SecurityContext securityContext=SecurityContext.AUTH_DISABLED;
+  when(initialTransaction.transactionType()).thenReturn(transactionType);
+  when(initialTransaction.securityContext()).thenReturn(securityContext);
+  when(initialTransaction.terminationReason()).thenReturn(Optional.empty());
+  GraphDatabaseQueryService queryService=mock(GraphDatabaseQueryService.class);
+  Statement initialStatement=mock(Statement.class);
+  KernelTransaction initialKTX=mockTransaction(initialStatement);
+  QueryRegistryOperations initialQueryRegistry=mock(QueryRegistryOperations.class);
+  ExecutingQuery executingQuery=mock(ExecutingQuery.class);
+  PropertyContainerLocker locker=new PropertyContainerLocker();
+  ThreadToStatementContextBridge txBridge=mock(ThreadToStatementContextBridge.class);
+  Statement secondStatement=mock(Statement.class);
+  KernelTransaction secondKTX=mockTransaction(secondStatement);
+  InternalTransaction secondTransaction=mock(InternalTransaction.class);
+  when(secondTransaction.terminationReason()).thenReturn(Optional.empty());
+  QueryRegistryOperations secondQueryRegistry=mock(QueryRegistryOperations.class);
+  when(executingQuery.queryText()).thenReturn("X");
+  when(executingQuery.queryParameters()).thenReturn(EMPTY_MAP);
+  Mockito.doThrow(RuntimeException.class).when(initialTransaction).close();
+  when(initialStatement.queryRegistration()).thenReturn(initialQueryRegistry);
+  when(queryService.beginTransaction(transactionType,securityContext)).thenReturn(secondTransaction);
+  when(txBridge.getKernelTransactionBoundToThisThread(true)).thenReturn(initialKTX,initialKTX,secondKTX);
+  when(txBridge.get()).thenReturn(secondStatement);
+  when(secondStatement.queryRegistration()).thenReturn(secondQueryRegistry);
+  Kernel kernel=mock(Kernel.class);
+  Neo4jTransactionalContext context=new Neo4jTransactionalContext(queryService,txBridge,locker,initialTransaction,initialStatement,executingQuery,kernel);
+  try {
+    context.commitAndRestartTx();
+    throw new AssertionError("Expected RuntimeException to be thrown");
+  }
+ catch (  RuntimeException e) {
+    Object[] mocks={txBridge,initialTransaction,initialQueryRegistry,initialKTX,secondQueryRegistry,secondKTX,secondTransaction};
+    InOrder order=Mockito.inOrder(mocks);
+    order.verify(initialTransaction).transactionType();
+    order.verify(initialTransaction).securityContext();
+    order.verify(txBridge).getKernelTransactionBoundToThisThread(true);
+    order.verify(initialTransaction).terminationReason();
+    order.verify(initialKTX).executionStatistics();
+    order.verify(txBridge).getKernelTransactionBoundToThisThread(true);
+    order.verify(txBridge).unbindTransactionFromCurrentThread();
+    order.verify(txBridge).getKernelTransactionBoundToThisThread(true);
+    order.verify(secondKTX).acquireStatement();
+    order.verify(secondQueryRegistry).registerExecutingQuery(executingQuery);
+    order.verify(txBridge).unbindTransactionFromCurrentThread();
+    order.verify(txBridge).bindTransactionToCurrentThread(initialKTX);
+    order.verify(initialQueryRegistry).unregisterExecutingQuery(executingQuery);
+    order.verify(initialTransaction).success();
+    order.verify(initialTransaction).close();
+    order.verify(txBridge).bindTransactionToCurrentThread(secondKTX);
+    order.verify(secondTransaction).failure();
+    order.verify(secondTransaction).close();
+    order.verify(txBridge).unbindTransactionFromCurrentThread();
+    verifyNoMoreInteractions(mocks);
+  }
+}

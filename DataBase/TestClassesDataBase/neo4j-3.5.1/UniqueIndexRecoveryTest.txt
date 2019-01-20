@@ -1,0 +1,112 @@
+@RunWith(Parameterized.class) public class UniqueIndexRecoveryTest {
+  @Rule public final TestDirectory storeDir=TestDirectory.testDirectory();
+  private static final String PROPERTY_KEY="key";
+  private static final String PROPERTY_VALUE="value";
+  private static final Label LABEL=label("label");
+  private final TestGraphDatabaseFactory factory=new TestGraphDatabaseFactory();
+  private GraphDatabaseAPI db;
+  @Parameterized.Parameters(name="{0}") public static SchemaIndex[] parameters(){
+    return SchemaIndex.values();
+  }
+  @Parameterized.Parameter public SchemaIndex schemaIndex;
+  @Before public void before(){
+    db=(GraphDatabaseAPI)newDb();
+  }
+  @After public void after(){
+    db.shutdown();
+  }
+  @Test public void shouldRecoverCreationOfUniquenessConstraintFollowedByDeletionOfThatSameConstraint() throws Exception {
+    createUniqueConstraint();
+    dropConstraints();
+    restart(snapshot(storeDir.absolutePath()));
+    try (Transaction tx=db.beginTx()){
+      assertFalse(db.schema().getConstraints(LABEL).iterator().hasNext());
+      tx.success();
+    }
+   }
+  @Test public void shouldRecoverWhenCommandsTemporarilyViolateConstraints() throws Exception {
+    Node unLabeledNode=createUnLabeledNodeWithProperty();
+    Node labeledNode=createLabeledNode();
+    createUniqueConstraint();
+    rotateLogAndCheckPoint();
+    setPropertyOnLabeledNode(labeledNode);
+    deletePropertyOnLabeledNode(labeledNode);
+    addLabelToUnLabeledNode(unLabeledNode);
+    flushAll();
+    restart(snapshot(storeDir.absolutePath()));
+    try (Transaction tx=db.beginTx()){
+      assertThat(db.findNode(LABEL,PROPERTY_KEY,PROPERTY_VALUE),equalTo(unLabeledNode));
+      tx.success();
+    }
+   }
+  private void restart(  File newStore){
+    db.shutdown();
+    db=(GraphDatabaseAPI)newDb();
+  }
+  private GraphDatabaseService newDb(){
+    return factory.newEmbeddedDatabaseBuilder(storeDir.absolutePath()).setConfig(GraphDatabaseSettings.default_schema_provider,schemaIndex.providerName()).newGraphDatabase();
+  }
+  private static File snapshot(  final File path) throws IOException {
+    File snapshotDir=new File(path,"snapshot-" + new Random().nextInt());
+    FileUtils.copyRecursively(path,snapshotDir,pathName -> {
+      String subPath=pathName.getAbsolutePath().substring(path.getPath().length() + 1);
+      return !"store_lock".equals(subPath) && !subPath.endsWith("write.lock");
+    }
+);
+    return snapshotDir;
+  }
+  private void addLabelToUnLabeledNode(  Node unLabeledNode){
+    try (Transaction tx=db.beginTx()){
+      unLabeledNode.addLabel(LABEL);
+      tx.success();
+    }
+   }
+  private void setPropertyOnLabeledNode(  Node labeledNode){
+    try (Transaction tx=db.beginTx()){
+      labeledNode.setProperty(PROPERTY_KEY,PROPERTY_VALUE);
+      tx.success();
+    }
+   }
+  private void deletePropertyOnLabeledNode(  Node labeledNode){
+    try (Transaction tx=db.beginTx()){
+      labeledNode.removeProperty(PROPERTY_KEY);
+      tx.success();
+    }
+   }
+  private void createUniqueConstraint(){
+    try (Transaction tx=db.beginTx()){
+      db.schema().constraintFor(LABEL).assertPropertyIsUnique(PROPERTY_KEY).create();
+      tx.success();
+    }
+   }
+  private Node createLabeledNode(){
+    try (Transaction tx=db.beginTx()){
+      Node node=db.createNode(LABEL);
+      tx.success();
+      return node;
+    }
+   }
+  private Node createUnLabeledNodeWithProperty(){
+    try (Transaction tx=db.beginTx()){
+      Node node=db.createNode();
+      node.setProperty(PROPERTY_KEY,PROPERTY_VALUE);
+      tx.success();
+      return node;
+    }
+   }
+  private void dropConstraints(){
+    try (Transaction tx=db.beginTx()){
+      for (      ConstraintDefinition constraint : db.schema().getConstraints(LABEL)) {
+        constraint.drop();
+      }
+      tx.success();
+    }
+   }
+  private void rotateLogAndCheckPoint() throws IOException {
+    db.getDependencyResolver().resolveDependency(LogRotation.class).rotateLogFile();
+    db.getDependencyResolver().resolveDependency(CheckPointer.class).forceCheckPoint(new SimpleTriggerInfo("test"));
+  }
+  private void flushAll(){
+    db.getDependencyResolver().resolveDependency(StorageEngine.class).flushAndForce(IOLimiter.UNLIMITED);
+  }
+}

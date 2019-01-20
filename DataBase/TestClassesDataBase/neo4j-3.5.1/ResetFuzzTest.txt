@@ -1,0 +1,85 @@
+public class ResetFuzzTest {
+  private static final String CONNECTOR="bolt";
+  private final int seed=new Random().nextInt();
+  private final Random rand=new Random(seed);
+  private final LifeSupport life=new LifeSupport();
+  /** 
+ * We track the number of un-closed transactions, and fail if we ever leak one 
+ */
+  private final AtomicLong liveTransactions=new AtomicLong();
+  private final Monitors monitors=new Monitors();
+  private final JobScheduler scheduler=life.add(createScheduler());
+  private final Config config=createConfig();
+  private final BoltSchedulerProvider boltSchedulerProvider=life.add(new ExecutorBoltSchedulerProvider(config,new CachedThreadPoolExecutorFactory(NullLog.getInstance()),scheduler,NullLogService.getInstance()));
+  private final Clock clock=Clock.systemUTC();
+  private final BoltStateMachine machine=new BoltStateMachineV1(new FuzzStubSPI(),BoltTestUtil.newTestBoltChannel(),clock);
+  private final BoltConnectionFactory connectionFactory=new DefaultBoltConnectionFactory(boltSchedulerProvider,TransportThrottleGroup.NO_THROTTLE,config,NullLogService.getInstance(),clock,monitors);
+  private BoltChannel boltChannel;
+  private final List<List<RequestMessage>> sequences=asList(asList(new RunMessage("test",EMPTY_MAP),DiscardAllMessage.INSTANCE),asList(new RunMessage("test",EMPTY_MAP),PullAllMessage.INSTANCE),singletonList(new RunMessage("test",EMPTY_MAP)));
+  private final List<RequestMessage> sent=new LinkedList<>();
+  @Before public void setup(){
+    boltChannel=mock(BoltChannel.class,RETURNS_MOCKS);
+    when(boltChannel.id()).thenReturn(UUID.randomUUID().toString());
+    when(boltChannel.connector()).thenReturn(CONNECTOR);
+  }
+  @Test public void shouldAlwaysReturnToReadyAfterReset() throws Throwable {
+    life.start();
+    BoltConnection boltConnection=connectionFactory.newConnection(boltChannel,machine);
+    boltConnection.enqueue(machine -> machine.process(new InitMessage("ResetFuzzTest/0.0",emptyMap()),nullResponseHandler()));
+    long deadline=System.currentTimeMillis() + 2 * 1000;
+    while (System.currentTimeMillis() < deadline) {
+      dispatchRandomSequenceOfMessages(boltConnection);
+      assertSchedulerWorks(boltConnection);
+    }
+  }
+  private void assertSchedulerWorks(  BoltConnection connection) throws InterruptedException {
+    BoltResponseRecorder recorder=new BoltResponseRecorder();
+    connection.enqueue(machine -> machine.process(ResetMessage.INSTANCE,recorder));
+    try {
+      RecordedBoltResponse response=recorder.nextResponse();
+      assertThat(response.message(),equalTo(SUCCESS));
+      assertThat(((BoltStateMachineV1)machine).state(),instanceOf(ReadyState.class));
+      assertThat(liveTransactions.get(),equalTo(0L));
+    }
+ catch (    AssertionError e) {
+      throw new AssertionError(String.format("Expected session to return to good state after RESET, but " + "assertion failed: %s.%n" + "Seed: %s%n"+ "Messages sent:%n"+ "%s",e.getMessage(),seed,Iterables.toString(sent,"\n")),e);
+    }
+  }
+  private void dispatchRandomSequenceOfMessages(  BoltConnection connection){
+    List<RequestMessage> sequence=sequences.get(rand.nextInt(sequences.size()));
+    for (    RequestMessage message : sequence) {
+      sent.add(message);
+      connection.enqueue(stateMachine -> stateMachine.process(message,nullResponseHandler()));
+    }
+  }
+  @After public void cleanup(){
+    life.shutdown();
+  }
+  private static Config createConfig(){
+    Map<String,String> configProps=new HashMap<>();
+    configProps.put(new BoltConnector(CONNECTOR).enabled.name(),"TRUE");
+    configProps.put(new BoltConnector(CONNECTOR).listen_address.name(),"localhost:0");
+    configProps.put(new BoltConnector(CONNECTOR).type.name(),BoltConnector.ConnectorType.BOLT.name());
+    configProps.put(new BoltConnector(CONNECTOR).thread_pool_min_size.name(),"5");
+    configProps.put(new BoltConnector(CONNECTOR).thread_pool_max_size.name(),"10");
+    return Config.fromSettings(configProps).build();
+  }
+  /** 
+ * We can't use mockito to create this, because it stores all invocations, so we run out of RAM in like five seconds.
+ */
+private class FuzzStubSPI implements BoltStateMachineSPI {
+    @Override public TransactionStateMachineSPI transactionSpi(){
+      return null;
+    }
+    @Override public void reportError(    Neo4jError err){
+    }
+    @Override public AuthenticationResult authenticate(    Map<String,Object> authToken){
+      return AuthenticationResult.AUTH_DISABLED;
+    }
+    @Override public void udcRegisterClient(    String clientName){
+    }
+    @Override public String version(){
+      return "<test-version>";
+    }
+  }
+}

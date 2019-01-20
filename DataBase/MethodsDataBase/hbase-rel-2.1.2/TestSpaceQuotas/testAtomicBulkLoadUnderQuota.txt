@@ -1,0 +1,50 @@
+@Test public void testAtomicBulkLoadUnderQuota() throws Exception {
+  TableName tn=helper.createTableWithRegions(10);
+  final long sizeLimit=50L * SpaceQuotaHelperForTests.ONE_KILOBYTE;
+  QuotaSettings settings=QuotaSettingsFactory.limitTableSpace(tn,sizeLimit,SpaceViolationPolicy.NO_INSERTS);
+  TEST_UTIL.getAdmin().setQuota(settings);
+  HRegionServer rs=TEST_UTIL.getMiniHBaseCluster().getRegionServer(0);
+  RegionServerSpaceQuotaManager spaceQuotaManager=rs.getRegionServerSpaceQuotaManager();
+  Map<TableName,SpaceQuotaSnapshot> snapshots=spaceQuotaManager.copyQuotaSnapshots();
+  Map<RegionInfo,Long> regionSizes=getReportedSizesForTable(tn);
+  while (true) {
+    SpaceQuotaSnapshot snapshot=snapshots.get(tn);
+    if (snapshot != null && snapshot.getLimit() > 0) {
+      break;
+    }
+    LOG.debug("Snapshot does not yet realize quota limit: " + snapshots + ", regionsizes: "+ regionSizes);
+    Thread.sleep(3000);
+    snapshots=spaceQuotaManager.copyQuotaSnapshots();
+    regionSizes=getReportedSizesForTable(tn);
+  }
+  SpaceQuotaSnapshot snapshot=snapshots.get(tn);
+  assertEquals(0L,snapshot.getUsage());
+  assertEquals(sizeLimit,snapshot.getLimit());
+  ActivePolicyEnforcement activePolicies=spaceQuotaManager.getActiveEnforcements();
+  SpaceViolationPolicyEnforcement enforcement=activePolicies.getPolicyEnforcement(tn);
+  assertTrue("Expected to find Noop policy, but got " + enforcement.getClass().getSimpleName(),enforcement instanceof DefaultViolationPolicyEnforcement);
+  ClientServiceCallable<Void> callable=generateFileToLoad(tn,2,500);
+  FileSystem fs=TEST_UTIL.getTestFileSystem();
+  FileStatus[] files=fs.listStatus(new Path(fs.getHomeDirectory(),testName.getMethodName() + "_files"));
+  for (  FileStatus file : files) {
+    assertTrue("Expected the file, " + file.getPath() + ",  length to be larger than 25KB, but was "+ file.getLen(),file.getLen() > 25 * SpaceQuotaHelperForTests.ONE_KILOBYTE);
+    LOG.debug(file.getPath() + " -> " + file.getLen()+ "B");
+  }
+  RpcRetryingCallerFactory factory=new RpcRetryingCallerFactory(TEST_UTIL.getConfiguration());
+  RpcRetryingCaller<Void> caller=factory.<Void>newCaller();
+  try {
+    caller.callWithRetries(callable,Integer.MAX_VALUE);
+    fail("Expected the bulk load call to fail!");
+  }
+ catch (  SpaceLimitingException e) {
+    LOG.trace("Caught expected exception",e);
+  }
+  Table table=TEST_UTIL.getConnection().getTable(tn);
+  ResultScanner scanner=table.getScanner(new Scan());
+  try {
+    assertNull("Expected no results",scanner.next());
+  }
+  finally {
+    scanner.close();
+  }
+}

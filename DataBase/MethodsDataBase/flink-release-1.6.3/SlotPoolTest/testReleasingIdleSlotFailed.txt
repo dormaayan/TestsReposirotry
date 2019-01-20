@@ -1,0 +1,47 @@
+/** 
+ * Tests that idle slots which cannot be released are only recycled if the owning  {@link TaskExecutor}is still registered at the  {@link SlotPool}. See FLINK-9047.
+ */
+@Test public void testReleasingIdleSlotFailed() throws Exception {
+  final ManualClock clock=new ManualClock();
+  final SlotPool slotPool=new SlotPool(rpcService,jobId,LocationPreferenceSchedulingStrategy.getInstance(),clock,TestingUtils.infiniteTime(),timeout);
+  try {
+    final SlotPoolGateway slotPoolGateway=setupSlotPool(slotPool,resourceManagerGateway);
+    final AllocationID expiredAllocationId=new AllocationID();
+    final SlotOffer slotToExpire=new SlotOffer(expiredAllocationId,0,ResourceProfile.UNKNOWN);
+    final ArrayDeque<CompletableFuture<Acknowledge>> responseQueue=new ArrayDeque<>(2);
+    taskManagerGateway.setFreeSlotFunction((    AllocationID allocationId,    Throwable cause) -> {
+      if (responseQueue.isEmpty()) {
+        return CompletableFuture.completedFuture(Acknowledge.get());
+      }
+ else {
+        return responseQueue.pop();
+      }
+    }
+);
+    responseQueue.add(FutureUtils.completedExceptionally(new FlinkException("Test failure")));
+    final CompletableFuture<Acknowledge> responseFuture=new CompletableFuture<>();
+    responseQueue.add(responseFuture);
+    assertThat(slotPoolGateway.registerTaskManager(taskManagerLocation.getResourceID()).get(),Matchers.is(Acknowledge.get()));
+    assertThat(slotPoolGateway.offerSlot(taskManagerLocation,taskManagerGateway,slotToExpire).get(),Matchers.is(true));
+    clock.advanceTime(timeout.toMilliseconds(),TimeUnit.MILLISECONDS);
+    slotPool.triggerCheckIdleSlot();
+    CompletableFuture<LogicalSlot> allocatedSlotFuture=slotPoolGateway.allocateSlot(new SlotRequestId(),new DummyScheduledUnit(),SlotProfile.noRequirements(),true,timeout);
+    final LogicalSlot logicalSlot=allocatedSlotFuture.get();
+    assertThat(logicalSlot.getAllocationId(),Matchers.is(expiredAllocationId));
+    slotPool.getSlotOwner().returnAllocatedSlot(logicalSlot).get();
+    clock.advanceTime(timeout.toMilliseconds(),TimeUnit.MILLISECONDS);
+    slotPool.triggerCheckIdleSlot();
+    allocatedSlotFuture=slotPoolGateway.allocateSlot(new SlotRequestId(),new DummyScheduledUnit(),SlotProfile.noRequirements(),true,timeout);
+    slotPoolGateway.releaseTaskManager(taskManagerLocation.getResourceID(),null).get();
+    responseFuture.completeExceptionally(new FlinkException("Second test exception"));
+    try {
+      allocatedSlotFuture.get(10L,TimeUnit.MILLISECONDS);
+      fail("Expected to fail with a timeout.");
+    }
+ catch (    TimeoutException ignored) {
+    }
+  }
+  finally {
+    RpcUtils.terminateRpcEndpoint(slotPool,timeout);
+  }
+}

@@ -1,0 +1,47 @@
+@RunWith(Parameterized.class) @Category({RegionServerTests.class,LargeTests.class}) public class TestWALOpenAfterDNRollingStart {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestWALOpenAfterDNRollingStart.class);
+  private static final HBaseTestingUtility TEST_UTIL=new HBaseTestingUtility();
+  private static long DN_RESTART_INTERVAL=15000;
+  private static long CHECK_LOW_REPLICATION_INTERVAL=10000;
+  @Parameter public String walProvider;
+  @Parameters(name="{index}: wal={0}") public static List<Object[]> data(){
+    return Arrays.asList(new Object[]{"asyncfs"},new Object[]{"filesystem"});
+  }
+  @BeforeClass public static void setUpBeforeClass() throws Exception {
+    TEST_UTIL.getConfiguration().setBoolean("dfs.client.block.write.replace-datanode-on-failure.enable",false);
+    TEST_UTIL.getConfiguration().setLong("hbase.regionserver.hlog.check.lowreplication.interval",CHECK_LOW_REPLICATION_INTERVAL);
+    TEST_UTIL.startMiniDFSCluster(3);
+    TEST_UTIL.startMiniZKCluster();
+  }
+  @Before public void setUp() throws IOException, InterruptedException {
+    TEST_UTIL.getConfiguration().set("hbase.wal.provider",walProvider);
+    TEST_UTIL.startMiniHBaseCluster(1,1);
+  }
+  @After public void tearDown() throws Exception {
+    TEST_UTIL.shutdownMiniHBaseCluster();
+  }
+  @AfterClass public static void tearDownAfterClass() throws Exception {
+    TEST_UTIL.shutdownMiniCluster();
+  }
+  /** 
+ * see HBASE-18132 This is a test case of failing open a wal(for replication for example) after all datanode restarted (rolling upgrade, for example). Before this patch, low replication detection is only used when syncing wal. But if the wal haven't had any entry whiten, it will never know all the replica of the wal is broken(because of dn restarting). And this wal can never be open
+ * @throws Exception
+ */
+  @Test public void test() throws Exception {
+    HRegionServer server=TEST_UTIL.getHBaseCluster().getRegionServer(0);
+    AbstractFSWAL<?> wal=(AbstractFSWAL<?>)server.getWAL(null);
+    Path currentFile=wal.getCurrentFileName();
+    for (int i=0, n=TEST_UTIL.getDFSCluster().getDataNodes().size(); i < n; i++) {
+      TEST_UTIL.getDFSCluster().restartDataNode(0);
+      Thread.sleep(DN_RESTART_INTERVAL);
+    }
+    if (!server.getFileSystem().exists(currentFile)) {
+      Path walRootDir=FSUtils.getWALRootDir(TEST_UTIL.getConfiguration());
+      final Path oldLogDir=new Path(walRootDir,HConstants.HREGION_OLDLOGDIR_NAME);
+      currentFile=new Path(oldLogDir,currentFile.getName());
+    }
+    try (WAL.Reader reader=WALFactory.createReader(TEST_UTIL.getTestFileSystem(),currentFile,TEST_UTIL.getConfiguration())){
+      reader.next();
+    }
+   }
+}

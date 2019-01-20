@@ -1,0 +1,81 @@
+/** 
+ * See HBASE-19929 for more details.
+ */
+@RunWith(Parameterized.class) @Category({RegionServerTests.class,MediumTests.class}) public class TestShutdownWhileWALBroken {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestShutdownWhileWALBroken.class);
+  private static final Logger LOG=LoggerFactory.getLogger(TestShutdownWhileWALBroken.class);
+  private static final HBaseTestingUtility UTIL=new HBaseTestingUtility();
+  private static TableName TABLE_NAME=TableName.valueOf("TestShutdownWhileWALBroken");
+  private static byte[] CF=Bytes.toBytes("CF");
+  @Parameter public String walType;
+  @Parameters(name="{index}: WAL={0}") public static List<Object[]> params(){
+    return Arrays.asList(new Object[]{"asyncfs"},new Object[]{"filesystem"});
+  }
+public static final class MyRegionServer extends HRegionServer {
+    private final CountDownLatch latch=new CountDownLatch(1);
+    public MyRegionServer(    Configuration conf) throws IOException {
+      super(conf);
+    }
+    @Override protected void tryRegionServerReport(    long reportStartTime,    long reportEndTime) throws IOException {
+      try {
+        super.tryRegionServerReport(reportStartTime,reportEndTime);
+      }
+ catch (      YouAreDeadException e) {
+        LOG.info("Caught YouAreDeadException, ignore",e);
+      }
+    }
+    @Override public void abort(    String reason,    Throwable cause){
+      if (cause instanceof SessionExpiredException) {
+        try {
+          latch.await();
+        }
+ catch (        InterruptedException e) {
+        }
+      }
+ else {
+        latch.countDown();
+      }
+      super.abort(reason,cause);
+    }
+  }
+  @Before public void setUp() throws Exception {
+    UTIL.getConfiguration().setClass(HConstants.REGION_SERVER_IMPL,MyRegionServer.class,HRegionServer.class);
+    UTIL.getConfiguration().set(WALFactory.WAL_PROVIDER,walType);
+    UTIL.startMiniCluster(2);
+  }
+  @After public void tearDown() throws Exception {
+    UTIL.shutdownMiniCluster();
+  }
+  @Test public void test() throws Exception {
+    UTIL.createMultiRegionTable(TABLE_NAME,CF);
+    try (Table table=UTIL.getConnection().getTable(TABLE_NAME)){
+      UTIL.loadTable(table,CF);
+    }
+     int numRegions=UTIL.getMiniHBaseCluster().getRegions(TABLE_NAME).size();
+    RegionServerThread rst0=UTIL.getMiniHBaseCluster().getRegionServerThreads().get(0);
+    RegionServerThread rst1=UTIL.getMiniHBaseCluster().getRegionServerThreads().get(1);
+    HRegionServer liveRS;
+    RegionServerThread toKillRSThread;
+    if (rst1.getRegionServer().getRegions(TableName.META_TABLE_NAME).isEmpty()) {
+      liveRS=rst0.getRegionServer();
+      toKillRSThread=rst1;
+    }
+ else {
+      liveRS=rst1.getRegionServer();
+      toKillRSThread=rst0;
+    }
+    assertTrue(liveRS.getRegions(TABLE_NAME).size() < numRegions);
+    UTIL.expireSession(toKillRSThread.getRegionServer().getZooKeeper(),false);
+    UTIL.waitFor(30000,new ExplainingPredicate<Exception>(){
+      @Override public boolean evaluate() throws Exception {
+        return liveRS.getRegions(TABLE_NAME).size() == numRegions;
+      }
+      @Override public String explainFailure() throws Exception {
+        return "Failover is not finished yet";
+      }
+    }
+);
+    toKillRSThread.getRegionServer().stop("Stop for test");
+    toKillRSThread.join();
+  }
+}

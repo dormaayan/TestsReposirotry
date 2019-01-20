@@ -1,0 +1,67 @@
+/** 
+ * Verifies that  {@link RemoteInputChannel} is enqueued in the pipeline for notifying credits,and verifies the behaviour of credit notification by triggering channel's writability changed.
+ */
+@Test public void testNotifyCreditAvailable() throws Exception {
+  final CreditBasedPartitionRequestClientHandler handler=new CreditBasedPartitionRequestClientHandler();
+  final EmbeddedChannel channel=new EmbeddedChannel(handler);
+  final PartitionRequestClient client=new PartitionRequestClient(channel,handler,mock(ConnectionID.class),mock(PartitionRequestClientFactory.class));
+  final NetworkBufferPool networkBufferPool=new NetworkBufferPool(10,32);
+  final SingleInputGate inputGate=createSingleInputGate();
+  final RemoteInputChannel inputChannel1=createRemoteInputChannel(inputGate,client);
+  final RemoteInputChannel inputChannel2=createRemoteInputChannel(inputGate,client);
+  try {
+    final BufferPool bufferPool=networkBufferPool.createBufferPool(6,6);
+    inputGate.setBufferPool(bufferPool);
+    final int numExclusiveBuffers=2;
+    inputGate.assignExclusiveSegments(networkBufferPool,numExclusiveBuffers);
+    inputChannel1.requestSubpartition(0);
+    inputChannel2.requestSubpartition(0);
+    assertTrue(channel.isWritable());
+    Object readFromOutbound=channel.readOutbound();
+    assertThat(readFromOutbound,instanceOf(PartitionRequest.class));
+    assertEquals(inputChannel1.getInputChannelId(),((PartitionRequest)readFromOutbound).receiverId);
+    assertEquals(2,((PartitionRequest)readFromOutbound).credit);
+    readFromOutbound=channel.readOutbound();
+    assertThat(readFromOutbound,instanceOf(PartitionRequest.class));
+    assertEquals(inputChannel2.getInputChannelId(),((PartitionRequest)readFromOutbound).receiverId);
+    assertEquals(2,((PartitionRequest)readFromOutbound).credit);
+    final BufferResponse bufferResponse1=createBufferResponse(TestBufferFactory.createBuffer(32),0,inputChannel1.getInputChannelId(),1);
+    final BufferResponse bufferResponse2=createBufferResponse(TestBufferFactory.createBuffer(32),0,inputChannel2.getInputChannelId(),1);
+    handler.channelRead(mock(ChannelHandlerContext.class),bufferResponse1);
+    handler.channelRead(mock(ChannelHandlerContext.class),bufferResponse2);
+    assertEquals(2,inputChannel1.getUnannouncedCredit());
+    assertEquals(2,inputChannel2.getUnannouncedCredit());
+    channel.runPendingTasks();
+    readFromOutbound=channel.readOutbound();
+    assertThat(readFromOutbound,instanceOf(AddCredit.class));
+    assertEquals(inputChannel1.getInputChannelId(),((AddCredit)readFromOutbound).receiverId);
+    assertEquals(2,((AddCredit)readFromOutbound).credit);
+    readFromOutbound=channel.readOutbound();
+    assertThat(readFromOutbound,instanceOf(AddCredit.class));
+    assertEquals(inputChannel2.getInputChannelId(),((AddCredit)readFromOutbound).receiverId);
+    assertEquals(2,((AddCredit)readFromOutbound).credit);
+    assertNull(channel.readOutbound());
+    ByteBuf channelBlockingBuffer=blockChannel(channel);
+    final BufferResponse bufferResponse3=createBufferResponse(TestBufferFactory.createBuffer(32),1,inputChannel1.getInputChannelId(),1);
+    handler.channelRead(mock(ChannelHandlerContext.class),bufferResponse3);
+    assertEquals(1,inputChannel1.getUnannouncedCredit());
+    assertEquals(0,inputChannel2.getUnannouncedCredit());
+    channel.runPendingTasks();
+    assertFalse(channel.isWritable());
+    assertNull(channel.readOutbound());
+    channel.flush();
+    assertSame(channelBlockingBuffer,channel.readOutbound());
+    assertTrue(channel.isWritable());
+    readFromOutbound=channel.readOutbound();
+    assertThat(readFromOutbound,instanceOf(AddCredit.class));
+    assertEquals(1,((AddCredit)readFromOutbound).credit);
+    assertEquals(0,inputChannel1.getUnannouncedCredit());
+    assertEquals(0,inputChannel2.getUnannouncedCredit());
+    assertNull(channel.readOutbound());
+  }
+  finally {
+    inputGate.releaseAllResources();
+    networkBufferPool.destroyAllBufferPools();
+    networkBufferPool.destroy();
+  }
+}

@@ -1,0 +1,90 @@
+/** 
+ */
+public class FileConsumerCustomExceptionHandlerTest extends ContextTestSupport {
+  private MyReadLockStrategy myReadLockStrategy=new MyReadLockStrategy();
+  private MyExceptionHandler myExceptionHandler=new MyExceptionHandler();
+  @Test public void testCustomExceptionHandler() throws Exception {
+    myExceptionHandler.setTemplate(context.createProducerTemplate());
+    getMockEndpoint("mock:result").expectedMessageCount(2);
+    getMockEndpoint("mock:error").expectedBodiesReceived("Error Forced to simulate no space on device");
+    template.sendBodyAndHeader("file:target/nospace","Hello World",Exchange.FILE_NAME,"hello.txt");
+    template.sendBodyAndHeader("file:target/nospace","Bye World",Exchange.FILE_NAME,"bye.txt");
+    assertMockEndpointsSatisfied();
+    assertEquals("Should pickup bye.txt file 2 times",2,myReadLockStrategy.getCounter());
+  }
+  @Override protected JndiRegistry createRegistry() throws Exception {
+    JndiRegistry jndi=super.createRegistry();
+    jndi.bind("myExceptionHandler",myExceptionHandler);
+    jndi.bind("myReadLockStrategy",myReadLockStrategy);
+    return jndi;
+  }
+  @Override protected RouteBuilder createRouteBuilder() throws Exception {
+    return new RouteBuilder(){
+      @Override public void configure() throws Exception {
+        onException(IOException.class).handled(true).log("IOException occurred due: ${exception.message}").to("direct:file-error");
+        from("direct:file-error").log("File error route triggered to deal with exception ${exception?.class}").transform().simple("Error ${exception.message}").to("mock:error");
+        from("file:target/nospace?exclusiveReadLockStrategy=#myReadLockStrategy&consumer.exceptionHandler=#myExceptionHandler&initialDelay=0&delay=10").convertBodyTo(String.class).to("mock:result");
+      }
+    }
+;
+  }
+  /** 
+ * Custom  {@link ExceptionHandler} to be used on the file consumer, to sendexceptions to a Camel route, to let Camel deal with the error.
+ */
+private static class MyExceptionHandler implements ExceptionHandler {
+    private ProducerTemplate template;
+    /** 
+ * We use a producer template to send a message to the Camel route
+ */
+    public void setTemplate(    ProducerTemplate template){
+      this.template=template;
+    }
+    @Override public void handleException(    Throwable exception){
+      handleException(exception.getMessage(),exception);
+    }
+    @Override public void handleException(    String message,    Throwable exception){
+      handleException(exception.getMessage(),null,exception);
+    }
+    @Override public void handleException(    final String message,    final Exchange originalExchange,    final Throwable exception){
+      template.send("direct:file-error",new Processor(){
+        @Override public void process(        Exchange exchange) throws Exception {
+          exchange.setException(exception);
+          exchange.getIn().setBody(message);
+        }
+      }
+);
+    }
+  }
+private static class MyReadLockStrategy implements GenericFileExclusiveReadLockStrategy<File> {
+    private int counter;
+    @Override public void prepareOnStartup(    GenericFileOperations<File> operations,    GenericFileEndpoint<File> endpoint) throws Exception {
+    }
+    @Override public boolean acquireExclusiveReadLock(    GenericFileOperations<File> operations,    GenericFile<File> file,    Exchange exchange) throws Exception {
+      if (file.getFileNameOnly().equals("bye.txt")) {
+        if (counter++ == 0) {
+          throw new IOException("Forced to simulate no space on device");
+        }
+      }
+      return true;
+    }
+    @Override public void releaseExclusiveReadLockOnAbort(    GenericFileOperations<File> operations,    GenericFile<File> file,    Exchange exchange) throws Exception {
+    }
+    @Override public void releaseExclusiveReadLockOnRollback(    GenericFileOperations<File> operations,    GenericFile<File> file,    Exchange exchange) throws Exception {
+    }
+    @Override public void releaseExclusiveReadLockOnCommit(    GenericFileOperations<File> operations,    GenericFile<File> file,    Exchange exchange) throws Exception {
+    }
+    @Override public void setTimeout(    long timeout){
+    }
+    @Override public void setCheckInterval(    long checkInterval){
+    }
+    @Override public void setReadLockLoggingLevel(    LoggingLevel readLockLoggingLevel){
+    }
+    @Override public void setMarkerFiler(    boolean markerFile){
+    }
+    @Override public void setDeleteOrphanLockFiles(    boolean deleteOrphanLockFiles){
+    }
+    public int getCounter(){
+      return counter;
+    }
+  }
+}

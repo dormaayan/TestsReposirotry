@@ -1,0 +1,85 @@
+/** 
+ * CAMEL-11471: Unable to update the cron details from Quartz scheduler MBean
+ */
+@RunWith(PaxExam.class) public class CamelQuartz2JmxUpdateTest extends AbstractFeatureTest {
+  private static final Logger LOGGER=LoggerFactory.getLogger(CamelQuartz2JmxUpdateTest.class);
+  @Test public void testUpdateCronDetails() throws Exception {
+    installCamelFeature("camel-quartz2");
+    URL url=ObjectHelper.loadResourceAsURL("org/apache/camel/itest/CamelQuartz2JmxUpdateTest.xml",CamelQuartz2JmxUpdateTest.class.getClassLoader());
+    installBlueprintAsBundle("CamelQuartz2JmxUpdateTest",url,true);
+    CamelContext camel=getOsgiService(bundleContext,CamelContext.class);
+    MockEndpoint mock=camel.getEndpoint("mock:result",MockEndpoint.class);
+    mock.expectedBodiesReceived("Hello World");
+    mock.assertIsSatisfied(5000);
+    doUpdateCronDetails();
+  }
+  private void doUpdateCronDetails() throws Exception {
+    String trigger="myTimer";
+    String group="myGroup";
+    String cronExpression="0 * * * * ?";
+    MBeanServer mBeanServer=ManagementFactory.getPlatformMBeanServer();
+    Set<ObjectName> objectNames=mBeanServer.queryNames(new ObjectName("quartz:type=QuartzScheduler,name=*,instance=NON_CLUSTERED"),null);
+    assertFalse("There should be a quartz scheduler MBean",objectNames.isEmpty());
+    ObjectName oName=objectNames.stream().findFirst().get();
+    LOGGER.info("Scheduler MBean: {}",oName);
+    CompositeData triggerData=(CompositeData)mBeanServer.invoke(oName,"getTrigger",new Object[]{trigger,group},new String[]{"java.lang.String","java.lang.String"});
+    String jobName=(String)triggerData.get("jobName");
+    String jobGroup=(String)triggerData.get("jobGroup");
+    CompositeData jobData=(CompositeData)mBeanServer.invoke(oName,"getJobDetail",new Object[]{jobName,jobGroup},new String[]{"java.lang.String","java.lang.String"});
+    String original=getCronExpression(jobData);
+    assertNotEquals("make sure original cron is different",cronExpression,original);
+    Map<String,Object> jobInfo=createJobInfo(jobName,jobGroup,cronExpression,jobData);
+    Map<String,Object> triggerInfo=createTriggerInfo(trigger,group,cronExpression,jobName,jobGroup);
+    mBeanServer.invoke(oName,"scheduleBasicJob",new Object[]{jobInfo,triggerInfo},new String[]{"java.util.Map","java.util.Map"});
+    CompositeData jobData2=(CompositeData)mBeanServer.invoke(oName,"getJobDetail",new Object[]{jobName,jobGroup},new String[]{"java.lang.String","java.lang.String"});
+    String updated=getCronExpression(jobData2);
+    assertEquals("cron should be updated",cronExpression,updated);
+  }
+  private String getCronExpression(  CompositeData jobData){
+    TabularData jobDataMap=(TabularData)jobData.get("jobDataMap");
+    CompositeData cron=jobDataMap.get(new String[]{"CamelQuartzTriggerCronExpression"});
+    Iterator it=cron.values().iterator();
+    it.next();
+    return (String)it.next();
+  }
+  private Map<String,Object> createJobInfo(  String jobName,  String jobGroup,  String cronExpression,  CompositeData jobData){
+    Map<String,Object> jobInfo=new HashMap<>();
+    jobInfo.put("name",jobName);
+    jobInfo.put("group",jobGroup);
+    if (jobData.get("description") != null) {
+      jobInfo.put("description",jobData.get("description"));
+    }
+    jobInfo.put("jobClass",jobData.get("jobClass"));
+    jobInfo.put("durability",jobData.get("durability"));
+    jobInfo.put("shouldRecover",jobData.get("shouldRecover"));
+    Map<String,Object> jobDataMap=new HashMap<>();
+    TabularData tJobDataMap=(TabularData)jobData.get("jobDataMap");
+    for (    Object cKey : tJobDataMap.keySet()) {
+      Object key=((List)cKey).get(0);
+      CompositeData cd=tJobDataMap.get(new Object[]{key});
+      if (cd != null) {
+        Iterator it=cd.values().iterator();
+        String tKey=(String)it.next();
+        Object tValue=it.next();
+        jobDataMap.put(tKey,tValue);
+      }
+    }
+    jobDataMap.put("CamelQuartzTriggerType","cron");
+    jobDataMap.put("CamelQuartzTriggerCronExpression",cronExpression);
+    jobInfo.put("jobDataMap",jobDataMap);
+    return jobInfo;
+  }
+  private Map<String,Object> createTriggerInfo(  String trigger,  String group,  String cronExpression,  String jobName,  String jobGroup){
+    Map<String,Object> triggerInfo=new HashMap<>();
+    triggerInfo.put("cronExpression",cronExpression);
+    triggerInfo.put("name",trigger);
+    triggerInfo.put("group",group);
+    triggerInfo.put("jobName",jobName);
+    triggerInfo.put("jobGroup",jobGroup);
+    triggerInfo.put("misfireInstruction",1);
+    return triggerInfo;
+  }
+  @Configuration public Option[] configure(){
+    return configure("camel-test-karaf");
+  }
+}

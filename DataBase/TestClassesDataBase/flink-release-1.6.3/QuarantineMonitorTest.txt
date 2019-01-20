@@ -1,0 +1,196 @@
+/** 
+ * Tests for  {@link QuarantineMonitor}.
+ */
+public class QuarantineMonitorTest extends TestLogger {
+  private static final Logger LOG=LoggerFactory.getLogger(QuarantineMonitorTest.class);
+  private static final FiniteDuration zeroDelay=new FiniteDuration(0L,TimeUnit.SECONDS);
+  private static ActorSystem actorSystem1;
+  private ActorSystem actorSystem2;
+  @BeforeClass public static void setup(){
+    Properties properties=new Properties();
+    properties.setProperty("akka.remote.watch-failure-detector.threshold","0.00001");
+    properties.setProperty("akka.remote.watch-failure-detector.heartbeat-interval","1 ms");
+    properties.setProperty("akka.remote.watch-failure-detector.acceptable-heartbeat-pause","1 ms");
+    Config deathWatch=ConfigFactory.parseProperties(properties);
+    Config defaultConfig=AkkaUtils.getDefaultAkkaConfig();
+    actorSystem1=AkkaUtils.createActorSystem(deathWatch.withFallback(defaultConfig));
+  }
+  @AfterClass public static void tearDown(){
+    if (actorSystem1 != null) {
+      actorSystem1.shutdown();
+      actorSystem1.awaitTermination();
+    }
+  }
+  @Before public void setupTest(){
+    actorSystem2=AkkaUtils.createDefaultActorSystem();
+  }
+  @After public void tearDownTest(){
+    if (actorSystem2 != null) {
+      actorSystem2.shutdown();
+      actorSystem2.awaitTermination();
+    }
+  }
+  /** 
+ * Tests that the quarantine monitor detects if an actor system has been quarantined by another actor system.
+ */
+  @Test(timeout=5000L) public void testWatcheeQuarantined() throws ExecutionException, InterruptedException {
+    TestingQuarantineHandler quarantineHandler=new TestingQuarantineHandler();
+    ActorRef watchee=null;
+    ActorRef watcher=null;
+    ActorRef monitor=null;
+    FiniteDuration timeout=new FiniteDuration(5,TimeUnit.SECONDS);
+    FiniteDuration interval=new FiniteDuration(200,TimeUnit.MILLISECONDS);
+    try {
+      monitor=actorSystem2.actorOf(getQuarantineMonitorProps(quarantineHandler),"quarantineMonitor");
+      watchee=actorSystem2.actorOf(getWatcheeProps(timeout,interval,quarantineHandler),"watchee");
+      watcher=actorSystem1.actorOf(getWatcherProps(timeout,interval,quarantineHandler),"watcher");
+      final Address actorSystem1Address=AkkaUtils.getAddress(actorSystem1);
+      final String watcheeAddress=AkkaUtils.getAkkaURL(actorSystem2,watchee);
+      final String watcherAddress=AkkaUtils.getAkkaURL(actorSystem1,watcher);
+      watchee.tell(new Ping(watcherAddress),ActorRef.noSender());
+      watcher.tell(new Watch(watcheeAddress),ActorRef.noSender());
+      CompletableFuture<String> quarantineFuture=quarantineHandler.getWasQuarantinedByFuture();
+      Assert.assertEquals(actorSystem1Address.toString(),quarantineFuture.get());
+    }
+  finally {
+      TestingUtils.stopActor(watchee);
+      TestingUtils.stopActor(watcher);
+      TestingUtils.stopActor(monitor);
+    }
+  }
+  /** 
+ * Tests that the quarantine monitor detects if an actor system quarantines another actor system.
+ */
+  @Test(timeout=5000L) public void testWatcherQuarantining() throws ExecutionException, InterruptedException {
+    TestingQuarantineHandler quarantineHandler=new TestingQuarantineHandler();
+    ActorRef watchee=null;
+    ActorRef watcher=null;
+    ActorRef monitor=null;
+    FiniteDuration timeout=new FiniteDuration(5,TimeUnit.SECONDS);
+    FiniteDuration interval=new FiniteDuration(200,TimeUnit.MILLISECONDS);
+    try {
+      monitor=actorSystem1.actorOf(getQuarantineMonitorProps(quarantineHandler),"quarantineMonitor");
+      watchee=actorSystem2.actorOf(getWatcheeProps(timeout,interval,quarantineHandler),"watchee");
+      watcher=actorSystem1.actorOf(getWatcherProps(timeout,interval,quarantineHandler),"watcher");
+      final Address actorSystem1Address=AkkaUtils.getAddress(actorSystem2);
+      final String watcheeAddress=AkkaUtils.getAkkaURL(actorSystem2,watchee);
+      final String watcherAddress=AkkaUtils.getAkkaURL(actorSystem1,watcher);
+      watchee.tell(new Ping(watcherAddress),ActorRef.noSender());
+      watcher.tell(new Watch(watcheeAddress),ActorRef.noSender());
+      CompletableFuture<String> quarantineFuture=quarantineHandler.getHasQuarantinedFuture();
+      Assert.assertEquals(actorSystem1Address.toString(),quarantineFuture.get());
+    }
+  finally {
+      TestingUtils.stopActor(watchee);
+      TestingUtils.stopActor(watcher);
+      TestingUtils.stopActor(monitor);
+    }
+  }
+private static class TestingQuarantineHandler implements QuarantineHandler, ErrorHandler {
+    private final CompletableFuture<String> wasQuarantinedByFuture;
+    private final CompletableFuture<String> hasQuarantinedFuture;
+    public TestingQuarantineHandler(){
+      this.wasQuarantinedByFuture=new CompletableFuture<>();
+      this.hasQuarantinedFuture=new CompletableFuture<>();
+    }
+    @Override public void wasQuarantinedBy(    String remoteSystem,    ActorSystem actorSystem){
+      wasQuarantinedByFuture.complete(remoteSystem);
+    }
+    @Override public void hasQuarantined(    String remoteSystem,    ActorSystem actorSystem){
+      hasQuarantinedFuture.complete(remoteSystem);
+    }
+    public CompletableFuture<String> getWasQuarantinedByFuture(){
+      return wasQuarantinedByFuture;
+    }
+    public CompletableFuture<String> getHasQuarantinedFuture(){
+      return hasQuarantinedFuture;
+    }
+    @Override public void handleError(    Throwable failure){
+      wasQuarantinedByFuture.completeExceptionally(failure);
+      hasQuarantinedFuture.completeExceptionally(failure);
+    }
+  }
+private interface ErrorHandler {
+    void handleError(    Throwable failure);
+  }
+static class Watcher extends UntypedActor {
+    private final FiniteDuration timeout;
+    private final FiniteDuration interval;
+    private final ErrorHandler errorHandler;
+    Watcher(    FiniteDuration timeout,    FiniteDuration interval,    ErrorHandler errorHandler){
+      this.timeout=Preconditions.checkNotNull(timeout);
+      this.interval=Preconditions.checkNotNull(interval);
+      this.errorHandler=Preconditions.checkNotNull(errorHandler);
+    }
+    @Override public void onReceive(    Object message) throws Exception {
+      if (message instanceof Watch) {
+        Watch watch=(Watch)message;
+        getContext().actorSelection(watch.getTarget()).resolveOne(timeout).onComplete(new OnComplete<ActorRef>(){
+          @Override public void onComplete(          Throwable failure,          ActorRef success) throws Throwable {
+            if (success != null) {
+              getContext().watch(success);
+              getContext().system().scheduler().schedule(zeroDelay,interval,success,"Watcher message",getContext().dispatcher(),getSelf());
+            }
+ else {
+              errorHandler.handleError(failure);
+            }
+          }
+        }
+,getContext().dispatcher());
+      }
+    }
+  }
+static class Watchee extends UntypedActor {
+    private final FiniteDuration timeout;
+    private final FiniteDuration interval;
+    private final ErrorHandler errorHandler;
+    Watchee(    FiniteDuration timeout,    FiniteDuration interval,    ErrorHandler errorHandler){
+      this.timeout=Preconditions.checkNotNull(timeout);
+      this.interval=Preconditions.checkNotNull(interval);
+      this.errorHandler=Preconditions.checkNotNull(errorHandler);
+    }
+    @Override public void onReceive(    Object message) throws Exception {
+      if (message instanceof Ping) {
+        final Ping ping=(Ping)message;
+        getContext().actorSelection(ping.getTarget()).resolveOne(timeout).onComplete(new OnComplete<ActorRef>(){
+          @Override public void onComplete(          Throwable failure,          ActorRef success) throws Throwable {
+            if (success != null) {
+              getContext().system().scheduler().schedule(zeroDelay,interval,success,"Watchee message",getContext().dispatcher(),getSelf());
+            }
+ else {
+              errorHandler.handleError(failure);
+            }
+          }
+        }
+,getContext().dispatcher());
+      }
+    }
+  }
+static class Watch {
+    private final String target;
+    Watch(    String target){
+      this.target=target;
+    }
+    public String getTarget(){
+      return target;
+    }
+  }
+static class Ping {
+    private final String target;
+    Ping(    String target){
+      this.target=target;
+    }
+    public String getTarget(){
+      return target;
+    }
+  }
+  static Props getWatcheeProps(  FiniteDuration timeout,  FiniteDuration interval,  ErrorHandler errorHandler){
+    return Props.create(Watchee.class,timeout,interval,errorHandler);
+  }
+  static Props getWatcherProps(  FiniteDuration timeout,  FiniteDuration interval,  ErrorHandler errorHandler){
+    return Props.create(Watcher.class,timeout,interval,errorHandler);
+  }
+  static Props getQuarantineMonitorProps(  QuarantineHandler handler){
+    return Props.create(QuarantineMonitor.class,handler,LOG);
+  }
+}

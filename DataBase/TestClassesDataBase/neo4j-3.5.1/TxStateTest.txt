@@ -1,0 +1,487 @@
+@SuppressWarnings("unchecked") @RunWith(Parameterized.class) public class TxStateTest {
+  private static final CachingOffHeapBlockAllocator BLOCK_ALLOCATOR=new CachingOffHeapBlockAllocator();
+  public final RandomRule random=new RandomRule();
+  @Rule public final TestRule repeatWithDifferentRandomization(){
+    return RuleChain.outerRule(new RepeatRule()).around(random);
+  }
+  private final IndexDescriptor indexOn_1_1=TestIndexDescriptorFactory.forLabel(1,1);
+  private final IndexDescriptor indexOn_2_1=TestIndexDescriptorFactory.forLabel(2,1);
+  private CollectionsFactory collectionsFactory;
+  private TxState state;
+  @Parameter public CollectionsFactorySupplier collectionsFactorySupplier;
+  @Parameters(name="{0}") public static List<CollectionsFactorySupplier> data(){
+    return asList(new CollectionsFactorySupplier(){
+      @Override public CollectionsFactory create(){
+        return CollectionsFactorySupplier.ON_HEAP.create();
+      }
+      @Override public String toString(){
+        return "On heap";
+      }
+    }
+,new CollectionsFactorySupplier(){
+      @Override public CollectionsFactory create(){
+        return new OffHeapCollectionsFactory(BLOCK_ALLOCATOR);
+      }
+      @Override public String toString(){
+        return "Off heap";
+      }
+    }
+);
+  }
+  @AfterClass public static void afterAll(){
+    BLOCK_ALLOCATOR.release();
+  }
+  @Before public void before(){
+    collectionsFactory=spy(collectionsFactorySupplier.create());
+    state=new TxState(collectionsFactory);
+  }
+  @After public void after(){
+    collectionsFactory.release();
+    assertEquals("Seems like native memory is leaking",0L,collectionsFactory.getMemoryTracker().usedDirectMemory());
+  }
+  @Test public void shouldGetAddedLabels(){
+    state.nodeDoAddLabel(1,0);
+    state.nodeDoAddLabel(1,1);
+    state.nodeDoAddLabel(2,1);
+    LongSet addedLabels=state.nodeStateLabelDiffSets(1).getAdded();
+    assertEquals(newSetWith(1,2),addedLabels);
+  }
+  @Test public void shouldGetRemovedLabels(){
+    state.nodeDoRemoveLabel(1,0);
+    state.nodeDoRemoveLabel(1,1);
+    state.nodeDoRemoveLabel(2,1);
+    LongSet removedLabels=state.nodeStateLabelDiffSets(1).getRemoved();
+    assertEquals(newSetWith(1,2),removedLabels);
+  }
+  @Test public void removeAddedLabelShouldRemoveFromAdded(){
+    state.nodeDoAddLabel(1,0);
+    state.nodeDoAddLabel(1,1);
+    state.nodeDoAddLabel(2,1);
+    state.nodeDoRemoveLabel(1,1);
+    assertEquals(newSetWith(2),state.nodeStateLabelDiffSets(1).getAdded());
+  }
+  @Test public void addRemovedLabelShouldRemoveFromRemoved(){
+    state.nodeDoRemoveLabel(1,0);
+    state.nodeDoRemoveLabel(1,1);
+    state.nodeDoRemoveLabel(2,1);
+    state.nodeDoAddLabel(1,1);
+    assertEquals(newSetWith(2),state.nodeStateLabelDiffSets(1).getRemoved());
+  }
+  @Test public void shouldMapFromRemovedLabelToNodes(){
+    state.nodeDoRemoveLabel(1,0);
+    state.nodeDoRemoveLabel(2,0);
+    state.nodeDoRemoveLabel(1,1);
+    state.nodeDoRemoveLabel(3,1);
+    state.nodeDoRemoveLabel(2,2);
+    LongSet nodes=state.nodesWithLabelChanged(2).getRemoved();
+    assertEquals(newSetWith(0L,2L),nodes);
+  }
+  @Test public void shouldComputeIndexUpdatesOnUninitializedTxState(){
+    UnmodifiableMap<ValueTuple,? extends LongDiffSets> diffSets=state.getIndexUpdates(indexOn_1_1.schema());
+    assertNull(diffSets);
+  }
+  @Test public void shouldComputeSortedIndexUpdatesOnUninitializedTxState(){
+    NavigableMap<ValueTuple,? extends LongDiffSets> diffSets=state.getSortedIndexUpdates(indexOn_1_1.schema());
+    assertNull(diffSets);
+  }
+  @Test public void shouldComputeIndexUpdatesOnEmptyTxState(){
+    addNodesToIndex(indexOn_2_1).withDefaultStringProperties(42L);
+    UnmodifiableMap<ValueTuple,? extends LongDiffSets> diffSets=state.getIndexUpdates(indexOn_1_1.schema());
+    assertNull(diffSets);
+  }
+  @Test public void shouldComputeSortedIndexUpdatesOnEmptyTxState(){
+    addNodesToIndex(indexOn_2_1).withDefaultStringProperties(42L);
+    NavigableMap<ValueTuple,? extends LongDiffSets> diffSets=state.getSortedIndexUpdates(indexOn_1_1.schema());
+    assertNull(diffSets);
+  }
+  @Test public void shouldComputeIndexUpdatesOnTxStateWithAddedNodes(){
+    addNodesToIndex(indexOn_1_1).withDefaultStringProperties(42L);
+    addNodesToIndex(indexOn_1_1).withDefaultStringProperties(43L);
+    addNodesToIndex(indexOn_1_1).withDefaultStringProperties(41L);
+    UnmodifiableMap<ValueTuple,? extends LongDiffSets> diffSets=state.getIndexUpdates(indexOn_1_1.schema());
+    assertEqualDiffSets(addedNodes(42L),diffSets.get(ValueTuple.of(stringValue("value42"))));
+    assertEqualDiffSets(addedNodes(43L),diffSets.get(ValueTuple.of(stringValue("value43"))));
+    assertEqualDiffSets(addedNodes(41L),diffSets.get(ValueTuple.of(stringValue("value41"))));
+  }
+  @Test public void shouldComputeSortedIndexUpdatesOnTxStateWithAddedNodes(){
+    addNodesToIndex(indexOn_1_1).withDefaultStringProperties(42L);
+    addNodesToIndex(indexOn_1_1).withDefaultStringProperties(43L);
+    addNodesToIndex(indexOn_1_1).withDefaultStringProperties(41L);
+    NavigableMap<ValueTuple,? extends LongDiffSets> diffSets=state.getSortedIndexUpdates(indexOn_1_1.schema());
+    TreeMap<ValueTuple,LongDiffSets> expected=sortedAddedNodesDiffSets(42,41,43);
+    assertEquals(expected.keySet(),diffSets.keySet());
+    for (    final ValueTuple key : expected.keySet()) {
+      assertEqualDiffSets(expected.get(key),diffSets.get(key));
+    }
+  }
+  @Test public void shouldAddAndGetByLabel(){
+    state.indexDoAdd(indexOn_1_1);
+    state.indexDoAdd(indexOn_2_1);
+    assertEquals(asSet(indexOn_1_1),state.indexDiffSetsByLabel(indexOn_1_1.schema().keyId()).getAdded());
+  }
+  @Test public void shouldAddAndGetByRuleId(){
+    state.indexDoAdd(indexOn_1_1);
+    assertEquals(asSet(indexOn_1_1),state.indexChanges().getAdded());
+  }
+  @Test public void shouldListNodeAsDeletedIfItIsDeleted(){
+    long nodeId=1337L;
+    state.nodeDoDelete(nodeId);
+    assertThat(state.addedAndRemovedNodes().getRemoved(),equalTo(newSetWith(nodeId)));
+  }
+  @Test public void shouldAddUniquenessConstraint(){
+    UniquenessConstraintDescriptor constraint=ConstraintDescriptorFactory.uniqueForLabel(1,17);
+    state.constraintDoAdd(constraint,7);
+    DiffSets<ConstraintDescriptor> diff=state.constraintsChangesForLabel(1);
+    assertEquals(singleton(constraint),diff.getAdded());
+    assertTrue(diff.getRemoved().isEmpty());
+  }
+  @Test public void addingUniquenessConstraintShouldBeIdempotent(){
+    UniquenessConstraintDescriptor constraint1=ConstraintDescriptorFactory.uniqueForLabel(1,17);
+    state.constraintDoAdd(constraint1,7);
+    UniquenessConstraintDescriptor constraint2=ConstraintDescriptorFactory.uniqueForLabel(1,17);
+    state.constraintDoAdd(constraint2,19);
+    assertEquals(constraint1,constraint2);
+    assertEquals(singleton(constraint1),state.constraintsChangesForLabel(1).getAdded());
+  }
+  @Test public void shouldDifferentiateBetweenUniquenessConstraintsForDifferentLabels(){
+    UniquenessConstraintDescriptor constraint1=ConstraintDescriptorFactory.uniqueForLabel(1,17);
+    state.constraintDoAdd(constraint1,7);
+    UniquenessConstraintDescriptor constraint2=ConstraintDescriptorFactory.uniqueForLabel(2,17);
+    state.constraintDoAdd(constraint2,19);
+    assertEquals(singleton(constraint1),state.constraintsChangesForLabel(1).getAdded());
+    assertEquals(singleton(constraint2),state.constraintsChangesForLabel(2).getAdded());
+  }
+  @Test public void shouldAddRelationshipPropertyExistenceConstraint(){
+    ConstraintDescriptor constraint=ConstraintDescriptorFactory.existsForRelType(1,42);
+    state.constraintDoAdd(constraint);
+    assertEquals(singleton(constraint),state.constraintsChangesForRelationshipType(1).getAdded());
+  }
+  @Test public void addingRelationshipPropertyExistenceConstraintConstraintShouldBeIdempotent(){
+    ConstraintDescriptor constraint1=ConstraintDescriptorFactory.existsForRelType(1,42);
+    ConstraintDescriptor constraint2=ConstraintDescriptorFactory.existsForRelType(1,42);
+    state.constraintDoAdd(constraint1);
+    state.constraintDoAdd(constraint2);
+    assertEquals(constraint1,constraint2);
+    assertEquals(singleton(constraint1),state.constraintsChangesForRelationshipType(1).getAdded());
+  }
+  @Test public void shouldDropRelationshipPropertyExistenceConstraint(){
+    ConstraintDescriptor constraint=ConstraintDescriptorFactory.existsForRelType(1,42);
+    state.constraintDoAdd(constraint);
+    state.constraintDoDrop(constraint);
+    assertTrue(state.constraintsChangesForRelationshipType(1).isEmpty());
+  }
+  @Test public void shouldDifferentiateRelationshipPropertyExistenceConstraints(){
+    ConstraintDescriptor constraint1=ConstraintDescriptorFactory.existsForRelType(1,11);
+    ConstraintDescriptor constraint2=ConstraintDescriptorFactory.existsForRelType(1,22);
+    ConstraintDescriptor constraint3=ConstraintDescriptorFactory.existsForRelType(3,33);
+    state.constraintDoAdd(constraint1);
+    state.constraintDoAdd(constraint2);
+    state.constraintDoAdd(constraint3);
+    assertEquals(asSet(constraint1,constraint2),state.constraintsChangesForRelationshipType(1).getAdded());
+    assertEquals(singleton(constraint1),state.constraintsChangesForSchema(constraint1.schema()).getAdded());
+    assertEquals(singleton(constraint2),state.constraintsChangesForSchema(constraint2.schema()).getAdded());
+    assertEquals(singleton(constraint3),state.constraintsChangesForRelationshipType(3).getAdded());
+    assertEquals(singleton(constraint3),state.constraintsChangesForSchema(constraint3.schema()).getAdded());
+  }
+  @Test public void shouldListRelationshipsAsCreatedIfCreated(){
+    long relId=10;
+    state.relationshipDoCreate(relId,0,1,2);
+    assertTrue(state.hasChanges());
+    assertTrue(state.relationshipIsAddedInThisTx(relId));
+  }
+  @Test public void shouldNotChangeRecordForCreatedAndDeletedNode() throws Exception {
+    state.nodeDoCreate(0);
+    state.nodeDoDelete(0);
+    state.nodeDoCreate(1);
+    state.accept(new TxStateVisitor.Adapter(){
+      @Override public void visitCreatedNode(      long id){
+        assertEquals("Should not create any other node than 1",1,id);
+      }
+      @Override public void visitDeletedNode(      long id){
+        fail("Should not delete any node");
+      }
+    }
+);
+  }
+  @Test public void shouldVisitDeletedNode() throws Exception {
+    state.nodeDoDelete(42);
+    state.accept(new TxStateVisitor.Adapter(){
+      @Override public void visitDeletedNode(      long id){
+        assertEquals("Wrong deleted node id",42,id);
+      }
+    }
+);
+  }
+  @Test public void shouldReportDeletedNodeIfItWasCreatedAndDeletedInSameTx(){
+    long nodeId=42;
+    state.nodeDoCreate(nodeId);
+    state.nodeDoDelete(nodeId);
+    assertTrue(state.nodeIsDeletedInThisTx(nodeId));
+  }
+  @Test public void shouldNotReportDeletedNodeIfItIsNotDeleted(){
+    long nodeId=42;
+    state.nodeDoCreate(nodeId);
+    assertFalse(state.nodeIsDeletedInThisTx(nodeId));
+  }
+  @Test public void shouldNotChangeRecordForCreatedAndDeletedRelationship() throws Exception {
+    state.relationshipDoCreate(0,0,1,2);
+    state.relationshipDoDelete(0,0,1,2);
+    state.relationshipDoCreate(1,0,2,3);
+    state.accept(new TxStateVisitor.Adapter(){
+      @Override public void visitCreatedRelationship(      long id,      int type,      long startNode,      long endNode){
+        assertEquals("Should not create any other relationship than 1",1,id);
+      }
+      @Override public void visitDeletedRelationship(      long id){
+        fail("Should not delete any relationship");
+      }
+    }
+);
+  }
+  @Test public void doNotVisitNotModifiedPropertiesOnModifiedNodes() throws ConstraintValidationException, CreateConstraintFailureException {
+    state.nodeDoAddLabel(5,1);
+    MutableBoolean labelsChecked=new MutableBoolean();
+    state.accept(new TxStateVisitor.Adapter(){
+      @Override public void visitNodeLabelChanges(      long id,      LongSet added,      LongSet removed){
+        labelsChecked.setTrue();
+        assertEquals(1,id);
+        assertEquals(1,added.size());
+        assertTrue(added.contains(5));
+        assertTrue(removed.isEmpty());
+      }
+      @Override public void visitNodePropertyChanges(      long id,      Iterator<StorageProperty> added,      Iterator<StorageProperty> changed,      IntIterable removed){
+        fail("Properties were not changed.");
+      }
+    }
+);
+    assertTrue(labelsChecked.booleanValue());
+  }
+  @Test public void doNotVisitNotModifiedLabelsOnModifiedNodes() throws ConstraintValidationException, CreateConstraintFailureException {
+    state.nodeDoAddProperty(1,2,stringValue("propertyValue"));
+    MutableBoolean propertiesChecked=new MutableBoolean();
+    state.accept(new TxStateVisitor.Adapter(){
+      @Override public void visitNodeLabelChanges(      long id,      LongSet added,      LongSet removed){
+        fail("Labels were not changed.");
+      }
+      @Override public void visitNodePropertyChanges(      long id,      Iterator<StorageProperty> added,      Iterator<StorageProperty> changed,      IntIterable removed){
+        propertiesChecked.setTrue();
+        assertEquals(1,id);
+        assertFalse(changed.hasNext());
+        assertTrue(removed.isEmpty());
+        assertEquals(1,Iterators.count(added,Predicates.alwaysTrue()));
+      }
+    }
+);
+    assertTrue(propertiesChecked.booleanValue());
+  }
+  @Test public void shouldVisitDeletedRelationship() throws Exception {
+    state.relationshipDoDelete(42,2,3,4);
+    state.accept(new TxStateVisitor.Adapter(){
+      @Override public void visitDeletedRelationship(      long id){
+        assertEquals("Wrong deleted relationship id",42,id);
+      }
+    }
+);
+  }
+  @Test public void shouldReportDeletedRelationshipIfItWasCreatedAndDeletedInSameTx(){
+    long startNodeId=1;
+    long relationshipId=2;
+    int relationshipType=3;
+    long endNodeId=4;
+    state.relationshipDoCreate(relationshipId,relationshipType,startNodeId,endNodeId);
+    state.relationshipDoDelete(relationshipId,relationshipType,startNodeId,endNodeId);
+    assertTrue(state.relationshipIsDeletedInThisTx(relationshipId));
+  }
+  @Test public void shouldNotReportDeletedRelationshipIfItIsNotDeleted(){
+    long startNodeId=1;
+    long relationshipId=2;
+    int relationshipType=3;
+    long endNodeId=4;
+    state.relationshipDoCreate(relationshipId,relationshipType,startNodeId,endNodeId);
+    assertFalse(state.relationshipIsDeletedInThisTx(relationshipId));
+  }
+  @Test @RepeatRule.Repeat(times=100) public void shouldVisitCreatedNodesBeforeDeletedNodes() throws Exception {
+    state.accept(new VisitationOrder(random.nextInt(100)){
+      @Override void createEarlyState(){
+        state.nodeDoCreate(random.nextInt(1 << 20));
+      }
+      @Override void createLateState(){
+        state.nodeDoDelete(random.nextInt(1 << 20));
+      }
+      @Override public void visitCreatedNode(      long id){
+        visitEarly();
+      }
+      @Override public void visitDeletedNode(      long id){
+        visitLate();
+      }
+    }
+);
+  }
+  @Test @RepeatRule.Repeat(times=100) public void shouldVisitCreatedNodesBeforeCreatedRelationships() throws Exception {
+    state.accept(new VisitationOrder(random.nextInt(100)){
+      @Override void createEarlyState(){
+        state.nodeDoCreate(random.nextInt(1 << 20));
+      }
+      @Override void createLateState(){
+        state.relationshipDoCreate(random.nextInt(1 << 20),random.nextInt(128),random.nextInt(1 << 20),random.nextInt(1 << 20));
+      }
+      @Override public void visitCreatedNode(      long id){
+        visitEarly();
+      }
+      @Override public void visitCreatedRelationship(      long id,      int type,      long startNode,      long endNode){
+        visitLate();
+      }
+    }
+);
+  }
+  @Test @RepeatRule.Repeat(times=100) public void shouldVisitCreatedRelationshipsBeforeDeletedRelationships() throws Exception {
+    state.accept(new VisitationOrder(random.nextInt(100)){
+      @Override void createEarlyState(){
+        state.relationshipDoCreate(random.nextInt(1 << 20),random.nextInt(128),random.nextInt(1 << 20),random.nextInt(1 << 20));
+      }
+      @Override void createLateState(){
+        state.relationshipDoDelete(random.nextInt(1 << 20),random.nextInt(128),random.nextInt(1 << 20),random.nextInt(1 << 20));
+      }
+      @Override public void visitCreatedRelationship(      long id,      int type,      long startNode,      long endNode){
+        visitEarly();
+      }
+      @Override public void visitDeletedRelationship(      long id){
+        visitLate();
+      }
+    }
+);
+  }
+  @Test @RepeatRule.Repeat(times=100) public void shouldVisitDeletedNodesAfterDeletedRelationships() throws Exception {
+    state.accept(new VisitationOrder(random.nextInt(100)){
+      @Override void createEarlyState(){
+        state.relationshipDoCreate(random.nextInt(1 << 20),random.nextInt(128),random.nextInt(1 << 20),random.nextInt(1 << 20));
+      }
+      @Override void createLateState(){
+        state.nodeDoDelete(random.nextInt(1 << 20));
+      }
+      @Override public void visitDeletedRelationship(      long id){
+        visitEarly();
+      }
+      @Override public void visitDeletedNode(      long id){
+        visitLate();
+      }
+    }
+);
+  }
+  @Test public void getOrCreateNodeState_props_useCollectionsFactory(){
+    final NodeStateImpl nodeState=state.getOrCreateNodeState(1);
+    nodeState.addProperty(2,stringValue("foo"));
+    nodeState.removeProperty(3);
+    nodeState.changeProperty(4,stringValue("bar"));
+    verify(collectionsFactory,times(2)).newValuesMap();
+    verify(collectionsFactory,times(1)).newLongSet();
+    verifyNoMoreInteractions(collectionsFactory);
+  }
+  @Test public void getOrCreateGraphState_useCollectionsFactory(){
+    final GraphStateImpl graphState=state.getOrCreateGraphState();
+    graphState.addProperty(2,stringValue("foo"));
+    graphState.removeProperty(3);
+    graphState.changeProperty(4,stringValue("bar"));
+    verify(collectionsFactory,times(2)).newValuesMap();
+    verify(collectionsFactory,times(1)).newLongSet();
+    verifyNoMoreInteractions(collectionsFactory);
+  }
+  @Test public void getOrCreateLabelStateNodeDiffSets_useCollectionsFactory(){
+    final MutableLongDiffSets diffSets=state.getOrCreateLabelStateNodeDiffSets(1);
+    diffSets.add(1);
+    diffSets.remove(2);
+    verify(collectionsFactory,times(2)).newLongSet();
+    verifyNoMoreInteractions(collectionsFactory);
+  }
+  @Test public void getOrCreateIndexUpdatesForSeek_useCollectionsFactory(){
+    final MutableLongDiffSets diffSets=state.getOrCreateIndexUpdatesForSeek(new HashMap<>(),ValueTuple.of(stringValue("test")));
+    diffSets.add(1);
+    diffSets.remove(2);
+    verify(collectionsFactory,times(2)).newLongSet();
+    verifyNoMoreInteractions(collectionsFactory);
+  }
+  private LongDiffSets addedNodes(  long... added){
+    return new MutableLongDiffSetsImpl(LongSets.mutable.of(added),LongSets.mutable.empty(),collectionsFactory);
+  }
+  private TreeMap<ValueTuple,LongDiffSets> sortedAddedNodesDiffSets(  long... added){
+    TreeMap<ValueTuple,LongDiffSets> map=new TreeMap<>(ValueTuple.COMPARATOR);
+    for (    long node : added) {
+      map.put(ValueTuple.of(stringValue("value" + node)),addedNodes(node));
+    }
+    return map;
+  }
+abstract class VisitationOrder extends TxStateVisitor.Adapter {
+    private final Set<String> visitMethods=new HashSet<>();
+    VisitationOrder(    int size){
+      for (      Method method : getClass().getDeclaredMethods()) {
+        if (method.getName().startsWith("visit")) {
+          visitMethods.add(method.getName());
+        }
+      }
+      assertEquals("should implement exactly two visit*(...) methods",2,visitMethods.size());
+      do {
+        if (random.nextBoolean()) {
+          createEarlyState();
+        }
+ else {
+          createLateState();
+        }
+      }
+ while (size-- > 0);
+    }
+    abstract void createEarlyState();
+    abstract void createLateState();
+    private boolean late;
+    final void visitEarly(){
+      if (late) {
+        String early="the early visit*-method";
+        String late="the late visit*-method";
+        for (        StackTraceElement trace : Thread.currentThread().getStackTrace()) {
+          if (visitMethods.contains(trace.getMethodName())) {
+            early=trace.getMethodName();
+            for (            String method : visitMethods) {
+              if (!method.equals(early)) {
+                late=method;
+              }
+            }
+            break;
+          }
+        }
+        fail(early + "(...) should not be invoked after " + late+ "(...)");
+      }
+    }
+    final void visitLate(){
+      late=true;
+    }
+  }
+private interface IndexUpdater {
+    void withDefaultStringProperties(    long... nodeIds);
+  }
+  private IndexUpdater addNodesToIndex(  final IndexDescriptor descriptor){
+    return new IndexUpdater(){
+      @Override public void withDefaultStringProperties(      long... nodeIds){
+        Collection<Pair<Long,String>> entries=new ArrayList<>(nodeIds.length);
+        for (        long nodeId : nodeIds) {
+          entries.add(of(nodeId,"value" + nodeId));
+        }
+        withProperties(entries);
+      }
+      private <T>void withProperties(      Collection<Pair<Long,T>> nodesWithValues){
+        final int labelId=descriptor.schema().keyId();
+        final int propertyKeyId=descriptor.schema().getPropertyId();
+        for (        Pair<Long,T> entry : nodesWithValues) {
+          long nodeId=entry.first();
+          state.nodeDoCreate(nodeId);
+          state.nodeDoAddLabel(labelId,nodeId);
+          Value valueAfter=Values.of(entry.other());
+          state.nodeDoAddProperty(nodeId,propertyKeyId,valueAfter);
+          state.indexDoUpdateEntry(descriptor.schema(),nodeId,null,ValueTuple.of(valueAfter));
+        }
+      }
+    }
+;
+  }
+  private static void assertEqualDiffSets(  LongDiffSets expected,  LongDiffSets actual){
+    assertEquals(expected.getRemoved(),actual.getRemoved());
+    assertEquals(expected.getAdded(),actual.getAdded());
+  }
+}

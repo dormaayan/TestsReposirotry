@@ -1,0 +1,51 @@
+@Test public void testForCheckingIfEnableAndDisableWorksFineAfterSwitch() throws Exception {
+  final int NUM_MASTERS=2;
+  final int NUM_RS=1;
+  final int NUM_REGIONS_TO_CREATE=4;
+  log("Starting cluster");
+  Configuration conf=HBaseConfiguration.create();
+  HBaseTestingUtility TEST_UTIL=new HBaseTestingUtility(conf);
+  TEST_UTIL.startMiniCluster(NUM_MASTERS,NUM_RS);
+  MiniHBaseCluster cluster=TEST_UTIL.getHBaseCluster();
+  log("Waiting for active/ready master");
+  cluster.waitForActiveAndReadyMaster();
+  final TableName tableName=TableName.valueOf(name.getMethodName());
+  byte[] family=Bytes.toBytes("family");
+  log("Creating table with " + NUM_REGIONS_TO_CREATE + " regions");
+  Table ht=TEST_UTIL.createMultiRegionTable(tableName,family,NUM_REGIONS_TO_CREATE);
+  int numRegions=-1;
+  try (RegionLocator r=TEST_UTIL.getConnection().getRegionLocator(tableName)){
+    numRegions=r.getStartKeys().length;
+  }
+   numRegions+=1;
+  log("Waiting for no more RIT\n");
+  TEST_UTIL.waitUntilNoRegionsInTransition(60000);
+  log("Disabling table\n");
+  TEST_UTIL.getAdmin().disableTable(tableName);
+  NavigableSet<String> regions=HBaseTestingUtility.getAllOnlineRegions(cluster);
+  assertEquals("The number of regions for the table tableRestart should be 0 and only" + "the catalog and namespace tables should be present.",2,regions.size());
+  List<MasterThread> masterThreads=cluster.getMasterThreads();
+  MasterThread activeMaster=null;
+  if (masterThreads.get(0).getMaster().isActiveMaster()) {
+    activeMaster=masterThreads.get(0);
+  }
+ else {
+    activeMaster=masterThreads.get(1);
+  }
+  activeMaster.getMaster().stop("stopping the active master so that the backup can become active");
+  cluster.hbaseCluster.waitOnMaster(activeMaster);
+  cluster.waitForActiveAndReadyMaster();
+  assertTrue("The table should not be in enabled state",cluster.getMaster().getTableStateManager().isTableState(TableName.valueOf(name.getMethodName()),TableState.State.DISABLED,TableState.State.DISABLING));
+  log("Enabling table\n");
+  Admin admin=TEST_UTIL.getAdmin();
+  admin.enableTable(tableName);
+  admin.close();
+  log("Waiting for no more RIT\n");
+  TEST_UTIL.waitUntilNoRegionsInTransition(60000);
+  log("Verifying there are " + numRegions + " assigned on cluster\n");
+  regions=HBaseTestingUtility.getAllOnlineRegions(cluster);
+  assertEquals("The assigned regions were not onlined after master" + " switch except for the catalog and namespace tables.",6,regions.size());
+  assertTrue("The table should be in enabled state",cluster.getMaster().getTableStateManager().isTableState(TableName.valueOf(name.getMethodName()),TableState.State.ENABLED));
+  ht.close();
+  TEST_UTIL.shutdownMiniCluster();
+}

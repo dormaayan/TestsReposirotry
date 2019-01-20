@@ -1,0 +1,126 @@
+public class TemporalIndexCacheTest {
+  @Test public void shouldIterateOverCreatedParts() throws Exception {
+    StringFactory factory=new StringFactory();
+    TemporalIndexCache<String> cache=new TemporalIndexCache<>(factory);
+    assertEquals(Iterables.count(cache),0);
+    cache.select(LOCAL_DATE_TIME);
+    cache.select(ZONED_TIME);
+    assertThat(cache,containsInAnyOrder("LocalDateTime","ZonedTime"));
+    cache.select(DATE);
+    cache.select(LOCAL_TIME);
+    cache.select(LOCAL_DATE_TIME);
+    cache.select(ZONED_TIME);
+    cache.select(ZONED_DATE_TIME);
+    cache.select(DURATION);
+    assertThat(cache,containsInAnyOrder("Date","LocalDateTime","ZonedDateTime","LocalTime","ZonedTime","Duration"));
+  }
+  @SuppressWarnings("Duplicates") @Test public void stressCache() throws Exception {
+    StringFactory factory=new StringFactory();
+    TemporalIndexCache<String> cache=new TemporalIndexCache<>(factory);
+    ExecutorService pool=Executors.newFixedThreadPool(20);
+    Future<?>[] futures=new Future[100];
+    AtomicBoolean shouldContinue=new AtomicBoolean(true);
+    try {
+      for (int i=0; i < futures.length; i++) {
+        futures[i]=pool.submit(new CacheStresser(cache,shouldContinue));
+      }
+      Thread.sleep(5_000);
+      shouldContinue.set(false);
+      for (      Future<?> future : futures) {
+        future.get(10,TimeUnit.SECONDS);
+      }
+    }
+  finally {
+      pool.shutdown();
+    }
+  }
+  @Test public void stressInstantiationWithClose() throws Throwable {
+    StringFactory factory=new StringFactory();
+    TemporalIndexCache<String> cache=new TemporalIndexCache<>(factory);
+    Race race=new Race().withRandomStartDelays();
+    MutableInt instantiatedAtClose=new MutableInt();
+    race.addContestant(() -> {
+      try {
+        cache.uncheckedSelect(valueGroups[0]);
+        cache.uncheckedSelect(valueGroups[1]);
+      }
+ catch (      IllegalStateException e) {
+      }
+    }
+,1);
+    race.addContestant(() -> {
+      cache.closeInstantiateCloseLock();
+      instantiatedAtClose.setValue(count(cache));
+    }
+,1);
+    race.go();
+    try {
+      cache.uncheckedSelect(valueGroups[2]);
+      fail("No instantiation after closed");
+    }
+ catch (    IllegalStateException e) {
+    }
+    assertEquals(instantiatedAtClose.intValue(),count(cache));
+  }
+  private static final ValueGroup[] valueGroups={ZONED_DATE_TIME,LOCAL_DATE_TIME,DATE,ZONED_TIME,LOCAL_TIME,DURATION};
+static class CacheStresser extends Thread {
+    private final TemporalIndexCache<String> cache;
+    private final AtomicBoolean shouldContinue;
+    private final Random r=new Random();
+    CacheStresser(    TemporalIndexCache<String> cache,    AtomicBoolean shouldContinue){
+      this.cache=cache;
+      this.shouldContinue=shouldContinue;
+    }
+    @Override public void run(){
+      while (shouldContinue.get()) {
+        stress();
+      }
+    }
+    private void stress(){
+      cache.select(valueGroups[r.nextInt(valueGroups.length)]);
+      for (      String s : cache) {
+        if (s == null) {
+          throw new IllegalStateException("iterated over null");
+        }
+      }
+    }
+  }
+private static class StringFactory implements TemporalIndexCache.Factory<String> {
+    AtomicInteger dateCounter=new AtomicInteger(0);
+    AtomicInteger localDateTimeCounter=new AtomicInteger(0);
+    AtomicInteger zonedDateTimeCounter=new AtomicInteger(0);
+    AtomicInteger localTimeCounter=new AtomicInteger(0);
+    AtomicInteger zonedTimeCounter=new AtomicInteger(0);
+    AtomicInteger durationCounter=new AtomicInteger(0);
+    @Override public String newDate(){
+      updateCounterAndAssertSingleUpdate(dateCounter);
+      return "Date";
+    }
+    @Override public String newLocalDateTime(){
+      updateCounterAndAssertSingleUpdate(localDateTimeCounter);
+      return "LocalDateTime";
+    }
+    @Override public String newZonedDateTime(){
+      updateCounterAndAssertSingleUpdate(zonedDateTimeCounter);
+      return "ZonedDateTime";
+    }
+    @Override public String newLocalTime(){
+      updateCounterAndAssertSingleUpdate(localTimeCounter);
+      return "LocalTime";
+    }
+    @Override public String newZonedTime(){
+      updateCounterAndAssertSingleUpdate(zonedTimeCounter);
+      return "ZonedTime";
+    }
+    @Override public String newDuration(){
+      updateCounterAndAssertSingleUpdate(durationCounter);
+      return "Duration";
+    }
+    private void updateCounterAndAssertSingleUpdate(    AtomicInteger counter){
+      int count=counter.incrementAndGet();
+      if (count > 1) {
+        throw new IllegalStateException("called new on same factory method multiple times");
+      }
+    }
+  }
+}

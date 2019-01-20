@@ -1,0 +1,80 @@
+/** 
+ * Tests for WAL write durability - hflush vs hsync
+ */
+@Category({MediumTests.class}) public class TestWALDurability {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestWALDurability.class);
+  private static final String COLUMN_FAMILY="MyCF";
+  private static final byte[] COLUMN_FAMILY_BYTES=Bytes.toBytes(COLUMN_FAMILY);
+  private final static HBaseTestingUtility TEST_UTIL=new HBaseTestingUtility();
+  private Configuration conf;
+  private String dir;
+  @Rule public TestName name=new TestName();
+  protected TableName tableName;
+  @Before public void setup() throws IOException {
+    conf=TEST_UTIL.getConfiguration();
+    dir=TEST_UTIL.getDataTestDir("TestHRegion").toString();
+    tableName=TableName.valueOf(name.getMethodName());
+  }
+  @Test public void testWALDurability() throws IOException {
+class CustomFSLog extends FSHLog {
+      private Boolean syncFlag;
+      public CustomFSLog(      FileSystem fs,      Path root,      String logDir,      Configuration conf) throws IOException {
+        super(fs,root,logDir,conf);
+      }
+      @Override public void sync(      boolean forceSync) throws IOException {
+        syncFlag=forceSync;
+        super.sync(forceSync);
+      }
+      @Override public void sync(      long txid,      boolean forceSync) throws IOException {
+        syncFlag=forceSync;
+        super.sync(txid,forceSync);
+      }
+      private void resetSyncFlag(){
+        this.syncFlag=null;
+      }
+    }
+    conf.set(HRegion.WAL_HSYNC_CONF_KEY,"false");
+    FileSystem fs=FileSystem.get(conf);
+    Path rootDir=new Path(dir + getName());
+    CustomFSLog customFSLog=new CustomFSLog(fs,rootDir,getName(),conf);
+    HRegion region=initHRegion(tableName,null,null,customFSLog);
+    byte[] bytes=Bytes.toBytes(getName());
+    Put put=new Put(bytes);
+    put.addColumn(COLUMN_FAMILY_BYTES,Bytes.toBytes("1"),bytes);
+    customFSLog.resetSyncFlag();
+    assertNull(customFSLog.syncFlag);
+    region.put(put);
+    assertEquals(customFSLog.syncFlag,false);
+    conf.set(HRegion.WAL_HSYNC_CONF_KEY,"true");
+    fs=FileSystem.get(conf);
+    customFSLog=new CustomFSLog(fs,rootDir,getName(),conf);
+    region=initHRegion(tableName,null,null,customFSLog);
+    customFSLog.resetSyncFlag();
+    assertNull(customFSLog.syncFlag);
+    region.put(put);
+    assertEquals(customFSLog.syncFlag,true);
+    put.setDurability(Durability.FSYNC_WAL);
+    customFSLog.resetSyncFlag();
+    assertNull(customFSLog.syncFlag);
+    region.put(put);
+    assertEquals(customFSLog.syncFlag,true);
+    put=new Put(bytes);
+    put.addColumn(COLUMN_FAMILY_BYTES,Bytes.toBytes("1"),bytes);
+    put.setDurability(Durability.SYNC_WAL);
+    customFSLog.resetSyncFlag();
+    assertNull(customFSLog.syncFlag);
+    region.put(put);
+    assertEquals(customFSLog.syncFlag,false);
+    HBaseTestingUtility.closeRegionAndWAL(region);
+  }
+  private String getName(){
+    return name.getMethodName();
+  }
+  /** 
+ * @return A region on which you must call {@link HBaseTestingUtility#closeRegionAndWAL(HRegion)}when done.
+ */
+  public static HRegion initHRegion(  TableName tableName,  byte[] startKey,  byte[] stopKey,  WAL wal) throws IOException {
+    ChunkCreator.initialize(MemStoreLABImpl.CHUNK_SIZE_DEFAULT,false,0,0,0,null);
+    return TEST_UTIL.createLocalHRegion(tableName,startKey,stopKey,false,Durability.USE_DEFAULT,wal,COLUMN_FAMILY_BYTES);
+  }
+}

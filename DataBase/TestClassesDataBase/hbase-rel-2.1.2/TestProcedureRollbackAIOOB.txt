@@ -1,0 +1,53 @@
+/** 
+ * Testcase for HBASE-20973
+ */
+@Category({MasterTests.class,MediumTests.class}) public class TestProcedureRollbackAIOOB {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestProcedureRollbackAIOOB.class);
+  private static final HBaseCommonTestingUtility UTIL=new HBaseCommonTestingUtility();
+public static final class ParentProcedure extends NoopProcedure<Void> {
+    private final CountDownLatch latch=new CountDownLatch(1);
+    private boolean scheduled;
+    @Override protected Procedure<Void>[] execute(    Void env) throws ProcedureYieldException, ProcedureSuspendedException, InterruptedException {
+      latch.await();
+      if (scheduled) {
+        return null;
+      }
+      scheduled=true;
+      return new Procedure[]{new SubProcedure()};
+    }
+  }
+public static final class SubProcedure extends NoopProcedure<Void> {
+    @Override protected Procedure[] execute(    Void env) throws ProcedureYieldException, ProcedureSuspendedException, InterruptedException {
+      setFailure("Inject error",new RuntimeException("Inject error"));
+      return null;
+    }
+  }
+  private WALProcedureStore procStore;
+  private ProcedureExecutor<Void> procExec;
+  @Rule public final TestName name=new TestName();
+  @Before public void setUp() throws IOException {
+    procStore=ProcedureTestingUtility.createWalStore(UTIL.getConfiguration(),UTIL.getDataTestDir(name.getMethodName()));
+    procStore.start(2);
+    procExec=new ProcedureExecutor<Void>(UTIL.getConfiguration(),null,procStore);
+    ProcedureTestingUtility.initAndStartWorkers(procExec,2,true);
+  }
+  @After public void tearDown(){
+    procExec.stop();
+    procStore.stop(false);
+  }
+  @AfterClass public static void tearDownAfterClass() throws IOException {
+    UTIL.cleanupTestDir();
+  }
+  @Test public void testArrayIndexOutOfBounds(){
+    ParentProcedure proc=new ParentProcedure();
+    long procId=procExec.submitProcedure(proc);
+    long noopProcId=-1L;
+    for (int i=0; i < Long.SIZE - 2; i++) {
+      noopProcId=procExec.submitProcedure(new NoopProcedure<>());
+    }
+    final long lastNoopProcId=noopProcId;
+    UTIL.waitFor(30000,() -> procExec.isFinished(lastNoopProcId));
+    proc.latch.countDown();
+    UTIL.waitFor(10000,() -> procExec.isFinished(procId));
+  }
+}

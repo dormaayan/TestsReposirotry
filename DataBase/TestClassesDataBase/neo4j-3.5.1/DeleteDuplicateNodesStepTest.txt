@@ -1,0 +1,142 @@
+public class DeleteDuplicateNodesStepTest {
+  private final RandomRule random=new RandomRule().withConfiguration(new RandomValues.Default(){
+    @Override public int stringMaxLength(){
+      return 200;
+    }
+    @Override public int arrayMaxLength(){
+      return 200;
+    }
+  }
+);
+  private final NeoStoresRule neoStoresRule=new NeoStoresRule(getClass());
+  private final RepeatRule repeater=new RepeatRule();
+  @Rule public final RuleChain rules=RuleChain.outerRule(repeater).around(random).around(neoStoresRule);
+  @Repeat(times=10) @Test public void shouldDeleteEverythingAboutTheDuplicatedNodes() throws Exception {
+    NeoStores neoStores=neoStoresRule.builder().build();
+    Ids[] ids=new Ids[9];
+    DataImporter.Monitor monitor=new DataImporter.Monitor();
+    ids[0]=createNode(monitor,neoStores,10,10);
+    ids[1]=createNode(monitor,neoStores,10,1);
+    ids[2]=createNode(monitor,neoStores,10,0);
+    ids[3]=createNode(monitor,neoStores,1,10);
+    ids[4]=createNode(monitor,neoStores,1,1);
+    ids[5]=createNode(monitor,neoStores,1,0);
+    ids[6]=createNode(monitor,neoStores,0,10);
+    ids[7]=createNode(monitor,neoStores,0,1);
+    ids[8]=createNode(monitor,neoStores,0,0);
+    long[] duplicateNodeIds=randomNodes(ids);
+    SimpleStageControl control=new SimpleStageControl();
+    try (DeleteDuplicateNodesStep step=new DeleteDuplicateNodesStep(control,Configuration.DEFAULT,PrimitiveLongCollections.iterator(duplicateNodeIds),neoStores.getNodeStore(),neoStores.getPropertyStore(),monitor)){
+      control.steps(step);
+      startAndAwaitCompletionOf(step);
+    }
+     control.assertHealthy();
+    int expectedNodes=0;
+    int expectedProperties=0;
+    for (    Ids entity : ids) {
+      boolean expectedToBeInUse=!ArrayUtils.contains(duplicateNodeIds,entity.node.getId());
+      int stride=expectedToBeInUse ? 1 : 0;
+      expectedNodes+=stride;
+      assertEquals(expectedToBeInUse,neoStores.getNodeStore().isInUse(entity.node.getId()));
+      for (      DynamicRecord labelRecord : entity.node.getDynamicLabelRecords()) {
+        assertEquals(expectedToBeInUse,neoStores.getNodeStore().getDynamicLabelStore().isInUse(labelRecord.getId()));
+      }
+      for (      PropertyRecord propertyRecord : entity.properties) {
+        assertEquals(expectedToBeInUse,neoStores.getPropertyStore().isInUse(propertyRecord.getId()));
+        for (        PropertyBlock property : propertyRecord) {
+          for (          DynamicRecord valueRecord : property.getValueRecords()) {
+            AbstractDynamicStore valueStore;
+switch (property.getType()) {
+case STRING:
+              valueStore=neoStores.getPropertyStore().getStringStore();
+            break;
+case ARRAY:
+          valueStore=neoStores.getPropertyStore().getArrayStore();
+        break;
+default :
+      throw new IllegalArgumentException(propertyRecord + " " + property);
+  }
+  assertEquals(expectedToBeInUse,valueStore.isInUse(valueRecord.getId()));
+}
+expectedProperties+=stride;
+}
+}
+}
+assertEquals(expectedNodes,monitor.nodesImported());
+assertEquals(expectedProperties,monitor.propertiesImported());
+}
+private long[] randomNodes(Ids[] ids){
+long[] nodeIds=new long[ids.length];
+int cursor=0;
+for (Ids id : ids) {
+if (random.nextBoolean()) {
+nodeIds[cursor++]=id.node.getId();
+}
+}
+if (cursor == 0) {
+nodeIds[cursor++]=random.among(ids).node.getId();
+}
+return Arrays.copyOf(nodeIds,cursor);
+}
+private static class Ids {
+private final NodeRecord node;
+private final PropertyRecord[] properties;
+Ids(NodeRecord node,PropertyRecord[] properties){
+this.node=node;
+this.properties=properties;
+}
+}
+private Ids createNode(DataImporter.Monitor monitor,NeoStores neoStores,int propertyCount,int labelCount){
+PropertyStore propertyStore=neoStores.getPropertyStore();
+RecordAccess<PropertyRecord,PrimitiveRecord> propertyRecordAccess=new DirectRecordAccess<>(propertyStore,new Loaders(neoStores).propertyLoader());
+NodeStore nodeStore=neoStores.getNodeStore();
+NodeRecord nodeRecord=nodeStore.newRecord();
+nodeRecord.setId(nodeStore.nextId());
+nodeRecord.setInUse(true);
+NodeLabelsField.parseLabelsField(nodeRecord).put(labelIds(labelCount),nodeStore,nodeStore.getDynamicLabelStore());
+long nextProp=new PropertyCreator(propertyStore,new PropertyTraverser()).createPropertyChain(nodeRecord,properties(propertyStore,propertyCount),propertyRecordAccess);
+nodeRecord.setNextProp(nextProp);
+nodeStore.updateRecord(nodeRecord);
+PropertyRecord[] propertyRecords=extractPropertyRecords(propertyRecordAccess,nextProp);
+propertyRecordAccess.close();
+monitor.nodesImported(1);
+monitor.propertiesImported(propertyCount);
+return new Ids(nodeRecord,propertyRecords);
+}
+private static PropertyRecord[] extractPropertyRecords(RecordAccess<PropertyRecord,PrimitiveRecord> propertyRecordAccess,long nextProp){
+List<PropertyRecord> result=new ArrayList<>();
+while (!Record.NULL_REFERENCE.is(nextProp)) {
+PropertyRecord record=propertyRecordAccess.getIfLoaded(nextProp).forReadingLinkage();
+result.add(record);
+nextProp=record.getNextProp();
+}
+return result.toArray(new PropertyRecord[result.size()]);
+}
+private Iterator<PropertyBlock> properties(PropertyStore propertyStore,int propertyCount){
+return new PrefetchingIterator<PropertyBlock>(){
+private int i;
+@Override protected PropertyBlock fetchNextOrNull(){
+if (i >= propertyCount) {
+return null;
+}
+PropertyBlock block=new PropertyBlock();
+propertyStore.encodeValue(block,i,random.nextValue());
+i++;
+return block;
+}
+}
+;
+}
+private static long[] labelIds(int labelCount){
+long[] result=new long[labelCount];
+for (int i=0; i < labelCount; i++) {
+result[i]=i;
+}
+return result;
+}
+private static void startAndAwaitCompletionOf(DeleteDuplicateNodesStep step) throws InterruptedException {
+step.start(0);
+step.receive(0,null);
+step.awaitCompleted();
+}
+}

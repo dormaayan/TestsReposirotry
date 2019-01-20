@@ -1,0 +1,58 @@
+@Test public void testRemoveCompactedFilesWithException() throws Exception {
+  byte[] fam=Bytes.toBytes("f");
+  byte[] col=Bytes.toBytes("c");
+  byte[] val=Bytes.toBytes("val");
+  TableName tableName=TableName.valueOf(name.getMethodName());
+  TableDescriptor htd=TableDescriptorBuilder.newBuilder(tableName).setColumnFamily(ColumnFamilyDescriptorBuilder.of(fam)).build();
+  RegionInfo info=RegionInfoBuilder.newBuilder(tableName).build();
+  HRegion region=initHRegion(htd,info);
+  RegionServerServices rss=mock(RegionServerServices.class);
+  List<HRegion> regions=new ArrayList<>();
+  regions.add(region);
+  Mockito.doReturn(regions).when(rss).getRegions();
+  final CompactedHFilesDischarger cleaner=new CompactedHFilesDischarger(1000,(Stoppable)null,rss,false);
+  int batchSize=10;
+  int fileCount=10;
+  for (int f=0; f < fileCount; f++) {
+    int start=f * batchSize;
+    for (int i=start; i < start + batchSize; i++) {
+      Put p=new Put(Bytes.toBytes("row" + i));
+      p.addColumn(fam,col,val);
+      region.put(p);
+    }
+    region.flush(true);
+  }
+  HStore store=region.getStore(fam);
+  assertEquals(fileCount,store.getStorefilesCount());
+  Collection<HStoreFile> storefiles=store.getStorefiles();
+  for (  HStoreFile file : storefiles) {
+    assertFalse(file.isCompactedAway());
+  }
+  StoreFileManager fileManager=store.getStoreEngine().getStoreFileManager();
+  Collection<HStoreFile> initialCompactedFiles=fileManager.getCompactedfiles();
+  assertTrue(initialCompactedFiles == null || initialCompactedFiles.isEmpty());
+  region.compact(true);
+  Collection<HStoreFile> compactedFilesPreClean=fileManager.getCompactedfiles();
+  assertNotNull(compactedFilesPreClean);
+  assertTrue(compactedFilesPreClean.size() > 0);
+  HRegionFileSystem regionFS=region.getRegionFileSystem();
+  Path errFile=regionFS.getStoreFilePath(Bytes.toString(fam),ERROR_FILE);
+  FSDataOutputStream out=regionFS.getFileSystem().create(errFile);
+  out.writeInt(1);
+  out.close();
+  HStoreFile errStoreFile=new MockHStoreFile(testUtil,errFile,1,0,false,1);
+  fileManager.addCompactionResults(ImmutableList.of(errStoreFile),ImmutableList.of());
+  cleaner.chore();
+  Collection<HStoreFile> compactedFilesPostClean=fileManager.getCompactedfiles();
+  assertEquals(1,compactedFilesPostClean.size());
+  for (  HStoreFile origFile : compactedFilesPreClean) {
+    assertFalse(compactedFilesPostClean.contains(origFile));
+  }
+  try {
+    region.close();
+  }
+ catch (  FailedArchiveException e) {
+    assertEquals(1,e.getFailedFiles().size());
+    assertEquals(ERROR_FILE,e.getFailedFiles().iterator().next().getName());
+  }
+}

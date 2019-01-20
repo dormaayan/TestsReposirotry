@@ -1,0 +1,38 @@
+/** 
+ * Test case for FLINK-5638: Tests that the async wait operator can be closed even if the emitter is currently waiting on the checkpoint lock (e.g. in the case of two chained async wait operators where the latter operator's queue is currently full). <p>Note that this test does not enforce the exact strict ordering because with the fix it is no longer possible. However, it provokes the described situation without the fix.
+ */
+@Test(timeout=10000L) public void testClosingWithBlockedEmitter() throws Exception {
+  final Object lock=new Object();
+  ArgumentCaptor<Throwable> failureReason=ArgumentCaptor.forClass(Throwable.class);
+  MockEnvironment environment=createMockEnvironment();
+  StreamTask<?,?> containingTask=mock(StreamTask.class);
+  when(containingTask.getEnvironment()).thenReturn(environment);
+  when(containingTask.getCheckpointLock()).thenReturn(lock);
+  when(containingTask.getProcessingTimeService()).thenReturn(new TestProcessingTimeService());
+  StreamConfig streamConfig=new MockStreamConfig();
+  streamConfig.setTypeSerializerIn1(IntSerializer.INSTANCE);
+  final OneShotLatch closingLatch=new OneShotLatch();
+  final OneShotLatch outputLatch=new OneShotLatch();
+  Output<StreamRecord<Integer>> output=mock(Output.class);
+  doAnswer(new Answer(){
+    @Override public Object answer(    InvocationOnMock invocation) throws Throwable {
+      assertTrue("Output should happen under the checkpoint lock.",Thread.currentThread().holdsLock(lock));
+      outputLatch.trigger();
+      while (!closingLatch.isTriggered()) {
+        lock.wait();
+      }
+      return null;
+    }
+  }
+).when(output).collect(any(StreamRecord.class));
+  AsyncWaitOperator<Integer,Integer> operator=new TestAsyncWaitOperator<>(new MyAsyncFunction(),1000L,1,AsyncDataStream.OutputMode.ORDERED,closingLatch);
+  operator.setup(containingTask,streamConfig,output);
+  operator.open();
+synchronized (lock) {
+    operator.processElement(new StreamRecord<>(42));
+  }
+  outputLatch.await();
+synchronized (lock) {
+    operator.close();
+  }
+}

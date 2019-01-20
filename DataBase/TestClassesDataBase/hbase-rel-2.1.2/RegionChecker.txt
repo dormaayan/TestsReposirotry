@@ -1,0 +1,84 @@
+/** 
+ * Checks regions using MetaTableAccessor and HTable methods
+ */
+static class RegionChecker extends ScheduledChore {
+  Connection connection;
+  Configuration conf;
+  TableName tableName;
+  Throwable ex;
+  RegionChecker(  Configuration conf,  Stoppable stopper,  TableName tableName) throws IOException {
+    super("RegionChecker",stopper,100);
+    this.conf=conf;
+    this.tableName=tableName;
+    this.connection=ConnectionFactory.createConnection(conf);
+  }
+  /** 
+ * verify region boundaries obtained from MetaScanner 
+ */
+  void verifyRegionsUsingMetaTableAccessor() throws Exception {
+    List<RegionInfo> regionList=MetaTableAccessor.getTableRegions(connection,tableName,true);
+    verifyTableRegions(regionList.stream().collect(Collectors.toCollection(() -> new TreeSet<>(RegionInfo.COMPARATOR))));
+    regionList=MetaTableAccessor.getAllRegions(connection,true);
+    verifyTableRegions(regionList.stream().collect(Collectors.toCollection(() -> new TreeSet<>(RegionInfo.COMPARATOR))));
+  }
+  /** 
+ * verify region boundaries obtained from HTable.getStartEndKeys() 
+ */
+  void verifyRegionsUsingHTable() throws IOException {
+    Table table=null;
+    try {
+      table=connection.getTable(tableName);
+      try (RegionLocator rl=connection.getRegionLocator(tableName)){
+        Pair<byte[][],byte[][]> keys=rl.getStartEndKeys();
+        verifyStartEndKeys(keys);
+        Set<RegionInfo> regions=new TreeSet<>(RegionInfo.COMPARATOR);
+        for (        HRegionLocation loc : rl.getAllRegionLocations()) {
+          regions.add(loc.getRegionInfo());
+        }
+        verifyTableRegions(regions);
+      }
+     }
+  finally {
+      IOUtils.closeQuietly(table);
+    }
+  }
+  void verify() throws Exception {
+    verifyRegionsUsingMetaTableAccessor();
+    verifyRegionsUsingHTable();
+  }
+  void verifyTableRegions(  Set<RegionInfo> regions){
+    log("Verifying " + regions.size() + " regions: "+ regions);
+    byte[][] startKeys=new byte[regions.size()][];
+    byte[][] endKeys=new byte[regions.size()][];
+    int i=0;
+    for (    RegionInfo region : regions) {
+      startKeys[i]=region.getStartKey();
+      endKeys[i]=region.getEndKey();
+      i++;
+    }
+    Pair<byte[][],byte[][]> keys=new Pair<>(startKeys,endKeys);
+    verifyStartEndKeys(keys);
+  }
+  void verifyStartEndKeys(  Pair<byte[][],byte[][]> keys){
+    byte[][] startKeys=keys.getFirst();
+    byte[][] endKeys=keys.getSecond();
+    assertEquals(startKeys.length,endKeys.length);
+    assertTrue("Found 0 regions for the table",startKeys.length > 0);
+    assertArrayEquals("Start key for the first region is not byte[0]",HConstants.EMPTY_START_ROW,startKeys[0]);
+    byte[] prevEndKey=HConstants.EMPTY_START_ROW;
+    for (int i=0; i < startKeys.length; i++) {
+      assertArrayEquals("Hole in hbase:meta is detected. prevEndKey=" + Bytes.toStringBinary(prevEndKey) + " ,regionStartKey="+ Bytes.toStringBinary(startKeys[i]),prevEndKey,startKeys[i]);
+      prevEndKey=endKeys[i];
+    }
+    assertArrayEquals("End key for the last region is not byte[0]",HConstants.EMPTY_END_ROW,endKeys[endKeys.length - 1]);
+  }
+  @Override protected void chore(){
+    try {
+      verify();
+    }
+ catch (    Throwable ex) {
+      this.ex=ex;
+      getStopper().stop("caught exception");
+    }
+  }
+}

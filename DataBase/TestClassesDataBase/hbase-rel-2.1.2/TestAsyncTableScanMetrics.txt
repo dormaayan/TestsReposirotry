@@ -1,0 +1,72 @@
+@RunWith(Parameterized.class) @Category({MediumTests.class,ClientTests.class}) public class TestAsyncTableScanMetrics {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestAsyncTableScanMetrics.class);
+  private static final HBaseTestingUtility UTIL=new HBaseTestingUtility();
+  private static final TableName TABLE_NAME=TableName.valueOf("ScanMetrics");
+  private static final byte[] CF=Bytes.toBytes("cf");
+  private static final byte[] CQ=Bytes.toBytes("cq");
+  private static final byte[] VALUE=Bytes.toBytes("value");
+  private static AsyncConnection CONN;
+  private static int NUM_REGIONS;
+@FunctionalInterface private interface ScanWithMetrics {
+    Pair<List<Result>,ScanMetrics> scan(    Scan scan) throws Exception ;
+  }
+  @Parameter(0) public String methodName;
+  @Parameter(1) public ScanWithMetrics method;
+  @Parameters(name="{index}: scan={0}") public static List<Object[]> params(){
+    ScanWithMetrics doScanWithRawAsyncTable=TestAsyncTableScanMetrics::doScanWithRawAsyncTable;
+    ScanWithMetrics doScanWithAsyncTableScan=TestAsyncTableScanMetrics::doScanWithAsyncTableScan;
+    ScanWithMetrics doScanWithAsyncTableScanner=TestAsyncTableScanMetrics::doScanWithAsyncTableScanner;
+    return Arrays.asList(new Object[]{"doScanWithRawAsyncTable",doScanWithRawAsyncTable},new Object[]{"doScanWithAsyncTableScan",doScanWithAsyncTableScan},new Object[]{"doScanWithAsyncTableScanner",doScanWithAsyncTableScanner});
+  }
+  @BeforeClass public static void setUp() throws Exception {
+    UTIL.startMiniCluster(3);
+    try (Table table=UTIL.createMultiRegionTable(TABLE_NAME,CF)){
+      table.put(Arrays.asList(new Put(Bytes.toBytes("zzz1")).addColumn(CF,CQ,VALUE),new Put(Bytes.toBytes("zzz2")).addColumn(CF,CQ,VALUE),new Put(Bytes.toBytes("zzz3")).addColumn(CF,CQ,VALUE)));
+    }
+     CONN=ConnectionFactory.createAsyncConnection(UTIL.getConfiguration()).get();
+    NUM_REGIONS=UTIL.getHBaseCluster().getRegions(TABLE_NAME).size();
+  }
+  @AfterClass public static void tearDown() throws Exception {
+    IOUtils.closeQuietly(CONN);
+    UTIL.shutdownMiniCluster();
+  }
+  private static Pair<List<Result>,ScanMetrics> doScanWithRawAsyncTable(  Scan scan) throws IOException, InterruptedException {
+    BufferingScanResultConsumer consumer=new BufferingScanResultConsumer();
+    CONN.getTable(TABLE_NAME).scan(scan,consumer);
+    List<Result> results=new ArrayList<>();
+    for (Result result; (result=consumer.take()) != null; ) {
+      results.add(result);
+    }
+    return Pair.newPair(results,consumer.getScanMetrics());
+  }
+  private static Pair<List<Result>,ScanMetrics> doScanWithAsyncTableScan(  Scan scan) throws Exception {
+    SimpleScanResultConsumer consumer=new SimpleScanResultConsumer();
+    CONN.getTable(TABLE_NAME,ForkJoinPool.commonPool()).scan(scan,consumer);
+    return Pair.newPair(consumer.getAll(),consumer.getScanMetrics());
+  }
+  private static Pair<List<Result>,ScanMetrics> doScanWithAsyncTableScanner(  Scan scan) throws IOException {
+    try (ResultScanner scanner=CONN.getTable(TABLE_NAME,ForkJoinPool.commonPool()).getScanner(scan)){
+      List<Result> results=new ArrayList<>();
+      for (Result result; (result=scanner.next()) != null; ) {
+        results.add(result);
+      }
+      return Pair.newPair(results,scanner.getScanMetrics());
+    }
+   }
+  @Test public void testNoScanMetrics() throws Exception {
+    Pair<List<Result>,ScanMetrics> pair=method.scan(new Scan());
+    assertEquals(3,pair.getFirst().size());
+    assertNull(pair.getSecond());
+  }
+  @Test public void testScanMetrics() throws Exception {
+    Pair<List<Result>,ScanMetrics> pair=method.scan(new Scan().setScanMetricsEnabled(true));
+    List<Result> results=pair.getFirst();
+    assertEquals(3,results.size());
+    long bytes=results.stream().flatMap(r -> Arrays.asList(r.rawCells()).stream()).mapToLong(c -> PrivateCellUtil.estimatedSerializedSizeOf(c)).sum();
+    ScanMetrics scanMetrics=pair.getSecond();
+    assertEquals(NUM_REGIONS,scanMetrics.countOfRegions.get());
+    assertEquals(bytes,scanMetrics.countOfBytesInResults.get());
+    assertEquals(NUM_REGIONS,scanMetrics.countOfRPCcalls.get());
+    assertEquals(3,scanMetrics.countOfRowsScanned.get());
+  }
+}

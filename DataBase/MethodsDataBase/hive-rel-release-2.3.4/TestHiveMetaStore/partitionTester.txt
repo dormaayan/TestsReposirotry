@@ -1,0 +1,241 @@
+public static void partitionTester(HiveMetaStoreClient client,HiveConf hiveConf) throws Exception {
+  try {
+    String dbName="compdb";
+    String tblName="comptbl";
+    String typeName="Person";
+    List<String> vals=makeVals("2008-07-01 14:13:12","14");
+    List<String> vals2=makeVals("2008-07-01 14:13:12","15");
+    List<String> vals3=makeVals("2008-07-02 14:13:12","15");
+    List<String> vals4=makeVals("2008-07-03 14:13:12","151");
+    client.dropTable(dbName,tblName);
+    silentDropDatabase(dbName);
+    Database db=new Database();
+    db.setName(dbName);
+    client.createDatabase(db);
+    db=client.getDatabase(dbName);
+    Path dbPath=new Path(db.getLocationUri());
+    FileSystem fs=FileSystem.get(dbPath.toUri(),hiveConf);
+    boolean inheritPerms=hiveConf.getBoolVar(HiveConf.ConfVars.HIVE_WAREHOUSE_SUBDIR_INHERIT_PERMS);
+    FsPermission dbPermission=fs.getFileStatus(dbPath).getPermission();
+    if (inheritPerms) {
+      dbPermission=new FsPermission((short)488);
+      fs.setPermission(dbPath,dbPermission);
+    }
+    client.dropType(typeName);
+    Type typ1=new Type();
+    typ1.setName(typeName);
+    typ1.setFields(new ArrayList<FieldSchema>(2));
+    typ1.getFields().add(new FieldSchema("name",serdeConstants.STRING_TYPE_NAME,""));
+    typ1.getFields().add(new FieldSchema("income",serdeConstants.INT_TYPE_NAME,""));
+    client.createType(typ1);
+    Table tbl=new Table();
+    tbl.setDbName(dbName);
+    tbl.setTableName(tblName);
+    StorageDescriptor sd=new StorageDescriptor();
+    tbl.setSd(sd);
+    sd.setCols(typ1.getFields());
+    sd.setCompressed(false);
+    sd.setNumBuckets(1);
+    sd.setParameters(new HashMap<String,String>());
+    sd.getParameters().put("test_param_1","Use this for comments etc");
+    sd.setBucketCols(new ArrayList<String>(2));
+    sd.getBucketCols().add("name");
+    sd.setSerdeInfo(new SerDeInfo());
+    sd.getSerdeInfo().setName(tbl.getTableName());
+    sd.getSerdeInfo().setParameters(new HashMap<String,String>());
+    sd.getSerdeInfo().getParameters().put(serdeConstants.SERIALIZATION_FORMAT,"1");
+    sd.setSortCols(new ArrayList<Order>());
+    sd.setStoredAsSubDirectories(false);
+    sd.getSerdeInfo().setSerializationLib(LazySimpleSerDe.class.getName());
+    sd.setInputFormat(HiveInputFormat.class.getName());
+    sd.setOutputFormat(HiveOutputFormat.class.getName());
+    SkewedInfo skewInfor=new SkewedInfo();
+    skewInfor.setSkewedColNames(Arrays.asList("name"));
+    List<String> skv=Arrays.asList("1");
+    skewInfor.setSkewedColValues(Arrays.asList(skv));
+    Map<List<String>,String> scvlm=new HashMap<List<String>,String>();
+    scvlm.put(skv,"location1");
+    skewInfor.setSkewedColValueLocationMaps(scvlm);
+    sd.setSkewedInfo(skewInfor);
+    tbl.setPartitionKeys(new ArrayList<FieldSchema>(2));
+    tbl.getPartitionKeys().add(new FieldSchema("ds",serdeConstants.STRING_TYPE_NAME,""));
+    tbl.getPartitionKeys().add(new FieldSchema("hr",serdeConstants.STRING_TYPE_NAME,""));
+    client.createTable(tbl);
+    if (isThriftClient) {
+      tbl=client.getTable(dbName,tblName);
+    }
+    assertEquals(dbPermission,fs.getFileStatus(new Path(tbl.getSd().getLocation())).getPermission());
+    Partition part=makePartitionObject(dbName,tblName,vals,tbl,"/part1");
+    Partition part2=makePartitionObject(dbName,tblName,vals2,tbl,"/part2");
+    Partition part3=makePartitionObject(dbName,tblName,vals3,tbl,"/part3");
+    Partition part4=makePartitionObject(dbName,tblName,vals4,tbl,"/part4");
+    boolean exceptionThrown=false;
+    try {
+      Partition p=client.getPartition(dbName,tblName,vals);
+    }
+ catch (    Exception e) {
+      assertEquals("partition should not have existed",NoSuchObjectException.class,e.getClass());
+      exceptionThrown=true;
+    }
+    assertTrue("getPartition() should have thrown NoSuchObjectException",exceptionThrown);
+    Partition retp=client.add_partition(part);
+    assertNotNull("Unable to create partition " + part,retp);
+    assertEquals(dbPermission,fs.getFileStatus(new Path(retp.getSd().getLocation())).getPermission());
+    Partition retp2=client.add_partition(part2);
+    assertNotNull("Unable to create partition " + part2,retp2);
+    assertEquals(dbPermission,fs.getFileStatus(new Path(retp2.getSd().getLocation())).getPermission());
+    Partition retp3=client.add_partition(part3);
+    assertNotNull("Unable to create partition " + part3,retp3);
+    assertEquals(dbPermission,fs.getFileStatus(new Path(retp3.getSd().getLocation())).getPermission());
+    Partition retp4=client.add_partition(part4);
+    assertNotNull("Unable to create partition " + part4,retp4);
+    assertEquals(dbPermission,fs.getFileStatus(new Path(retp4.getSd().getLocation())).getPermission());
+    Partition part_get=client.getPartition(dbName,tblName,part.getValues());
+    if (isThriftClient) {
+      adjust(client,part,dbName,tblName);
+      adjust(client,part2,dbName,tblName);
+      adjust(client,part3,dbName,tblName);
+    }
+    assertTrue("Partitions are not same",part.equals(part_get));
+    List<String> vals6=makeVals("2016-02-22 00:00:00","16");
+    Partition part6=makePartitionObject(dbName,tblName,vals6,tbl,"/part5");
+    part6.getSd().setCols(null);
+    LOG.info("Creating partition will null field schema");
+    client.add_partition(part6);
+    LOG.info("Listing all partitions for table " + dbName + "."+ tblName);
+    final List<Partition> partitions=client.listPartitions(dbName,tblName,(short)-1);
+    boolean foundPart=false;
+    for (    Partition p : partitions) {
+      if (p.getValues().equals(vals6)) {
+        assertNull(p.getSd().getCols());
+        LOG.info("Found partition " + p + " having null field schema");
+        foundPart=true;
+      }
+    }
+    assertTrue(foundPart);
+    String partName="ds=" + FileUtils.escapePathName("2008-07-01 14:13:12") + "/hr=14";
+    String part2Name="ds=" + FileUtils.escapePathName("2008-07-01 14:13:12") + "/hr=15";
+    String part3Name="ds=" + FileUtils.escapePathName("2008-07-02 14:13:12") + "/hr=15";
+    String part4Name="ds=" + FileUtils.escapePathName("2008-07-03 14:13:12") + "/hr=151";
+    part_get=client.getPartition(dbName,tblName,partName);
+    assertTrue("Partitions are not the same",part.equals(part_get));
+    List<String> partialVals=new ArrayList<String>();
+    partialVals.add(vals.get(0));
+    Set<Partition> parts=new HashSet<Partition>();
+    parts.add(part);
+    parts.add(part2);
+    List<Partition> partial=client.listPartitions(dbName,tblName,partialVals,(short)-1);
+    assertTrue("Should have returned 2 partitions",partial.size() == 2);
+    assertTrue("Not all parts returned",partial.containsAll(parts));
+    Set<String> partNames=new HashSet<String>();
+    partNames.add(partName);
+    partNames.add(part2Name);
+    List<String> partialNames=client.listPartitionNames(dbName,tblName,partialVals,(short)-1);
+    assertTrue("Should have returned 2 partition names",partialNames.size() == 2);
+    assertTrue("Not all part names returned",partialNames.containsAll(partNames));
+    partNames.add(part3Name);
+    partNames.add(part4Name);
+    partialVals.clear();
+    partialVals.add("");
+    partialNames=client.listPartitionNames(dbName,tblName,partialVals,(short)-1);
+    assertTrue("Should have returned 5 partition names",partialNames.size() == 5);
+    assertTrue("Not all part names returned",partialNames.containsAll(partNames));
+    parts.clear();
+    parts.add(part2);
+    parts.add(part3);
+    partialVals.clear();
+    partialVals.add("");
+    partialVals.add(vals2.get(1));
+    partial=client.listPartitions(dbName,tblName,partialVals,(short)-1);
+    assertEquals("Should have returned 2 partitions",2,partial.size());
+    assertTrue("Not all parts returned",partial.containsAll(parts));
+    partNames.clear();
+    partNames.add(part2Name);
+    partNames.add(part3Name);
+    partialNames=client.listPartitionNames(dbName,tblName,partialVals,(short)-1);
+    assertEquals("Should have returned 2 partition names",2,partialNames.size());
+    assertTrue("Not all part names returned",partialNames.containsAll(partNames));
+    exceptionThrown=false;
+    try {
+      String badPartName="ds=2008-07-01 14%3A13%3A12/hrs=14";
+      client.getPartition(dbName,tblName,badPartName);
+    }
+ catch (    NoSuchObjectException e) {
+      exceptionThrown=true;
+    }
+    assertTrue("Bad partition spec should have thrown an exception",exceptionThrown);
+    Path partPath=new Path(part.getSd().getLocation());
+    assertTrue(fs.exists(partPath));
+    client.dropPartition(dbName,tblName,part.getValues(),true);
+    assertFalse(fs.exists(partPath));
+    client.appendPartition(dbName,tblName,partName);
+    Partition part5=client.getPartition(dbName,tblName,part.getValues());
+    assertTrue("Append partition by name failed",part5.getValues().equals(vals));
+    ;
+    Path part5Path=new Path(part5.getSd().getLocation());
+    assertTrue(fs.exists(part5Path));
+    assertTrue("Drop partition by name failed",client.dropPartition(dbName,tblName,partName,true));
+    assertFalse(fs.exists(part5Path));
+    retp=client.add_partition(part);
+    assertNotNull("Unable to create partition " + part,retp);
+    assertEquals(dbPermission,fs.getFileStatus(new Path(retp.getSd().getLocation())).getPermission());
+    List<String> mvals1=makeVals("2008-07-04 14:13:12","14641");
+    List<String> mvals2=makeVals("2008-07-04 14:13:12","14642");
+    List<String> mvals3=makeVals("2008-07-04 14:13:12","14643");
+    List<String> mvals4=makeVals("2008-07-04 14:13:12","14643");
+    List<String> mvals5=makeVals("2008-07-04 14:13:12","14645");
+    Exception savedException;
+    client.add_partitions(new ArrayList<Partition>());
+    Partition mpart1=makePartitionObject(dbName,tblName,mvals1,tbl,"/mpart1");
+    Partition mpart2=makePartitionObject(dbName,tblName,mvals2,tbl,"/mpart2");
+    Partition mpart3=makePartitionObject(dbName,tblName,mvals3,tbl,"/mpart3");
+    client.add_partitions(Arrays.asList(mpart1,mpart2,mpart3));
+    if (isThriftClient) {
+      adjust(client,mpart1,dbName,tblName);
+      adjust(client,mpart2,dbName,tblName);
+      adjust(client,mpart3,dbName,tblName);
+    }
+    verifyPartitionsPublished(client,dbName,tblName,Arrays.asList(mvals1.get(0)),Arrays.asList(mpart1,mpart2,mpart3));
+    Partition mpart4=makePartitionObject(dbName,tblName,mvals4,tbl,"/mpart4");
+    Partition mpart5=makePartitionObject(dbName,tblName,mvals5,tbl,"/mpart5");
+    Path mp5Path=new Path(mpart5.getSd().getLocation());
+    warehouse.mkdirs(mp5Path,true);
+    assertTrue(fs.exists(mp5Path));
+    assertEquals(dbPermission,fs.getFileStatus(mp5Path).getPermission());
+    savedException=null;
+    try {
+      client.add_partitions(Arrays.asList(mpart5,mpart4));
+    }
+ catch (    Exception e) {
+      savedException=e;
+    }
+ finally {
+      assertNotNull(savedException);
+    }
+    assertTrue(fs.exists(mp5Path));
+    assertFalse(fs.exists(new Path(mpart4.getSd().getLocation())));
+    client.add_partitions(Arrays.asList(mpart5));
+    if (isThriftClient) {
+      adjust(client,mpart5,dbName,tblName);
+    }
+    verifyPartitionsPublished(client,dbName,tblName,Arrays.asList(mvals1.get(0)),Arrays.asList(mpart1,mpart2,mpart3,mpart5));
+    client.dropTable(dbName,tblName);
+    client.dropType(typeName);
+    tbl.setParameters(new HashMap<String,String>());
+    tbl.getParameters().put("EXTERNAL","TRUE");
+    client.createTable(tbl);
+    retp=client.add_partition(part);
+    assertTrue(fs.exists(partPath));
+    client.dropPartition(dbName,tblName,part.getValues(),true);
+    assertTrue(fs.exists(partPath));
+    for (    String tableName : client.getTables(dbName,"*")) {
+      client.dropTable(dbName,tableName);
+    }
+    client.dropDatabase(dbName);
+  }
+ catch (  Exception e) {
+    System.err.println(StringUtils.stringifyException(e));
+    System.err.println("testPartition() failed.");
+    throw e;
+  }
+}

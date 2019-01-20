@@ -1,0 +1,60 @@
+@Test public void testConcurrentTableCreations() throws Exception {
+  final Configuration conf=getConfiguration();
+  Assume.assumeTrue("Test only applies when DynamoDB is used for S3Guard",conf.get(Constants.S3_METADATA_STORE_IMPL).equals(Constants.S3GUARD_METASTORE_DYNAMO));
+  DynamoDBMetadataStore ms=new DynamoDBMetadataStore();
+  ms.initialize(getFileSystem());
+  DynamoDB db=ms.getDynamoDB();
+  String tableName="testConcurrentTableCreations" + new Random().nextInt();
+  conf.setBoolean(Constants.S3GUARD_DDB_TABLE_CREATE_KEY,true);
+  conf.set(Constants.S3GUARD_DDB_TABLE_NAME_KEY,tableName);
+  String region=conf.getTrimmed(S3GUARD_DDB_REGION_KEY);
+  if (StringUtils.isEmpty(region)) {
+    conf.set(S3GUARD_DDB_REGION_KEY,getFileSystem().getBucketLocation());
+  }
+  int concurrentOps=16;
+  int iterations=4;
+  failIfTableExists(db,tableName);
+  for (int i=0; i < iterations; i++) {
+    ExecutorService executor=Executors.newFixedThreadPool(concurrentOps,new ThreadFactory(){
+      private AtomicInteger count=new AtomicInteger(0);
+      public Thread newThread(      Runnable r){
+        return new Thread(r,"testConcurrentTableCreations" + count.getAndIncrement());
+      }
+    }
+);
+    ((ThreadPoolExecutor)executor).prestartAllCoreThreads();
+    Future<Exception>[] futures=new Future[concurrentOps];
+    for (int f=0; f < concurrentOps; f++) {
+      final int index=f;
+      futures[f]=executor.submit(new Callable<Exception>(){
+        @Override public Exception call() throws Exception {
+          ContractTestUtils.NanoTimer timer=new ContractTestUtils.NanoTimer();
+          Exception result=null;
+          try (DynamoDBMetadataStore store=new DynamoDBMetadataStore()){
+            store.initialize(conf);
+          }
+ catch (          Exception e) {
+            LOG.error(e.getClass() + ": " + e.getMessage());
+            result=e;
+          }
+          timer.end("Parallel DynamoDB client creation %d",index);
+          LOG.info("Parallel DynamoDB client creation {} ran from {} to {}",index,timer.getStartTime(),timer.getEndTime());
+          return result;
+        }
+      }
+);
+    }
+    List<Exception> exceptions=new ArrayList<>(concurrentOps);
+    for (int f=0; f < concurrentOps; f++) {
+      Exception outcome=futures[f].get();
+      if (outcome != null) {
+        exceptions.add(outcome);
+      }
+    }
+    deleteTable(db,tableName);
+    int exceptionsThrown=exceptions.size();
+    if (exceptionsThrown > 0) {
+      throw new AssertionError(exceptionsThrown + "/" + concurrentOps+ " threads threw exceptions while initializing on iteration "+ i,exceptions.get(0));
+    }
+  }
+}

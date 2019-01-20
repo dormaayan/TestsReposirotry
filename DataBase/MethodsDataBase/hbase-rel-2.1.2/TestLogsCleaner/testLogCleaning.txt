@@ -1,0 +1,57 @@
+/** 
+ * This tests verifies LogCleaner works correctly with WALs and Procedure WALs located in the same oldWALs directory. Created files: - 2 invalid files - 5 old Procedure WALs - 30 old WALs from which 3 are in replication - 5 recent Procedure WALs - 1 recent WAL - 1 very new WAL (timestamp in future) - masterProcedureWALs subdirectory Files which should stay: - 3 replication WALs - 2 new WALs - 5 latest Procedure WALs - masterProcedureWALs subdirectory
+ */
+@Test public void testLogCleaning() throws Exception {
+  Configuration conf=TEST_UTIL.getConfiguration();
+  long ttlWAL=2000;
+  long ttlProcedureWAL=4000;
+  conf.setLong("hbase.master.logcleaner.ttl",ttlWAL);
+  conf.setLong("hbase.master.procedurewalcleaner.ttl",ttlProcedureWAL);
+  HMaster.decorateMasterConfiguration(conf);
+  Server server=new DummyServer();
+  ReplicationQueueStorage queueStorage=ReplicationStorageFactory.getReplicationQueueStorage(server.getZooKeeper(),conf);
+  final Path oldLogDir=new Path(TEST_UTIL.getDataTestDir(),HConstants.HREGION_OLDLOGDIR_NAME);
+  final Path oldProcedureWALDir=new Path(oldLogDir,"masterProcedureWALs");
+  String fakeMachineName=URLEncoder.encode(server.getServerName().toString(),"UTF8");
+  final FileSystem fs=FileSystem.get(conf);
+  long now=System.currentTimeMillis();
+  fs.delete(oldLogDir,true);
+  fs.mkdirs(oldLogDir);
+  fs.createNewFile(new Path(oldLogDir,"a"));
+  fs.createNewFile(new Path(oldLogDir,fakeMachineName + "." + "a"));
+  for (int i=1; i < 6; i++) {
+    Path fileName=new Path(oldProcedureWALDir,String.format("pv2-%020d.log",i));
+    fs.createNewFile(fileName);
+  }
+  Thread.sleep(ttlProcedureWAL - ttlWAL);
+  for (int i=1; i < 31; i++) {
+    Path fileName=new Path(oldLogDir,fakeMachineName + "." + (now - i));
+    fs.createNewFile(fileName);
+    if (i % (30 / 3) == 1) {
+      queueStorage.addWAL(server.getServerName(),fakeMachineName,fileName.getName());
+      LOG.info("Replication log file: " + fileName);
+    }
+  }
+  for (int i=6; i < 11; i++) {
+    Path fileName=new Path(oldProcedureWALDir,String.format("pv2-%020d.log",i));
+    fs.createNewFile(fileName);
+  }
+  Thread.sleep(ttlWAL);
+  fs.createNewFile(new Path(oldLogDir,fakeMachineName + "." + now));
+  fs.createNewFile(new Path(oldLogDir,fakeMachineName + "." + (now + ttlWAL)));
+  for (  FileStatus stat : fs.listStatus(oldLogDir)) {
+    LOG.info(stat.getPath().toString());
+  }
+  assertEquals(35,fs.listStatus(oldLogDir).length);
+  assertEquals(10,fs.listStatus(oldProcedureWALDir).length);
+  LogCleaner cleaner=new LogCleaner(1000,server,conf,fs,oldLogDir);
+  cleaner.chore();
+  TEST_UTIL.waitFor(1000,(Waiter.Predicate<Exception>)() -> 6 == fs.listStatus(oldLogDir).length);
+  TEST_UTIL.waitFor(1000,(Waiter.Predicate<Exception>)() -> 5 == fs.listStatus(oldProcedureWALDir).length);
+  for (  FileStatus file : fs.listStatus(oldLogDir)) {
+    LOG.debug("Kept log file in oldWALs: " + file.getPath().getName());
+  }
+  for (  FileStatus file : fs.listStatus(oldProcedureWALDir)) {
+    LOG.debug("Kept log file in masterProcedureWALs: " + file.getPath().getName());
+  }
+}

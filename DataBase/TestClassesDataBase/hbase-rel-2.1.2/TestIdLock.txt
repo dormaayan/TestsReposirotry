@@ -1,0 +1,55 @@
+@Category({MiscTests.class,MediumTests.class}) public class TestIdLock {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestIdLock.class);
+  private static final Logger LOG=LoggerFactory.getLogger(TestIdLock.class);
+  private static final int NUM_IDS=16;
+  private static final int NUM_THREADS=128;
+  private static final int NUM_SECONDS=15;
+  private IdLock idLock=new IdLock();
+  private Map<Long,String> idOwner=new ConcurrentHashMap<>();
+private class IdLockTestThread implements Callable<Boolean> {
+    private String clientId;
+    public IdLockTestThread(    String clientId){
+      this.clientId=clientId;
+    }
+    @Override public Boolean call() throws Exception {
+      Thread.currentThread().setName(clientId);
+      Random rand=new Random();
+      long endTime=System.currentTimeMillis() + NUM_SECONDS * 1000;
+      while (System.currentTimeMillis() < endTime) {
+        long id=rand.nextInt(NUM_IDS);
+        IdLock.Entry lockEntry=idLock.getLockEntry(id);
+        try {
+          int sleepMs=1 + rand.nextInt(4);
+          String owner=idOwner.get(id);
+          if (owner != null) {
+            LOG.error("Id " + id + " already taken by "+ owner+ ", "+ clientId+ " failed");
+            return false;
+          }
+          idOwner.put(id,clientId);
+          Thread.sleep(sleepMs);
+          idOwner.remove(id);
+        }
+  finally {
+          idLock.releaseLockEntry(lockEntry);
+        }
+      }
+      return true;
+    }
+  }
+  @Test public void testMultipleClients() throws Exception {
+    ExecutorService exec=Executors.newFixedThreadPool(NUM_THREADS);
+    try {
+      ExecutorCompletionService<Boolean> ecs=new ExecutorCompletionService<>(exec);
+      for (int i=0; i < NUM_THREADS; ++i)       ecs.submit(new IdLockTestThread("client_" + i));
+      for (int i=0; i < NUM_THREADS; ++i) {
+        Future<Boolean> result=ecs.take();
+        assertTrue(result.get());
+      }
+      idLock.assertMapEmpty();
+    }
+  finally {
+      exec.shutdown();
+      exec.awaitTermination(5000,TimeUnit.MILLISECONDS);
+    }
+  }
+}

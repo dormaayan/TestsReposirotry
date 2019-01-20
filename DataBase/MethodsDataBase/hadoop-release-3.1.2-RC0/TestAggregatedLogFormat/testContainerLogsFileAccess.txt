@@ -1,0 +1,49 @@
+@Test(timeout=10000) public void testContainerLogsFileAccess() throws IOException {
+  Assume.assumeTrue(NativeIO.isAvailable());
+  Configuration conf=new Configuration();
+  conf.set(CommonConfigurationKeysPublic.HADOOP_SECURITY_AUTHENTICATION,"kerberos");
+  UserGroupInformation.setConfiguration(conf);
+  File workDir=new File(testWorkDir,"testContainerLogsFileAccess1");
+  Path remoteAppLogFile=new Path(workDir.getAbsolutePath(),"aggregatedLogFile");
+  Path srcFileRoot=new Path(workDir.getAbsolutePath(),"srcFiles");
+  String data="Log File content for container : ";
+  ApplicationId applicationId=ApplicationId.newInstance(1,1);
+  ApplicationAttemptId applicationAttemptId=ApplicationAttemptId.newInstance(applicationId,1);
+  ContainerId testContainerId1=ContainerId.newContainerId(applicationAttemptId,1);
+  Path appDir=new Path(srcFileRoot,testContainerId1.getApplicationAttemptId().getApplicationId().toString());
+  Path srcFilePath1=new Path(appDir,testContainerId1.toString());
+  String stdout="stdout";
+  String stderr="stderr";
+  writeSrcFile(srcFilePath1,stdout,data + testContainerId1.toString() + stdout);
+  writeSrcFile(srcFilePath1,stderr,data + testContainerId1.toString() + stderr);
+  UserGroupInformation ugi=UserGroupInformation.getCurrentUser();
+  try (LogWriter logWriter=new LogWriter()){
+    logWriter.initialize(conf,remoteAppLogFile,ugi);
+    LogKey logKey=new LogKey(testContainerId1);
+    String randomUser="randomUser";
+    LogValue logValue=spy(new LogValue(Collections.singletonList(srcFileRoot.toString()),testContainerId1,randomUser));
+    when(logValue.getUser()).thenReturn(randomUser).thenReturn(ugi.getShortUserName());
+    logWriter.append(logKey,logValue);
+  }
+   BufferedReader in=new BufferedReader(new FileReader(new File(remoteAppLogFile.toUri().getRawPath())));
+  String line;
+  StringBuffer sb=new StringBuffer("");
+  while ((line=in.readLine()) != null) {
+    LOG.info(line);
+    sb.append(line);
+  }
+  line=sb.toString();
+  String expectedOwner=ugi.getShortUserName();
+  if (Path.WINDOWS) {
+    final String adminsGroupString="Administrators";
+    if (Arrays.asList(ugi.getGroupNames()).contains(adminsGroupString)) {
+      expectedOwner=adminsGroupString;
+    }
+  }
+  String stdoutFile1=StringUtils.join(File.separator,Arrays.asList(new String[]{workDir.getAbsolutePath(),"srcFiles",testContainerId1.getApplicationAttemptId().getApplicationId().toString(),testContainerId1.toString(),stderr}));
+  String stdoutFile2=StringUtils.join(File.separator,Arrays.asList(new String[]{workDir.getAbsolutePath(),"srcFiles",testContainerId1.getApplicationAttemptId().getApplicationId().toString(),testContainerId1.toString(),stdout}));
+  String message2="Owner '" + expectedOwner + "' for path "+ stdoutFile2+ " did not match expected owner '"+ ugi.getShortUserName()+ "'";
+  Assert.assertFalse(line.contains(message2));
+  Assert.assertFalse(line.contains(data + testContainerId1.toString() + stderr));
+  Assert.assertTrue(line.contains(data + testContainerId1.toString() + stdout));
+}

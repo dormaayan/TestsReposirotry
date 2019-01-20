@@ -1,0 +1,131 @@
+@RunWith(Parameterized.class) public class IndexingServiceIntegrationTest {
+  private static final String FOOD_LABEL="food";
+  private static final String CLOTHES_LABEL="clothes";
+  private static final String WEATHER_LABEL="weather";
+  private static final String PROPERTY_NAME="name";
+  @Rule public ExpectedException expectedException=ExpectedException.none();
+  @Rule public EphemeralFileSystemRule fileSystemRule=new EphemeralFileSystemRule();
+  private GraphDatabaseService database;
+  @Parameterized.Parameters(name="{0}") public static GraphDatabaseSettings.SchemaIndex[] parameters(){
+    return GraphDatabaseSettings.SchemaIndex.values();
+  }
+  @Parameterized.Parameter() public GraphDatabaseSettings.SchemaIndex schemaIndex;
+  @Before public void setUp(){
+    EphemeralFileSystemAbstraction fileSystem=fileSystemRule.get();
+    database=new TestGraphDatabaseFactory().setFileSystem(fileSystem).newImpermanentDatabaseBuilder().setConfig(GraphDatabaseSettings.default_schema_provider,schemaIndex.providerName()).newGraphDatabase();
+    createData(database,100);
+  }
+  @After public void tearDown(){
+    try {
+      database.shutdown();
+    }
+ catch (    Exception e) {
+    }
+  }
+  @Test public void testManualIndexPopulation() throws InterruptedException, IndexNotFoundKernelException {
+    try (Transaction tx=database.beginTx()){
+      database.schema().indexFor(Label.label(FOOD_LABEL)).on(PROPERTY_NAME).create();
+      tx.success();
+    }
+     int labelId=getLabelId(FOOD_LABEL);
+    int propertyKeyId=getPropertyKeyId(PROPERTY_NAME);
+    IndexingService indexingService=getIndexingService(database);
+    IndexProxy indexProxy=indexingService.getIndexProxy(forLabel(labelId,propertyKeyId));
+    waitIndexOnline(indexProxy);
+    assertEquals(InternalIndexState.ONLINE,indexProxy.getState());
+    PopulationProgress progress=indexProxy.getIndexPopulationProgress();
+    assertEquals(progress.getCompleted(),progress.getTotal());
+  }
+  @Test public void testManualRelationshipIndexPopulation() throws Exception {
+    RelationTypeSchemaDescriptor descriptor;
+    try (org.neo4j.internal.kernel.api.Transaction tx=((GraphDatabaseAPI)database).getDependencyResolver().resolveDependency(Kernel.class).beginTransaction(explicit,AUTH_DISABLED)){
+      int foodId=tx.tokenWrite().relationshipTypeGetOrCreateForName(FOOD_LABEL);
+      int propertyId=tx.tokenWrite().propertyKeyGetOrCreateForName(PROPERTY_NAME);
+      descriptor=forRelType(foodId,propertyId);
+      tx.schemaWrite().indexCreate(descriptor);
+      tx.success();
+    }
+     IndexingService indexingService=getIndexingService(database);
+    IndexProxy indexProxy=indexingService.getIndexProxy(descriptor);
+    waitIndexOnline(indexProxy);
+    assertEquals(InternalIndexState.ONLINE,indexProxy.getState());
+    PopulationProgress progress=indexProxy.getIndexPopulationProgress();
+    assertEquals(progress.getCompleted(),progress.getTotal());
+  }
+  @Test public void testSchemaIndexMatchIndexingService() throws IndexNotFoundKernelException {
+    try (Transaction transaction=database.beginTx()){
+      database.schema().constraintFor(Label.label(CLOTHES_LABEL)).assertPropertyIsUnique(PROPERTY_NAME).create();
+      database.schema().indexFor(Label.label(WEATHER_LABEL)).on(PROPERTY_NAME).create();
+      transaction.success();
+    }
+     try (Transaction ignored=database.beginTx()){
+      database.schema().awaitIndexesOnline(1,TimeUnit.MINUTES);
+    }
+     IndexingService indexingService=getIndexingService(database);
+    int clothedLabelId=getLabelId(CLOTHES_LABEL);
+    int weatherLabelId=getLabelId(WEATHER_LABEL);
+    int propertyId=getPropertyKeyId(PROPERTY_NAME);
+    IndexProxy clothesIndex=indexingService.getIndexProxy(forLabel(clothedLabelId,propertyId));
+    IndexProxy weatherIndex=indexingService.getIndexProxy(forLabel(weatherLabelId,propertyId));
+    assertEquals(InternalIndexState.ONLINE,clothesIndex.getState());
+    assertEquals(InternalIndexState.ONLINE,weatherIndex.getState());
+  }
+  @Test public void failForceIndexesWhenOneOfTheIndexesIsBroken() throws Exception {
+    String constraintLabelPrefix="ConstraintLabel";
+    String constraintPropertyPrefix="ConstraintProperty";
+    String indexLabelPrefix="Label";
+    String indexPropertyPrefix="Property";
+    for (int i=0; i < 10; i++) {
+      try (Transaction transaction=database.beginTx()){
+        database.schema().constraintFor(Label.label(constraintLabelPrefix + i)).assertPropertyIsUnique(constraintPropertyPrefix + i).create();
+        database.schema().indexFor(Label.label(indexLabelPrefix + i)).on(indexPropertyPrefix + i).create();
+        transaction.success();
+      }
+     }
+    try (Transaction ignored=database.beginTx()){
+      database.schema().awaitIndexesOnline(1,TimeUnit.MINUTES);
+    }
+     IndexingService indexingService=getIndexingService(database);
+    int indexLabel7=getLabelId(indexLabelPrefix + 7);
+    int indexProperty7=getPropertyKeyId(indexPropertyPrefix + 7);
+    IndexProxy index=indexingService.getIndexProxy(TestIndexDescriptorFactory.forLabel(indexLabel7,indexProperty7).schema());
+    index.drop();
+    expectedException.expect(UnderlyingStorageException.class);
+    expectedException.expectMessage("Unable to force");
+    indexingService.forceAll(IOLimiter.UNLIMITED);
+  }
+  private void waitIndexOnline(  IndexProxy indexProxy) throws InterruptedException {
+    while (InternalIndexState.ONLINE != indexProxy.getState()) {
+      Thread.sleep(10);
+    }
+  }
+  private IndexingService getIndexingService(  GraphDatabaseService database){
+    return getDependencyResolver(database).resolveDependency(IndexingService.class);
+  }
+  private DependencyResolver getDependencyResolver(  GraphDatabaseService database){
+    return ((GraphDatabaseAPI)database).getDependencyResolver();
+  }
+  private void createData(  GraphDatabaseService database,  int numberOfNodes){
+    for (int i=0; i < numberOfNodes; i++) {
+      try (Transaction transaction=database.beginTx()){
+        Node node=database.createNode(Label.label(FOOD_LABEL),Label.label(CLOTHES_LABEL),Label.label(WEATHER_LABEL));
+        node.setProperty(PROPERTY_NAME,"Node" + i);
+        Relationship relationship=node.createRelationshipTo(node,RelationshipType.withName(FOOD_LABEL));
+        relationship.setProperty(PROPERTY_NAME,"Relationship" + i);
+        transaction.success();
+      }
+     }
+  }
+  private int getPropertyKeyId(  String name){
+    try (Transaction tx=database.beginTx()){
+      KernelTransaction transaction=((GraphDatabaseAPI)database).getDependencyResolver().resolveDependency(ThreadToStatementContextBridge.class).getKernelTransactionBoundToThisThread(true);
+      return transaction.tokenRead().propertyKey(name);
+    }
+   }
+  private int getLabelId(  String name){
+    try (Transaction tx=database.beginTx()){
+      KernelTransaction transaction=((GraphDatabaseAPI)database).getDependencyResolver().resolveDependency(ThreadToStatementContextBridge.class).getKernelTransactionBoundToThisThread(true);
+      return transaction.tokenRead().nodeLabel(name);
+    }
+   }
+}

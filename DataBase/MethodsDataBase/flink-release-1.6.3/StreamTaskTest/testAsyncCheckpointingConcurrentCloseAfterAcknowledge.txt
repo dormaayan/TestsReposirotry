@@ -1,0 +1,61 @@
+/** 
+ * FLINK-5667 <p>Tests that a concurrent cancel operation does not discard the state handles of an acknowledged checkpoint. The situation can only happen if the cancel call is executed after Environment.acknowledgeCheckpoint() and before the CloseableRegistry.unregisterClosable() call.
+ */
+@Test public void testAsyncCheckpointingConcurrentCloseAfterAcknowledge() throws Exception {
+  final long checkpointId=42L;
+  final long timestamp=1L;
+  final OneShotLatch acknowledgeCheckpointLatch=new OneShotLatch();
+  final OneShotLatch completeAcknowledge=new OneShotLatch();
+  CheckpointResponder checkpointResponder=mock(CheckpointResponder.class);
+  doAnswer(new Answer(){
+    @Override public Object answer(    InvocationOnMock invocation) throws Throwable {
+      acknowledgeCheckpointLatch.trigger();
+      completeAcknowledge.await();
+      return null;
+    }
+  }
+).when(checkpointResponder).acknowledgeCheckpoint(any(JobID.class),any(ExecutionAttemptID.class),anyLong(),any(CheckpointMetrics.class),any(TaskStateSnapshot.class));
+  TaskStateManager taskStateManager=new TaskStateManagerImpl(new JobID(1L,2L),new ExecutionAttemptID(1L,2L),mock(TaskLocalStateStoreImpl.class),null,checkpointResponder);
+  MockEnvironment mockEnvironment=new MockEnvironmentBuilder().setTaskName("mock-task").setTaskStateManager(taskStateManager).build();
+  StreamTask<?,?> streamTask=new EmptyStreamTask(mockEnvironment);
+  CheckpointMetaData checkpointMetaData=new CheckpointMetaData(checkpointId,timestamp);
+  StreamOperator<?> streamOperator=mock(StreamOperator.class);
+  when(streamOperator.getOperatorID()).thenReturn(new OperatorID(42,42));
+  KeyedStateHandle managedKeyedStateHandle=mock(KeyedStateHandle.class);
+  KeyedStateHandle rawKeyedStateHandle=mock(KeyedStateHandle.class);
+  OperatorStateHandle managedOperatorStateHandle=mock(OperatorStreamStateHandle.class);
+  OperatorStateHandle rawOperatorStateHandle=mock(OperatorStreamStateHandle.class);
+  OperatorSnapshotFutures operatorSnapshotResult=new OperatorSnapshotFutures(DoneFuture.of(SnapshotResult.of(managedKeyedStateHandle)),DoneFuture.of(SnapshotResult.of(rawKeyedStateHandle)),DoneFuture.of(SnapshotResult.of(managedOperatorStateHandle)),DoneFuture.of(SnapshotResult.of(rawOperatorStateHandle)));
+  when(streamOperator.snapshotState(anyLong(),anyLong(),any(CheckpointOptions.class),any(CheckpointStreamFactory.class))).thenReturn(operatorSnapshotResult);
+  StreamOperator<?>[] streamOperators={streamOperator};
+  OperatorChain<Void,AbstractStreamOperator<Void>> operatorChain=mock(OperatorChain.class);
+  when(operatorChain.getAllOperators()).thenReturn(streamOperators);
+  CheckpointStorage checkpointStorage=new MemoryBackendCheckpointStorage(new JobID(),null,null,Integer.MAX_VALUE);
+  Whitebox.setInternalState(streamTask,"isRunning",true);
+  Whitebox.setInternalState(streamTask,"lock",new Object());
+  Whitebox.setInternalState(streamTask,"operatorChain",operatorChain);
+  Whitebox.setInternalState(streamTask,"cancelables",new CloseableRegistry());
+  Whitebox.setInternalState(streamTask,"asyncOperationsThreadPool",Executors.newFixedThreadPool(1));
+  Whitebox.setInternalState(streamTask,"configuration",new StreamConfig(new Configuration()));
+  Whitebox.setInternalState(streamTask,"checkpointStorage",checkpointStorage);
+  streamTask.triggerCheckpoint(checkpointMetaData,CheckpointOptions.forCheckpointWithDefaultLocation());
+  acknowledgeCheckpointLatch.await();
+  ArgumentCaptor<TaskStateSnapshot> subtaskStateCaptor=ArgumentCaptor.forClass(TaskStateSnapshot.class);
+  verify(checkpointResponder).acknowledgeCheckpoint(any(JobID.class),any(ExecutionAttemptID.class),eq(checkpointId),any(CheckpointMetrics.class),subtaskStateCaptor.capture());
+  TaskStateSnapshot subtaskStates=subtaskStateCaptor.getValue();
+  OperatorSubtaskState subtaskState=subtaskStates.getSubtaskStateMappings().iterator().next().getValue();
+  assertEquals(StateObjectCollection.singleton(managedKeyedStateHandle),subtaskState.getManagedKeyedState());
+  assertEquals(StateObjectCollection.singleton(rawKeyedStateHandle),subtaskState.getRawKeyedState());
+  assertEquals(StateObjectCollection.singleton(managedOperatorStateHandle),subtaskState.getManagedOperatorState());
+  assertEquals(StateObjectCollection.singleton(rawOperatorStateHandle),subtaskState.getRawOperatorState());
+  verify(managedKeyedStateHandle,never()).discardState();
+  verify(rawKeyedStateHandle,never()).discardState();
+  verify(managedOperatorStateHandle,never()).discardState();
+  verify(rawOperatorStateHandle,never()).discardState();
+  streamTask.cancel();
+  completeAcknowledge.trigger();
+  verify(managedKeyedStateHandle,never()).discardState();
+  verify(rawKeyedStateHandle,never()).discardState();
+  verify(managedOperatorStateHandle,never()).discardState();
+  verify(rawOperatorStateHandle,never()).discardState();
+}

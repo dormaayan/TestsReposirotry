@@ -1,0 +1,100 @@
+@Test(timeout=180000) public void testDeadlock() throws Throwable {
+  GenericTestUtils.setLogLevel(FSEditLog.LOG,Level.INFO);
+  Configuration conf=getConf();
+  NameNode.initMetrics(conf,NamenodeRole.NAMENODE);
+  DFSTestUtil.formatNameNode(conf);
+  final FSNamesystem namesystem=FSNamesystem.loadFromDisk(conf);
+  final AtomicBoolean done=new AtomicBoolean(false);
+  final Semaphore blockerSemaphore=new Semaphore(0);
+  final CountDownLatch startSpamLatch=new CountDownLatch(1);
+  ExecutorService executor=Executors.newCachedThreadPool();
+  try {
+    final FSEditLog editLog=namesystem.getEditLog();
+    FSEditLogOp.OpInstanceCache cache=editLog.cache.get();
+    final FSEditLogOp op=FSEditLogOp.SetOwnerOp.getInstance(cache).setSource("/").setUser("u").setGroup("g");
+    final FSEditLogOp reuseOp=Mockito.spy(op);
+    Mockito.doNothing().when(reuseOp).reset();
+    Future[] logSpammers=new Future[16];
+    for (int i=0; i < logSpammers.length; i++) {
+      final int ii=i;
+      logSpammers[i]=executor.submit(new Callable(){
+        @Override public Void call() throws Exception {
+          Thread.currentThread().setName("Log spammer " + ii);
+          startSpamLatch.await();
+          for (int i=0; !done.get() && i < 1000000; i++) {
+            editLog.logEdit(reuseOp);
+            if (i % 2048 == 0) {
+              LOG.info("thread[" + ii + "] edits="+ i);
+            }
+          }
+          assertTrue("too many edits",done.get());
+          return null;
+        }
+      }
+);
+    }
+    final FSEditLogOp blockingOp=Mockito.spy(op);
+    doAnswer(new Answer<Void>(){
+      @Override public Void answer(      InvocationOnMock invocation) throws Throwable {
+        startSpamLatch.countDown();
+        blockerSemaphore.acquire();
+        invocation.callRealMethod();
+        return null;
+      }
+    }
+).when(blockingOp).setTransactionId(Mockito.anyLong());
+    Mockito.doNothing().when(blockingOp).reset();
+    for (int i=0; i < 8; i++) {
+      Future blockingEdit=executor.submit(new Callable(){
+        @Override public Void call() throws Exception {
+          Thread.currentThread().setName("Log blocker");
+          editLog.logEdit(blockingOp);
+          editLog.logSync();
+          return null;
+        }
+      }
+);
+      long startTxId=editLog.getLastWrittenTxIdWithoutLock();
+      final long[] txIds={startTxId,startTxId,startTxId};
+      GenericTestUtils.waitFor(new Supplier<Boolean>(){
+        @Override public Boolean get(){
+          txIds[0]=txIds[1];
+          txIds[1]=txIds[2];
+          txIds[2]=editLog.getLastWrittenTxIdWithoutLock();
+          return (txIds[0] == txIds[1] && txIds[1] == txIds[2] && txIds[2] > startTxId);
+        }
+      }
+,100,10000);
+      CountDownLatch readyLatch=new CountDownLatch(1);
+      Future synchedEdits=executor.submit(new Callable(){
+        @Override public Void call() throws Exception {
+          Thread.currentThread().setName("Log synchronizer");
+          readyLatch.countDown();
+synchronized (editLog) {
+            editLog.logEdit(reuseOp);
+            editLog.logSync();
+          }
+          return null;
+        }
+      }
+);
+      readyLatch.await();
+      blockerSemaphore.release();
+      blockingEdit.get();
+      synchedEdits.get();
+    }
+    done.set(true);
+    for (int i=0; i < logSpammers.length; i++) {
+      logSpammers[i].get();
+    }
+    editLog.logSyncAll();
+  }
+  finally {
+    LOG.info("Closing nn");
+    executor.shutdownNow();
+    if (namesystem != null) {
+      namesystem.getFSImage().getStorage().close();
+      namesystem.close();
+    }
+  }
+}

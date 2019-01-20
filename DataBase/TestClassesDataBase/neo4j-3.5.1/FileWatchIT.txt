@@ -1,0 +1,245 @@
+public class FileWatchIT {
+  private static final long TEST_TIMEOUT=600_000;
+  @Rule public final TestDirectory testDirectory=TestDirectory.testDirectory();
+  private File storeDir;
+  private AssertableLogProvider logProvider;
+  private GraphDatabaseService database;
+  @Before public void setUp(){
+    storeDir=testDirectory.storeDir();
+    logProvider=new AssertableLogProvider();
+    database=new TestGraphDatabaseFactory().setInternalLogProvider(logProvider).newEmbeddedDatabase(storeDir);
+  }
+  @After public void tearDown(){
+    shutdownDatabaseSilently(database);
+  }
+  @Test(timeout=TEST_TIMEOUT) public void notifyAboutStoreFileDeletion() throws Exception {
+    assumeFalse(SystemUtils.IS_OS_WINDOWS);
+    String fileName=testDirectory.databaseLayout().metadataStore().getName();
+    FileWatcher fileWatcher=getFileWatcher(database);
+    CheckPointer checkpointer=getCheckpointer(database);
+    DeletionLatchEventListener deletionListener=new DeletionLatchEventListener(fileName);
+    fileWatcher.addFileWatchEventListener(deletionListener);
+    do {
+      createNode(database);
+      forceCheckpoint(checkpointer);
+    }
+ while (!deletionListener.awaitModificationNotification());
+    deleteFile(testDirectory.storeDir(),fileName);
+    deletionListener.awaitDeletionNotification();
+    logProvider.assertContainsMessageContaining("'" + fileName + "' which belongs to the store was deleted while database was running.");
+  }
+  @Test(timeout=TEST_TIMEOUT) public void notifyWhenFileWatchingFailToStart(){
+    AssertableLogProvider logProvider=new AssertableLogProvider(true);
+    GraphDatabaseService db=null;
+    try {
+      db=new TestGraphDatabaseFactory().setInternalLogProvider(logProvider).setFileSystem(new NonWatchableFileSystemAbstraction()).newEmbeddedDatabase(testDirectory.storeDir("failed-start-db"));
+      logProvider.assertContainsMessageContaining("Can not create file watcher for current file system. " + "File monitoring capabilities for store files will be disabled.");
+    }
+  finally {
+      shutdownDatabaseSilently(db);
+    }
+  }
+  @Test(timeout=TEST_TIMEOUT) public void notifyAboutExplicitIndexFolderRemoval() throws InterruptedException, IOException {
+    String monitoredDirectory=getExplicitIndexDirectory(testDirectory.databaseLayout());
+    FileWatcher fileWatcher=getFileWatcher(database);
+    CheckPointer checkPointer=getCheckpointer(database);
+    DeletionLatchEventListener deletionListener=new DeletionLatchEventListener(monitoredDirectory);
+    String metadataStore=testDirectory.databaseLayout().metadataStore().getName();
+    ModificationEventListener modificationEventListener=new ModificationEventListener(metadataStore);
+    fileWatcher.addFileWatchEventListener(deletionListener);
+    fileWatcher.addFileWatchEventListener(modificationEventListener);
+    do {
+      createNode(database);
+      forceCheckpoint(checkPointer);
+    }
+ while (!modificationEventListener.awaitModificationNotification());
+    deleteStoreDirectory(storeDir,monitoredDirectory);
+    deletionListener.awaitDeletionNotification();
+    logProvider.assertContainsMessageContaining("'" + monitoredDirectory + "' which belongs to the store was deleted while database was running.");
+  }
+  @Test(timeout=TEST_TIMEOUT) public void doNotNotifyAboutLuceneIndexFilesDeletion() throws InterruptedException, IOException {
+    DependencyResolver dependencyResolver=((GraphDatabaseAPI)database).getDependencyResolver();
+    FileWatcher fileWatcher=getFileWatcher(database);
+    CheckPointer checkPointer=dependencyResolver.resolveDependency(CheckPointer.class);
+    String propertyStoreName=testDirectory.databaseLayout().propertyStore().getName();
+    AccumulativeDeletionEventListener accumulativeListener=new AccumulativeDeletionEventListener();
+    ModificationEventListener modificationListener=new ModificationEventListener(propertyStoreName);
+    fileWatcher.addFileWatchEventListener(modificationListener);
+    fileWatcher.addFileWatchEventListener(accumulativeListener);
+    String labelName="labelName";
+    String propertyName="propertyName";
+    Label testLabel=Label.label(labelName);
+    createIndexes(database,propertyName,testLabel);
+    do {
+      createNode(database,propertyName,testLabel);
+      forceCheckpoint(checkPointer);
+    }
+ while (!modificationListener.awaitModificationNotification());
+    fileWatcher.removeFileWatchEventListener(modificationListener);
+    ModificationEventListener afterRemovalListener=new ModificationEventListener(propertyStoreName);
+    fileWatcher.addFileWatchEventListener(afterRemovalListener);
+    dropAllIndexes(database);
+    do {
+      createNode(database,propertyName,testLabel);
+      forceCheckpoint(checkPointer);
+    }
+ while (!afterRemovalListener.awaitModificationNotification());
+    accumulativeListener.assertDoesNotHaveAnyDeletions();
+  }
+  @Test(timeout=TEST_TIMEOUT) public void doNotMonitorTransactionLogFiles() throws InterruptedException, IOException {
+    assumeFalse(SystemUtils.IS_OS_WINDOWS);
+    FileWatcher fileWatcher=getFileWatcher(database);
+    CheckPointer checkpointer=getCheckpointer(database);
+    String metadataStore=testDirectory.databaseLayout().metadataStore().getName();
+    ModificationEventListener modificationEventListener=new ModificationEventListener(metadataStore);
+    fileWatcher.addFileWatchEventListener(modificationEventListener);
+    do {
+      createNode(database);
+      forceCheckpoint(checkpointer);
+    }
+ while (!modificationEventListener.awaitModificationNotification());
+    String fileName=TransactionLogFiles.DEFAULT_NAME + ".0";
+    DeletionLatchEventListener deletionListener=new DeletionLatchEventListener(fileName);
+    fileWatcher.addFileWatchEventListener(deletionListener);
+    deleteFile(testDirectory.storeDir(),fileName);
+    deletionListener.awaitDeletionNotification();
+    AssertableLogProvider.LogMatcher logMatcher=AssertableLogProvider.inLog(DefaultFileDeletionEventListener.class).info(containsString(fileName));
+    logProvider.assertNone(logMatcher);
+  }
+  @Test(timeout=TEST_TIMEOUT) public void notifyWhenWholeStoreDirectoryRemoved() throws IOException, InterruptedException {
+    assumeFalse(SystemUtils.IS_OS_WINDOWS);
+    String fileName=testDirectory.databaseLayout().metadataStore().getName();
+    FileWatcher fileWatcher=getFileWatcher(database);
+    CheckPointer checkpointer=getCheckpointer(database);
+    ModificationEventListener modificationListener=new ModificationEventListener(fileName);
+    fileWatcher.addFileWatchEventListener(modificationListener);
+    do {
+      createNode(database);
+      forceCheckpoint(checkpointer);
+    }
+ while (!modificationListener.awaitModificationNotification());
+    fileWatcher.removeFileWatchEventListener(modificationListener);
+    String storeDirectoryName=testDirectory.databaseLayout().databaseDirectory().getName();
+    DeletionLatchEventListener eventListener=new DeletionLatchEventListener(storeDirectoryName);
+    fileWatcher.addFileWatchEventListener(eventListener);
+    FileUtils.deleteRecursively(testDirectory.databaseLayout().databaseDirectory());
+    eventListener.awaitDeletionNotification();
+    logProvider.assertContainsMessageContaining("'" + storeDirectoryName + "' which belongs to the store was deleted while database was running.");
+  }
+  @Test(timeout=TEST_TIMEOUT) public void shouldLogWhenDisabled(){
+    AssertableLogProvider logProvider=new AssertableLogProvider(true);
+    GraphDatabaseService db=null;
+    try {
+      db=new TestGraphDatabaseFactory().setInternalLogProvider(logProvider).setFileSystem(new NonWatchableFileSystemAbstraction()).newEmbeddedDatabaseBuilder(testDirectory.directory("failed-start-db")).setConfig(GraphDatabaseSettings.filewatcher_enabled,Settings.FALSE).newGraphDatabase();
+      logProvider.assertContainsMessageContaining("File watcher disabled by configuration.");
+    }
+  finally {
+      shutdownDatabaseSilently(db);
+    }
+  }
+  private static void shutdownDatabaseSilently(  GraphDatabaseService databaseService){
+    if (databaseService != null) {
+      try {
+        databaseService.shutdown();
+      }
+ catch (      Exception expected) {
+      }
+    }
+  }
+  private static void dropAllIndexes(  GraphDatabaseService database){
+    try (Transaction transaction=database.beginTx()){
+      for (      IndexDefinition definition : database.schema().getIndexes()) {
+        definition.drop();
+      }
+      transaction.success();
+    }
+   }
+  private static void createIndexes(  GraphDatabaseService database,  String propertyName,  Label testLabel){
+    try (Transaction transaction=database.beginTx()){
+      database.schema().indexFor(testLabel).on(propertyName).create();
+      transaction.success();
+    }
+     try (Transaction ignored=database.beginTx()){
+      database.schema().awaitIndexesOnline(1,TimeUnit.MINUTES);
+    }
+   }
+  private static void forceCheckpoint(  CheckPointer checkPointer) throws IOException {
+    checkPointer.forceCheckPoint(new SimpleTriggerInfo("testForceCheckPoint"));
+  }
+  private static String getExplicitIndexDirectory(  DatabaseLayout databaseLayout){
+    File schemaIndexDirectory=LuceneDataSource.getLuceneIndexStoreDirectory(databaseLayout);
+    Path relativeIndexPath=databaseLayout.databaseDirectory().toPath().relativize(schemaIndexDirectory.toPath());
+    return relativeIndexPath.getName(0).toString();
+  }
+  private static void createNode(  GraphDatabaseService database,  String propertyName,  Label testLabel){
+    try (Transaction transaction=database.beginTx()){
+      Node node=database.createNode(testLabel);
+      node.setProperty(propertyName,"value");
+      transaction.success();
+    }
+   }
+  private static CheckPointer getCheckpointer(  GraphDatabaseService database){
+    return ((GraphDatabaseAPI)database).getDependencyResolver().resolveDependency(CheckPointer.class);
+  }
+  private static FileWatcher getFileWatcher(  GraphDatabaseService database){
+    DependencyResolver dependencyResolver=((GraphDatabaseAPI)database).getDependencyResolver();
+    return dependencyResolver.resolveDependency(FileSystemWatcherService.class).getFileWatcher();
+  }
+  private static void deleteFile(  File storeDir,  String fileName){
+    File metadataStore=new File(storeDir,fileName);
+    FileUtils.deleteFile(metadataStore);
+  }
+  private static void deleteStoreDirectory(  File storeDir,  String directoryName) throws IOException {
+    File directory=new File(storeDir,directoryName);
+    FileUtils.deleteRecursively(directory);
+  }
+  private static void createNode(  GraphDatabaseService database){
+    try (Transaction transaction=database.beginTx()){
+      database.createNode();
+      transaction.success();
+    }
+   }
+private static class NonWatchableFileSystemAbstraction extends DefaultFileSystemAbstraction {
+    @Override public FileWatcher fileWatcher() throws IOException {
+      throw new IOException("You can't watch me!");
+    }
+  }
+private static class AccumulativeDeletionEventListener implements FileWatchEventListener {
+    private final List<String> deletedFiles=new ArrayList<>();
+    @Override public void fileDeleted(    String fileName){
+      deletedFiles.add(fileName);
+    }
+    void assertDoesNotHaveAnyDeletions(){
+      assertThat("Should not have any deletions registered",deletedFiles,Matchers.empty());
+    }
+  }
+private static class ModificationEventListener implements FileWatchEventListener {
+    final String expectedFileName;
+    private final CountDownLatch modificationLatch=new CountDownLatch(1);
+    ModificationEventListener(    String expectedFileName){
+      this.expectedFileName=expectedFileName;
+    }
+    @Override public void fileModified(    String fileName){
+      if (expectedFileName.equals(fileName)) {
+        modificationLatch.countDown();
+      }
+    }
+    boolean awaitModificationNotification() throws InterruptedException {
+      return modificationLatch.await(1,TimeUnit.SECONDS);
+    }
+  }
+private static class DeletionLatchEventListener extends ModificationEventListener {
+    private final CountDownLatch deletionLatch=new CountDownLatch(1);
+    DeletionLatchEventListener(    String expectedFileName){
+      super(expectedFileName);
+    }
+    @Override public void fileDeleted(    String fileName){
+      if (fileName.endsWith(expectedFileName)) {
+        deletionLatch.countDown();
+      }
+    }
+    void awaitDeletionNotification() throws InterruptedException {
+      deletionLatch.await();
+    }
+  }
+}

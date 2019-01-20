@@ -1,0 +1,81 @@
+/** 
+ * <p> Test case verifies the order of applications activated after RM Restart. </p> <li>App-1 and app-2 submitted and scheduled and running with a priority 5 and 6 Respectively</li> <li>App-3 submitted and scheduled with a priority 7. This is not activated since AMResourceLimit is reached</li> <li>RM restarted</li> <li>App-1 get activated nevertheless of AMResourceLimit</li> <li>App-2 and app-3 put in pendingOrderingPolicy</li> <li>After NM registration, app-3 is activated</li> <p> Expected Output : App-2 must get activated since app-2 was running earlier </p>
+ * @throws Exception
+ */
+@Test public void testOrderOfActivatingThePriorityApplicationOnRMRestart() throws Exception {
+  conf.setBoolean(YarnConfiguration.RECOVERY_ENABLED,true);
+  conf.setBoolean(YarnConfiguration.RM_WORK_PRESERVING_RECOVERY_ENABLED,true);
+  conf.set(YarnConfiguration.RM_STORE,MemoryRMStateStore.class.getName());
+  conf.setInt(YarnConfiguration.RM_AM_MAX_ATTEMPTS,YarnConfiguration.DEFAULT_RM_AM_MAX_ATTEMPTS);
+  conf.setInt(YarnConfiguration.MAX_CLUSTER_LEVEL_APPLICATION_PRIORITY,10);
+  MockRM rm1=new MockRM(conf);
+  MemoryRMStateStore memStore=(MemoryRMStateStore)rm1.getRMStateStore();
+  rm1.start();
+  MockNM nm1=new MockNM("127.0.0.1:1234",16384,rm1.getResourceTrackerService());
+  nm1.registerNode();
+  rm1.drainEvents();
+  ResourceScheduler scheduler=rm1.getRMContext().getScheduler();
+  LeafQueue defaultQueue=(LeafQueue)((CapacityScheduler)scheduler).getQueue("default");
+  int memory=(int)(defaultQueue.getAMResourceLimit().getMemorySize() / 2);
+  Priority appPriority1=Priority.newInstance(5);
+  RMApp app1=rm1.submitApp(memory,appPriority1);
+  MockAM am1=MockRM.launchAM(app1,rm1,nm1);
+  am1.registerAppAttempt();
+  Priority appPriority2=Priority.newInstance(6);
+  RMApp app2=rm1.submitApp(memory,appPriority2);
+  MockAM am2=MockRM.launchAM(app2,rm1,nm1);
+  am2.registerAppAttempt();
+  rm1.drainEvents();
+  Assert.assertEquals(2,defaultQueue.getNumActiveApplications());
+  Assert.assertEquals(0,defaultQueue.getNumPendingApplications());
+  Priority appPriority3=Priority.newInstance(7);
+  RMApp app3=rm1.submitApp(memory,appPriority3);
+  rm1.drainEvents();
+  Assert.assertEquals(2,defaultQueue.getNumActiveApplications());
+  Assert.assertEquals(1,defaultQueue.getNumPendingApplications());
+  Iterator<FiCaSchedulerApp> iterator=defaultQueue.getOrderingPolicy().getSchedulableEntities().iterator();
+  FiCaSchedulerApp fcApp2=iterator.next();
+  Assert.assertEquals(app2.getCurrentAppAttempt().getAppAttemptId(),fcApp2.getApplicationAttemptId());
+  FiCaSchedulerApp fcApp1=iterator.next();
+  Assert.assertEquals(app1.getCurrentAppAttempt().getAppAttemptId(),fcApp1.getApplicationAttemptId());
+  iterator=defaultQueue.getPendingApplications().iterator();
+  FiCaSchedulerApp fcApp3=iterator.next();
+  Assert.assertEquals(app3.getCurrentAppAttempt().getAppAttemptId(),fcApp3.getApplicationAttemptId());
+  MockRM rm2=new MockRM(conf,memStore);
+  rm2.start();
+  nm1.setResourceTrackerService(rm2.getResourceTrackerService());
+  Assert.assertEquals(3,rm2.getRMContext().getRMApps().size());
+  rm2.drainEvents();
+  scheduler=rm2.getRMContext().getScheduler();
+  defaultQueue=(LeafQueue)((CapacityScheduler)scheduler).getQueue("default");
+  int count=50;
+  while (count-- > 0) {
+    if (defaultQueue.getNumPendingApplications() == 3) {
+      break;
+    }
+    Thread.sleep(50);
+  }
+  Assert.assertEquals(0,defaultQueue.getNumActiveApplications());
+  Assert.assertEquals(3,defaultQueue.getNumPendingApplications());
+  nm1.registerNode();
+  rm2.drainEvents();
+  count=50;
+  while (count-- > 0) {
+    if (defaultQueue.getNumActiveApplications() == 2) {
+      break;
+    }
+    Thread.sleep(50);
+  }
+  Assert.assertEquals(2,defaultQueue.getNumActiveApplications());
+  Assert.assertEquals(1,defaultQueue.getNumPendingApplications());
+  iterator=defaultQueue.getOrderingPolicy().getSchedulableEntities().iterator();
+  fcApp2=iterator.next();
+  Assert.assertEquals(app2.getCurrentAppAttempt().getAppAttemptId(),fcApp2.getApplicationAttemptId());
+  fcApp1=iterator.next();
+  Assert.assertEquals(app1.getCurrentAppAttempt().getAppAttemptId(),fcApp1.getApplicationAttemptId());
+  iterator=defaultQueue.getPendingApplications().iterator();
+  fcApp3=iterator.next();
+  Assert.assertEquals(app3.getCurrentAppAttempt().getAppAttemptId(),fcApp3.getApplicationAttemptId());
+  rm2.stop();
+  rm1.stop();
+}

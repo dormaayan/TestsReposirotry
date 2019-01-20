@@ -1,0 +1,107 @@
+@Test public void testFileDumpCorruptSideFiles() throws Exception {
+  dropDB(msClient,dbName3);
+  String dbLocation=dbFolder.newFolder(dbName3).getCanonicalPath() + ".db";
+  dbLocation=dbLocation.replaceAll("\\\\","/");
+  String[] colNames="key1,key2,data".split(",");
+  String[] colTypes="string,int,string".split(",");
+  String[] bucketNames="key1,key2".split(",");
+  int bucketCount=4;
+  createDbAndTable(driver,dbName3,tblName3,null,colNames,colTypes,bucketNames,null,dbLocation,bucketCount);
+  HiveEndPoint endPt=new HiveEndPoint(metaStoreURI,dbName3,tblName3,null);
+  StreamingConnection connection=endPt.newConnection(false,"UT_" + Thread.currentThread().getName());
+  DelimitedInputWriter writer=new DelimitedInputWriter(colNames,",",endPt,connection);
+  TransactionBatch txnBatch=connection.fetchTransactionBatch(2,writer);
+  txnBatch.beginNextTransaction();
+  txnBatch.write("name0,1,Hello streaming".getBytes());
+  txnBatch.write("name2,2,Welcome to streaming".getBytes());
+  txnBatch.write("name4,2,more Streaming unlimited".getBytes());
+  txnBatch.write("name5,2,even more Streaming unlimited".getBytes());
+  txnBatch.write("name6,3,aHello streaming".getBytes());
+  txnBatch.commit();
+  Map<String,List<Long>> offsetMap=new HashMap<String,List<Long>>();
+  recordOffsets(conf,dbLocation,offsetMap);
+  txnBatch.beginNextTransaction();
+  txnBatch.write("name01,11,-Hello streaming".getBytes());
+  txnBatch.write("name21,21,-Welcome to streaming".getBytes());
+  txnBatch.write("name41,21,-more Streaming unlimited".getBytes());
+  txnBatch.write("name51,21,-even more Streaming unlimited".getBytes());
+  txnBatch.write("name02,12,--Hello streaming".getBytes());
+  txnBatch.write("name22,22,--Welcome to streaming".getBytes());
+  txnBatch.write("name42,22,--more Streaming unlimited".getBytes());
+  txnBatch.write("name52,22,--even more Streaming unlimited".getBytes());
+  txnBatch.write("name7,4,aWelcome to streaming".getBytes());
+  txnBatch.write("name8,5,amore Streaming unlimited".getBytes());
+  txnBatch.write("name9,6,aeven more Streaming unlimited".getBytes());
+  txnBatch.write("name10,7,bHello streaming".getBytes());
+  txnBatch.write("name11,8,bWelcome to streaming".getBytes());
+  txnBatch.write("name12,9,bmore Streaming unlimited".getBytes());
+  txnBatch.write("name13,10,beven more Streaming unlimited".getBytes());
+  txnBatch.commit();
+  recordOffsets(conf,dbLocation,offsetMap);
+  Path path=new Path(dbLocation);
+  Collection<String> files=FileDump.getAllFilesInPath(path,conf);
+  for (  String file : files) {
+    if (file.contains("bucket_00000")) {
+      corruptSideFile(file,conf,offsetMap,"bucket_00000",-1);
+    }
+ else     if (file.contains("bucket_00001")) {
+      corruptSideFile(file,conf,offsetMap,"bucket_00001",0);
+    }
+ else     if (file.contains("bucket_00002")) {
+      corruptSideFile(file,conf,offsetMap,"bucket_00002",3);
+    }
+ else     if (file.contains("bucket_00003")) {
+      corruptSideFile(file,conf,offsetMap,"bucket_00003",10);
+    }
+  }
+  PrintStream origErr=System.err;
+  ByteArrayOutputStream myErr=new ByteArrayOutputStream();
+  System.setErr(new PrintStream(myErr));
+  FileDump.main(new String[]{dbLocation});
+  System.err.flush();
+  System.setErr(origErr);
+  String errDump=new String(myErr.toByteArray());
+  Assert.assertEquals(true,errDump.contains("bucket_00000_flush_length [length: 11"));
+  Assert.assertEquals(true,errDump.contains("bucket_00001_flush_length [length: 0"));
+  Assert.assertEquals(true,errDump.contains("bucket_00002_flush_length [length: 24"));
+  Assert.assertEquals(true,errDump.contains("bucket_00003_flush_length [length: 80"));
+  Assert.assertEquals(false,errDump.contains("Exception"));
+  Assert.assertEquals(true,errDump.contains("4 file(s) are corrupted"));
+  Assert.assertEquals(false,errDump.contains("is still open for writes."));
+  origErr=System.err;
+  myErr=new ByteArrayOutputStream();
+  System.setErr(new PrintStream(myErr));
+  FileDump.main(new String[]{dbLocation,"--recover","--skip-dump"});
+  System.err.flush();
+  System.setErr(origErr);
+  errDump=new String(myErr.toByteArray());
+  Assert.assertEquals(true,errDump.contains("bucket_00000 recovered successfully!"));
+  Assert.assertEquals(true,errDump.contains("bucket_00001 recovered successfully!"));
+  Assert.assertEquals(true,errDump.contains("bucket_00002 recovered successfully!"));
+  Assert.assertEquals(true,errDump.contains("bucket_00003 recovered successfully!"));
+  List<Long> offsets=offsetMap.get("bucket_00000");
+  Assert.assertEquals(true,errDump.contains("Readable footerOffsets: " + offsets.toString()));
+  offsets=offsetMap.get("bucket_00001");
+  Assert.assertEquals(true,errDump.contains("Readable footerOffsets: " + offsets.toString()));
+  offsets=offsetMap.get("bucket_00002");
+  Assert.assertEquals(true,errDump.contains("Readable footerOffsets: " + offsets.toString()));
+  offsets=offsetMap.get("bucket_00003");
+  Assert.assertEquals(true,errDump.contains("Readable footerOffsets: " + offsets.toString()));
+  Assert.assertEquals(false,errDump.contains("Exception"));
+  Assert.assertEquals(false,errDump.contains("is still open for writes."));
+  origErr=System.err;
+  myErr=new ByteArrayOutputStream();
+  System.setErr(new PrintStream(myErr));
+  FileDump.main(new String[]{dbLocation});
+  System.err.flush();
+  System.setErr(origErr);
+  errDump=new String(myErr.toByteArray());
+  Assert.assertEquals(false,errDump.contains("Exception"));
+  Assert.assertEquals(false,errDump.contains("file(s) are corrupted"));
+  Assert.assertEquals(false,errDump.contains("is still open for writes."));
+  files=FileDump.getAllFilesInPath(path,conf);
+  for (  String file : files) {
+    Assert.assertEquals(false,file.contains("_flush_length"));
+  }
+  txnBatch.close();
+}

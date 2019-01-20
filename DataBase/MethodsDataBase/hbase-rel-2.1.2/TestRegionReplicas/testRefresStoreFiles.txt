@@ -1,0 +1,49 @@
+@Test public void testRefresStoreFiles() throws Exception {
+  final int refreshPeriod=2000;
+  HTU.getConfiguration().setInt("hbase.hstore.compactionThreshold",100);
+  HTU.getConfiguration().setInt(StorefileRefresherChore.REGIONSERVER_STOREFILE_REFRESH_PERIOD,refreshPeriod);
+  restartRegionServer();
+  try {
+    LOG.info("Opening the secondary region " + hriSecondary.getEncodedName());
+    openRegion(HTU,getRS(),hriSecondary);
+    LOG.info("Loading data to primary region");
+    HTU.loadNumericRows(table,f,0,1000);
+    Assert.assertEquals(1000,HTU.countRows(table));
+    LOG.info("Flushing primary region");
+    HRegion region=getRS().getRegionByEncodedName(hriPrimary.getEncodedName());
+    region.flush(true);
+    HRegion primaryRegion=region;
+    LOG.info("Sleeping for " + (4 * refreshPeriod));
+    Threads.sleep(4 * refreshPeriod);
+    LOG.info("Checking results from secondary region replica");
+    Region secondaryRegion=getRS().getRegion(hriSecondary.getEncodedName());
+    Assert.assertEquals(1,secondaryRegion.getStore(f).getStorefilesCount());
+    assertGet(secondaryRegion,42,true);
+    assertGetRpc(hriSecondary,42,true);
+    assertGetRpc(hriSecondary,1042,false);
+    HTU.loadNumericRows(table,f,1000,1100);
+    region=getRS().getRegionByEncodedName(hriPrimary.getEncodedName());
+    region.flush(true);
+    HTU.loadNumericRows(table,f,2000,2100);
+    region=getRS().getRegionByEncodedName(hriPrimary.getEncodedName());
+    region.flush(true);
+    Threads.sleep(4 * refreshPeriod);
+    assertGetRpc(hriSecondary,42,true);
+    assertGetRpc(hriSecondary,1042,true);
+    assertGetRpc(hriSecondary,2042,true);
+    Assert.assertEquals(3,secondaryRegion.getStore(f).getStorefilesCount());
+    HTU.compact(table.getName(),true);
+    long wakeUpTime=System.currentTimeMillis() + 4 * refreshPeriod;
+    while (System.currentTimeMillis() < wakeUpTime) {
+      assertGetRpc(hriSecondary,42,true);
+      assertGetRpc(hriSecondary,1042,true);
+      assertGetRpc(hriSecondary,2042,true);
+      Threads.sleep(10);
+    }
+    Assert.assertEquals(4,secondaryRegion.getStore(f).getStorefilesCount());
+  }
+  finally {
+    HTU.deleteNumericRows(table,HConstants.CATALOG_FAMILY,0,1000);
+    closeRegion(HTU,getRS(),hriSecondary);
+  }
+}

@@ -1,0 +1,107 @@
+@Test public void testDelegationToken() throws IOException, InterruptedException {
+  org.apache.log4j.Logger rootLogger=LogManager.getRootLogger();
+  rootLogger.setLevel(Level.DEBUG);
+  final YarnConfiguration conf=new YarnConfiguration(new JobConf());
+  conf.set(JHAdminConfig.MR_HISTORY_PRINCIPAL,"RandomOrc/localhost@apache.org");
+  conf.set(CommonConfigurationKeysPublic.HADOOP_SECURITY_AUTHENTICATION,"kerberos");
+  UserGroupInformation.setConfiguration(conf);
+  final long initialInterval=10000l;
+  final long maxLifetime=20000l;
+  final long renewInterval=10000l;
+  JobHistoryServer jobHistoryServer=null;
+  MRClientProtocol clientUsingDT=null;
+  long tokenFetchTime;
+  try {
+    jobHistoryServer=new JobHistoryServer(){
+      protected void doSecureLogin(      Configuration conf) throws IOException {
+      }
+      @Override protected JHSDelegationTokenSecretManager createJHSSecretManager(      Configuration conf,      HistoryServerStateStoreService store){
+        return new JHSDelegationTokenSecretManager(initialInterval,maxLifetime,renewInterval,3600000,store);
+      }
+      @Override protected HistoryClientService createHistoryClientService(){
+        return new HistoryClientService(historyContext,this.jhsDTSecretManager){
+          @Override protected void initializeWebApp(          Configuration conf){
+          }
+        }
+;
+      }
+    }
+;
+    jobHistoryServer.init(conf);
+    jobHistoryServer.start();
+    final MRClientProtocol hsService=jobHistoryServer.getClientService().getClientHandler();
+    UserGroupInformation loggedInUser=UserGroupInformation.createRemoteUser("testrenewer@APACHE.ORG");
+    Assert.assertEquals("testrenewer",loggedInUser.getShortUserName());
+    loggedInUser.setAuthenticationMethod(AuthenticationMethod.KERBEROS);
+    Token token=getDelegationToken(loggedInUser,hsService,loggedInUser.getShortUserName());
+    tokenFetchTime=System.currentTimeMillis();
+    LOG.info("Got delegation token at: " + tokenFetchTime);
+    clientUsingDT=getMRClientProtocol(token,jobHistoryServer.getClientService().getBindAddress(),"TheDarkLord",conf);
+    GetJobReportRequest jobReportRequest=Records.newRecord(GetJobReportRequest.class);
+    jobReportRequest.setJobId(MRBuilderUtils.newJobId(123456,1,1));
+    try {
+      clientUsingDT.getJobReport(jobReportRequest);
+    }
+ catch (    IOException e) {
+      Assert.assertEquals("Unknown job job_123456_0001",e.getMessage());
+    }
+    while (System.currentTimeMillis() < tokenFetchTime + initialInterval / 2) {
+      Thread.sleep(500l);
+    }
+    long nextExpTime=renewDelegationToken(loggedInUser,hsService,token);
+    long renewalTime=System.currentTimeMillis();
+    LOG.info("Renewed token at: " + renewalTime + ", NextExpiryTime: "+ nextExpTime);
+    while (System.currentTimeMillis() > tokenFetchTime + initialInterval && System.currentTimeMillis() < nextExpTime) {
+      Thread.sleep(500l);
+    }
+    Thread.sleep(50l);
+    try {
+      clientUsingDT.getJobReport(jobReportRequest);
+    }
+ catch (    IOException e) {
+      Assert.assertEquals("Unknown job job_123456_0001",e.getMessage());
+    }
+    while (System.currentTimeMillis() < renewalTime + renewInterval) {
+      Thread.sleep(500l);
+    }
+    Thread.sleep(50l);
+    LOG.info("At time: " + System.currentTimeMillis() + ", token should be invalid");
+    try {
+      clientUsingDT.getJobReport(jobReportRequest);
+      fail("Should not have succeeded with an expired token");
+    }
+ catch (    IOException e) {
+      assertTrue(e.getCause().getMessage().contains("is expired"));
+    }
+    if (clientUsingDT != null) {
+      clientUsingDT=null;
+    }
+    token=getDelegationToken(loggedInUser,hsService,loggedInUser.getShortUserName());
+    tokenFetchTime=System.currentTimeMillis();
+    LOG.info("Got delegation token at: " + tokenFetchTime);
+    clientUsingDT=getMRClientProtocol(token,jobHistoryServer.getClientService().getBindAddress(),"loginuser2",conf);
+    try {
+      clientUsingDT.getJobReport(jobReportRequest);
+    }
+ catch (    IOException e) {
+      fail("Unexpected exception" + e);
+    }
+    cancelDelegationToken(loggedInUser,hsService,token);
+    Token tokenWithDifferentRenewer=getDelegationToken(loggedInUser,hsService,"yarn");
+    cancelDelegationToken(loggedInUser,hsService,tokenWithDifferentRenewer);
+    if (clientUsingDT != null) {
+      clientUsingDT=null;
+    }
+    clientUsingDT=getMRClientProtocol(token,jobHistoryServer.getClientService().getBindAddress(),"loginuser2",conf);
+    LOG.info("Cancelled delegation token at: " + System.currentTimeMillis());
+    try {
+      clientUsingDT.getJobReport(jobReportRequest);
+      fail("Should not have succeeded with a cancelled delegation token");
+    }
+ catch (    IOException e) {
+    }
+  }
+  finally {
+    jobHistoryServer.stop();
+  }
+}

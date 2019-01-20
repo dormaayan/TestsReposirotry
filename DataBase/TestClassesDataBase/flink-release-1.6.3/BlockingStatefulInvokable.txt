@@ -1,0 +1,50 @@
+public static class BlockingStatefulInvokable extends BlockingInvokable {
+  private static final int NUM_CHECKPOINTS_TO_COMPLETE=5;
+  private static volatile CountDownLatch completedCheckpointsLatch=new CountDownLatch(1);
+  static volatile long[] recoveredStates=new long[0];
+  private int completedCheckpoints=0;
+  public BlockingStatefulInvokable(  Environment environment){
+    super(environment);
+  }
+  @Override public boolean triggerCheckpoint(  CheckpointMetaData checkpointMetaData,  CheckpointOptions checkpointOptions) throws Exception {
+    ByteStreamStateHandle byteStreamStateHandle=new ByteStreamStateHandle(String.valueOf(UUID.randomUUID()),InstantiationUtil.serializeObject(checkpointMetaData.getCheckpointId()));
+    Map<String,OperatorStateHandle.StateMetaInfo> stateNameToPartitionOffsets=new HashMap<>(1);
+    stateNameToPartitionOffsets.put("test-state",new OperatorStateHandle.StateMetaInfo(new long[]{0L},OperatorStateHandle.Mode.SPLIT_DISTRIBUTE));
+    OperatorStateHandle operatorStateHandle=new OperatorStreamStateHandle(stateNameToPartitionOffsets,byteStreamStateHandle);
+    TaskStateSnapshot checkpointStateHandles=new TaskStateSnapshot();
+    checkpointStateHandles.putSubtaskStateByOperatorID(OperatorID.fromJobVertexID(getEnvironment().getJobVertexId()),new OperatorSubtaskState(StateObjectCollection.singleton(operatorStateHandle),StateObjectCollection.empty(),StateObjectCollection.empty(),StateObjectCollection.empty()));
+    getEnvironment().acknowledgeCheckpoint(checkpointMetaData.getCheckpointId(),new CheckpointMetrics(0L,0L,0L,0L),checkpointStateHandles);
+    return true;
+  }
+  @Override public void triggerCheckpointOnBarrier(  CheckpointMetaData checkpointMetaData,  CheckpointOptions checkpointOptions,  CheckpointMetrics checkpointMetrics) throws Exception {
+    throw new UnsupportedOperationException("should not be called!");
+  }
+  @Override public void abortCheckpointOnBarrier(  long checkpointId,  Throwable cause){
+    throw new UnsupportedOperationException("should not be called!");
+  }
+  @Override public void notifyCheckpointComplete(  long checkpointId){
+    if (completedCheckpoints++ > NUM_CHECKPOINTS_TO_COMPLETE) {
+      completedCheckpointsLatch.countDown();
+    }
+  }
+  static void initializeStaticHelpers(  int numSubtasks){
+    completedCheckpointsLatch=new CountDownLatch(numSubtasks);
+    recoveredStates=new long[numSubtasks];
+  }
+  static void awaitCompletedCheckpoints() throws InterruptedException {
+    completedCheckpointsLatch.await();
+  }
+  static long[] getRecoveredStates(){
+    return recoveredStates;
+  }
+  private static OperatorStateHandle extractSingletonOperatorState(  TaskStateSnapshot taskStateHandles){
+    Set<Map.Entry<OperatorID,OperatorSubtaskState>> subtaskStateMappings=taskStateHandles.getSubtaskStateMappings();
+    Preconditions.checkNotNull(subtaskStateMappings);
+    Preconditions.checkState(subtaskStateMappings.size() == 1);
+    OperatorSubtaskState subtaskState=subtaskStateMappings.iterator().next().getValue();
+    Collection<OperatorStateHandle> managedOperatorState=Preconditions.checkNotNull(subtaskState).getManagedOperatorState();
+    Preconditions.checkNotNull(managedOperatorState);
+    Preconditions.checkState(managedOperatorState.size() == 1);
+    return managedOperatorState.iterator().next();
+  }
+}

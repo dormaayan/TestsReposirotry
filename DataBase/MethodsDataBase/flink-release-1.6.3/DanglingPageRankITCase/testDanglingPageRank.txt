@@ -1,0 +1,82 @@
+@Test public void testDanglingPageRank(){
+  try {
+    final int numIterations=25;
+    final ExecutionEnvironment env=ExecutionEnvironment.getExecutionEnvironment();
+    DataSet<Tuple2<Long,Boolean>> vertices=env.fromElements(new Tuple2<>(1L,false),new Tuple2<>(2L,false),new Tuple2<>(5L,false),new Tuple2<>(3L,true),new Tuple2<>(4L,false));
+    DataSet<PageWithLinks> edges=env.fromElements(new PageWithLinks(2L,new long[]{1}),new PageWithLinks(5L,new long[]{2,4}),new PageWithLinks(4L,new long[]{3,2}),new PageWithLinks(1L,new long[]{4,2,3}));
+    final long numVertices=vertices.count();
+    final long numDanglingVertices=vertices.filter(new FilterFunction<Tuple2<Long,Boolean>>(){
+      @Override public boolean filter(      Tuple2<Long,Boolean> value){
+        return value.f1;
+      }
+    }
+).count();
+    DataSet<PageWithRankAndDangling> verticesWithInitialRank=vertices.map(new MapFunction<Tuple2<Long,Boolean>,PageWithRankAndDangling>(){
+      @Override public PageWithRankAndDangling map(      Tuple2<Long,Boolean> value){
+        return new PageWithRankAndDangling(value.f0,1.0 / numVertices,value.f1);
+      }
+    }
+);
+    IterativeDataSet<PageWithRankAndDangling> iteration=verticesWithInitialRank.iterate(numIterations);
+    iteration.getAggregators().registerAggregationConvergenceCriterion(AGGREGATOR_NAME,new PageRankStatsAggregator(),new DiffL1NormConvergenceCriterion());
+    DataSet<PageWithRank> partialRanks=iteration.join(edges).where("pageId").equalTo("pageId").with(new FlatJoinFunction<PageWithRankAndDangling,PageWithLinks,PageWithRank>(){
+      @Override public void join(      PageWithRankAndDangling page,      PageWithLinks links,      Collector<PageWithRank> out){
+        double rankToDistribute=page.rank / (double)links.targets.length;
+        PageWithRank output=new PageWithRank(0L,rankToDistribute);
+        for (        long target : links.targets) {
+          output.pageId=target;
+          out.collect(output);
+        }
+      }
+    }
+);
+    DataSet<PageWithRankAndDangling> newRanks=iteration.coGroup(partialRanks).where("pageId").equalTo("pageId").with(new RichCoGroupFunction<PageWithRankAndDangling,PageWithRank,PageWithRankAndDangling>(){
+      private static final double BETA=0.85;
+      private final double randomJump=(1.0 - BETA) / numVertices;
+      private PageRankStatsAggregator aggregator;
+      private double danglingRankFactor;
+      @Override public void open(      Configuration parameters) throws Exception {
+        int currentIteration=getIterationRuntimeContext().getSuperstepNumber();
+        aggregator=getIterationRuntimeContext().getIterationAggregator(AGGREGATOR_NAME);
+        if (currentIteration == 1) {
+          danglingRankFactor=BETA * (double)numDanglingVertices / ((double)numVertices * (double)numVertices);
+        }
+ else {
+          PageRankStats previousAggregate=getIterationRuntimeContext().getPreviousIterationAggregate(AGGREGATOR_NAME);
+          danglingRankFactor=BETA * previousAggregate.danglingRank() / (double)numVertices;
+        }
+      }
+      @Override public void coGroup(      Iterable<PageWithRankAndDangling> currentPages,      Iterable<PageWithRank> partialRanks,      Collector<PageWithRankAndDangling> out){
+        long edges=0;
+        double summedRank=0;
+        for (        PageWithRank partial : partialRanks) {
+          summedRank+=partial.rank;
+          edges++;
+        }
+        double rank=BETA * summedRank + randomJump + danglingRankFactor;
+        PageWithRankAndDangling currentPage=currentPages.iterator().next();
+        double currentRank=currentPage.rank;
+        boolean isDangling=currentPage.dangling;
+        double danglingRankToAggregate=isDangling ? rank : 0;
+        long danglingVerticesToAggregate=isDangling ? 1 : 0;
+        double diff=Math.abs(currentRank - rank);
+        aggregator.aggregate(diff,rank,danglingRankToAggregate,danglingVerticesToAggregate,1,edges);
+        currentPage.rank=rank;
+        out.collect(currentPage);
+      }
+    }
+);
+    List<PageWithRankAndDangling> result=iteration.closeWith(newRanks).collect();
+    double totalRank=0.0;
+    for (    PageWithRankAndDangling r : result) {
+      totalRank+=r.rank;
+      assertTrue(r.pageId >= 1 && r.pageId <= 5);
+      assertTrue(r.pageId != 3 || r.dangling);
+    }
+    assertEquals(1.0,totalRank,0.001);
+  }
+ catch (  Exception e) {
+    e.printStackTrace();
+    fail(e.getMessage());
+  }
+}

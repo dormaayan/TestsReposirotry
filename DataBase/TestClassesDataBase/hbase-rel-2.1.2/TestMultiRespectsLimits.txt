@@ -1,0 +1,87 @@
+/** 
+ * This test sets the multi size WAAAAAY low and then checks to make sure that gets will still make progress.
+ */
+@Category({MediumTests.class,ClientTests.class}) public class TestMultiRespectsLimits {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestMultiRespectsLimits.class);
+  private final static HBaseTestingUtility TEST_UTIL=new HBaseTestingUtility();
+  private static final MetricsAssertHelper METRICS_ASSERT=CompatibilityFactory.getInstance(MetricsAssertHelper.class);
+  private final static byte[] FAMILY=Bytes.toBytes("D");
+  public static final int MAX_SIZE=500;
+  @Rule public TestName name=new TestName();
+  @BeforeClass public static void setUpBeforeClass() throws Exception {
+    TEST_UTIL.getConfiguration().setLong(HConstants.HBASE_SERVER_SCANNER_MAX_RESULT_SIZE_KEY,MAX_SIZE);
+    TEST_UTIL.startMiniCluster(1);
+  }
+  @AfterClass public static void tearDownAfterClass() throws Exception {
+    TEST_UTIL.shutdownMiniCluster();
+  }
+  @Test public void testMultiLimits() throws Exception {
+    final TableName tableName=TableName.valueOf(name.getMethodName());
+    Table t=TEST_UTIL.createTable(tableName,FAMILY);
+    TEST_UTIL.loadTable(t,FAMILY,false);
+    try (final Admin admin=TEST_UTIL.getAdmin()){
+      admin.split(tableName);
+      TEST_UTIL.waitFor(60000,new Waiter.Predicate<Exception>(){
+        @Override public boolean evaluate() throws Exception {
+          return admin.getTableRegions(tableName).size() > 1;
+        }
+      }
+);
+    }
+     List<Get> gets=new ArrayList<>(MAX_SIZE);
+    for (int i=0; i < MAX_SIZE; i++) {
+      gets.add(new Get(HBaseTestingUtility.ROWS[i]));
+    }
+    RpcServerInterface rpcServer=TEST_UTIL.getHBaseCluster().getRegionServer(0).getRpcServer();
+    BaseSource s=rpcServer.getMetrics().getMetricsSource();
+    long startingExceptions=METRICS_ASSERT.getCounter("exceptions",s);
+    long startingMultiExceptions=METRICS_ASSERT.getCounter("exceptions.multiResponseTooLarge",s);
+    Result[] results=t.get(gets);
+    assertEquals(MAX_SIZE,results.length);
+    METRICS_ASSERT.assertCounterGt("exceptions",startingExceptions + ((MAX_SIZE * 25) / MAX_SIZE),s);
+    METRICS_ASSERT.assertCounterGt("exceptions.multiResponseTooLarge",startingMultiExceptions + ((MAX_SIZE * 25) / MAX_SIZE),s);
+  }
+  @Test public void testBlockMultiLimits() throws Exception {
+    final TableName tableName=TableName.valueOf(name.getMethodName());
+    HTableDescriptor desc=new HTableDescriptor(tableName);
+    HColumnDescriptor hcd=new HColumnDescriptor(FAMILY);
+    hcd.setDataBlockEncoding(DataBlockEncoding.FAST_DIFF);
+    desc.addFamily(hcd);
+    TEST_UTIL.getAdmin().createTable(desc);
+    Table t=TEST_UTIL.getConnection().getTable(tableName);
+    final HRegionServer regionServer=TEST_UTIL.getHBaseCluster().getRegionServer(0);
+    RpcServerInterface rpcServer=regionServer.getRpcServer();
+    BaseSource s=rpcServer.getMetrics().getMetricsSource();
+    long startingExceptions=METRICS_ASSERT.getCounter("exceptions",s);
+    long startingMultiExceptions=METRICS_ASSERT.getCounter("exceptions.multiResponseTooLarge",s);
+    byte[] row=Bytes.toBytes("TEST");
+    byte[][] cols=new byte[][]{Bytes.toBytes("0"),Bytes.toBytes("1"),Bytes.toBytes("2"),Bytes.toBytes("3"),Bytes.toBytes("4"),Bytes.toBytes("5")};
+    byte[] value=new byte[MAX_SIZE - 100];
+    ThreadLocalRandom.current().nextBytes(value);
+    for (    byte[] col : cols) {
+      Put p=new Put(row);
+      p.add(CellBuilderFactory.create(CellBuilderType.SHALLOW_COPY).setRow(row).setFamily(FAMILY).setQualifier(col).setTimestamp(p.getTimestamp()).setType(Cell.Type.Put).setValue(value).build());
+      t.put(p);
+    }
+    try (final Admin admin=TEST_UTIL.getAdmin()){
+      admin.flush(tableName);
+      TEST_UTIL.waitFor(60000,new Waiter.Predicate<Exception>(){
+        @Override public boolean evaluate() throws Exception {
+          return regionServer.getRegions(tableName).get(0).getMaxFlushedSeqId() > 3;
+        }
+      }
+);
+    }
+     List<Get> gets=new ArrayList<>(2);
+    Get g0=new Get(row);
+    g0.addColumn(FAMILY,cols[0]);
+    gets.add(g0);
+    Get g2=new Get(row);
+    g2.addColumn(FAMILY,cols[3]);
+    gets.add(g2);
+    Result[] results=t.get(gets);
+    assertEquals(2,results.length);
+    METRICS_ASSERT.assertCounterGt("exceptions",startingExceptions,s);
+    METRICS_ASSERT.assertCounterGt("exceptions.multiResponseTooLarge",startingMultiExceptions,s);
+  }
+}

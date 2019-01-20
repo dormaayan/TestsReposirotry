@@ -1,0 +1,29 @@
+/** 
+ * Tests that a cancellation concurrent to a local failover leads to a properly cancelled state.
+ */
+@Test public void testCancelWhileInLocalFailover() throws Exception {
+  final JobID jid=new JobID();
+  final int parallelism=2;
+  final ManuallyTriggeredDirectExecutor executor=new ManuallyTriggeredDirectExecutor();
+  final SimpleSlotProvider slotProvider=new SimpleSlotProvider(jid,parallelism);
+  final ExecutionGraph graph=createSampleGraph(jid,new FailoverPipelinedRegionWithCustomExecutor(executor),new FixedDelayRestartStrategy(Integer.MAX_VALUE,0),slotProvider,2);
+  final ExecutionJobVertex ejv=graph.getVerticesTopologically().iterator().next();
+  final ExecutionVertex vertex1=ejv.getTaskVertices()[0];
+  final ExecutionVertex vertex2=ejv.getTaskVertices()[1];
+  graph.scheduleForExecution();
+  assertEquals(JobStatus.RUNNING,graph.getState());
+  vertex1.getCurrentExecutionAttempt().fail(new Exception("test failure"));
+  assertEquals(ExecutionState.FAILED,vertex1.getCurrentExecutionAttempt().getState());
+  assertEquals(JobStatus.RUNNING,graph.getState());
+  assertEquals(1,executor.numQueuedRunnables());
+  graph.cancel();
+  assertEquals(JobStatus.CANCELLING,graph.getState());
+  assertEquals(ExecutionState.FAILED,vertex1.getCurrentExecutionAttempt().getState());
+  assertEquals(ExecutionState.CANCELING,vertex2.getCurrentExecutionAttempt().getState());
+  executor.trigger();
+  vertex2.getCurrentExecutionAttempt().cancelingComplete();
+  assertEquals(JobStatus.CANCELED,graph.getTerminationFuture().get());
+  assertTrue(vertex1.getCurrentExecutionAttempt().getState().isTerminal());
+  assertTrue(vertex2.getCurrentExecutionAttempt().getState().isTerminal());
+  assertEquals(parallelism,slotProvider.getNumberOfAvailableSlots());
+}

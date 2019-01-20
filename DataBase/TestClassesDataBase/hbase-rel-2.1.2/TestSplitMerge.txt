@@ -1,0 +1,48 @@
+@Category({MiscTests.class,MediumTests.class}) public class TestSplitMerge {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestSplitMerge.class);
+  private static final HBaseTestingUtility UTIL=new HBaseTestingUtility();
+  @BeforeClass public static void setUp() throws Exception {
+    UTIL.getConfiguration().setInt(HConstants.HBASE_CLIENT_META_OPERATION_TIMEOUT,1000);
+    UTIL.getConfiguration().setInt(HConstants.HBASE_CLIENT_RETRIES_NUMBER,2);
+    UTIL.startMiniCluster(1);
+  }
+  @AfterClass public static void tearDown() throws Exception {
+    UTIL.shutdownMiniCluster();
+  }
+  @Test public void test() throws Exception {
+    TableName tableName=TableName.valueOf("SplitMerge");
+    byte[] family=Bytes.toBytes("CF");
+    TableDescriptor td=TableDescriptorBuilder.newBuilder(tableName).setColumnFamily(ColumnFamilyDescriptorBuilder.of(family)).build();
+    UTIL.getAdmin().createTable(td,new byte[][]{Bytes.toBytes(1)});
+    UTIL.waitTableAvailable(tableName);
+    UTIL.getAdmin().split(tableName,Bytes.toBytes(2));
+    UTIL.waitFor(30000,new ExplainingPredicate<Exception>(){
+      @Override public boolean evaluate() throws Exception {
+        return UTIL.getMiniHBaseCluster().getRegions(tableName).size() == 3;
+      }
+      @Override public String explainFailure() throws Exception {
+        return "Split has not finished yet";
+      }
+    }
+);
+    RegionInfo regionA=null;
+    RegionInfo regionB=null;
+    for (    RegionInfo region : UTIL.getAdmin().getRegions(tableName)) {
+      if (region.getStartKey().length == 0) {
+        regionA=region;
+      }
+ else       if (Bytes.equals(region.getStartKey(),Bytes.toBytes(1))) {
+        regionB=region;
+      }
+    }
+    assertNotNull(regionA);
+    assertNotNull(regionB);
+    UTIL.getAdmin().mergeRegionsAsync(regionA.getRegionName(),regionB.getRegionName(),false).get(30,TimeUnit.SECONDS);
+    assertEquals(2,UTIL.getAdmin().getRegions(tableName).size());
+    ServerName expected=UTIL.getMiniHBaseCluster().getRegionServer(0).getServerName();
+    assertEquals(expected,UTIL.getConnection().getRegionLocator(tableName).getRegionLocation(Bytes.toBytes(1),true).getServerName());
+    try (AsyncConnection asyncConn=ConnectionFactory.createAsyncConnection(UTIL.getConfiguration()).get()){
+      assertEquals(expected,asyncConn.getRegionLocator(tableName).getRegionLocation(Bytes.toBytes(1),true).get().getServerName());
+    }
+   }
+}

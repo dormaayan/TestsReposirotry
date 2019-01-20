@@ -1,0 +1,42 @@
+@Test public void testGetShardListRetry() throws Exception {
+  Properties kinesisConsumerConfig=new Properties();
+  kinesisConsumerConfig.setProperty(ConsumerConfigConstants.AWS_REGION,"us-east-1");
+  Shard shard=new Shard();
+  shard.setShardId("fake-shard-000000000000");
+  final ListShardsResult expectedResult=new ListShardsResult();
+  expectedResult.withShards(shard);
+  MutableInt exceptionCount=new MutableInt();
+  final Throwable[] retriableExceptions=new Throwable[]{new AmazonKinesisException("attempt1"),new AmazonKinesisException("attempt2")};
+  AmazonKinesisClient mockClient=mock(AmazonKinesisClient.class);
+  Mockito.when(mockClient.listShards(any())).thenAnswer(new Answer<ListShardsResult>(){
+    @Override public ListShardsResult answer(    InvocationOnMock invocation) throws Throwable {
+      if (exceptionCount.intValue() < retriableExceptions.length) {
+        exceptionCount.increment();
+        throw retriableExceptions[exceptionCount.intValue() - 1];
+      }
+      return expectedResult;
+    }
+  }
+);
+  KinesisProxy kinesisProxy=new KinesisProxy(kinesisConsumerConfig);
+  Whitebox.getField(KinesisProxy.class,"kinesisClient").set(kinesisProxy,mockClient);
+  HashMap<String,String> streamNames=new HashMap();
+  streamNames.put("fake-stream",null);
+  GetShardListResult result=kinesisProxy.getShardList(streamNames);
+  assertEquals(retriableExceptions.length,exceptionCount.intValue());
+  assertEquals(true,result.hasRetrievedShards());
+  assertEquals(shard.getShardId(),result.getLastSeenShardOfStream("fake-stream").getShard().getShardId());
+  int maxRetries=1;
+  exceptionCount.setValue(0);
+  kinesisConsumerConfig.setProperty(ConsumerConfigConstants.LIST_SHARDS_RETRIES,String.valueOf(maxRetries));
+  kinesisProxy=new KinesisProxy(kinesisConsumerConfig);
+  Whitebox.getField(KinesisProxy.class,"kinesisClient").set(kinesisProxy,mockClient);
+  try {
+    kinesisProxy.getShardList(streamNames);
+    Assert.fail("exception expected");
+  }
+ catch (  SdkClientException ex) {
+    assertEquals(retriableExceptions[maxRetries],ex);
+  }
+  assertEquals(maxRetries + 1,exceptionCount.intValue());
+}

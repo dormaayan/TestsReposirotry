@@ -1,0 +1,90 @@
+/** 
+ * This thread will keep writing to a 'wal' file even after the split process has started. It simulates a region server that was considered dead but woke up and wrote some more to the last log entry. Does its writing as an alternate user in another filesystem instance to simulate better it being a regionserver.
+ */
+class ZombieLastLogWriterRegionServer extends Thread {
+  final AtomicLong editsCount;
+  final AtomicBoolean stop;
+  final int numOfWriters;
+  /** 
+ * Region to write edits for.
+ */
+  final String region;
+  final User user;
+  public ZombieLastLogWriterRegionServer(  AtomicLong counter,  AtomicBoolean stop,  final String region,  final int writers) throws IOException, InterruptedException {
+    super("ZombieLastLogWriterRegionServer");
+    setDaemon(true);
+    this.stop=stop;
+    this.editsCount=counter;
+    this.region=region;
+    this.user=User.createUserForTesting(conf,ZOMBIE,GROUP);
+    numOfWriters=writers;
+  }
+  @Override public void run(){
+    try {
+      doWriting();
+    }
+ catch (    IOException e) {
+      LOG.warn(getName() + " Writer exiting " + e);
+    }
+catch (    InterruptedException e) {
+      LOG.warn(getName() + " Writer exiting " + e);
+    }
+  }
+  private void doWriting() throws IOException, InterruptedException {
+    this.user.runAs(new PrivilegedExceptionAction<Object>(){
+      @Override public Object run() throws Exception {
+        int walToKeepOpen=numOfWriters - 1;
+        Writer writer=null;
+        try {
+          writer=generateWALs(numOfWriters,ENTRIES,walToKeepOpen);
+        }
+ catch (        IOException e1) {
+          throw new RuntimeException("Failed",e1);
+        }
+        editsCount.addAndGet(numOfWriters * ENTRIES);
+        loop(writer);
+        try {
+          writer.close();
+          fail("Writing closing after parsing should give an error.");
+        }
+ catch (        IOException exception) {
+          LOG.debug("ignoring error when closing final writer.",exception);
+        }
+        return null;
+      }
+    }
+);
+  }
+  private void loop(  final Writer writer){
+    byte[] regionBytes=Bytes.toBytes(this.region);
+    while (!stop.get()) {
+      try {
+        long seq=appendEntry(writer,TABLE_NAME,regionBytes,Bytes.toBytes("r" + editsCount.get()),regionBytes,QUALIFIER,VALUE,0);
+        long count=editsCount.incrementAndGet();
+        LOG.info(getName() + " sync count=" + count+ ", seq="+ seq);
+        try {
+          Thread.sleep(1);
+        }
+ catch (        InterruptedException e) {
+        }
+      }
+ catch (      IOException ex) {
+        LOG.error(getName() + " ex " + ex.toString());
+        if (ex instanceof RemoteException) {
+          LOG.error("Juliet: got RemoteException " + ex.getMessage() + " while writing "+ (editsCount.get() + 1));
+        }
+ else {
+          LOG.error(getName() + " failed to write....at " + editsCount.get());
+          fail("Failed to write " + editsCount.get());
+        }
+        break;
+      }
+catch (      Throwable t) {
+        LOG.error(getName() + " HOW? " + t);
+        LOG.debug("exception details",t);
+        break;
+      }
+    }
+    LOG.info(getName() + " Writer exiting");
+  }
+}

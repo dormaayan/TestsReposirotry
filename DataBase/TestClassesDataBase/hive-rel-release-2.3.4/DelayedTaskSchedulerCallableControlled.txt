@@ -1,0 +1,91 @@
+class DelayedTaskSchedulerCallableControlled extends DelayedTaskSchedulerCallable {
+  private final ReentrantLock lock=new ReentrantLock();
+  private final Condition triggerRunCondition=lock.newCondition();
+  private boolean shouldRun=false;
+  private final Condition runCompleteCondition=lock.newCondition();
+  private boolean runComplete=false;
+  static final int STATE_NOT_RUN=0;
+  static final int STATE_NULL_FOUND=1;
+  static final int STATE_TIMEOUT_NOT_EXPIRED=2;
+  static final int STATE_RETURNED_TASK=3;
+  volatile int lastState=STATE_NOT_RUN;
+  volatile boolean lastShouldScheduleTaskResult=false;
+  volatile boolean shouldScheduleTaskTriggered=false;
+  @Override public void processEvictedTask(  TaskInfo taskInfo){
+    super.processEvictedTask(taskInfo);
+    signalRunComplete();
+  }
+  @Override public TaskInfo getNextTask() throws InterruptedException {
+    while (true) {
+      lock.lock();
+      try {
+        while (!shouldRun) {
+          triggerRunCondition.await();
+        }
+        shouldRun=false;
+      }
+  finally {
+        lock.unlock();
+      }
+      TaskInfo taskInfo=delayedTaskQueue.peek();
+      if (taskInfo == null) {
+        LOG.info("Triggered getTask but the queue is empty");
+        lastState=STATE_NULL_FOUND;
+        signalRunComplete();
+        continue;
+      }
+      if (taskInfo.shouldDelayForLocality(LlapTaskSchedulerServiceForTestControlled.this.clock.getTime())) {
+        LOG.info("Triggered getTask but the first element is not ready to execute");
+        lastState=STATE_TIMEOUT_NOT_EXPIRED;
+        signalRunComplete();
+        continue;
+      }
+ else {
+        delayedTaskQueue.poll();
+        lastState=STATE_RETURNED_TASK;
+        return taskInfo;
+      }
+    }
+  }
+  @Override public boolean shouldScheduleTask(  TaskInfo taskInfo){
+    shouldScheduleTaskTriggered=true;
+    lastShouldScheduleTaskResult=super.shouldScheduleTask(taskInfo);
+    return lastShouldScheduleTaskResult;
+  }
+  void resetShouldScheduleInformation(){
+    shouldScheduleTaskTriggered=false;
+    lastShouldScheduleTaskResult=false;
+  }
+  private void signalRunComplete(){
+    lock.lock();
+    try {
+      runComplete=true;
+      runCompleteCondition.signal();
+    }
+  finally {
+      lock.unlock();
+    }
+  }
+  void triggerGetNextTask(){
+    lock.lock();
+    try {
+      shouldRun=true;
+      triggerRunCondition.signal();
+    }
+  finally {
+      lock.unlock();
+    }
+  }
+  void awaitGetNextTaskProcessing() throws InterruptedException {
+    lock.lock();
+    try {
+      while (!runComplete) {
+        runCompleteCondition.await();
+      }
+      runComplete=false;
+    }
+  finally {
+      lock.unlock();
+    }
+  }
+}

@@ -1,0 +1,286 @@
+/** 
+ * Test class to exercise the inclusion of snapshots in space quotas
+ */
+@Category({LargeTests.class}) public class TestSpaceQuotasWithSnapshots {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestSpaceQuotasWithSnapshots.class);
+  private static final Logger LOG=LoggerFactory.getLogger(TestSpaceQuotasWithSnapshots.class);
+  private static final HBaseTestingUtility TEST_UTIL=new HBaseTestingUtility();
+  private static final AtomicLong COUNTER=new AtomicLong(0);
+  private static final long FUDGE_FOR_TABLE_SIZE=500L * SpaceQuotaHelperForTests.ONE_KILOBYTE;
+  @Rule public TestName testName=new TestName();
+  private SpaceQuotaHelperForTests helper;
+  private Connection conn;
+  private Admin admin;
+  @BeforeClass public static void setUp() throws Exception {
+    Configuration conf=TEST_UTIL.getConfiguration();
+    SpaceQuotaHelperForTests.updateConfigForQuotas(conf);
+    TEST_UTIL.startMiniCluster(1);
+  }
+  @AfterClass public static void tearDown() throws Exception {
+    TEST_UTIL.shutdownMiniCluster();
+  }
+  @Before public void removeAllQuotas() throws Exception {
+    helper=new SpaceQuotaHelperForTests(TEST_UTIL,testName,COUNTER);
+    conn=TEST_UTIL.getConnection();
+    admin=TEST_UTIL.getAdmin();
+  }
+  @Test public void testTablesInheritSnapshotSize() throws Exception {
+    TableName tn=helper.createTableWithRegions(1);
+    LOG.info("Writing data");
+    QuotaSettings settings=QuotaSettingsFactory.limitTableSpace(tn,SpaceQuotaHelperForTests.ONE_GIGABYTE,SpaceViolationPolicy.NO_INSERTS);
+    admin.setQuota(settings);
+    final long initialSize=2L * SpaceQuotaHelperForTests.ONE_MEGABYTE;
+    helper.writeData(tn,initialSize);
+    LOG.info("Waiting until table size reflects written data");
+    TEST_UTIL.waitFor(30 * 1000,500,new SpaceQuotaSnapshotPredicate(conn,tn){
+      @Override boolean evaluate(      SpaceQuotaSnapshot snapshot) throws Exception {
+        return snapshot.getUsage() >= initialSize;
+      }
+    }
+);
+    waitForStableQuotaSize(conn,tn,null);
+    final long actualInitialSize=QuotaTableUtil.getCurrentSnapshot(conn,tn).getUsage();
+    LOG.info("Initial table size was " + actualInitialSize);
+    LOG.info("Snapshot the table");
+    final String snapshot1=tn.toString() + "_snapshot1";
+    admin.snapshot(snapshot1,tn);
+    LOG.info("Write more data");
+    helper.writeData(tn,initialSize);
+    LOG.info("Flush the table");
+    admin.flush(tn);
+    LOG.info("Synchronously compacting the table");
+    TEST_UTIL.compact(tn,true);
+    final long upperBound=initialSize + FUDGE_FOR_TABLE_SIZE;
+    final long lowerBound=initialSize - FUDGE_FOR_TABLE_SIZE;
+    LOG.info("Waiting for the region reports to reflect the correct size, between (" + lowerBound + ", "+ upperBound+ ")");
+    TEST_UTIL.waitFor(30 * 1000,500,new Predicate<Exception>(){
+      @Override public boolean evaluate() throws Exception {
+        long size=getRegionSizeReportForTable(conn,tn);
+        return size < upperBound && size > lowerBound;
+      }
+    }
+);
+    waitForStableRegionSizeReport(conn,tn);
+    final long finalSize=getRegionSizeReportForTable(conn,tn);
+    assertNotNull("Did not expect to see a null size",finalSize);
+    LOG.info("Last seen size: " + finalSize);
+    TEST_UTIL.waitFor(20 * 1000,500,new SpaceQuotaSnapshotPredicate(conn,tn){
+      @Override public boolean evaluate(      SpaceQuotaSnapshot snapshot) throws Exception {
+        return snapshot.getUsage() >= finalSize;
+      }
+    }
+);
+    long expectedFinalSize=actualInitialSize + finalSize;
+    LOG.info("Expecting table usage to be " + actualInitialSize + " + "+ finalSize+ " = "+ expectedFinalSize);
+    TEST_UTIL.waitFor(30 * 1000,1000,new SpaceQuotaSnapshotPredicate(conn,tn){
+      @Override boolean evaluate(      SpaceQuotaSnapshot snapshot) throws Exception {
+        LOG.debug("Checking for " + expectedFinalSize + " == "+ snapshot.getUsage());
+        return expectedFinalSize == snapshot.getUsage();
+      }
+    }
+);
+    Map<String,Long> snapshotSizes=QuotaTableUtil.getObservedSnapshotSizes(conn);
+    Long size=snapshotSizes.get(snapshot1);
+    assertNotNull("Did not observe the size of the snapshot",size);
+    assertEquals("The recorded size of the HBase snapshot was not the size we expected",actualInitialSize,size.longValue());
+  }
+  @Test public void testNamespacesInheritSnapshotSize() throws Exception {
+    String ns=helper.createNamespace().getName();
+    TableName tn=helper.createTableWithRegions(ns,1);
+    LOG.info("Writing data");
+    QuotaSettings settings=QuotaSettingsFactory.limitNamespaceSpace(ns,SpaceQuotaHelperForTests.ONE_GIGABYTE,SpaceViolationPolicy.NO_INSERTS);
+    admin.setQuota(settings);
+    final long initialSize=2L * SpaceQuotaHelperForTests.ONE_MEGABYTE;
+    helper.writeData(tn,initialSize);
+    admin.flush(tn);
+    LOG.info("Waiting until namespace size reflects written data");
+    TEST_UTIL.waitFor(30 * 1000,500,new SpaceQuotaSnapshotPredicate(conn,ns){
+      @Override boolean evaluate(      SpaceQuotaSnapshot snapshot) throws Exception {
+        return snapshot.getUsage() >= initialSize;
+      }
+    }
+);
+    waitForStableQuotaSize(conn,null,ns);
+    final long actualInitialSize=QuotaTableUtil.getCurrentSnapshot(conn,ns).getUsage();
+    LOG.info("Initial table size was " + actualInitialSize);
+    LOG.info("Snapshot the table");
+    final String snapshot1=tn.getQualifierAsString() + "_snapshot1";
+    admin.snapshot(snapshot1,tn);
+    LOG.info("Write more data");
+    helper.writeData(tn,initialSize);
+    LOG.info("Flush the table");
+    admin.flush(tn);
+    LOG.info("Synchronously compacting the table");
+    TEST_UTIL.compact(tn,true);
+    final long upperBound=initialSize + FUDGE_FOR_TABLE_SIZE;
+    final long lowerBound=initialSize - FUDGE_FOR_TABLE_SIZE;
+    LOG.info("Waiting for the region reports to reflect the correct size, between (" + lowerBound + ", "+ upperBound+ ")");
+    TEST_UTIL.waitFor(30 * 1000,500,new Predicate<Exception>(){
+      @Override public boolean evaluate() throws Exception {
+        Map<TableName,Long> sizes=QuotaTableUtil.getMasterReportedTableSizes(conn);
+        LOG.debug("Master observed table sizes from region size reports: " + sizes);
+        Long size=sizes.get(tn);
+        if (null == size) {
+          return false;
+        }
+        return size < upperBound && size > lowerBound;
+      }
+    }
+);
+    waitForStableRegionSizeReport(conn,tn);
+    final long finalSize=getRegionSizeReportForTable(conn,tn);
+    assertNotNull("Did not expect to see a null size",finalSize);
+    LOG.info("Final observed size of table: " + finalSize);
+    TEST_UTIL.waitFor(20 * 1000,500,new SpaceQuotaSnapshotPredicate(conn,ns){
+      @Override public boolean evaluate(      SpaceQuotaSnapshot snapshot) throws Exception {
+        return snapshot.getUsage() >= finalSize;
+      }
+    }
+);
+    long expectedFinalSize=actualInitialSize + finalSize;
+    LOG.info("Expecting namespace usage to be " + actualInitialSize + " + "+ finalSize+ " = "+ expectedFinalSize);
+    TEST_UTIL.waitFor(30 * 1000,1000,new SpaceQuotaSnapshotPredicate(conn,ns){
+      @Override boolean evaluate(      SpaceQuotaSnapshot snapshot) throws Exception {
+        LOG.debug("Checking for " + expectedFinalSize + " == "+ snapshot.getUsage());
+        return expectedFinalSize == snapshot.getUsage();
+      }
+    }
+);
+    Map<String,Long> snapshotSizes=QuotaTableUtil.getObservedSnapshotSizes(conn);
+    Long size=snapshotSizes.get(snapshot1);
+    assertNotNull("Did not observe the size of the snapshot",size);
+    assertEquals("The recorded size of the HBase snapshot was not the size we expected",actualInitialSize,size.longValue());
+  }
+  @Test public void testTablesWithSnapshots() throws Exception {
+    final Connection conn=TEST_UTIL.getConnection();
+    final SpaceViolationPolicy policy=SpaceViolationPolicy.NO_INSERTS;
+    final TableName tn=helper.createTableWithRegions(10);
+    final long tableLimit=3L * SpaceQuotaHelperForTests.ONE_MEGABYTE;
+    TEST_UTIL.getAdmin().setQuota(QuotaSettingsFactory.limitTableSpace(tn,tableLimit,policy));
+    LOG.info("Writing first data set");
+    helper.writeData(tn,1L * SpaceQuotaHelperForTests.ONE_MEGABYTE,"q1");
+    LOG.info("Creating snapshot");
+    TEST_UTIL.getAdmin().snapshot(tn.toString() + "snap1",tn,SnapshotType.FLUSH);
+    LOG.info("Writing second data set");
+    helper.writeData(tn,1L * SpaceQuotaHelperForTests.ONE_MEGABYTE,"q2");
+    LOG.info("Flushing and major compacting table");
+    TEST_UTIL.getAdmin().flush(tn);
+    TEST_UTIL.compact(tn,true);
+    LOG.info("Checking for quota violation");
+    TEST_UTIL.waitFor(60_000,1_000,new Predicate<Exception>(){
+      @Override public boolean evaluate() throws Exception {
+        Scan s=QuotaTableUtil.makeQuotaSnapshotScanForTable(tn);
+        try (Table t=conn.getTable(QuotaTableUtil.QUOTA_TABLE_NAME)){
+          ResultScanner rs=t.getScanner(s);
+          try {
+            Result r=Iterables.getOnlyElement(rs);
+            CellScanner cs=r.cellScanner();
+            assertTrue(cs.advance());
+            Cell c=cs.current();
+            SpaceQuotaSnapshot snapshot=SpaceQuotaSnapshot.toSpaceQuotaSnapshot(QuotaProtos.SpaceQuotaSnapshot.parseFrom(UnsafeByteOperations.unsafeWrap(c.getValueArray(),c.getValueOffset(),c.getValueLength())));
+            LOG.info(snapshot.getUsage() + "/" + snapshot.getLimit()+ " "+ snapshot.getQuotaStatus());
+            return snapshot.getQuotaStatus().isInViolation();
+          }
+  finally {
+            if (null != rs) {
+              rs.close();
+            }
+          }
+        }
+       }
+    }
+);
+  }
+  @Test public void testRematerializedTablesDoNoInheritSpace() throws Exception {
+    TableName tn=helper.createTableWithRegions(1);
+    TableName tn2=helper.getNextTableName();
+    LOG.info("Writing data");
+    QuotaSettings settings=QuotaSettingsFactory.limitTableSpace(tn,SpaceQuotaHelperForTests.ONE_GIGABYTE,SpaceViolationPolicy.NO_INSERTS);
+    admin.setQuota(settings);
+    QuotaSettings settings2=QuotaSettingsFactory.limitTableSpace(tn2,SpaceQuotaHelperForTests.ONE_GIGABYTE,SpaceViolationPolicy.NO_INSERTS);
+    admin.setQuota(settings2);
+    final long initialSize=2L * SpaceQuotaHelperForTests.ONE_MEGABYTE;
+    helper.writeData(tn,initialSize);
+    LOG.info("Waiting until table size reflects written data");
+    TEST_UTIL.waitFor(30 * 1000,500,new SpaceQuotaSnapshotPredicate(conn,tn){
+      @Override boolean evaluate(      SpaceQuotaSnapshot snapshot) throws Exception {
+        return snapshot.getUsage() >= initialSize;
+      }
+    }
+);
+    waitForStableQuotaSize(conn,tn,null);
+    final long actualInitialSize=QuotaTableUtil.getCurrentSnapshot(conn,tn).getUsage();
+    LOG.info("Initial table size was " + actualInitialSize);
+    LOG.info("Snapshot the table");
+    final String snapshot1=tn.toString() + "_snapshot1";
+    admin.snapshot(snapshot1,tn);
+    admin.cloneSnapshot(snapshot1,tn2);
+    helper.writeData(tn,initialSize,"q2");
+    admin.flush(tn);
+    TEST_UTIL.waitFor(30_000,1_000,new SpaceQuotaSnapshotPredicate(conn,tn){
+      @Override boolean evaluate(      SpaceQuotaSnapshot snapshot) throws Exception {
+        return snapshot.getUsage() >= actualInitialSize * 2;
+      }
+    }
+);
+    SpaceQuotaSnapshot snapshot=QuotaTableUtil.getCurrentSnapshot(conn,tn2);
+    assertNotNull(snapshot);
+    assertEquals(0,snapshot.getUsage());
+    TEST_UTIL.compact(tn2,true);
+    TEST_UTIL.waitFor(30_000,1_000,new SpaceQuotaSnapshotPredicate(conn,tn2){
+      @Override boolean evaluate(      SpaceQuotaSnapshot snapshot) throws Exception {
+        return snapshot.getUsage() == actualInitialSize;
+      }
+    }
+);
+  }
+  void waitForStableQuotaSize(  Connection conn,  TableName tn,  String ns) throws Exception {
+    AtomicLong lastValue=new AtomicLong(-1);
+    AtomicInteger counter=new AtomicInteger(0);
+    TEST_UTIL.waitFor(15_000,500,new SpaceQuotaSnapshotPredicate(conn,tn,ns){
+      @Override boolean evaluate(      SpaceQuotaSnapshot snapshot) throws Exception {
+        LOG.debug("Last observed size=" + lastValue.get());
+        if (snapshot.getUsage() == lastValue.get()) {
+          int numMatches=counter.incrementAndGet();
+          if (numMatches >= 5) {
+            return true;
+          }
+          return false;
+        }
+        counter.set(0);
+        lastValue.set(snapshot.getUsage());
+        return false;
+      }
+    }
+);
+  }
+  long getRegionSizeReportForTable(  Connection conn,  TableName tn) throws IOException {
+    Map<TableName,Long> sizes=QuotaTableUtil.getMasterReportedTableSizes(conn);
+    Long value=sizes.get(tn);
+    if (null == value) {
+      return 0L;
+    }
+    return value.longValue();
+  }
+  void waitForStableRegionSizeReport(  Connection conn,  TableName tn) throws Exception {
+    AtomicLong lastValue=new AtomicLong(-1);
+    AtomicInteger counter=new AtomicInteger(0);
+    TEST_UTIL.waitFor(15_000,500,new Predicate<Exception>(){
+      @Override public boolean evaluate() throws Exception {
+        LOG.debug("Last observed size=" + lastValue.get());
+        long actual=getRegionSizeReportForTable(conn,tn);
+        if (actual == lastValue.get()) {
+          int numMatches=counter.incrementAndGet();
+          if (numMatches >= 5) {
+            return true;
+          }
+          return false;
+        }
+        counter.set(0);
+        lastValue.set(actual);
+        return false;
+      }
+    }
+);
+  }
+}

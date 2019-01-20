@@ -1,0 +1,39 @@
+/** 
+ * FLINK-5652 Tests that registered timers are properly canceled upon completion of a {@link StreamRecordQueueEntry} in order to avoid resource leaks because TriggerTasks holda reference on the StreamRecordQueueEntry.
+ */
+@Test public void testTimeoutCleanup() throws Exception {
+  final Object lock=new Object();
+  final long timeout=100000L;
+  final long timestamp=1L;
+  Environment environment=createMockEnvironment();
+  ScheduledFuture<?> scheduledFuture=mock(ScheduledFuture.class);
+  ProcessingTimeService processingTimeService=mock(ProcessingTimeService.class);
+  when(processingTimeService.getCurrentProcessingTime()).thenReturn(timestamp);
+  doReturn(scheduledFuture).when(processingTimeService).registerTimer(anyLong(),any(ProcessingTimeCallback.class));
+  StreamTask<?,?> containingTask=mock(StreamTask.class);
+  when(containingTask.getEnvironment()).thenReturn(environment);
+  when(containingTask.getCheckpointLock()).thenReturn(lock);
+  when(containingTask.getProcessingTimeService()).thenReturn(processingTimeService);
+  StreamConfig streamConfig=new MockStreamConfig();
+  streamConfig.setTypeSerializerIn1(IntSerializer.INSTANCE);
+  Output<StreamRecord<Integer>> output=mock(Output.class);
+  AsyncWaitOperator<Integer,Integer> operator=new AsyncWaitOperator<>(new AsyncFunction<Integer,Integer>(){
+    private static final long serialVersionUID=-3718276118074877073L;
+    @Override public void asyncInvoke(    Integer input,    ResultFuture<Integer> resultFuture) throws Exception {
+      resultFuture.complete(Collections.singletonList(input));
+    }
+  }
+,timeout,1,AsyncDataStream.OutputMode.UNORDERED);
+  operator.setup(containingTask,streamConfig,output);
+  operator.open();
+  final StreamRecord<Integer> streamRecord=new StreamRecord<>(42,timestamp);
+synchronized (lock) {
+    operator.processElement(streamRecord);
+  }
+synchronized (lock) {
+    operator.close();
+  }
+  verify(output).collect(eq(streamRecord));
+  verify(processingTimeService).registerTimer(eq(processingTimeService.getCurrentProcessingTime() + timeout),any(ProcessingTimeCallback.class));
+  verify(scheduledFuture).cancel(eq(true));
+}

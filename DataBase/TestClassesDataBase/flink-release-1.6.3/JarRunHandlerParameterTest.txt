@@ -1,0 +1,134 @@
+/** 
+ * Tests for the parameter handling of the  {@link JarRunHandler}.
+ */
+public class JarRunHandlerParameterTest extends TestLogger {
+  @ClassRule public static final TemporaryFolder TMP=new TemporaryFolder();
+  @ClassRule public static final BlobServerResource BLOB_SERVER_RESOURCE=new BlobServerResource();
+  private static final AtomicReference<JobGraph> lastSubmittedJobGraphReference=new AtomicReference<>();
+  private static JarRunHandler handler;
+  private static Path jarWithManifest;
+  private static Path jarWithoutManifest;
+  private static TestingDispatcherGateway restfulGateway;
+  @BeforeClass public static void setup() throws Exception {
+    Path jarDir=TMP.newFolder().toPath();
+    final String parameterProgramJarName=System.getProperty("parameterJarName") + ".jar";
+    final String parameterProgramWithoutManifestJarName=System.getProperty("parameterJarWithoutManifestName") + ".jar";
+    final Path jarLocation=Paths.get(System.getProperty("targetDir"));
+    jarWithManifest=Files.copy(jarLocation.resolve(parameterProgramJarName),jarDir.resolve("program-with-manifest.jar"));
+    jarWithoutManifest=Files.copy(jarLocation.resolve(parameterProgramWithoutManifestJarName),jarDir.resolve("program-without-manifest.jar"));
+    Configuration config=new Configuration();
+    config.setString(BlobServerOptions.STORAGE_DIRECTORY,TMP.newFolder().getAbsolutePath());
+    restfulGateway=new TestingDispatcherGateway.Builder().setBlobServerPort(BLOB_SERVER_RESOURCE.getBlobServerPort()).setSubmitFunction(jobGraph -> {
+      lastSubmittedJobGraphReference.set(jobGraph);
+      return CompletableFuture.completedFuture(Acknowledge.get());
+    }
+).build();
+    final GatewayRetriever<TestingDispatcherGateway> gatewayRetriever=() -> CompletableFuture.completedFuture(restfulGateway);
+    final CompletableFuture<String> localAddressFuture=CompletableFuture.completedFuture("shazam://localhost:12345");
+    final Time timeout=Time.seconds(10);
+    final Map<String,String> responseHeaders=Collections.emptyMap();
+    final Executor executor=TestingUtils.defaultExecutor();
+    handler=new JarRunHandler(localAddressFuture,gatewayRetriever,timeout,responseHeaders,JarRunHeaders.getInstance(),jarDir,new Configuration(),executor);
+  }
+  @Before public void reset(){
+    ParameterProgram.actualArguments=null;
+  }
+  @Test public void testDefaultParameters() throws Exception {
+    sendRequestAndValidateGraph(handler,restfulGateway,() -> createRequest(new JarRunRequestBody(),JarRunHeaders.getInstance().getUnresolvedMessageParameters(),jarWithManifest),jobGraph -> {
+      Assert.assertEquals(0,ParameterProgram.actualArguments.length);
+      Assert.assertEquals(ExecutionConfig.PARALLELISM_DEFAULT,getExecutionConfig(jobGraph).getParallelism());
+      final SavepointRestoreSettings savepointRestoreSettings=jobGraph.getSavepointRestoreSettings();
+      Assert.assertFalse(savepointRestoreSettings.allowNonRestoredState());
+      Assert.assertNull(savepointRestoreSettings.getRestorePath());
+    }
+);
+  }
+  @Test public void testConfigurationViaQueryParameters() throws Exception {
+    sendRequestAndValidateGraph(handler,restfulGateway,() -> {
+      final JarRunMessageParameters parameters=JarRunHeaders.getInstance().getUnresolvedMessageParameters();
+      parameters.allowNonRestoredStateQueryParameter.resolve(Collections.singletonList(true));
+      parameters.savepointPathQueryParameter.resolve(Collections.singletonList("/foo/bar"));
+      parameters.entryClassQueryParameter.resolve(Collections.singletonList(ParameterProgram.class.getCanonicalName()));
+      parameters.parallelismQueryParameter.resolve(Collections.singletonList(4));
+      parameters.programArgsQueryParameter.resolve(Collections.singletonList("--host localhost --port 1234"));
+      return createRequest(new JarRunRequestBody(),parameters,jarWithoutManifest);
+    }
+,jobGraph -> {
+      Assert.assertEquals(4,ParameterProgram.actualArguments.length);
+      Assert.assertEquals("--host",ParameterProgram.actualArguments[0]);
+      Assert.assertEquals("localhost",ParameterProgram.actualArguments[1]);
+      Assert.assertEquals("--port",ParameterProgram.actualArguments[2]);
+      Assert.assertEquals("1234",ParameterProgram.actualArguments[3]);
+      Assert.assertEquals(4,getExecutionConfig(jobGraph).getParallelism());
+      final SavepointRestoreSettings savepointRestoreSettings=jobGraph.getSavepointRestoreSettings();
+      Assert.assertTrue(savepointRestoreSettings.allowNonRestoredState());
+      Assert.assertEquals("/foo/bar",savepointRestoreSettings.getRestorePath());
+    }
+);
+  }
+  @Test public void testConfigurationViaJsonRequest() throws Exception {
+    sendRequestAndValidateGraph(handler,restfulGateway,() -> {
+      final JarRunRequestBody jsonRequest=new JarRunRequestBody(ParameterProgram.class.getCanonicalName(),"--host localhost --port 1234",4,true,"/foo/bar");
+      return createRequest(jsonRequest,JarRunHeaders.getInstance().getUnresolvedMessageParameters(),jarWithoutManifest);
+    }
+,jobGraph -> {
+      Assert.assertEquals(4,ParameterProgram.actualArguments.length);
+      Assert.assertEquals("--host",ParameterProgram.actualArguments[0]);
+      Assert.assertEquals("localhost",ParameterProgram.actualArguments[1]);
+      Assert.assertEquals("--port",ParameterProgram.actualArguments[2]);
+      Assert.assertEquals("1234",ParameterProgram.actualArguments[3]);
+      Assert.assertEquals(4,getExecutionConfig(jobGraph).getParallelism());
+      final SavepointRestoreSettings savepointRestoreSettings=jobGraph.getSavepointRestoreSettings();
+      Assert.assertTrue(savepointRestoreSettings.allowNonRestoredState());
+      Assert.assertEquals("/foo/bar",savepointRestoreSettings.getRestorePath());
+    }
+);
+  }
+  @Test public void testParameterPrioritization() throws Exception {
+    sendRequestAndValidateGraph(handler,restfulGateway,() -> {
+      final JarRunRequestBody jsonRequest=new JarRunRequestBody(ParameterProgram.class.getCanonicalName(),"--host localhost --port 1234",4,true,"/foo/bar");
+      final JarRunMessageParameters parameters=JarRunHeaders.getInstance().getUnresolvedMessageParameters();
+      parameters.allowNonRestoredStateQueryParameter.resolve(Collections.singletonList(false));
+      parameters.savepointPathQueryParameter.resolve(Collections.singletonList("/no/uh"));
+      parameters.entryClassQueryParameter.resolve(Collections.singletonList("please.dont.run.me"));
+      parameters.parallelismQueryParameter.resolve(Collections.singletonList(64));
+      parameters.programArgsQueryParameter.resolve(Collections.singletonList("--host wrong --port wrong"));
+      return createRequest(jsonRequest,parameters,jarWithoutManifest);
+    }
+,jobGraph -> {
+      Assert.assertEquals(4,ParameterProgram.actualArguments.length);
+      Assert.assertEquals("--host",ParameterProgram.actualArguments[0]);
+      Assert.assertEquals("localhost",ParameterProgram.actualArguments[1]);
+      Assert.assertEquals("--port",ParameterProgram.actualArguments[2]);
+      Assert.assertEquals("1234",ParameterProgram.actualArguments[3]);
+      Assert.assertEquals(4,getExecutionConfig(jobGraph).getParallelism());
+      final SavepointRestoreSettings savepointRestoreSettings=jobGraph.getSavepointRestoreSettings();
+      Assert.assertTrue(savepointRestoreSettings.allowNonRestoredState());
+      Assert.assertEquals("/foo/bar",savepointRestoreSettings.getRestorePath());
+    }
+);
+  }
+  private static HandlerRequest<JarRunRequestBody,JarRunMessageParameters> createRequest(  JarRunRequestBody requestBody,  JarRunMessageParameters parameters,  Path jar) throws HandlerRequestException {
+    final Map<String,List<String>> queryParameterAsMap=parameters.getQueryParameters().stream().filter(MessageParameter::isResolved).collect(Collectors.toMap(MessageParameter::getKey,JarRunHandlerParameterTest::getValuesAsString));
+    return new HandlerRequest<>(requestBody,JarRunHeaders.getInstance().getUnresolvedMessageParameters(),Collections.singletonMap(JarIdPathParameter.KEY,jar.getFileName().toString()),queryParameterAsMap,Collections.emptyList());
+  }
+  private static void sendRequestAndValidateGraph(  JarRunHandler handler,  DispatcherGateway dispatcherGateway,  SupplierWithException<HandlerRequest<JarRunRequestBody,JarRunMessageParameters>,HandlerRequestException> requestSupplier,  ThrowingConsumer<JobGraph,AssertionError> validator) throws Exception {
+    handler.handleRequest(requestSupplier.get(),dispatcherGateway).get();
+    JobGraph submittedJobGraph=lastSubmittedJobGraphReference.getAndSet(null);
+    validator.accept(submittedJobGraph);
+  }
+  private static ExecutionConfig getExecutionConfig(  JobGraph jobGraph){
+    ExecutionConfig executionConfig;
+    try {
+      executionConfig=jobGraph.getSerializedExecutionConfig().deserializeValue(ParameterProgram.class.getClassLoader());
+    }
+ catch (    Exception e) {
+      throw new AssertionError("Exception while deserializing ExecutionConfig.",e);
+    }
+    return executionConfig;
+  }
+  private static <X>List<String> getValuesAsString(  MessageQueryParameter<X> parameter){
+    final List<X> values=parameter.getValue();
+    return values.stream().map(parameter::convertValueToString).collect(Collectors.toList());
+  }
+}

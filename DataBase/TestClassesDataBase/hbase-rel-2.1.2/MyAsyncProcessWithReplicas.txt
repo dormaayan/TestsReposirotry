@@ -1,0 +1,70 @@
+static class MyAsyncProcessWithReplicas extends MyAsyncProcess {
+  private Set<byte[]> failures=new TreeSet<>(new Bytes.ByteArrayComparator());
+  private long primarySleepMs=0, replicaSleepMs=0;
+  private Map<ServerName,Long> customPrimarySleepMs=new HashMap<>();
+  private final AtomicLong replicaCalls=new AtomicLong(0);
+  public void addFailures(  RegionInfo... hris){
+    for (    RegionInfo hri : hris) {
+      failures.add(hri.getRegionName());
+    }
+  }
+  public long getReplicaCallCount(){
+    return replicaCalls.get();
+  }
+  public void setPrimaryCallDelay(  ServerName server,  long primaryMs){
+    customPrimarySleepMs.put(server,primaryMs);
+  }
+  public MyAsyncProcessWithReplicas(  ClusterConnection hc,  Configuration conf){
+    super(hc,conf);
+  }
+  public void setCallDelays(  long primaryMs,  long replicaMs){
+    this.primarySleepMs=primaryMs;
+    this.replicaSleepMs=replicaMs;
+  }
+  @Override protected RpcRetryingCaller<AbstractResponse> createCaller(  CancellableRegionServerCallable payloadCallable,  int rpcTimeout){
+    MultiServerCallable callable=(MultiServerCallable)payloadCallable;
+    final MultiResponse mr=createMultiResponse(callable.getMulti(),nbMultiResponse,nbActions,new ResponseGenerator(){
+      @Override public void addResponse(      MultiResponse mr,      byte[] regionName,      Action a){
+        if (failures.contains(regionName)) {
+          mr.add(regionName,a.getOriginalIndex(),failure);
+        }
+ else {
+          boolean isStale=!RegionReplicaUtil.isDefaultReplica(a.getReplicaId());
+          mr.add(regionName,a.getOriginalIndex(),Result.create(new Cell[0],null,isStale));
+        }
+      }
+    }
+);
+    final boolean isDefault=RegionReplicaUtil.isDefaultReplica(callable.getMulti().actions.values().iterator().next().iterator().next().getReplicaId());
+    final ServerName server=((MultiServerCallable)callable).getServerName();
+    String debugMsg="Call to " + server + ", primary="+ isDefault+ " with "+ callable.getMulti().actions.size()+ " entries: ";
+    for (    byte[] region : callable.getMulti().actions.keySet()) {
+      debugMsg+="[" + Bytes.toStringBinary(region) + "], ";
+    }
+    LOG.debug(debugMsg);
+    if (!isDefault) {
+      replicaCalls.incrementAndGet();
+    }
+    return new RpcRetryingCallerImpl<AbstractResponse>(100,500,10,9){
+      @Override public MultiResponse callWithoutRetries(      RetryingCallable<AbstractResponse> callable,      int callTimeout) throws IOException, RuntimeException {
+        long sleep=-1;
+        if (isDefault) {
+          Long customSleep=customPrimarySleepMs.get(server);
+          sleep=(customSleep == null ? primarySleepMs : customSleep.longValue());
+        }
+ else {
+          sleep=replicaSleepMs;
+        }
+        if (sleep != 0) {
+          try {
+            Thread.sleep(sleep);
+          }
+ catch (          InterruptedException e) {
+          }
+        }
+        return mr;
+      }
+    }
+;
+  }
+}

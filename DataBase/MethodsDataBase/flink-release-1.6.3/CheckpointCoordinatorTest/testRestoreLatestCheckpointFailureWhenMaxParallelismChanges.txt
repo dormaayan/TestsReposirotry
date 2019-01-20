@@ -1,0 +1,53 @@
+/** 
+ * Tests that the checkpoint restoration fails if the max parallelism of the job vertices has changed.
+ * @throws Exception
+ */
+@Test(expected=IllegalStateException.class) public void testRestoreLatestCheckpointFailureWhenMaxParallelismChanges() throws Exception {
+  final JobID jid=new JobID();
+  final long timestamp=System.currentTimeMillis();
+  final JobVertexID jobVertexID1=new JobVertexID();
+  final JobVertexID jobVertexID2=new JobVertexID();
+  int parallelism1=3;
+  int parallelism2=2;
+  int maxParallelism1=42;
+  int maxParallelism2=13;
+  final ExecutionJobVertex jobVertex1=mockExecutionJobVertex(jobVertexID1,parallelism1,maxParallelism1);
+  final ExecutionJobVertex jobVertex2=mockExecutionJobVertex(jobVertexID2,parallelism2,maxParallelism2);
+  List<ExecutionVertex> allExecutionVertices=new ArrayList<>(parallelism1 + parallelism2);
+  allExecutionVertices.addAll(Arrays.asList(jobVertex1.getTaskVertices()));
+  allExecutionVertices.addAll(Arrays.asList(jobVertex2.getTaskVertices()));
+  ExecutionVertex[] arrayExecutionVertices=allExecutionVertices.toArray(new ExecutionVertex[allExecutionVertices.size()]);
+  CheckpointCoordinator coord=new CheckpointCoordinator(jid,600000,600000,0,Integer.MAX_VALUE,CheckpointRetentionPolicy.NEVER_RETAIN_AFTER_TERMINATION,arrayExecutionVertices,arrayExecutionVertices,arrayExecutionVertices,new StandaloneCheckpointIDCounter(),new StandaloneCompletedCheckpointStore(1),new MemoryStateBackend(),Executors.directExecutor(),SharedStateRegistry.DEFAULT_FACTORY);
+  coord.triggerCheckpoint(timestamp,false);
+  assertTrue(coord.getPendingCheckpoints().keySet().size() == 1);
+  long checkpointId=Iterables.getOnlyElement(coord.getPendingCheckpoints().keySet());
+  List<KeyGroupRange> keyGroupPartitions1=StateAssignmentOperation.createKeyGroupPartitions(maxParallelism1,parallelism1);
+  List<KeyGroupRange> keyGroupPartitions2=StateAssignmentOperation.createKeyGroupPartitions(maxParallelism2,parallelism2);
+  for (int index=0; index < jobVertex1.getParallelism(); index++) {
+    KeyGroupsStateHandle keyGroupState=generateKeyGroupState(jobVertexID1,keyGroupPartitions1.get(index),false);
+    OperatorSubtaskState operatorSubtaskState=new OperatorSubtaskState(null,null,keyGroupState,null);
+    TaskStateSnapshot taskOperatorSubtaskStates=new TaskStateSnapshot();
+    taskOperatorSubtaskStates.putSubtaskStateByOperatorID(OperatorID.fromJobVertexID(jobVertexID1),operatorSubtaskState);
+    AcknowledgeCheckpoint acknowledgeCheckpoint=new AcknowledgeCheckpoint(jid,jobVertex1.getTaskVertices()[index].getCurrentExecutionAttempt().getAttemptId(),checkpointId,new CheckpointMetrics(),taskOperatorSubtaskStates);
+    coord.receiveAcknowledgeMessage(acknowledgeCheckpoint);
+  }
+  for (int index=0; index < jobVertex2.getParallelism(); index++) {
+    KeyGroupsStateHandle keyGroupState=generateKeyGroupState(jobVertexID2,keyGroupPartitions2.get(index),false);
+    OperatorSubtaskState operatorSubtaskState=new OperatorSubtaskState(null,null,keyGroupState,null);
+    TaskStateSnapshot taskOperatorSubtaskStates=new TaskStateSnapshot();
+    taskOperatorSubtaskStates.putSubtaskStateByOperatorID(OperatorID.fromJobVertexID(jobVertexID2),operatorSubtaskState);
+    AcknowledgeCheckpoint acknowledgeCheckpoint=new AcknowledgeCheckpoint(jid,jobVertex2.getTaskVertices()[index].getCurrentExecutionAttempt().getAttemptId(),checkpointId,new CheckpointMetrics(),taskOperatorSubtaskStates);
+    coord.receiveAcknowledgeMessage(acknowledgeCheckpoint);
+  }
+  List<CompletedCheckpoint> completedCheckpoints=coord.getSuccessfulCheckpoints();
+  assertEquals(1,completedCheckpoints.size());
+  Map<JobVertexID,ExecutionJobVertex> tasks=new HashMap<>();
+  int newMaxParallelism1=20;
+  int newMaxParallelism2=42;
+  final ExecutionJobVertex newJobVertex1=mockExecutionJobVertex(jobVertexID1,parallelism1,newMaxParallelism1);
+  final ExecutionJobVertex newJobVertex2=mockExecutionJobVertex(jobVertexID2,parallelism2,newMaxParallelism2);
+  tasks.put(jobVertexID1,newJobVertex1);
+  tasks.put(jobVertexID2,newJobVertex2);
+  coord.restoreLatestCheckpointedState(tasks,true,false);
+  fail("The restoration should have failed because the max parallelism changed.");
+}

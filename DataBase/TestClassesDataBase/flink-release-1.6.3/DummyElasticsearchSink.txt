@@ -1,0 +1,81 @@
+private static class DummyElasticsearchSink<T> extends ElasticsearchSinkBase<T,Client> {
+  private static final long serialVersionUID=5051907841570096991L;
+  private transient BulkProcessor mockBulkProcessor;
+  private transient BulkRequest nextBulkRequest=new BulkRequest();
+  private transient MultiShotLatch flushLatch=new MultiShotLatch();
+  private List<? extends Throwable> mockItemFailuresList;
+  private Throwable nextBulkFailure;
+  public DummyElasticsearchSink(  Map<String,String> userConfig,  ElasticsearchSinkFunction<T> sinkFunction,  ActionRequestFailureHandler failureHandler){
+    super(new DummyElasticsearchApiCallBridge(),userConfig,sinkFunction,failureHandler);
+  }
+  /** 
+ * This method is used to mimic a scheduled bulk request; we need to do this manually because we are mocking the BulkProcessor.
+ */
+  public void manualBulkRequestWithAllPendingRequests(){
+    flushLatch.trigger();
+    mockBulkProcessor.flush();
+  }
+  /** 
+ * On non-manual flushes, i.e. when flush is called in the snapshot method implementation, usages need to explicitly call this to allow the flush to continue. This is useful to make sure that specific requests get added to the next bulk request for flushing.
+ */
+  public void continueFlush(){
+    flushLatch.trigger();
+  }
+  /** 
+ * Set the list of mock failures to use for the next bulk of item responses. A  {@code null}means that the response is successful, failed otherwise. <p>The list is used with corresponding order to the requests in the bulk, i.e. the first request uses the response at index 0, the second requests uses the response at index 1, etc.
+ */
+  public void setMockItemFailuresListForNextBulkItemResponses(  List<? extends Throwable> mockItemFailuresList){
+    this.mockItemFailuresList=mockItemFailuresList;
+  }
+  /** 
+ * Let the next bulk request fail completely with the provided throwable. If this is set, the failures list provided with setMockItemFailuresListForNextBulkItemResponses is not respected.
+ */
+  public void setFailNextBulkRequestCompletely(  Throwable failure){
+    this.nextBulkFailure=failure;
+  }
+  public BulkProcessor getMockBulkProcessor(){
+    return mockBulkProcessor;
+  }
+  /** 
+ * Override the bulk processor build process to provide a mock implementation, but reuse the listener implementation in our mock to test that the listener logic works correctly with request flushing logic.
+ */
+  @Override protected BulkProcessor buildBulkProcessor(  final BulkProcessor.Listener listener){
+    this.mockBulkProcessor=mock(BulkProcessor.class);
+    when(mockBulkProcessor.add(any(IndexRequest.class))).thenAnswer(new Answer<Object>(){
+      @Override public Object answer(      InvocationOnMock invocationOnMock) throws Throwable {
+        nextBulkRequest.add(invocationOnMock.getArgumentAt(0,IndexRequest.class));
+        return null;
+      }
+    }
+);
+    doAnswer(new Answer(){
+      @Override public Object answer(      InvocationOnMock invocationOnMock) throws Throwable {
+        while (nextBulkRequest.numberOfActions() > 0) {
+          flushLatch.await();
+          BulkRequest currentBulkRequest=nextBulkRequest;
+          nextBulkRequest=new BulkRequest();
+          listener.beforeBulk(123L,currentBulkRequest);
+          if (nextBulkFailure == null) {
+            BulkItemResponse[] mockResponses=new BulkItemResponse[currentBulkRequest.requests().size()];
+            for (int i=0; i < currentBulkRequest.requests().size(); i++) {
+              Throwable mockItemFailure=mockItemFailuresList.get(i);
+              if (mockItemFailure == null) {
+                mockResponses[i]=new BulkItemResponse(i,"opType",mock(ActionResponse.class));
+              }
+ else {
+                mockResponses[i]=new BulkItemResponse(i,"opType",new BulkItemResponse.Failure("index","type","id",mockItemFailure));
+              }
+            }
+            listener.afterBulk(123L,currentBulkRequest,new BulkResponse(mockResponses,1000L));
+          }
+ else {
+            listener.afterBulk(123L,currentBulkRequest,nextBulkFailure);
+          }
+        }
+        return null;
+      }
+    }
+).when(mockBulkProcessor).flush();
+    return mockBulkProcessor;
+  }
+}

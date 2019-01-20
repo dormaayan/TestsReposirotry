@@ -1,0 +1,225 @@
+/** 
+ * Test to verify that the cloned table is independent of the table from which it was cloned
+ */
+@Category({LargeTests.class,ClientTests.class}) public class TestSnapshotCloneIndependence {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestSnapshotCloneIndependence.class);
+  private static final Logger LOG=LoggerFactory.getLogger(TestSnapshotCloneIndependence.class);
+  @Rule public TestName testName=new TestName();
+  protected static final HBaseTestingUtility UTIL=new HBaseTestingUtility();
+  protected static final int NUM_RS=2;
+  private static final String STRING_TABLE_NAME="test";
+  private static final String TEST_FAM_STR="fam";
+  protected static final byte[] TEST_FAM=Bytes.toBytes(TEST_FAM_STR);
+  private static final int CLEANER_INTERVAL=100;
+  private FileSystem fs;
+  private Path rootDir;
+  private Admin admin;
+  private TableName originalTableName;
+  private Table originalTable;
+  private TableName cloneTableName;
+  private int countOriginalTable;
+  String snapshotNameAsString;
+  byte[] snapshotName;
+  /** 
+ * Setup the config for the cluster and start it
+ */
+  @BeforeClass public static void setupCluster() throws Exception {
+    setupConf(UTIL.getConfiguration());
+    UTIL.startMiniCluster(NUM_RS);
+  }
+  static void setupConf(  Configuration conf){
+    conf.setInt(HConstants.REGION_SERVER_HIGH_PRIORITY_HANDLER_COUNT,15);
+    conf.setBoolean(SnapshotManager.HBASE_SNAPSHOT_ENABLED,true);
+    conf.setInt("hbase.hregion.memstore.flush.size",25000);
+    conf.setInt("hbase.hstore.compaction.min",10);
+    conf.setInt("hbase.hstore.compactionThreshold",10);
+    conf.setInt("hbase.hstore.blockingStoreFiles",12);
+    conf.setInt("hbase.regionserver.msginterval",100);
+    conf.setBoolean("hbase.master.enabletable.roundrobin",true);
+    conf.set(HConstants.HBASE_REGION_SPLIT_POLICY_KEY,ConstantSizeRegionSplitPolicy.class.getName());
+    conf.setInt("hbase.master.cleaner.interval",CLEANER_INTERVAL);
+    conf.setInt("hbase.master.hfilecleaner.plugins.snapshot.period",CLEANER_INTERVAL);
+    conf.setInt("hbase.master.hfilecleaner.ttl",CLEANER_INTERVAL);
+  }
+  @Before public void setup() throws Exception {
+    fs=UTIL.getHBaseCluster().getMaster().getMasterFileSystem().getFileSystem();
+    rootDir=UTIL.getHBaseCluster().getMaster().getMasterFileSystem().getRootDir();
+    admin=UTIL.getAdmin();
+    originalTableName=TableName.valueOf("test" + testName.getMethodName());
+    cloneTableName=TableName.valueOf("test-clone-" + originalTableName);
+    snapshotNameAsString="snapshot_" + originalTableName;
+    snapshotName=Bytes.toBytes(snapshotNameAsString);
+    originalTable=createTable(originalTableName,TEST_FAM);
+    loadData(originalTable,TEST_FAM);
+    countOriginalTable=countRows(originalTable);
+    System.out.println("Original table has: " + countOriginalTable + " rows");
+  }
+  @After public void tearDown() throws Exception {
+    UTIL.deleteTable(originalTableName);
+    UTIL.deleteTable(cloneTableName);
+    SnapshotTestingUtils.deleteAllSnapshots(UTIL.getAdmin());
+    SnapshotTestingUtils.deleteArchiveDirectory(UTIL);
+  }
+  @AfterClass public static void cleanupTest() throws Exception {
+    try {
+      UTIL.shutdownMiniCluster();
+    }
+ catch (    Exception e) {
+      LOG.warn("failure shutting down cluster",e);
+    }
+  }
+  /** 
+ * Verify that adding data to the cloned table will not affect the original, and vice-versa when it is taken as an online snapshot.
+ */
+  @Test public void testOnlineSnapshotAppendIndependent() throws Exception {
+    createAndCloneSnapshot(true);
+    runTestSnapshotAppendIndependent();
+  }
+  /** 
+ * Verify that adding data to the cloned table will not affect the original, and vice-versa when it is taken as an offline snapshot.
+ */
+  @Test public void testOfflineSnapshotAppendIndependent() throws Exception {
+    createAndCloneSnapshot(false);
+    runTestSnapshotAppendIndependent();
+  }
+  /** 
+ * Verify that adding metadata to the cloned table will not affect the original, and vice-versa when it is taken as an online snapshot.
+ */
+  @Test public void testOnlineSnapshotMetadataChangesIndependent() throws Exception {
+    createAndCloneSnapshot(true);
+    runTestSnapshotMetadataChangesIndependent();
+  }
+  /** 
+ * Verify that adding netadata to the cloned table will not affect the original, and vice-versa when is taken as an online snapshot.
+ */
+  @Test public void testOfflineSnapshotMetadataChangesIndependent() throws Exception {
+    createAndCloneSnapshot(false);
+    runTestSnapshotMetadataChangesIndependent();
+  }
+  /** 
+ * Verify that region operations, in this case splitting a region, are independent between the cloned table and the original.
+ */
+  @Test public void testOfflineSnapshotRegionOperationsIndependent() throws Exception {
+    createAndCloneSnapshot(false);
+    runTestRegionOperationsIndependent();
+  }
+  /** 
+ * Verify that region operations, in this case splitting a region, are independent between the cloned table and the original.
+ */
+  @Test public void testOnlineSnapshotRegionOperationsIndependent() throws Exception {
+    createAndCloneSnapshot(true);
+    runTestRegionOperationsIndependent();
+  }
+  @Test public void testOfflineSnapshotDeleteIndependent() throws Exception {
+    createAndCloneSnapshot(false);
+    runTestSnapshotDeleteIndependent();
+  }
+  @Test public void testOnlineSnapshotDeleteIndependent() throws Exception {
+    createAndCloneSnapshot(true);
+    runTestSnapshotDeleteIndependent();
+  }
+  private static void waitOnSplit(  Connection c,  final Table t,  int originalCount) throws Exception {
+    for (int i=0; i < 200; i++) {
+      Threads.sleepWithoutInterrupt(500);
+      try (RegionLocator locator=c.getRegionLocator(t.getName())){
+        if (locator.getAllRegionLocations().size() > originalCount) {
+          return;
+        }
+      }
+     }
+    throw new Exception("Split did not increase the number of regions");
+  }
+  /** 
+ * Takes the snapshot of originalTable and clones the snapshot to another tables. If  {@code online} is false, the original table is disabled during taking snapshot, so alsoenables it again.
+ * @param online - Whether the table is online or not during the snapshot
+ */
+  private void createAndCloneSnapshot(  boolean online) throws Exception {
+    SnapshotTestingUtils.createSnapshotAndValidate(admin,originalTableName,TEST_FAM_STR,snapshotNameAsString,rootDir,fs,online);
+    if (!online) {
+      admin.enableTable(originalTableName);
+      UTIL.waitTableAvailable(originalTableName);
+    }
+    admin.cloneSnapshot(snapshotName,cloneTableName);
+    UTIL.waitUntilAllRegionsAssigned(cloneTableName);
+  }
+  /** 
+ * Verify that adding data to original table or clone table doesn't affect other table.
+ */
+  private void runTestSnapshotAppendIndependent() throws Exception {
+    try (Table clonedTable=UTIL.getConnection().getTable(cloneTableName)){
+      final int clonedTableRowCount=countRows(clonedTable);
+      Assert.assertEquals("The line counts of original and cloned tables do not match after clone. ",countOriginalTable,clonedTableRowCount);
+      Put p=new Put(Bytes.toBytes("new-row-" + System.currentTimeMillis()));
+      p.addColumn(TEST_FAM,Bytes.toBytes("someQualifier"),Bytes.toBytes("someString"));
+      originalTable.put(p);
+      Assert.assertEquals("The row count of the original table was not modified by the put",countOriginalTable + 1,countRows(originalTable));
+      Assert.assertEquals("The row count of the cloned table changed as a result of addition to the original",clonedTableRowCount,countRows(clonedTable));
+      Put p2=new Put(Bytes.toBytes("new-row-" + System.currentTimeMillis()));
+      p2.addColumn(TEST_FAM,Bytes.toBytes("someQualifier"),Bytes.toBytes("someString"));
+      clonedTable.put(p2);
+      Assert.assertEquals("The row count of the original table was modified by the put to the clone",countOriginalTable + 1,countRows(originalTable));
+      Assert.assertEquals("The row count of the cloned table was not modified by the put",clonedTableRowCount + 1,countRows(clonedTable));
+    }
+   }
+  /** 
+ * Do a split, and verify that this only affects one table
+ */
+  private void runTestRegionOperationsIndependent() throws Exception {
+    ((ClusterConnection)UTIL.getConnection()).clearRegionCache();
+    List<HRegionInfo> originalTableHRegions=admin.getTableRegions(originalTableName);
+    final int originalRegionCount=originalTableHRegions.size();
+    final int cloneTableRegionCount=admin.getTableRegions(cloneTableName).size();
+    Assert.assertEquals("The number of regions in the cloned table is different than in the original table.",originalRegionCount,cloneTableRegionCount);
+    admin.splitRegion(originalTableHRegions.get(0).getRegionName());
+    waitOnSplit(UTIL.getConnection(),originalTable,originalRegionCount);
+    final int cloneTableRegionCount2=admin.getTableRegions(cloneTableName).size();
+    Assert.assertEquals("The number of regions in the cloned table changed though none of its regions were split.",cloneTableRegionCount,cloneTableRegionCount2);
+  }
+  /** 
+ * Add metadata, and verify that this only affects one table
+ */
+  private void runTestSnapshotMetadataChangesIndependent() throws Exception {
+    byte[] TEST_FAM_2=Bytes.toBytes("fam2");
+    HColumnDescriptor hcd=new HColumnDescriptor(TEST_FAM_2);
+    admin.disableTable(originalTableName);
+    admin.addColumnFamily(originalTableName,hcd);
+    admin.enableTable(originalTableName);
+    UTIL.waitTableAvailable(originalTableName);
+    HTableDescriptor originalTableDescriptor=originalTable.getTableDescriptor();
+    HTableDescriptor clonedTableDescriptor=admin.getTableDescriptor(cloneTableName);
+    Assert.assertTrue("The original family was not found. There is something wrong. ",originalTableDescriptor.hasFamily(TEST_FAM));
+    Assert.assertTrue("The original family was not found in the clone. There is something wrong. ",clonedTableDescriptor.hasFamily(TEST_FAM));
+    Assert.assertTrue("The new family was not found. ",originalTableDescriptor.hasFamily(TEST_FAM_2));
+    Assert.assertTrue("The new family was not found. ",!clonedTableDescriptor.hasFamily(TEST_FAM_2));
+  }
+  /** 
+ * Verify that deleting the snapshot does not affect either table.
+ */
+  private void runTestSnapshotDeleteIndependent() throws Exception {
+    admin.majorCompact(originalTableName);
+    admin.deleteSnapshot(snapshotName);
+    Pattern pattern=Pattern.compile(snapshotNameAsString);
+    do {
+      Thread.sleep(5000);
+    }
+ while (!admin.listSnapshots(pattern).isEmpty());
+    try (Table original=UTIL.getConnection().getTable(originalTableName)){
+      try (Table clonedTable=UTIL.getConnection().getTable(cloneTableName)){
+        final int origTableRowCount=countRows(original);
+        final int clonedTableRowCount=countRows(clonedTable);
+        Assert.assertEquals(origTableRowCount,clonedTableRowCount);
+      }
+     }
+   }
+  protected Table createTable(  final TableName table,  byte[] family) throws Exception {
+    Table t=UTIL.createTable(table,family);
+    UTIL.waitUntilAllRegionsAssigned(table);
+    return t;
+  }
+  public void loadData(  final Table table,  byte[]... families) throws Exception {
+    UTIL.loadTable(originalTable,TEST_FAM);
+  }
+  protected int countRows(  final Table table,  final byte[]... families) throws Exception {
+    return UTIL.countRows(table,families);
+  }
+}

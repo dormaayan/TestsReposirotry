@@ -1,0 +1,126 @@
+public class ProtocolHandshakerTest {
+  private final BoltChannel boltChannel=newBoltChannel();
+  private final AssertableLogProvider logProvider=new AssertableLogProvider();
+  @Rule public ExpectedException thrown=ExpectedException.none();
+  @After public void tearDown() throws Exception {
+    boltChannel.close();
+  }
+  @Test public void shouldChooseFirstAvailableProtocol(){
+    BoltProtocol protocol=newBoltProtocol(1);
+    BoltProtocolFactory handlerFactory=newProtocolFactory(1,protocol);
+    EmbeddedChannel channel=new EmbeddedChannel(new ProtocolHandshaker(handlerFactory,boltChannel,logProvider,false,true));
+    ByteBuf input=Unpooled.wrappedBuffer(new byte[]{(byte)0x60,(byte)0x60,(byte)0xB0,(byte)0x17},new byte[]{0,0,0,0},new byte[]{0,0,0,1},new byte[]{0,0,0,0},new byte[]{0,0,0,0});
+    channel.writeInbound(input);
+    assertEquals(1,channel.outboundMessages().size());
+    assertByteBufEquals(Unpooled.buffer().writeInt(1),channel.readOutbound());
+    thrown.expect(NoSuchElementException.class);
+    channel.pipeline().remove(ProtocolHandshaker.class);
+    assertTrue(channel.isActive());
+    verify(protocol).install();
+  }
+  @Test public void shouldHandleFragmentedMessage(){
+    BoltProtocol protocol=newBoltProtocol(1);
+    BoltProtocolFactory handlerFactory=newProtocolFactory(1,protocol);
+    EmbeddedChannel channel=new EmbeddedChannel(new ProtocolHandshaker(handlerFactory,boltChannel,logProvider,false,true));
+    channel.writeInbound(Unpooled.wrappedBuffer(new byte[]{(byte)0x60,(byte)0x60,(byte)0xB0}));
+    assertEquals(0,channel.outboundMessages().size());
+    channel.writeInbound(Unpooled.wrappedBuffer(new byte[]{(byte)0x17,0,0,0}));
+    assertEquals(0,channel.outboundMessages().size());
+    channel.writeInbound(Unpooled.wrappedBuffer(new byte[]{0,0,0}));
+    assertEquals(0,channel.outboundMessages().size());
+    channel.writeInbound(Unpooled.wrappedBuffer(new byte[]{0,1,0,0,0}));
+    assertEquals(0,channel.outboundMessages().size());
+    channel.writeInbound(Unpooled.wrappedBuffer(new byte[]{0,0,0}));
+    assertEquals(0,channel.outboundMessages().size());
+    channel.writeInbound(Unpooled.wrappedBuffer(new byte[]{0,0}));
+    assertEquals(1,channel.outboundMessages().size());
+    assertByteBufEquals(Unpooled.buffer().writeInt(1),channel.readOutbound());
+    thrown.expect(NoSuchElementException.class);
+    channel.pipeline().remove(ProtocolHandshaker.class);
+    assertTrue(channel.isActive());
+    verify(protocol).install();
+  }
+  @Test public void shouldHandleHandshakeFollowedImmediatelyByMessage(){
+    BoltProtocol protocol=newBoltProtocol(1);
+    BoltProtocolFactory handlerFactory=newProtocolFactory(1,protocol);
+    EmbeddedChannel channel=new EmbeddedChannel(new ProtocolHandshaker(handlerFactory,boltChannel,logProvider,false,true));
+    ByteBuf input=Unpooled.wrappedBuffer(new byte[]{(byte)0x60,(byte)0x60,(byte)0xB0,(byte)0x17},new byte[]{0,0,0,0},new byte[]{0,0,0,1},new byte[]{0,0,0,0},new byte[]{0,0,0,0},new byte[]{1,2,3,4});
+    channel.writeInbound(input);
+    assertEquals(1,channel.outboundMessages().size());
+    assertByteBufEquals(Unpooled.buffer().writeInt(1),channel.readOutbound());
+    assertEquals(1,channel.inboundMessages().size());
+    assertByteBufEquals(Unpooled.wrappedBuffer(new byte[]{1,2,3,4}),channel.readInbound());
+    thrown.expect(NoSuchElementException.class);
+    channel.pipeline().remove(ProtocolHandshaker.class);
+    assertTrue(channel.isActive());
+    verify(protocol).install();
+  }
+  @Test public void shouldHandleMaxVersionNumber(){
+    long maxVersionNumber=4_294_967_295L;
+    BoltProtocol protocol=newBoltProtocol(maxVersionNumber);
+    BoltProtocolFactory handlerFactory=newProtocolFactory(maxVersionNumber,protocol);
+    EmbeddedChannel channel=new EmbeddedChannel(new ProtocolHandshaker(handlerFactory,boltChannel,logProvider,false,true));
+    ByteBuf input=Unpooled.wrappedBuffer(new byte[]{(byte)0x60,(byte)0x60,(byte)0xB0,(byte)0x17},new byte[]{(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF},new byte[]{0,0,0,0},new byte[]{0,0,0,0},new byte[]{0,0,0,0});
+    channel.writeInbound(input);
+    assertEquals(1,channel.outboundMessages().size());
+    assertByteBufEquals(Unpooled.buffer().writeInt((int)maxVersionNumber),channel.readOutbound());
+    thrown.expect(NoSuchElementException.class);
+    channel.pipeline().remove(ProtocolHandshaker.class);
+    assertTrue(channel.isActive());
+    verify(protocol).install();
+  }
+  @Test public void shouldFallbackToNoProtocolIfNoMatch(){
+    BoltProtocol protocol=newBoltProtocol(1);
+    BoltProtocolFactory handlerFactory=newProtocolFactory(1,protocol);
+    EmbeddedChannel channel=new EmbeddedChannel(new ProtocolHandshaker(handlerFactory,boltChannel,logProvider,false,true));
+    ByteBuf input=Unpooled.wrappedBuffer(new byte[]{(byte)0x60,(byte)0x60,(byte)0xB0,(byte)0x17},new byte[]{0,0,0,0},new byte[]{0,0,0,2},new byte[]{0,0,0,3},new byte[]{0,0,0,4});
+    channel.writeInbound(input);
+    assertEquals(1,channel.outboundMessages().size());
+    assertByteBufEquals(Unpooled.buffer().writeInt(0),channel.readOutbound());
+    assertFalse(channel.isActive());
+    verify(protocol,never()).install();
+  }
+  @Test public void shouldRejectIfWrongPreamble(){
+    BoltProtocol protocol=newBoltProtocol(1);
+    BoltProtocolFactory handlerFactory=newProtocolFactory(1,protocol);
+    EmbeddedChannel channel=new EmbeddedChannel(new ProtocolHandshaker(handlerFactory,boltChannel,logProvider,false,true));
+    ByteBuf input=Unpooled.wrappedBuffer(new byte[]{(byte)0xDE,(byte)0xAB,(byte)0xCD,(byte)0xEF},new byte[]{0,0,0,1},new byte[]{0,0,0,2},new byte[]{0,0,0,3},new byte[]{0,0,0,4});
+    channel.writeInbound(input);
+    assertEquals(0,channel.outboundMessages().size());
+    assertFalse(channel.isActive());
+    verify(protocol,never()).install();
+  }
+  @Test public void shouldRejectIfInsecureWhenEncryptionRequired(){
+    BoltProtocol protocol=newBoltProtocol(1);
+    BoltProtocolFactory handlerFactory=newProtocolFactory(1,protocol);
+    EmbeddedChannel channel=new EmbeddedChannel(new ProtocolHandshaker(handlerFactory,boltChannel,logProvider,true,false));
+    ByteBuf input=Unpooled.wrappedBuffer(new byte[]{(byte)0x60,(byte)0x60,(byte)0xB0,(byte)0x17},new byte[]{0,0,0,1},new byte[]{0,0,0,2},new byte[]{0,0,0,3},new byte[]{0,0,0,4});
+    channel.writeInbound(input);
+    assertEquals(0,channel.outboundMessages().size());
+    assertFalse(channel.isActive());
+    verify(protocol,never()).install();
+  }
+  @Test public void shouldRejectIfHttp(){
+    BoltProtocol protocol=newBoltProtocol(1);
+    BoltProtocolFactory handlerFactory=newProtocolFactory(1,protocol);
+    EmbeddedChannel channel=new EmbeddedChannel(new ProtocolHandshaker(handlerFactory,boltChannel,logProvider,false,true));
+    FullHttpRequest request=new DefaultFullHttpRequest(HttpVersion.HTTP_1_1,HttpMethod.POST,"http://hello_world:10000");
+    request.headers().setInt(HttpHeaderNames.CONTENT_LENGTH,0);
+    channel.writeInbound(request);
+    assertEquals(0,channel.outboundMessages().size());
+    assertFalse(channel.isActive());
+    verify(protocol,never()).install();
+    logProvider.assertExactly(AssertableLogProvider.inLog(ProtocolHandshaker.class).warn("Unsupported connection type: 'HTTP'. Bolt protocol only operates over a TCP connection or WebSocket."));
+  }
+  private static BoltChannel newBoltChannel(){
+    return new BoltChannel("bolt-1","bolt",new EmbeddedChannel());
+  }
+  private static BoltProtocol newBoltProtocol(  long version){
+    BoltProtocol handler=mock(BoltProtocol.class);
+    when(handler.version()).thenReturn(version);
+    return handler;
+  }
+  private static BoltProtocolFactory newProtocolFactory(  long version,  BoltProtocol protocol){
+    return (givenVersion,channel) -> version == givenVersion ? protocol : null;
+  }
+}

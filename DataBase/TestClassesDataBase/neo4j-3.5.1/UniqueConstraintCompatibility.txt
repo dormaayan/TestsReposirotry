@@ -1,0 +1,429 @@
+@Ignore("Not a test. This is a compatibility suite that provides test cases for verifying" + " IndexProvider implementations. Each index provider that is to be tested by this suite" + " must create their own test class extending IndexProviderCompatibilityTestSuite."+ " The @Ignore annotation doesn't prevent these tests to run, it rather removes some annoying"+ " errors or warnings in some IDEs about test classes needing a public zero-arg constructor.") public class UniqueConstraintCompatibility extends IndexProviderCompatibilityTestSuite.Compatibility {
+  public UniqueConstraintCompatibility(  IndexProviderCompatibilityTestSuite testSuite){
+    super(testSuite,TestIndexDescriptorFactory.uniqueForLabel(1,2));
+  }
+  @Before public void setUp(){
+    TestGraphDatabaseFactory dbFactory=new TestGraphDatabaseFactory();
+    dbFactory.setKernelExtensions(Collections.singletonList(new PredefinedIndexProviderFactory(indexProvider)));
+    db=dbFactory.newImpermanentDatabaseBuilder(graphDbDir).setConfig(default_schema_provider,indexProvider.getProviderDescriptor().name()).newGraphDatabase();
+  }
+  @After public void tearDown(){
+    db.shutdown();
+  }
+  @Test public void onlineConstraintShouldAcceptDistinctValuesInDifferentTransactions(){
+    givenOnlineConstraint();
+    Node n;
+    try (Transaction tx=db.beginTx()){
+      n=db.createNode(label);
+      n.setProperty(property,"n");
+      tx.success();
+    }
+     transaction(assertLookupNode("a",is(a)),assertLookupNode("n",is(n)));
+  }
+  @Test public void onlineConstraintShouldAcceptDistinctValuesInSameTransaction(){
+    givenOnlineConstraint();
+    Node n;
+    Node m;
+    try (Transaction tx=db.beginTx()){
+      n=db.createNode(label);
+      n.setProperty(property,"n");
+      m=db.createNode(label);
+      m.setProperty(property,"m");
+      tx.success();
+    }
+     transaction(assertLookupNode("n",is(n)),assertLookupNode("m",is(m)));
+  }
+  @Test public void onlineConstraintShouldNotFalselyCollideOnFindNodesByLabelAndProperty(){
+    givenOnlineConstraint();
+    Node n;
+    Node m;
+    try (Transaction tx=db.beginTx()){
+      n=db.createNode(label);
+      n.setProperty(property,COLLISION_X);
+      tx.success();
+    }
+     try (Transaction tx=db.beginTx()){
+      m=db.createNode(label);
+      m.setProperty(property,COLLISION_Y);
+      tx.success();
+    }
+     transaction(assertLookupNode(COLLISION_X,is(n)),assertLookupNode(COLLISION_Y,is(m)));
+  }
+  @Test public void onlineConstraintShouldNotConflictOnIntermediateStatesInSameTransaction(){
+    givenOnlineConstraint();
+    transaction(setProperty(a,"b"),setProperty(b,"a"),success);
+    transaction(assertLookupNode("a",is(b)),assertLookupNode("b",is(a)));
+  }
+  @Test(expected=ConstraintViolationException.class) public void onlineConstraintShouldRejectChangingEntryToAlreadyIndexedValue(){
+    givenOnlineConstraint();
+    transaction(setProperty(b,"b"),success);
+    transaction(setProperty(b,"a"),success,fail("Changing a property to an already indexed value should have thrown"));
+  }
+  @Test(expected=ConstraintViolationException.class) public void onlineConstraintShouldRejectConflictsInTheSameTransaction(){
+    givenOnlineConstraint();
+    transaction(setProperty(a,"x"),setProperty(b,"x"),success,fail("Should have rejected changes of two node/properties to the same index value"));
+  }
+  @Test public void onlineConstraintShouldRejectChangingEntryToAlreadyIndexedValueThatOtherTransactionsAreRemoving(){
+    givenOnlineConstraint();
+    transaction(setProperty(b,"b"),success);
+    Transaction otherTx=db.beginTx();
+    a.removeLabel(label);
+    suspend(otherTx);
+    try {
+      transaction(setProperty(b,"a"),success,fail("Changing a property to an already indexed value should have thrown"));
+    }
+ catch (    ConstraintViolationException ignore) {
+    }
+ finally {
+      resume(otherTx);
+      otherTx.failure();
+      otherTx.close();
+    }
+  }
+  @Test public void onlineConstraintShouldAddAndRemoveFromIndexAsPropertiesAndLabelsChange(){
+    givenOnlineConstraint();
+    transaction(setProperty(b,"b"),success);
+    transaction(setProperty(c,"c"),addLabel(c,label),success);
+    transaction(setProperty(d,"d"),addLabel(d,label),success);
+    transaction(removeProperty(a),success);
+    transaction(removeProperty(b),success);
+    transaction(removeProperty(c),success);
+    transaction(setProperty(a,"a"),success);
+    transaction(setProperty(c,"c2"),success);
+    transaction(assertLookupNode("a",is(a)),assertLookupNode("b",is(nullValue(Node.class))),assertLookupNode("c",is(nullValue(Node.class))),assertLookupNode("d",is(d)),assertLookupNode("c2",is(c)));
+  }
+  @Test(expected=ConstraintViolationException.class) public void onlineConstraintShouldRejectConflictingPropertyChange(){
+    givenOnlineConstraint();
+    transaction(setProperty(b,"a"),success,fail("Setting b.name = \"a\" should have caused a conflict"));
+  }
+  @Test(expected=ConstraintViolationException.class) public void onlineConstraintShouldRejectConflictingLabelChange(){
+    givenOnlineConstraint();
+    transaction(addLabel(c,label),success,fail("Setting c:Cybermen should have caused a conflict"));
+  }
+  @Test(expected=ConstraintViolationException.class) public void onlineConstraintShouldRejectAddingEntryForValueAlreadyIndexedByPriorChange(){
+    givenOnlineConstraint();
+    transaction(setProperty(a,"a1"),success);
+    transaction(setProperty(b,"a1"),success,fail("Setting b.name = \"a1\" should have caused a conflict"));
+  }
+  @Test public void onlineConstraintShouldAcceptUniqueEntries(){
+    givenOnlineConstraint();
+    transaction(setProperty(b,"b"),addLabel(d,label),success);
+    transaction(setProperty(c,"c"),addLabel(c,label),success);
+    transaction(assertLookupNode("a",is(a)),assertLookupNode("b",is(b)),assertLookupNode("c",is(c)),assertLookupNode("d",is(d)));
+  }
+  @Test public void onlineConstraintShouldAcceptUniqueEntryChanges(){
+    givenOnlineConstraint();
+    transaction(setProperty(a,"a1"),success);
+    transaction(assertLookupNode("a1",is(a)));
+  }
+  @Test(expected=ConstraintViolationException.class) public void onlineConstraintShouldRejectDuplicateEntriesAddedInSameTransaction(){
+    givenOnlineConstraint();
+    transaction(setProperty(b,"d"),addLabel(d,label),success,fail("Setting b.name = \"d\" and d:Cybermen should have caused a conflict"));
+  }
+  @Test public void populatingConstraintMustAcceptDatasetOfUniqueEntries(){
+    givenUniqueDataset();
+    createUniqueConstraint();
+  }
+  @Test(expected=ConstraintViolationException.class) public void populatingConstraintMustRejectDatasetWithDuplicateEntries(){
+    givenUniqueDataset();
+    transaction(setProperty(c,"b"),success);
+    createUniqueConstraint();
+  }
+  @Test public void populatingConstraintMustAcceptDatasetWithDalseIndexCollisions(){
+    givenUniqueDataset();
+    transaction(setProperty(b,COLLISION_X),setProperty(c,COLLISION_Y),success);
+    createUniqueConstraint();
+  }
+  @Test public void populatingConstraintMustAcceptDatasetThatGetsUpdatedWithUniqueEntries() throws Exception {
+    givenUniqueDataset();
+    Future<?> createConstraintTransaction=applyChangesToPopulatingUpdater(d.getId(),a.getId(),setProperty(d,"d1"));
+    createConstraintTransaction.get();
+  }
+  @Test public void populatingConstraintMustRejectDatasetThatGetsUpdatedWithDuplicateAddition() throws Exception {
+    givenUniqueDataset();
+    Future<?> createConstraintTransaction=applyChangesToPopulatingUpdater(d.getId(),a.getId(),createNode("b"));
+    try {
+      createConstraintTransaction.get();
+      Assert.fail("expected to throw when PopulatingUpdater got duplicates");
+    }
+ catch (    ExecutionException ee) {
+      Throwable cause=ee.getCause();
+      assertThat(cause,instanceOf(ConstraintViolationException.class));
+    }
+  }
+  @Test public void populatingConstraintMustRejectDatasetThatGetsUpdatedWithDuplicates() throws Exception {
+    givenUniqueDataset();
+    Future<?> createConstraintTransaction=applyChangesToPopulatingUpdater(d.getId(),a.getId(),setProperty(d,"b"));
+    try {
+      createConstraintTransaction.get();
+      Assert.fail("expected to throw when PopulatingUpdater got duplicates");
+    }
+ catch (    ExecutionException ee) {
+      Throwable cause=ee.getCause();
+      assertThat(cause,instanceOf(ConstraintViolationException.class));
+    }
+  }
+  @Test public void populatingConstraintMustAcceptDatasetThatGestUpdatedWithFalseIndexCollisions() throws Exception {
+    givenUniqueDataset();
+    transaction(setProperty(a,COLLISION_X),success);
+    Future<?> createConstraintTransaction=applyChangesToPopulatingUpdater(d.getId(),a.getId(),setProperty(d,COLLISION_Y));
+    createConstraintTransaction.get();
+  }
+  @Test public void populatingConstraintMustRejectDatasetThatGetsUpdatedWithDuplicatesInSameTransaction() throws Exception {
+    givenUniqueDataset();
+    Future<?> createConstraintTransaction=applyChangesToPopulatingUpdater(d.getId(),a.getId(),setProperty(d,"x"),setProperty(c,"x"));
+    try {
+      createConstraintTransaction.get();
+      Assert.fail("expected to throw when PopulatingUpdater got duplicates");
+    }
+ catch (    ExecutionException ee) {
+      Throwable cause=ee.getCause();
+      assertThat(cause,instanceOf(ConstraintViolationException.class));
+    }
+  }
+  @Test public void populatingConstraintMustAcceptDatasetThatGetsUpdatedWithDuplicatesThatAreLaterResolved() throws Exception {
+    givenUniqueDataset();
+    Future<?> createConstraintTransaction=applyChangesToPopulatingUpdater(d.getId(),a.getId(),setProperty(d,"b"),setProperty(b,"c"),setProperty(c,"d"));
+    createConstraintTransaction.get();
+  }
+  @Test public void populatingUpdaterMustRejectDatasetWhereAdditionsConflictsWithPriorChanges() throws Exception {
+    givenUniqueDataset();
+    Future<?> createConstraintTransaction=applyChangesToPopulatingUpdater(d.getId(),a.getId(),setProperty(d,"x"),createNode("x"));
+    try {
+      createConstraintTransaction.get();
+      Assert.fail("expected to throw when PopulatingUpdater got duplicates");
+    }
+ catch (    ExecutionException ee) {
+      Throwable cause=ee.getCause();
+      assertThat(cause,instanceOf(ConstraintViolationException.class));
+    }
+  }
+  /** 
+ * NOTE the tests using this will currently succeed for the wrong reasons, because the data-changing transaction does not actually release the schema read lock early enough for the PopulatingUpdater to come into play.
+ */
+  private Future<?> applyChangesToPopulatingUpdater(  long blockDataChangeTransactionOnLockOnId,  long blockPopulatorOnLockOnId,  final Action... actions) throws InterruptedException, ExecutionException {
+    final CountDownLatch createNodeReadyLatch=new CountDownLatch(1);
+    final CountDownLatch createNodeCommitLatch=new CountDownLatch(1);
+    Future<?> updatingTransaction=executor.submit(() -> {
+      try (Transaction tx=db.beginTx()){
+        for (        Action action : actions) {
+          action.accept(tx);
+        }
+        tx.success();
+        createNodeReadyLatch.countDown();
+        awaitUninterruptibly(createNodeCommitLatch);
+      }
+     }
+);
+    createNodeReadyLatch.await();
+    Lock lockBlockingDataChangeTransaction=getLockService().acquireNodeLock(blockDataChangeTransactionOnLockOnId,LockType.WRITE_LOCK);
+    Lock lockBlockingIndexPopulator=getLockService().acquireNodeLock(blockPopulatorOnLockOnId,LockType.WRITE_LOCK);
+    final CountDownLatch createConstraintTransactionStarted=new CountDownLatch(1);
+    Future<?> createConstraintTransaction=executor.submit(() -> createUniqueConstraint(createConstraintTransactionStarted));
+    createConstraintTransactionStarted.await();
+    createNodeCommitLatch.countDown();
+    lockBlockingDataChangeTransaction.release();
+    updatingTransaction.get();
+    lockBlockingIndexPopulator.release();
+    return createConstraintTransaction;
+  }
+  private static final long COLLISION_X=4611686018427387905L;
+  private static final long COLLISION_Y=4611686018427387907L;
+  private static final ExecutorService executor=Executors.newCachedThreadPool();
+  private final Label label=Label.label("Cybermen");
+  private final String property="name";
+  private Node a;
+  private Node b;
+  private Node c;
+  private Node d;
+  private GraphDatabaseService db;
+  /** 
+ * Effectively: <pre><code> CREATE CONSTRAINT ON (n:Cybermen) assert n.name is unique ; CREATE (a:Cybermen {name: "a"}), (b:Cybermen), (c: {name: "a"}), (d: {name: "d"}) ; </code></pre>
+ */
+  private void givenOnlineConstraint(){
+    createUniqueConstraint();
+    try (Transaction tx=db.beginTx()){
+      a=db.createNode(label);
+      a.setProperty(property,"a");
+      b=db.createNode(label);
+      c=db.createNode();
+      c.setProperty(property,"a");
+      d=db.createNode();
+      d.setProperty(property,"d");
+      tx.success();
+    }
+   }
+  /** 
+ * Effectively: <pre><code> CREATE (a:Cybermen {name: "a"}), (b:Cybermen {name: "b"}), (c:Cybermen {name: "c"}), (d:Cybermen {name: "d"}) ; </code></pre>
+ */
+  private void givenUniqueDataset(){
+    try (Transaction tx=db.beginTx()){
+      a=db.createNode(label);
+      a.setProperty(property,"a");
+      b=db.createNode(label);
+      b.setProperty(property,"b");
+      c=db.createNode(label);
+      c.setProperty(property,"c");
+      d=db.createNode(label);
+      d.setProperty(property,"d");
+      tx.success();
+    }
+   }
+  /** 
+ * Effectively: <pre><code> CREATE CONSTRAINT ON (n:Cybermen) assert n.name is unique ; </code></pre>
+ */
+  private void createUniqueConstraint(){
+    createUniqueConstraint(null);
+  }
+  /** 
+ * Effectively: <pre><code> CREATE CONSTRAINT ON (n:Cybermen) assert n.name is unique ; </code></pre> Also counts down the given latch prior to creating the constraint.
+ */
+  private void createUniqueConstraint(  CountDownLatch preCreateLatch){
+    try (Transaction tx=db.beginTx()){
+      if (preCreateLatch != null) {
+        preCreateLatch.countDown();
+      }
+      db.schema().constraintFor(label).assertPropertyIsUnique(property).create();
+      tx.success();
+    }
+   }
+  /** 
+ * Effectively: <pre><code> return single( db.findNodesByLabelAndProperty( label, property, value ), null ); </code></pre>
+ */
+  private Node lookUpNode(  Object value){
+    return db.findNode(label,property,value);
+  }
+  public void transaction(  Action... actions){
+    int progress=0;
+    try (Transaction tx=db.beginTx()){
+      for (      Action action : actions) {
+        action.accept(tx);
+        progress++;
+      }
+    }
+ catch (    Throwable ex) {
+      StringBuilder sb=new StringBuilder("Transaction failed:\n\n");
+      for (int i=0; i < actions.length; i++) {
+        String mark=progress == i ? " failed --> " : "            ";
+        sb.append(mark).append(actions[i]).append('\n');
+      }
+      ex.addSuppressed(new AssertionError(sb.toString()));
+      throw ex;
+    }
+  }
+private abstract class Action implements Consumer<Transaction> {
+    private final String name;
+    protected Action(    String name){
+      this.name=name;
+    }
+    @Override public String toString(){
+      return name;
+    }
+  }
+  private final Action success=new Action("tx.success();"){
+    @Override public void accept(    Transaction transaction){
+      transaction.success();
+      transaction.close();
+    }
+  }
+;
+  private Action createNode(  final Object propertyValue){
+    return new Action("Node node = db.createNode( label ); " + "node.setProperty( property, " + reprValue(propertyValue) + " );"){
+      @Override public void accept(      Transaction transaction){
+        Node node=db.createNode(label);
+        node.setProperty(property,propertyValue);
+      }
+    }
+;
+  }
+  private Action setProperty(  final Node node,  final Object value){
+    return new Action(reprNode(node) + ".setProperty( property, " + reprValue(value)+ " );"){
+      @Override public void accept(      Transaction transaction){
+        node.setProperty(property,value);
+      }
+    }
+;
+  }
+  private Action removeProperty(  final Node node){
+    return new Action(reprNode(node) + ".removeProperty( property );"){
+      @Override public void accept(      Transaction transaction){
+        node.removeProperty(property);
+      }
+    }
+;
+  }
+  private Action addLabel(  final Node node,  final Label label){
+    return new Action(reprNode(node) + ".addLabel( " + label+ " );"){
+      @Override public void accept(      Transaction transaction){
+        node.addLabel(label);
+      }
+    }
+;
+  }
+  private Action fail(  final String message){
+    return new Action("fail( \"" + message + "\" );"){
+      @Override public void accept(      Transaction transaction){
+        Assert.fail(message);
+      }
+    }
+;
+  }
+  private Action assertLookupNode(  final Object propertyValue,  final Matcher<Node> matcher){
+    return new Action("assertThat( lookUpNode( " + reprValue(propertyValue) + " ), "+ matcher+ " );"){
+      @Override public void accept(      Transaction transaction){
+        assertThat(lookUpNode(propertyValue),matcher);
+      }
+    }
+;
+  }
+  private String reprValue(  Object value){
+    return value instanceof String ? "\"" + value + "\"" : String.valueOf(value);
+  }
+  private String reprNode(  Node node){
+    return node == a ? "a" : node == b ? "b" : node == c ? "c" : node == d ? "d" : "n";
+  }
+  private final Map<Transaction,KernelTransaction> txMap=new IdentityHashMap<>();
+  private void suspend(  Transaction tx){
+    ThreadToStatementContextBridge txManager=getTransactionManager();
+    txMap.put(tx,txManager.getKernelTransactionBoundToThisThread(true));
+    txManager.unbindTransactionFromCurrentThread();
+  }
+  private void resume(  Transaction tx){
+    ThreadToStatementContextBridge txManager=getTransactionManager();
+    txManager.bindTransactionToCurrentThread(txMap.remove(tx));
+  }
+  private ThreadToStatementContextBridge getTransactionManager(){
+    return resolveInternalDependency(ThreadToStatementContextBridge.class);
+  }
+  /** 
+ * Locks controlling concurrent access to the store files.
+ */
+  private LockService getLockService(){
+    return resolveInternalDependency(LockService.class);
+  }
+  private <T>T resolveInternalDependency(  Class<T> type){
+    @SuppressWarnings("deprecation") GraphDatabaseAPI api=(GraphDatabaseAPI)db;
+    DependencyResolver resolver=api.getDependencyResolver();
+    return resolver.resolveDependency(type);
+  }
+  private static void awaitUninterruptibly(  CountDownLatch latch){
+    try {
+      latch.await();
+    }
+ catch (    InterruptedException e) {
+      throw new AssertionError("Interrupted",e);
+    }
+  }
+private static class PredefinedIndexProviderFactory extends KernelExtensionFactory<PredefinedIndexProviderFactory.NoDeps> {
+    private final IndexProvider indexProvider;
+    @Override public Lifecycle newInstance(    KernelContext context,    NoDeps noDeps){
+      return indexProvider;
+    }
+interface NoDeps {
+    }
+    PredefinedIndexProviderFactory(    IndexProvider indexProvider){
+      super(ExtensionType.DATABASE,indexProvider.getClass().getSimpleName());
+      this.indexProvider=indexProvider;
+    }
+  }
+}

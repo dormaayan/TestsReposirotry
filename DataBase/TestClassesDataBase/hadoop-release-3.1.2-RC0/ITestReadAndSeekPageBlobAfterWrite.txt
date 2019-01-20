@@ -1,0 +1,190 @@
+/** 
+ * Write data into a page blob and verify you can read back all of it or just a part of it.
+ */
+public class ITestReadAndSeekPageBlobAfterWrite extends AbstractAzureScaleTest {
+  private static final Logger LOG=LoggerFactory.getLogger(ITestReadAndSeekPageBlobAfterWrite.class);
+  private FileSystem fs;
+  private byte[] randomData;
+  private static final int PAGE_SIZE=PageBlobFormatHelpers.PAGE_SIZE;
+  private static final int PAGE_DATA_SIZE=PAGE_SIZE - PageBlobFormatHelpers.PAGE_HEADER_SIZE;
+  private static final int MAX_BYTES=33554432;
+  private static final int MAX_PAGES=MAX_BYTES / PAGE_SIZE;
+  private Random rand=new Random();
+  private static final String KEY="/pageBlobs/file.dat";
+  private Path blobPath;
+  @Override public void setUp() throws Exception {
+    super.setUp();
+    fs=getTestAccount().getFileSystem();
+    assertEquals(0,MAX_BYTES % PAGE_SIZE);
+    randomData=new byte[PAGE_SIZE * MAX_PAGES];
+    rand.nextBytes(randomData);
+    blobPath=blobPath("ITestReadAndSeekPageBlobAfterWrite");
+  }
+  @Override public void tearDown() throws Exception {
+    deleteQuietly(fs,blobPath,true);
+    super.tearDown();
+  }
+  /** 
+ * Make sure the file name (key) is a page blob file name. If anybody changes that, we need to come back and update this test class.
+ */
+  @Test public void testIsPageBlobFileName(){
+    AzureNativeFileSystemStore store=((NativeAzureFileSystem)fs).getStore();
+    String[] a=blobPath.toUri().getPath().split("/");
+    String key2=a[1] + "/";
+    assertTrue("Not a page blob: " + blobPath,store.isPageBlobKey(key2));
+  }
+  /** 
+ * For a set of different file sizes, write some random data to a page blob, read it back, and compare that what was read is the same as what was written.
+ */
+  @Test public void testReadAfterWriteRandomData() throws IOException {
+    final int pds=PAGE_DATA_SIZE;
+    int[] dataSizes={0,1,2,3,pds - 1,pds,pds + 1,pds + 2,pds + 3,(2 * pds) - 1,(2 * pds),(2 * pds) + 1,(2 * pds) + 2,(2 * pds) + 3,(10 * pds) - 1,(10 * pds),(10 * pds) + 1,(10 * pds) + 2,(10 * pds) + 3,MAX_BYTES};
+    for (    int i : dataSizes) {
+      testReadAfterWriteRandomData(i);
+    }
+  }
+  private void testReadAfterWriteRandomData(  int size) throws IOException {
+    writeRandomData(size);
+    readRandomDataAndVerify(size);
+  }
+  /** 
+ * Read "size" bytes of data and verify that what was read and what was written are the same.
+ */
+  private void readRandomDataAndVerify(  int size) throws AzureException, IOException {
+    byte[] b=new byte[size];
+    FSDataInputStream stream=fs.open(blobPath);
+    int bytesRead=stream.read(b);
+    stream.close();
+    assertEquals(bytesRead,size);
+    assertTrue(comparePrefix(randomData,b,size));
+  }
+  private boolean comparePrefix(  byte[] a,  byte[] b,  int size){
+    if (a.length < size || b.length < size) {
+      return false;
+    }
+    for (int i=0; i < size; i++) {
+      if (a[i] != b[i]) {
+        return false;
+      }
+    }
+    return true;
+  }
+  private void writeRandomData(  int size) throws IOException {
+    OutputStream output=fs.create(blobPath);
+    output.write(randomData,0,size);
+    output.close();
+  }
+  /** 
+ * Write data to a page blob, open it, seek, and then read a range of data. Then compare that the data read from that range is the same as the data originally written.
+ */
+  @Test public void testPageBlobSeekAndReadAfterWrite() throws IOException {
+    writeRandomData(PAGE_SIZE * MAX_PAGES);
+    int recordSize=100;
+    byte[] b=new byte[recordSize];
+    try (FSDataInputStream stream=fs.open(blobPath)){
+      int seekPosition=5 * PAGE_SIZE + 250;
+      stream.seek(seekPosition);
+      int bytesRead=stream.read(b);
+      verifyReadRandomData(b,bytesRead,seekPosition,recordSize);
+      seekPosition=10 * PAGE_SIZE + 250;
+      stream.seek(seekPosition);
+      recordSize=1000;
+      b=new byte[recordSize];
+      bytesRead=stream.read(b);
+      verifyReadRandomData(b,bytesRead,seekPosition,recordSize);
+      recordSize=100;
+      seekPosition=PAGE_SIZE * MAX_PAGES - recordSize;
+      stream.seek(seekPosition);
+      b=new byte[recordSize];
+      bytesRead=stream.read(b);
+      verifyReadRandomData(b,bytesRead,seekPosition,recordSize);
+      recordSize=100;
+      seekPosition=PAGE_SIZE * MAX_PAGES - recordSize + 50;
+      stream.seek(seekPosition);
+      b=new byte[recordSize];
+      bytesRead=stream.read(b);
+      assertEquals(50,bytesRead);
+      byte[] tail=Arrays.copyOfRange(randomData,seekPosition,randomData.length);
+      assertTrue(comparePrefix(tail,b,50));
+    }
+   }
+  private void verifyReadRandomData(  byte[] b,  int bytesRead,  int seekPosition,  int recordSize){
+    byte[] originalRecordData=Arrays.copyOfRange(randomData,seekPosition,seekPosition + recordSize + 1);
+    assertEquals(recordSize,bytesRead);
+    assertTrue(comparePrefix(originalRecordData,b,recordSize));
+  }
+  @Test public void testManySmallWritesWithHFlush() throws IOException {
+    writeAndReadOneFile(50,100,20);
+  }
+  /** 
+ * Write a total of numWrites * recordLength data to a file, read it back, and check to make sure what was read is the same as what was written. The syncInterval is the number of writes after which to call hflush to force the data to storage.
+ */
+  private void writeAndReadOneFile(  int numWrites,  int recordLength,  int syncInterval) throws IOException {
+    final long MINIMUM_EXPECTED_TIME=20;
+    LOG.info("Writing " + numWrites * recordLength + " bytes to " + blobPath.getName());
+    FSDataOutputStream output=fs.create(blobPath);
+    int writesSinceHFlush=0;
+    try {
+      output.flush();
+      output.hflush();
+      for (int i=0; i < numWrites; i++) {
+        output.write(randomData,i * recordLength,recordLength);
+        writesSinceHFlush++;
+        output.flush();
+        if ((i % syncInterval) == 0) {
+          output.hflush();
+          writesSinceHFlush=0;
+        }
+      }
+    }
+  finally {
+      long start=Time.monotonicNow();
+      output.close();
+      long end=Time.monotonicNow();
+      LOG.debug("close duration = " + (end - start) + " msec.");
+      if (writesSinceHFlush > 0) {
+        assertTrue(String.format("close duration with >= 1 pending write is %d, less than minimum expected of %d",end - start,MINIMUM_EXPECTED_TIME),end - start >= MINIMUM_EXPECTED_TIME);
+      }
+    }
+    FSDataInputStream stream=fs.open(blobPath);
+    int SIZE=numWrites * recordLength;
+    byte[] b=new byte[SIZE];
+    try {
+      stream.seek(0);
+      stream.read(b,0,SIZE);
+      verifyReadRandomData(b,SIZE,0,SIZE);
+    }
+  finally {
+      stream.close();
+    }
+    fs.delete(blobPath,false);
+  }
+  @Test public void testLargeFileStress() throws IOException {
+    int numWrites=32;
+    int recordSize=1024 * 1024;
+    int syncInterval=10;
+    int repetitions=1;
+    for (int i=0; i < repetitions; i++) {
+      writeAndReadOneFile(numWrites,recordSize,syncInterval);
+    }
+  }
+  public void testFileSizeExtension() throws IOException {
+    final int writeSize=1024 * 1024;
+    final int numWrites=129;
+    final byte dataByte=5;
+    byte[] data=new byte[writeSize];
+    Arrays.fill(data,dataByte);
+    try (FSDataOutputStream output=fs.create(blobPath)){
+      for (int i=0; i < numWrites; i++) {
+        output.write(data);
+        output.hflush();
+        LOG.debug("total writes = " + (i + 1));
+      }
+    }
+     assertTrue(numWrites * writeSize > PageBlobOutputStream.PAGE_BLOB_MIN_SIZE);
+    FileStatus[] status=fs.listStatus(blobPath);
+    assertEquals("File size hasn't changed " + status,numWrites * writeSize,status[0].getLen());
+    LOG.debug("Total bytes written to " + blobPath + " = "+ status[0].getLen());
+    fs.delete(blobPath,false);
+  }
+}

@@ -1,0 +1,63 @@
+/** 
+ * Verifies that the resources are merged correctly for chained operators (covers middle chaining and iteration cases) when generating job graph.
+ */
+@Test public void testResourcesForIteration() throws Exception {
+  ResourceSpec resource1=ResourceSpec.newBuilder().setCpuCores(0.1).setHeapMemoryInMB(100).build();
+  ResourceSpec resource2=ResourceSpec.newBuilder().setCpuCores(0.2).setHeapMemoryInMB(200).build();
+  ResourceSpec resource3=ResourceSpec.newBuilder().setCpuCores(0.3).setHeapMemoryInMB(300).build();
+  ResourceSpec resource4=ResourceSpec.newBuilder().setCpuCores(0.4).setHeapMemoryInMB(400).build();
+  ResourceSpec resource5=ResourceSpec.newBuilder().setCpuCores(0.5).setHeapMemoryInMB(500).build();
+  Method opMethod=SingleOutputStreamOperator.class.getDeclaredMethod("setResources",ResourceSpec.class);
+  opMethod.setAccessible(true);
+  Method sinkMethod=DataStreamSink.class.getDeclaredMethod("setResources",ResourceSpec.class);
+  sinkMethod.setAccessible(true);
+  StreamExecutionEnvironment env=StreamExecutionEnvironment.getExecutionEnvironment();
+  DataStream<Integer> source=env.addSource(new ParallelSourceFunction<Integer>(){
+    @Override public void run(    SourceContext<Integer> ctx) throws Exception {
+    }
+    @Override public void cancel(){
+    }
+  }
+).name("test_source");
+  opMethod.invoke(source,resource1);
+  IterativeStream<Integer> iteration=source.iterate(3000);
+  opMethod.invoke(iteration,resource2);
+  DataStream<Integer> flatMap=iteration.flatMap(new FlatMapFunction<Integer,Integer>(){
+    @Override public void flatMap(    Integer value,    Collector<Integer> out) throws Exception {
+      out.collect(value);
+    }
+  }
+).name("test_flatMap");
+  opMethod.invoke(flatMap,resource3);
+  DataStream<Integer> increment=flatMap.filter(new FilterFunction<Integer>(){
+    @Override public boolean filter(    Integer value) throws Exception {
+      return false;
+    }
+  }
+).name("test_filter");
+  opMethod.invoke(increment,resource4);
+  DataStreamSink<Integer> sink=iteration.closeWith(increment).addSink(new SinkFunction<Integer>(){
+    @Override public void invoke(    Integer value) throws Exception {
+    }
+  }
+).disableChaining().name("test_sink");
+  sinkMethod.invoke(sink,resource5);
+  JobGraph jobGraph=StreamingJobGraphGenerator.createJobGraph(env.getStreamGraph());
+  for (  JobVertex jobVertex : jobGraph.getVertices()) {
+    if (jobVertex.getName().contains("test_source")) {
+      assertTrue(jobVertex.getMinResources().equals(resource1));
+    }
+ else     if (jobVertex.getName().contains("Iteration_Source")) {
+      assertTrue(jobVertex.getPreferredResources().equals(resource2));
+    }
+ else     if (jobVertex.getName().contains("test_flatMap")) {
+      assertTrue(jobVertex.getMinResources().equals(resource3.merge(resource4)));
+    }
+ else     if (jobVertex.getName().contains("Iteration_Tail")) {
+      assertTrue(jobVertex.getPreferredResources().equals(ResourceSpec.DEFAULT));
+    }
+ else     if (jobVertex.getName().contains("test_sink")) {
+      assertTrue(jobVertex.getMinResources().equals(resource5));
+    }
+  }
+}

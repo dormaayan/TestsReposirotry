@@ -1,0 +1,202 @@
+public class InProcessServerBuilderIT {
+  @Rule public TestDirectory testDir=TestDirectory.testDirectory();
+  @Rule public SuppressOutput suppressOutput=SuppressOutput.suppressAll();
+  @Test public void shouldLaunchAServerInSpecifiedDirectory(){
+    File workDir=testDir.directory("specific");
+    try (ServerControls server=getTestServerBuilder(workDir).newServer()){
+      assertThat(HTTP.GET(server.httpURI().toString()).status(),equalTo(200));
+      assertThat(workDir.list().length,equalTo(1));
+    }
+     assertThat(Arrays.toString(workDir.list()),workDir.list().length,equalTo(0));
+  }
+  private TestServerBuilder getTestServerBuilder(  File workDir){
+    return newInProcessBuilder(workDir);
+  }
+  @Test public void shouldAllowCustomServerAndDbConfig() throws Exception {
+    trustAllSSLCerts();
+    SSLServerSocketFactory ssf=(SSLServerSocketFactory)SSLServerSocketFactory.getDefault();
+    String[] defaultCiphers=ssf.getDefaultCipherSuites();
+    HttpConnector httpConnector=new HttpConnector("0",Encryption.NONE);
+    HttpConnector httpsConnector=new HttpConnector("1",Encryption.TLS);
+    try (ServerControls server=getTestServerBuilder(testDir.directory()).withConfig(httpConnector.type,"HTTP").withConfig(httpConnector.enabled,"true").withConfig(httpConnector.encryption,"NONE").withConfig(httpConnector.listen_address,"localhost:0").withConfig(httpsConnector.type,"HTTP").withConfig(httpsConnector.enabled,"true").withConfig(httpsConnector.encryption,"TLS").withConfig(httpsConnector.listen_address,"localhost:0").withConfig(GraphDatabaseSettings.dense_node_threshold,"20").withConfig("https.ssl_policy","test").withConfig("dbms.ssl.policy.test.base_directory",testDir.directory("certificates").getAbsolutePath()).withConfig("dbms.ssl.policy.test.allow_key_generation","true").withConfig("dbms.ssl.policy.test.ciphers",String.join(",",defaultCiphers)).withConfig("dbms.ssl.policy.test.tls_versions","TLSv1.2, TLSv1.1, TLSv1").withConfig("dbms.ssl.policy.test.client_auth",ClientAuth.NONE.name()).withConfig("dbms.ssl.policy.test.trust_all","true").newServer()){
+      assertThat(HTTP.GET(server.httpURI().toString()).status(),equalTo(200));
+      assertThat(HTTP.GET(server.httpsURI().get().toString()).status(),equalTo(200));
+      assertDBConfig(server,"20",GraphDatabaseSettings.dense_node_threshold.name());
+    }
+   }
+  @Test public void shouldMountUnmanagedExtensionsByClass(){
+    try (ServerControls server=getTestServerBuilder(testDir.directory()).withExtension("/path/to/my/extension",MyUnmanagedExtension.class).newServer()){
+      assertThat(HTTP.GET(server.httpURI().toString() + "path/to/my/extension/myExtension").status(),equalTo(234));
+    }
+   }
+  @Test public void shouldMountUnmanagedExtensionsByPackage(){
+    try (ServerControls server=getTestServerBuilder(testDir.directory()).withExtension("/path/to/my/extension","org.neo4j.harness.extensionpackage").newServer()){
+      assertThat(HTTP.GET(server.httpURI().toString() + "path/to/my/extension/myExtension").status(),equalTo(234));
+    }
+   }
+  @Test public void shouldFindFreePort(){
+    try (ServerControls firstServer=getTestServerBuilder(testDir.directory()).newServer()){
+      try (ServerControls secondServer=getTestServerBuilder(testDir.directory()).newServer()){
+        assertThat(secondServer.httpURI().getPort(),not(firstServer.httpURI().getPort()));
+      }
+     }
+   }
+  @Test public void shouldRunBuilderOnExistingStoreDir() throws Exception {
+    File existingStoreDir=testDir.directory("existingStore");
+    File storeDir=Config.defaults(GraphDatabaseSettings.data_directory,existingStoreDir.toPath().toString()).get(GraphDatabaseSettings.database_path);
+    GraphDatabaseService db=new TestGraphDatabaseFactory().newEmbeddedDatabase(storeDir);
+    try {
+      db.execute("create ()");
+    }
+  finally {
+      db.shutdown();
+    }
+    try (ServerControls server=getTestServerBuilder(testDir.databaseDir()).copyFrom(existingStoreDir).newServer()){
+      try (Transaction tx=server.graph().beginTx()){
+        ResourceIterable<Node> allNodes=Iterables.asResourceIterable(server.graph().getAllNodes());
+        assertTrue(Iterables.count(allNodes) > 0);
+        server.graph().createNode();
+        tx.success();
+      }
+     }
+     db=new TestGraphDatabaseFactory().newEmbeddedDatabase(storeDir);
+    try {
+      try (Transaction tx=db.beginTx()){
+        assertEquals(1,Iterables.count(db.getAllNodes()));
+        tx.success();
+      }
+     }
+  finally {
+      db.shutdown();
+    }
+  }
+  @Test public void shouldOpenBoltPort() throws Throwable {
+    try (ServerControls controls=getTestServerBuilder(testDir.directory()).newServer()){
+      URI uri=controls.boltURI();
+      new SocketConnection().connect(new HostnamePort(uri.getHost(),uri.getPort()));
+    }
+   }
+  @Test public void shouldFailWhenProvidingANonDirectoryAsSource() throws IOException {
+    File notADirectory=File.createTempFile("prefix","suffix");
+    assertFalse(notADirectory.isDirectory());
+    try (ServerControls ignored=getTestServerBuilder(testDir.directory()).copyFrom(notADirectory).newServer()){
+      fail("server should not start");
+    }
+ catch (    RuntimeException rte) {
+      Throwable cause=rte.getCause();
+      assertTrue(cause instanceof IOException);
+      assertTrue(cause.getMessage().contains("exists but is not a directory"));
+    }
+  }
+  @Test public void shouldReturnBoltUriWhenMultipleBoltConnectorsConfigured(){
+    TestServerBuilder serverBuilder=newInProcessBuilder(testDir.directory()).withConfig("dbms.connector.another_bolt.type","BOLT").withConfig("dbms.connector.another_bolt.enabled","true").withConfig("dbms.connector.another_bolt.listen_address",":0").withConfig("dbms.connector.bolt.enabled","true").withConfig("dbms.connector.bolt.listen_address",":0");
+    try (ServerControls server=serverBuilder.newServer()){
+      HostnamePort boltHostPort=connectorAddress(server.graph(),"bolt");
+      HostnamePort anotherBoltHostPort=connectorAddress(server.graph(),"another_bolt");
+      assertNotNull(boltHostPort);
+      assertNotNull(anotherBoltHostPort);
+      assertNotEquals(boltHostPort,anotherBoltHostPort);
+      URI boltUri=server.boltURI();
+      assertEquals("bolt",boltUri.getScheme());
+      assertEquals(boltHostPort.getHost(),boltUri.getHost());
+      assertEquals(boltHostPort.getPort(),boltUri.getPort());
+    }
+   }
+  @Test public void shouldReturnBoltUriWhenDefaultBoltConnectorOffAndOtherConnectorConfigured(){
+    TestServerBuilder serverBuilder=newInProcessBuilder(testDir.directory()).withConfig("dbms.connector.bolt.enabled","false").withConfig("dbms.connector.another_bolt.type","BOLT").withConfig("dbms.connector.another_bolt.enabled","true").withConfig("dbms.connector.another_bolt.listen_address",":0");
+    try (ServerControls server=serverBuilder.newServer()){
+      HostnamePort boltHostPort=connectorAddress(server.graph(),"bolt");
+      HostnamePort anotherBoltHostPort=connectorAddress(server.graph(),"another_bolt");
+      assertNull(boltHostPort);
+      assertNotNull(anotherBoltHostPort);
+      URI boltUri=server.boltURI();
+      assertEquals("bolt",boltUri.getScheme());
+      assertEquals(anotherBoltHostPort.getHost(),boltUri.getHost());
+      assertEquals(anotherBoltHostPort.getPort(),boltUri.getPort());
+    }
+   }
+  @Test public void shouldStartServerWithHttpHttpsAndBoltDisabled(){
+    testStartupWithConnectors(false,false,false);
+  }
+  @Test public void shouldStartServerWithHttpEnabledAndHttpsBoltDisabled(){
+    testStartupWithConnectors(true,false,false);
+  }
+  @Test public void shouldStartServerWithHttpsEnabledAndHttpBoltDisabled(){
+    testStartupWithConnectors(false,true,false);
+  }
+  @Test public void shouldStartServerWithBoltEnabledAndHttpHttpsDisabled(){
+    testStartupWithConnectors(false,false,true);
+  }
+  @Test public void shouldStartServerWithHttpHttpsEnabledAndBoltDisabled(){
+    testStartupWithConnectors(true,true,false);
+  }
+  @Test public void shouldStartServerWithHttpBoltEnabledAndHttpsDisabled(){
+    testStartupWithConnectors(true,false,true);
+  }
+  @Test public void shouldStartServerWithHttpsBoltEnabledAndHttpDisabled(){
+    testStartupWithConnectors(false,true,true);
+  }
+  private void testStartupWithConnectors(  boolean httpEnabled,  boolean httpsEnabled,  boolean boltEnabled){
+    TestServerBuilder serverBuilder=newInProcessBuilder(testDir.directory()).withConfig("dbms.connector.http.enabled",Boolean.toString(httpEnabled)).withConfig("dbms.connector.http.listen_address",":0").withConfig("dbms.connector.https.enabled",Boolean.toString(httpsEnabled)).withConfig("dbms.connector.https.listen_address",":0").withConfig("dbms.connector.bolt.enabled",Boolean.toString(boltEnabled)).withConfig("dbms.connector.bolt.listen_address",":0");
+    try (ServerControls server=serverBuilder.newServer()){
+      GraphDatabaseService db=server.graph();
+      assertDbAccessible(db);
+      verifyConnector(db,"http",httpEnabled);
+      verifyConnector(db,"https",httpsEnabled);
+      verifyConnector(db,"bolt",boltEnabled);
+    }
+   }
+  private static void assertDbAccessible(  GraphDatabaseService db){
+    Label label=() -> "Person";
+    String propertyKey="name";
+    String propertyValue="Thor Odinson";
+    try (Transaction tx=db.beginTx()){
+      db.createNode(label).setProperty(propertyKey,propertyValue);
+      tx.success();
+    }
+     try (Transaction tx=db.beginTx()){
+      Node node=single(db.findNodes(label));
+      assertEquals(propertyValue,node.getProperty(propertyKey));
+      tx.success();
+    }
+   }
+  private void assertDBConfig(  ServerControls server,  String expected,  String key) throws JsonParseException {
+    JsonNode beans=HTTP.GET(server.httpURI().toString() + "db/manage/server/jmx/domain/org.neo4j/").get("beans");
+    JsonNode configurationBean=findNamedBean(beans,"Configuration").get("attributes");
+    boolean foundKey=false;
+    for (    JsonNode attribute : configurationBean) {
+      if (attribute.get("name").asText().equals(key)) {
+        assertThat(attribute.get("value").asText(),equalTo(expected));
+        foundKey=true;
+        break;
+      }
+    }
+    if (!foundKey) {
+      fail("No config key '" + key + "'.");
+    }
+  }
+  private JsonNode findNamedBean(  JsonNode beans,  String beanName){
+    for (    JsonNode bean : beans) {
+      JsonNode name=bean.get("name");
+      if (name != null && name.asText().endsWith(",name=" + beanName)) {
+        return bean;
+      }
+    }
+    throw new NoSuchElementException();
+  }
+  private void trustAllSSLCerts() throws NoSuchAlgorithmException, KeyManagementException {
+    TrustManager[] trustAllCerts=new TrustManager[]{new X509TrustManager(){
+      @Override public void checkClientTrusted(      X509Certificate[] arg0,      String arg1){
+      }
+      @Override public void checkServerTrusted(      X509Certificate[] arg0,      String arg1){
+      }
+      @Override public X509Certificate[] getAcceptedIssuers(){
+        return null;
+      }
+    }
+};
+    SSLContext sc=SSLContext.getInstance("TLS");
+    sc.init(null,trustAllCerts,new SecureRandom());
+    HttpsURLConnection.setDefaultSSLSocketFactory(sc.getSocketFactory());
+  }
+}

@@ -1,0 +1,57 @@
+/** 
+ * Upgrade, RollBack, and restart test for Truncate.
+ */
+@Test public void testUpgradeAndRestart() throws IOException {
+  fs.mkdirs(parent);
+  fs.setQuota(parent,100,1000);
+  fs.allowSnapshot(parent);
+  String truncateFile="testUpgrade";
+  final Path p=new Path(parent,truncateFile);
+  int startingFileSize=2 * BLOCK_SIZE;
+  int toTruncate=1;
+  byte[] contents=AppendTestUtil.initBuffer(startingFileSize);
+  writeContents(contents,startingFileSize,p);
+  Path snapshotDir=fs.createSnapshot(parent,"ss0");
+  Path snapshotFile=new Path(snapshotDir,truncateFile);
+  int newLengthBeforeUpgrade=startingFileSize - toTruncate;
+  boolean isReady=fs.truncate(p,newLengthBeforeUpgrade);
+  assertThat("truncate should have triggered block recovery.",isReady,is(false));
+  checkBlockRecovery(p);
+  checkFullFile(p,newLengthBeforeUpgrade,contents);
+  assertFileLength(snapshotFile,startingFileSize);
+  long totalBlockBefore=cluster.getNamesystem().getBlocksTotal();
+  restartCluster(StartupOption.UPGRADE);
+  assertThat("SafeMode should be OFF",cluster.getNamesystem().isInSafeMode(),is(false));
+  assertThat("NameNode should be performing upgrade.",cluster.getNamesystem().isUpgradeFinalized(),is(false));
+  FileStatus fileStatus=fs.getFileStatus(p);
+  assertThat(fileStatus.getLen(),is((long)newLengthBeforeUpgrade));
+  int newLengthAfterUpgrade=newLengthBeforeUpgrade - toTruncate;
+  Block oldBlk=getLocatedBlocks(p).getLastLocatedBlock().getBlock().getLocalBlock();
+  isReady=fs.truncate(p,newLengthAfterUpgrade);
+  assertThat("truncate should have triggered block recovery.",isReady,is(false));
+  fileStatus=fs.getFileStatus(p);
+  assertThat(fileStatus.getLen(),is((long)newLengthAfterUpgrade));
+  assertThat("Should copy on truncate during upgrade",getLocatedBlocks(p).getLastLocatedBlock().getBlock().getLocalBlock().getBlockId(),is(not(equalTo(oldBlk.getBlockId()))));
+  checkBlockRecovery(p);
+  checkFullFile(p,newLengthAfterUpgrade,contents);
+  assertThat("Total block count should be unchanged from copy-on-truncate",cluster.getNamesystem().getBlocksTotal(),is(totalBlockBefore));
+  restartCluster(StartupOption.ROLLBACK);
+  assertThat("File does not exist " + p,fs.exists(p),is(true));
+  fileStatus=fs.getFileStatus(p);
+  assertThat(fileStatus.getLen(),is((long)newLengthBeforeUpgrade));
+  checkFullFile(p,newLengthBeforeUpgrade,contents);
+  assertThat("Total block count should be unchanged from rolling back",cluster.getNamesystem().getBlocksTotal(),is(totalBlockBefore));
+  restartCluster(StartupOption.REGULAR);
+  assertThat("Total block count should be unchanged from start-up",cluster.getNamesystem().getBlocksTotal(),is(totalBlockBefore));
+  checkFullFile(p,newLengthBeforeUpgrade,contents);
+  assertFileLength(snapshotFile,startingFileSize);
+  fs.setSafeMode(SafeModeAction.SAFEMODE_ENTER);
+  fs.saveNamespace();
+  cluster.restartNameNode(true);
+  assertThat("Total block count should be unchanged from start-up",cluster.getNamesystem().getBlocksTotal(),is(totalBlockBefore));
+  checkFullFile(p,newLengthBeforeUpgrade,contents);
+  assertFileLength(snapshotFile,startingFileSize);
+  fs.deleteSnapshot(parent,"ss0");
+  fs.delete(parent,true);
+  assertThat("File " + p + " shouldn't exist",fs.exists(p),is(false));
+}

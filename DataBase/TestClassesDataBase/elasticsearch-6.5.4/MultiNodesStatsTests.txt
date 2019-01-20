@@ -1,0 +1,49 @@
+@ClusterScope(scope=Scope.TEST,numDataNodes=0,numClientNodes=0,transportClientRatio=0.0) public class MultiNodesStatsTests extends MonitoringIntegTestCase {
+  @Override protected Settings nodeSettings(  int nodeOrdinal){
+    return Settings.builder().put(super.nodeSettings(nodeOrdinal)).put("xpack.monitoring.exporters.default_local.type","local").build();
+  }
+  @After public void cleanup() throws Exception {
+    disableMonitoringCollection();
+    wipeMonitoringIndices();
+  }
+  public void testMultipleNodes() throws Exception {
+    int nodes=0;
+    int n=randomIntBetween(1,2);
+    internalCluster().getPlugins();
+    internalCluster().startMasterOnlyNodes(n);
+    nodes+=n;
+    n=randomIntBetween(2,3);
+    internalCluster().startDataOnlyNodes(n);
+    nodes+=n;
+    n=randomIntBetween(1,2);
+    internalCluster().startNodes(n,Settings.builder().put(Node.NODE_DATA_SETTING.getKey(),false).put(Node.NODE_MASTER_SETTING.getKey(),false).put(Node.NODE_INGEST_SETTING.getKey(),false).build());
+    nodes+=n;
+    n=randomIntBetween(1,2);
+    for (int i=0; i < n; i++) {
+      internalCluster().startNode();
+    }
+    nodes+=n;
+    final int nbNodes=nodes;
+    assertBusy(() -> {
+      assertThat(cluster().size(),equalTo(nbNodes));
+      assertNoTimeout(client().admin().cluster().prepareHealth().setWaitForNodes(Integer.toString(nbNodes)).get());
+    }
+);
+    enableMonitoringCollection();
+    waitForMonitoringIndices();
+    assertBusy(() -> {
+      flush(ALL_MONITORING_INDICES);
+      refresh();
+      SearchResponse response=client().prepareSearch(ALL_MONITORING_INDICES).setQuery(QueryBuilders.termQuery("type",NodeStatsMonitoringDoc.TYPE)).setSize(0).addAggregation(AggregationBuilders.terms("nodes_ids").field("node_stats.node_id")).get();
+      for (      Aggregation aggregation : response.getAggregations()) {
+        assertThat(aggregation,instanceOf(StringTerms.class));
+        assertThat(((StringTerms)aggregation).getBuckets().size(),equalTo(nbNodes));
+        for (        String nodeName : internalCluster().getNodeNames()) {
+          StringTerms.Bucket bucket=((StringTerms)aggregation).getBucketByKey(internalCluster().clusterService(nodeName).localNode().getId());
+          assertThat(bucket.getDocCount(),greaterThanOrEqualTo(1L));
+        }
+      }
+    }
+);
+  }
+}

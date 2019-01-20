@@ -1,0 +1,140 @@
+public class FileUserRepositoryTest {
+  private File authFile;
+  private final LogProvider logProvider=NullLogProvider.getInstance();
+  private FileSystemAbstraction fs;
+  @Rule public final TestDirectory testDirectory=TestDirectory.testDirectory();
+  @Rule public final ExpectedException thrown=ExpectedException.none();
+  @Rule public final ThreadingRule threading=new ThreadingRule();
+  @Rule public final DefaultFileSystemRule fileSystemRule=new DefaultFileSystemRule();
+  @Before public void setUp(){
+    fs=fileSystemRule.get();
+    authFile=new File(testDirectory.directory("dbms"),"auth");
+  }
+  @Test public void shouldStoreAndRetrieveUsersByName() throws Exception {
+    FileUserRepository users=new FileUserRepository(fs,authFile,logProvider);
+    User user=new User.Builder("jake",LegacyCredential.INACCESSIBLE).withRequiredPasswordChange(true).build();
+    users.create(user);
+    User result=users.getUserByName(user.name());
+    assertThat(result,equalTo(user));
+  }
+  @Test public void shouldPersistUsers() throws Throwable {
+    FileUserRepository users=new FileUserRepository(fs,authFile,logProvider);
+    User user=new User.Builder("jake",LegacyCredential.INACCESSIBLE).withRequiredPasswordChange(true).build();
+    users.create(user);
+    users=new FileUserRepository(fs,authFile,logProvider);
+    users.start();
+    User resultByName=users.getUserByName(user.name());
+    assertThat(resultByName,equalTo(user));
+  }
+  @Test public void shouldNotFindUserAfterDelete() throws Throwable {
+    FileUserRepository users=new FileUserRepository(fs,authFile,logProvider);
+    User user=new User.Builder("jake",LegacyCredential.INACCESSIBLE).withRequiredPasswordChange(true).build();
+    users.create(user);
+    users.delete(user);
+    assertThat(users.getUserByName(user.name()),nullValue());
+  }
+  @Test public void shouldNotAllowComplexNames() throws Exception {
+    FileUserRepository users=new FileUserRepository(fs,authFile,logProvider);
+    users.assertValidUsername("neo4j");
+    users.assertValidUsername("johnosbourne");
+    users.assertValidUsername("john_osbourne");
+    assertException(() -> users.assertValidUsername(null),InvalidArgumentsException.class,"The provided username is empty.");
+    assertException(() -> users.assertValidUsername(""),InvalidArgumentsException.class,"The provided username is empty.");
+    assertException(() -> users.assertValidUsername(","),InvalidArgumentsException.class,"Username ',' contains illegal characters. Use ascii characters that are not ',', ':' or whitespaces" + ".");
+    assertException(() -> users.assertValidUsername("with space"),InvalidArgumentsException.class,"Username 'with space' contains illegal characters. Use ascii characters that are not ',', ':' or " + "whitespaces.");
+    assertException(() -> users.assertValidUsername("with:colon"),InvalidArgumentsException.class,"Username 'with:colon' contains illegal characters. Use ascii characters that are not ',', ':' or " + "whitespaces.");
+    assertException(() -> users.assertValidUsername("withå"),InvalidArgumentsException.class,"Username 'withå' contains illegal characters. Use ascii characters that are not ',', ':' or " + "whitespaces.");
+  }
+  @Test public void shouldRecoverIfCrashedDuringMove() throws Throwable {
+    final IOException exception=new IOException("simulated IO Exception on create");
+    FileSystemAbstraction crashingFileSystem=new DelegatingFileSystemAbstraction(fs){
+      @Override public void renameFile(      File oldLocation,      File newLocation,      CopyOption... copyOptions) throws IOException {
+        if (authFile.getName().equals(newLocation.getName())) {
+          throw exception;
+        }
+        super.renameFile(oldLocation,newLocation,copyOptions);
+      }
+    }
+;
+    FileUserRepository users=new FileUserRepository(crashingFileSystem,authFile,logProvider);
+    users.start();
+    User user=new User.Builder("jake",LegacyCredential.INACCESSIBLE).withRequiredPasswordChange(true).build();
+    try {
+      users.create(user);
+      fail("Expected an IOException");
+    }
+ catch (    IOException e) {
+      assertSame(exception,e);
+    }
+    assertFalse(crashingFileSystem.fileExists(authFile));
+    assertThat(crashingFileSystem.listFiles(authFile.getParentFile()).length,equalTo(0));
+  }
+  @Test public void shouldThrowIfUpdateChangesName() throws Throwable {
+    FileUserRepository users=new FileUserRepository(fs,authFile,logProvider);
+    User user=new User.Builder("jake",LegacyCredential.INACCESSIBLE).withRequiredPasswordChange(true).build();
+    users.create(user);
+    User updatedUser=new User.Builder("john",LegacyCredential.INACCESSIBLE).withRequiredPasswordChange(true).build();
+    try {
+      users.update(user,updatedUser);
+      fail("expected exception not thrown");
+    }
+ catch (    IllegalArgumentException e) {
+    }
+    assertThat(users.getUserByName(user.name()),equalTo(user));
+  }
+  @Test public void shouldThrowIfExistingUserDoesNotMatch() throws Throwable {
+    FileUserRepository users=new FileUserRepository(fs,authFile,logProvider);
+    User user=new User.Builder("jake",LegacyCredential.INACCESSIBLE).withRequiredPasswordChange(true).build();
+    users.create(user);
+    User modifiedUser=user.augment().withCredentials(LegacyCredential.forPassword("foo")).build();
+    User updatedUser=user.augment().withCredentials(LegacyCredential.forPassword("bar")).build();
+    try {
+      users.update(modifiedUser,updatedUser);
+      fail("expected exception not thrown");
+    }
+ catch (    ConcurrentModificationException e) {
+    }
+  }
+  @Test public void shouldFailOnReadingInvalidEntries() throws Throwable {
+    AssertableLogProvider logProvider=new AssertableLogProvider();
+    fs.mkdir(authFile.getParentFile());
+    FileRepositorySerializer.writeToFile(fs,authFile,UTF8.encode("admin:SHA-256,A42E541F276CF17036DB7818F8B09B1C229AAD52A17F69F4029617F3A554640F,FB7E8AE08A6A7C741F678AD22217808F:\n" + "neo4j:fc4c600b43ffe4d5857b4439c35df88f:SHA-256," + "A42E541F276CF17036DB7818F8B09B1C229AAD52A17F69F4029617F3A554640F,FB7E8AE08A6A7C741F678AD22217808F:\n"));
+    FileUserRepository users=new FileUserRepository(fs,authFile,logProvider);
+    thrown.expect(IllegalStateException.class);
+    thrown.expectMessage(startsWith("Failed to read authentication file: "));
+    try {
+      users.start();
+    }
+ catch (    IllegalStateException e) {
+      assertThat(users.numberOfUsers(),equalTo(0));
+      logProvider.assertExactly(AssertableLogProvider.inLog(FileUserRepository.class).error("Failed to read authentication file \"%s\" (%s)",authFile.getAbsolutePath(),"wrong number of line fields, expected 3, got 4 [line 2]"));
+      throw e;
+    }
+  }
+  @Test public void shouldProvideUserByUsernameEvenIfMidSetUsers() throws Throwable {
+    FileUserRepository users=new FileUserRepository(fs,authFile,logProvider);
+    users.create(new User.Builder("oskar",LegacyCredential.forPassword("hidden")).build());
+    DoubleLatch latch=new DoubleLatch(2);
+    Future<Object> setUsers=threading.execute(o -> {
+      users.setUsers(new HangingListSnapshot(latch,10L,Collections.emptyList()));
+      return null;
+    }
+,null);
+    latch.startAndWaitForAllToStart();
+    assertNotNull(users.getUserByName("oskar"));
+    latch.finish();
+    setUsers.get();
+  }
+class HangingListSnapshot extends ListSnapshot<User> {
+    private final DoubleLatch latch;
+    HangingListSnapshot(    DoubleLatch latch,    long timestamp,    List<User> values){
+      super(timestamp,values,true);
+      this.latch=latch;
+    }
+    @Override public long timestamp(){
+      latch.start();
+      latch.finishAndWaitForAllToFinish();
+      return super.timestamp();
+    }
+  }
+}

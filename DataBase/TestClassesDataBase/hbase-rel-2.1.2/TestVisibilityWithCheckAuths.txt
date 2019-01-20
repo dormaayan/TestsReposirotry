@@ -1,0 +1,150 @@
+@Category({SecurityTests.class,MediumTests.class}) public class TestVisibilityWithCheckAuths {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestVisibilityWithCheckAuths.class);
+  private static final String TOPSECRET="TOPSECRET";
+  private static final String PUBLIC="PUBLIC";
+  public static final HBaseTestingUtility TEST_UTIL=new HBaseTestingUtility();
+  private static final byte[] row1=Bytes.toBytes("row1");
+  private final static byte[] fam=Bytes.toBytes("info");
+  private final static byte[] qual=Bytes.toBytes("qual");
+  private final static byte[] value=Bytes.toBytes("value");
+  public static Configuration conf;
+  @Rule public final TestName TEST_NAME=new TestName();
+  public static User SUPERUSER;
+  public static User USER;
+  @BeforeClass public static void setupBeforeClass() throws Exception {
+    conf=TEST_UTIL.getConfiguration();
+    VisibilityTestUtil.enableVisiblityLabels(conf);
+    conf.setBoolean(VisibilityConstants.CHECK_AUTHS_FOR_MUTATION,true);
+    conf.setClass(VisibilityUtils.VISIBILITY_LABEL_GENERATOR_CLASS,SimpleScanLabelGenerator.class,ScanLabelGenerator.class);
+    conf.set("hbase.superuser","admin");
+    TEST_UTIL.startMiniCluster(2);
+    SUPERUSER=User.createUserForTesting(conf,"admin",new String[]{"supergroup"});
+    USER=User.createUserForTesting(conf,"user",new String[]{});
+    TEST_UTIL.waitTableEnabled(LABELS_TABLE_NAME.getName(),50000);
+    addLabels();
+  }
+  @AfterClass public static void tearDownAfterClass() throws Exception {
+    TEST_UTIL.shutdownMiniCluster();
+  }
+  public static void addLabels() throws Exception {
+    PrivilegedExceptionAction<VisibilityLabelsResponse> action=new PrivilegedExceptionAction<VisibilityLabelsResponse>(){
+      @Override public VisibilityLabelsResponse run() throws Exception {
+        String[] labels={TOPSECRET};
+        try (Connection conn=ConnectionFactory.createConnection(conf)){
+          VisibilityClient.addLabels(conn,labels);
+        }
+ catch (        Throwable t) {
+          throw new IOException(t);
+        }
+        return null;
+      }
+    }
+;
+    SUPERUSER.runAs(action);
+  }
+  @Test public void testVerifyAccessDeniedForInvalidUserAuths() throws Exception {
+    PrivilegedExceptionAction<VisibilityLabelsResponse> action=new PrivilegedExceptionAction<VisibilityLabelsResponse>(){
+      @Override public VisibilityLabelsResponse run() throws Exception {
+        try (Connection conn=ConnectionFactory.createConnection(conf)){
+          return VisibilityClient.setAuths(conn,new String[]{TOPSECRET},USER.getShortName());
+        }
+ catch (        Throwable e) {
+        }
+        return null;
+      }
+    }
+;
+    SUPERUSER.runAs(action);
+    final TableName tableName=TableName.valueOf(TEST_NAME.getMethodName());
+    Admin hBaseAdmin=TEST_UTIL.getAdmin();
+    HColumnDescriptor colDesc=new HColumnDescriptor(fam);
+    colDesc.setMaxVersions(5);
+    HTableDescriptor desc=new HTableDescriptor(tableName);
+    desc.addFamily(colDesc);
+    hBaseAdmin.createTable(desc);
+    try {
+      TEST_UTIL.getAdmin().flush(tableName);
+      PrivilegedExceptionAction<Void> actiona=new PrivilegedExceptionAction<Void>(){
+        @Override public Void run() throws Exception {
+          try (Connection connection=ConnectionFactory.createConnection(conf);Table table=connection.getTable(tableName)){
+            Put p=new Put(row1);
+            p.setCellVisibility(new CellVisibility(PUBLIC + "&" + TOPSECRET));
+            p.addColumn(fam,qual,125L,value);
+            table.put(p);
+            Assert.fail("Testcase should fail with AccesDeniedException");
+          }
+ catch (          Throwable t) {
+            assertTrue(t.getMessage().contains("AccessDeniedException"));
+          }
+          return null;
+        }
+      }
+;
+      USER.runAs(actiona);
+    }
+ catch (    Exception e) {
+      throw new IOException(e);
+    }
+  }
+  @Test public void testLabelsWithAppend() throws Throwable {
+    PrivilegedExceptionAction<VisibilityLabelsResponse> action=new PrivilegedExceptionAction<VisibilityLabelsResponse>(){
+      @Override public VisibilityLabelsResponse run() throws Exception {
+        try (Connection conn=ConnectionFactory.createConnection(conf)){
+          return VisibilityClient.setAuths(conn,new String[]{TOPSECRET},USER.getShortName());
+        }
+ catch (        Throwable e) {
+        }
+        return null;
+      }
+    }
+;
+    SUPERUSER.runAs(action);
+    final TableName tableName=TableName.valueOf(TEST_NAME.getMethodName());
+    try (Table table=TEST_UTIL.createTable(tableName,fam)){
+      final byte[] row1=Bytes.toBytes("row1");
+      final byte[] val=Bytes.toBytes("a");
+      PrivilegedExceptionAction<Void> actiona=new PrivilegedExceptionAction<Void>(){
+        @Override public Void run() throws Exception {
+          try (Connection connection=ConnectionFactory.createConnection(conf);Table table=connection.getTable(tableName)){
+            Put put=new Put(row1);
+            put.addColumn(fam,qual,HConstants.LATEST_TIMESTAMP,val);
+            put.setCellVisibility(new CellVisibility(TOPSECRET));
+            table.put(put);
+          }
+           return null;
+        }
+      }
+;
+      USER.runAs(actiona);
+      actiona=new PrivilegedExceptionAction<Void>(){
+        @Override public Void run() throws Exception {
+          try (Connection connection=ConnectionFactory.createConnection(conf);Table table=connection.getTable(tableName)){
+            Append append=new Append(row1);
+            append.addColumn(fam,qual,Bytes.toBytes("b"));
+            table.append(append);
+          }
+           return null;
+        }
+      }
+;
+      USER.runAs(actiona);
+      actiona=new PrivilegedExceptionAction<Void>(){
+        @Override public Void run() throws Exception {
+          try (Connection connection=ConnectionFactory.createConnection(conf);Table table=connection.getTable(tableName)){
+            Append append=new Append(row1);
+            append.addColumn(fam,qual,Bytes.toBytes("c"));
+            append.setCellVisibility(new CellVisibility(PUBLIC));
+            table.append(append);
+            Assert.fail("Testcase should fail with AccesDeniedException");
+          }
+ catch (          Throwable t) {
+            assertTrue(t.getMessage().contains("AccessDeniedException"));
+          }
+          return null;
+        }
+      }
+;
+      USER.runAs(actiona);
+    }
+   }
+}

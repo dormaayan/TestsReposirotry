@@ -1,0 +1,60 @@
+@Test public void testConcurrentLocalFailAndRestart() throws Exception {
+  final int parallelism=10;
+  SimpleAckingTaskManagerGateway taskManagerGateway=new SimpleAckingTaskManagerGateway();
+  final OneShotLatch restartLatch=new OneShotLatch();
+  final TriggeredRestartStrategy triggeredRestartStrategy=new TriggeredRestartStrategy(restartLatch);
+  final ExecutionGraph eg=createSimpleTestGraph(new JobID(),taskManagerGateway,triggeredRestartStrategy,createNoOpVertex(parallelism));
+  WaitForTasks waitForTasks=new WaitForTasks(parallelism);
+  WaitForTasks waitForTasksCancelled=new WaitForTasks(parallelism);
+  taskManagerGateway.setSubmitConsumer(waitForTasks);
+  taskManagerGateway.setCancelConsumer(waitForTasksCancelled);
+  eg.setScheduleMode(ScheduleMode.EAGER);
+  eg.scheduleForExecution();
+  waitForTasks.getFuture().get(1000,TimeUnit.MILLISECONDS);
+  switchToRunning(eg);
+  final ExecutionJobVertex vertex=eg.getVerticesTopologically().iterator().next();
+  final Execution first=vertex.getTaskVertices()[0].getCurrentExecutionAttempt();
+  final Execution last=vertex.getTaskVertices()[vertex.getParallelism() - 1].getCurrentExecutionAttempt();
+  final OneShotLatch failTrigger=new OneShotLatch();
+  final CountDownLatch readyLatch=new CountDownLatch(2);
+  Thread failure1=new Thread(){
+    @Override public void run(){
+      readyLatch.countDown();
+      try {
+        failTrigger.await();
+      }
+ catch (      InterruptedException ignored) {
+      }
+      first.fail(new Exception("intended test failure 1"));
+    }
+  }
+;
+  Thread failure2=new Thread(){
+    @Override public void run(){
+      readyLatch.countDown();
+      try {
+        failTrigger.await();
+      }
+ catch (      InterruptedException ignored) {
+      }
+      last.fail(new Exception("intended test failure 2"));
+    }
+  }
+;
+  failure1.start();
+  failure2.start();
+  readyLatch.await();
+  failTrigger.trigger();
+  waitUntilJobStatus(eg,JobStatus.FAILING,1000);
+  WaitForTasks waitForTasksAfterRestart=new WaitForTasks(parallelism);
+  taskManagerGateway.setSubmitConsumer(waitForTasksAfterRestart);
+  waitForTasksCancelled.getFuture().get(1000L,TimeUnit.MILLISECONDS);
+  completeCancellingForAllVertices(eg);
+  restartLatch.trigger();
+  waitUntilJobStatus(eg,JobStatus.RUNNING,1000);
+  waitForTasksAfterRestart.getFuture().get(1000,TimeUnit.MILLISECONDS);
+  switchToRunning(eg);
+  finishAllVertices(eg);
+  eg.waitUntilTerminal();
+  assertEquals(JobStatus.FINISHED,eg.getState());
+}

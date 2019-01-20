@@ -1,0 +1,57 @@
+@Test(timeout=2000000) public void testClearLocalDirWhenNodeReboot() throws IOException, YarnException, InterruptedException {
+  nm=new MyNodeManager();
+  nm.start();
+  final ContainerManagementProtocol containerManager=nm.getContainerManager();
+  createFiles(nmLocalDir.getAbsolutePath(),ContainerLocalizer.FILECACHE,100);
+  localResourceDir.mkdirs();
+  ContainerLaunchContext containerLaunchContext=Records.newRecord(ContainerLaunchContext.class);
+  ContainerId cId=createContainerId();
+  URL localResourceUri=URL.fromPath(localFS.makeQualified(new Path(localResourceDir.getAbsolutePath())));
+  LocalResource localResource=LocalResource.newInstance(localResourceUri,LocalResourceType.FILE,LocalResourceVisibility.APPLICATION,-1,localResourceDir.lastModified());
+  String destinationFile="dest_file";
+  Map<String,LocalResource> localResources=new HashMap<String,LocalResource>();
+  localResources.put(destinationFile,localResource);
+  containerLaunchContext.setLocalResources(localResources);
+  List<String> commands=new ArrayList<String>();
+  containerLaunchContext.setCommands(commands);
+  NodeId nodeId=nm.getNMContext().getNodeId();
+  StartContainerRequest scRequest=StartContainerRequest.newInstance(containerLaunchContext,TestContainerManager.createContainerToken(cId,0,nodeId,destinationFile,nm.getNMContext().getContainerTokenSecretManager()));
+  List<StartContainerRequest> list=new ArrayList<StartContainerRequest>();
+  list.add(scRequest);
+  final StartContainersRequest allRequests=StartContainersRequest.newInstance(list);
+  final UserGroupInformation currentUser=UserGroupInformation.createRemoteUser(cId.getApplicationAttemptId().toString());
+  NMTokenIdentifier nmIdentifier=new NMTokenIdentifier(cId.getApplicationAttemptId(),nodeId,user,123);
+  currentUser.addTokenIdentifier(nmIdentifier);
+  currentUser.doAs(new PrivilegedExceptionAction<Void>(){
+    @Override public Void run() throws YarnException, IOException {
+      nm.getContainerManager().startContainers(allRequests);
+      return null;
+    }
+  }
+);
+  List<ContainerId> containerIds=new ArrayList<ContainerId>();
+  containerIds.add(cId);
+  GetContainerStatusesRequest request=GetContainerStatusesRequest.newInstance(containerIds);
+  Container container=nm.getNMContext().getContainers().get(request.getContainerIds().get(0));
+  final int MAX_TRIES=20;
+  int numTries=0;
+  while (!container.getContainerState().equals(ContainerState.DONE) && numTries <= MAX_TRIES) {
+    try {
+      Thread.sleep(500);
+    }
+ catch (    InterruptedException ex) {
+    }
+    numTries++;
+  }
+  Assert.assertEquals(ContainerState.DONE,container.getContainerState());
+  Assert.assertTrue("The container should create a subDir named currentUser: " + user + "under localDir/usercache",numOfLocalDirs(nmLocalDir.getAbsolutePath(),ContainerLocalizer.USERCACHE) > 0);
+  Assert.assertTrue("There should be files or Dirs under nm_private when " + "container is launched",numOfLocalDirs(nmLocalDir.getAbsolutePath(),ResourceLocalizationService.NM_PRIVATE_DIR) > 0);
+  restartNM(MAX_TRIES);
+  checkNumOfLocalDirs();
+  verify(delService,times(1)).delete(argThat(new FileDeletionMatcher(delService,null,new Path(ResourceLocalizationService.NM_PRIVATE_DIR + "_DEL_"),null)));
+  verify(delService,times(1)).delete(argThat(new FileDeletionMatcher(delService,null,new Path(ContainerLocalizer.FILECACHE + "_DEL_"),null)));
+  verify(delService,times(1)).delete(argThat(new FileDeletionMatcher(delService,user,null,Arrays.asList(new Path(destinationFile)))));
+  verify(delService,times(1)).delete(argThat(new FileDeletionMatcher(delService,null,new Path(ContainerLocalizer.USERCACHE + "_DEL_"),new ArrayList<Path>())));
+  restartNM(MAX_TRIES);
+  checkNumOfLocalDirs();
+}

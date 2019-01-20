@@ -1,0 +1,78 @@
+@Test(timeout=600000) public void testContainerAutoUpdateContainer() throws Exception {
+  rm.stop();
+  createAndStartRMWithAutoUpdateContainer();
+  MockNM nm1=new MockNM("h1:1234",4096,rm.getResourceTrackerService());
+  nm1.registerNode();
+  OpportunisticContainerAllocatorAMService amservice=(OpportunisticContainerAllocatorAMService)rm.getApplicationMasterService();
+  RMApp app1=rm.submitApp(1 * GB,"app","user",null,"default");
+  ApplicationAttemptId attemptId=app1.getCurrentAppAttempt().getAppAttemptId();
+  MockAM am1=MockRM.launchAndRegisterAM(app1,rm,nm1);
+  ResourceScheduler scheduler=rm.getResourceScheduler();
+  RMNode rmNode1=rm.getRMContext().getRMNodes().get(nm1.getNodeId());
+  nm1.nodeHeartbeat(true);
+  ((RMNodeImpl)rmNode1).setOpportunisticContainersStatus(getOppurtunisticStatus(-1,100));
+  OpportunisticContainerContext ctxt=((CapacityScheduler)scheduler).getApplicationAttempt(attemptId).getOpportunisticContainerContext();
+  amservice.handle(new NodeAddedSchedulerEvent(rmNode1));
+  amservice.handle(new NodeUpdateSchedulerEvent(rmNode1));
+  nm1.nodeHeartbeat(true);
+  Thread.sleep(1000);
+  AllocateResponse allocateResponse=am1.allocate(Arrays.asList(ResourceRequest.newInstance(Priority.newInstance(1),"*",Resources.createResource(1 * GB),2,true,null,ExecutionTypeRequest.newInstance(ExecutionType.OPPORTUNISTIC,true))),null);
+  List<Container> allocatedContainers=allocateResponse.getAllocatedContainers();
+  allocatedContainers.addAll(am1.allocate(null,null).getAllocatedContainers());
+  Assert.assertEquals(2,allocatedContainers.size());
+  Container container=allocatedContainers.get(0);
+  nm1.nodeHeartbeat(Arrays.asList(ContainerStatus.newInstance(container.getId(),ExecutionType.OPPORTUNISTIC,ContainerState.RUNNING,"",0)),true);
+  rm.drainEvents();
+  RMContainer rmContainer=((CapacityScheduler)scheduler).getApplicationAttempt(container.getId().getApplicationAttemptId()).getRMContainer(container.getId());
+  Assert.assertEquals(RMContainerState.RUNNING,rmContainer.getState());
+  allocateResponse=am1.sendContainerUpdateRequest(Arrays.asList(UpdateContainerRequest.newInstance(0,container.getId(),ContainerUpdateType.PROMOTE_EXECUTION_TYPE,null,ExecutionType.GUARANTEED)));
+  nm1.nodeHeartbeat(Arrays.asList(ContainerStatus.newInstance(container.getId(),ExecutionType.OPPORTUNISTIC,ContainerState.RUNNING,"",0)),true);
+  rm.drainEvents();
+  allocateResponse=am1.allocate(new ArrayList<>(),new ArrayList<>());
+  Assert.assertEquals(1,allocateResponse.getUpdatedContainers().size());
+  UpdatedContainer uc=allocateResponse.getUpdatedContainers().get(0);
+  Assert.assertEquals(container.getId(),uc.getContainer().getId());
+  Assert.assertEquals(ExecutionType.GUARANTEED,uc.getContainer().getExecutionType());
+  NodeHeartbeatResponse response=nm1.nodeHeartbeat(true);
+  Assert.assertEquals(1,response.getContainersToUpdate().size());
+  Container containersFromNM=response.getContainersToUpdate().get(0);
+  Assert.assertEquals(container.getId(),containersFromNM.getId());
+  Assert.assertEquals(ExecutionType.GUARANTEED,containersFromNM.getExecutionType());
+  allocateResponse=am1.sendContainerUpdateRequest(Arrays.asList(UpdateContainerRequest.newInstance(1,container.getId(),ContainerUpdateType.INCREASE_RESOURCE,Resources.createResource(2 * GB,1),null)));
+  response=nm1.nodeHeartbeat(Arrays.asList(ContainerStatus.newInstance(container.getId(),ExecutionType.GUARANTEED,ContainerState.RUNNING,"",0)),true);
+  rm.drainEvents();
+  if (allocateResponse.getUpdatedContainers().size() == 0) {
+    allocateResponse=am1.allocate(new ArrayList<>(),new ArrayList<>());
+  }
+  Assert.assertEquals(1,allocateResponse.getUpdatedContainers().size());
+  uc=allocateResponse.getUpdatedContainers().get(0);
+  Assert.assertEquals(container.getId(),uc.getContainer().getId());
+  Assert.assertEquals(Resource.newInstance(2 * GB,1),uc.getContainer().getResource());
+  rm.drainEvents();
+  if (response.getContainersToUpdate().size() == 0) {
+    response=nm1.nodeHeartbeat(true);
+  }
+  Assert.assertEquals(1,response.getContainersToUpdate().size());
+  Assert.assertEquals(Resource.newInstance(2 * GB,1),response.getContainersToUpdate().get(0).getResource());
+  allocateResponse=am1.sendContainerUpdateRequest(Arrays.asList(UpdateContainerRequest.newInstance(2,container.getId(),ContainerUpdateType.DECREASE_RESOURCE,Resources.createResource(1 * GB,1),null)));
+  Assert.assertEquals(1,allocateResponse.getUpdatedContainers().size());
+  rm.drainEvents();
+  response=nm1.nodeHeartbeat(true);
+  Assert.assertEquals(1,response.getContainersToUpdate().size());
+  Assert.assertEquals(Resource.newInstance(1 * GB,1),response.getContainersToUpdate().get(0).getResource());
+  nm1.nodeHeartbeat(true);
+  allocateResponse=am1.sendContainerUpdateRequest(Arrays.asList(UpdateContainerRequest.newInstance(3,container.getId(),ContainerUpdateType.DEMOTE_EXECUTION_TYPE,null,ExecutionType.OPPORTUNISTIC)));
+  response=nm1.nodeHeartbeat(Arrays.asList(ContainerStatus.newInstance(container.getId(),ExecutionType.GUARANTEED,ContainerState.RUNNING,"",0)),true);
+  rm.drainEvents();
+  if (allocateResponse.getUpdatedContainers().size() == 0) {
+    allocateResponse=am1.allocate(new ArrayList<>(),new ArrayList<>());
+  }
+  Assert.assertEquals(1,allocateResponse.getUpdatedContainers().size());
+  uc=allocateResponse.getUpdatedContainers().get(0);
+  Assert.assertEquals(ExecutionType.OPPORTUNISTIC,uc.getContainer().getExecutionType());
+  if (response.getContainersToUpdate().size() == 0) {
+    response=nm1.nodeHeartbeat(true);
+  }
+  Assert.assertEquals(1,response.getContainersToUpdate().size());
+  Assert.assertEquals(ExecutionType.OPPORTUNISTIC,response.getContainersToUpdate().get(0).getExecutionType());
+}

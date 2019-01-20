@@ -1,0 +1,44 @@
+/** 
+ * Testcase for HBASE-20242
+ */
+@Category({RegionServerTests.class,MediumTests.class}) public class TestOpenSeqNumUnexpectedIncrease {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestOpenSeqNumUnexpectedIncrease.class);
+  private static final HBaseTestingUtility UTIL=new HBaseTestingUtility();
+  private static AtomicInteger FAILED_OPEN=new AtomicInteger(0);
+  private static TableName TABLE_NAME=TableName.valueOf("test");
+  private static byte[] CF=Bytes.toBytes("CF");
+public static final class MockHRegion extends HRegion {
+    @SuppressWarnings("deprecation") public MockHRegion(    Path tableDir,    WAL wal,    FileSystem fs,    Configuration confParam,    RegionInfo regionInfo,    TableDescriptor htd,    RegionServerServices rsServices){
+      super(tableDir,wal,fs,confParam,regionInfo,htd,rsServices);
+    }
+    @Override protected void writeRegionOpenMarker(    WAL wal,    long openSeqId) throws IOException {
+      if (getRegionInfo().getTable().equals(TABLE_NAME) && FAILED_OPEN.get() > 0) {
+        FAILED_OPEN.decrementAndGet();
+        rsServices.abort("for testing",new Exception("Inject error for testing"));
+        throw new IOException("Inject error for testing");
+      }
+    }
+  }
+  @BeforeClass public static void setUp() throws Exception {
+    UTIL.getConfiguration().setInt(HConstants.HBASE_RPC_TIMEOUT_KEY,600000);
+    UTIL.getConfiguration().setClass(HConstants.REGION_IMPL,MockHRegion.class,HRegion.class);
+    UTIL.startMiniCluster(3);
+    UTIL.createTable(TABLE_NAME,CF);
+    UTIL.getAdmin().balancerSwitch(false,true);
+  }
+  @AfterClass public static void tearDown() throws Exception {
+    UTIL.shutdownMiniCluster();
+  }
+  @Test public void test() throws IOException, InterruptedException {
+    HRegion region=UTIL.getMiniHBaseCluster().getRegions(TABLE_NAME).get(0);
+    long openSeqNum=region.getOpenSeqNum();
+    HRegionServer src=UTIL.getRSForFirstRegionInTable(TABLE_NAME);
+    HRegionServer dst=UTIL.getOtherRegionServer(src);
+    FAILED_OPEN.set(2);
+    UTIL.getAdmin().move(region.getRegionInfo().getEncodedNameAsBytes(),Bytes.toBytes(dst.getServerName().getServerName()));
+    UTIL.waitTableAvailable(TABLE_NAME);
+    HRegion region1=UTIL.getMiniHBaseCluster().getRegions(TABLE_NAME).get(0);
+    long openSeqNum1=region1.getOpenSeqNum();
+    assertEquals(openSeqNum + 2,openSeqNum1);
+  }
+}

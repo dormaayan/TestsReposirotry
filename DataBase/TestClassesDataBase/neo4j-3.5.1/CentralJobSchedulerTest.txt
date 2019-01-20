@@ -1,0 +1,180 @@
+public class CentralJobSchedulerTest {
+  @Rule public final ExpectedException expectedException=ExpectedException.none();
+  private final AtomicInteger invocations=new AtomicInteger();
+  private final LifeSupport life=new LifeSupport();
+  private final CentralJobScheduler scheduler=life.add(new CentralJobScheduler());
+  private final Runnable countInvocationsJob=invocations::incrementAndGet;
+  @After public void stopScheduler(){
+    life.shutdown();
+  }
+  @Test public void taskSchedulerGroupMustNotBeDirectlySchedulable(){
+    life.start();
+    expectedException.expect(IllegalArgumentException.class);
+    scheduler.schedule(Group.TASK_SCHEDULER,() -> fail("This task should not have been executed."));
+  }
+  @Test(timeout=10_000) public void shouldRunRecurringJob() throws Throwable {
+    long period=10;
+    int count=5;
+    life.start();
+    scheduler.scheduleRecurring(Group.INDEX_POPULATION,countInvocationsJob,period,MILLISECONDS);
+    awaitInvocationCount(count);
+    scheduler.shutdown();
+    int actualInvocations=invocations.get();
+    sleep(period * 5);
+    assertThat(invocations.get(),equalTo(actualInvocations));
+  }
+  @Test public void shouldCancelRecurringJob() throws Exception {
+    long period=2;
+    life.start();
+    JobHandle jobHandle=scheduler.scheduleRecurring(Group.INDEX_POPULATION,countInvocationsJob,period,MILLISECONDS);
+    awaitFirstInvocation();
+    jobHandle.cancel(false);
+    try {
+      jobHandle.waitTermination();
+      fail("Task should be terminated");
+    }
+ catch (    CancellationException ignored) {
+    }
+    int recorded=invocations.get();
+    sleep(period * 100);
+    assertThat(invocations.get(),both(greaterThanOrEqualTo(recorded)).and(lessThanOrEqualTo(recorded + 1)));
+  }
+  @Test public void shouldRunWithDelay() throws Throwable {
+    life.start();
+    final AtomicLong runTime=new AtomicLong();
+    final CountDownLatch latch=new CountDownLatch(1);
+    long time=System.nanoTime();
+    scheduler.schedule(Group.INDEX_POPULATION,() -> {
+      runTime.set(System.nanoTime());
+      latch.countDown();
+    }
+,100,TimeUnit.MILLISECONDS);
+    latch.await();
+    assertTrue(time + TimeUnit.MILLISECONDS.toNanos(100) <= runTime.get());
+  }
+  @Test public void longRunningScheduledJobsMustNotDelayOtherLongRunningJobs(){
+    life.start();
+    List<JobHandle> handles=new ArrayList<>(30);
+    AtomicLong startedCounter=new AtomicLong();
+    BinaryLatch blockLatch=new BinaryLatch();
+    Runnable task=() -> {
+      startedCounter.incrementAndGet();
+      blockLatch.await();
+    }
+;
+    for (int i=0; i < 10; i++) {
+      handles.add(scheduler.schedule(Group.INDEX_POPULATION,task,0,TimeUnit.MILLISECONDS));
+    }
+    for (int i=0; i < 10; i++) {
+      handles.add(scheduler.scheduleRecurring(Group.INDEX_POPULATION,task,Integer.MAX_VALUE,TimeUnit.MILLISECONDS));
+    }
+    for (int i=0; i < 10; i++) {
+      handles.add(scheduler.scheduleRecurring(Group.INDEX_POPULATION,task,0,Integer.MAX_VALUE,TimeUnit.MILLISECONDS));
+    }
+    long deadline=TimeUnit.SECONDS.toNanos(10) + System.nanoTime();
+    do {
+      if (startedCounter.get() == handles.size()) {
+        blockLatch.release();
+        for (        JobHandle handle : handles) {
+          handle.cancel(false);
+        }
+        return;
+      }
+    }
+ while (System.nanoTime() < deadline);
+    fail("Only managed to start " + startedCounter.get() + " tasks in 10 seconds, when "+ handles.size()+ " was expected.");
+  }
+  @Test public void shouldNotifyCancelListeners(){
+    CentralJobScheduler centralJobScheduler=new CentralJobScheduler();
+    centralJobScheduler.init();
+    AtomicBoolean halted=new AtomicBoolean();
+    Runnable job=() -> {
+      while (!halted.get()) {
+        LockSupport.parkNanos(MILLISECONDS.toNanos(10));
+      }
+    }
+;
+    JobHandle handle=centralJobScheduler.schedule(Group.INDEX_POPULATION,job);
+    handle.registerCancelListener(mayBeInterrupted -> halted.set(true));
+    handle.cancel(false);
+    assertTrue(halted.get());
+    centralJobScheduler.shutdown();
+  }
+  @Test(timeout=10_000) public void waitTerminationOnDelayedJobMustWaitUntilJobCompletion() throws Exception {
+    CentralJobScheduler scheduler=new CentralJobScheduler();
+    scheduler.init();
+    AtomicBoolean triggered=new AtomicBoolean();
+    Runnable job=() -> {
+      LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(10));
+      triggered.set(true);
+    }
+;
+    JobHandle handle=scheduler.schedule(Group.INDEX_POPULATION,job,10,TimeUnit.MILLISECONDS);
+    handle.waitTermination();
+    assertTrue(triggered.get());
+  }
+  @Test(timeout=10_000) public void scheduledTasksThatThrowsMustPropagateException() throws Exception {
+    CentralJobScheduler scheduler=new CentralJobScheduler();
+    scheduler.init();
+    RuntimeException boom=new RuntimeException("boom");
+    AtomicInteger triggerCounter=new AtomicInteger();
+    Runnable job=() -> {
+      triggerCounter.incrementAndGet();
+      throw boom;
+    }
+;
+    JobHandle handle=scheduler.scheduleRecurring(Group.INDEX_POPULATION,job,1,TimeUnit.MILLISECONDS);
+    try {
+      handle.waitTermination();
+      fail("waitTermination should have failed.");
+    }
+ catch (    ExecutionException e) {
+      assertThat(e.getCause(),is(boom));
+    }
+  }
+  @Test(timeout=10_000) public void scheduledTasksThatThrowsShouldStop() throws Exception {
+    CentralJobScheduler scheduler=new CentralJobScheduler();
+    scheduler.init();
+    BinaryLatch triggerLatch=new BinaryLatch();
+    RuntimeException boom=new RuntimeException("boom");
+    AtomicInteger triggerCounter=new AtomicInteger();
+    Runnable job=() -> {
+      triggerCounter.incrementAndGet();
+      triggerLatch.release();
+      throw boom;
+    }
+;
+    scheduler.scheduleRecurring(Group.INDEX_POPULATION,job,1,TimeUnit.MILLISECONDS);
+    triggerLatch.await();
+    Thread.sleep(50);
+    assertThat(triggerCounter.get(),is(1));
+  }
+  @Test(timeout=10_000) public void shutDownMustKillCancelledJobs(){
+    CentralJobScheduler scheduler=new CentralJobScheduler();
+    scheduler.init();
+    BinaryLatch startLatch=new BinaryLatch();
+    BinaryLatch stopLatch=new BinaryLatch();
+    scheduler.schedule(Group.INDEX_POPULATION,() -> {
+      try {
+        startLatch.release();
+        Thread.sleep(100_000);
+      }
+ catch (      InterruptedException e) {
+        stopLatch.release();
+        throw new RuntimeException(e);
+      }
+    }
+);
+    startLatch.await();
+    scheduler.shutdown();
+    stopLatch.await();
+  }
+  private void awaitFirstInvocation() throws InterruptedException {
+    awaitInvocationCount(1);
+  }
+  private void awaitInvocationCount(  int count) throws InterruptedException {
+    while (invocations.get() < count) {
+      Thread.sleep(10);
+    }
+  }
+}

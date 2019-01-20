@@ -1,0 +1,108 @@
+private static class MockExternalCaches implements ExternalFooterCachesByConf, ExternalFooterCachesByConf.Cache, MetadataStore {
+private static class MockItem {
+    ByteBuffer data;
+    ByteBuffer[] extraCols;
+    ByteBuffer[] extraData;
+    @Override public String toString(){
+      return (data == null ? 0 : data.remaining()) + " bytes" + (extraCols == null ? "" : ("; " + extraCols.length + " extras"));
+    }
+  }
+  private final Map<Long,MockItem> cache=new ConcurrentHashMap<>();
+  private final OrcFileMetadataHandler handler=new OrcFileMetadataHandler();
+  private final AtomicInteger putCount=new AtomicInteger(0), getCount=new AtomicInteger(0), getHitCount=new AtomicInteger(0), getByExprCount=new AtomicInteger(0), getHitByExprCount=new AtomicInteger();
+  public void resetCounts(){
+    getByExprCount.set(0);
+    getCount.set(0);
+    putCount.set(0);
+    getHitCount.set(0);
+    getHitByExprCount.set(0);
+  }
+  @Override public Cache getCache(  HiveConf conf) throws IOException {
+    handler.configure(conf,new PartitionExpressionForMetastore(),this);
+    return this;
+  }
+  @Override public Iterator<Entry<Long,MetadataPpdResult>> getFileMetadataByExpr(  List<Long> fileIds,  ByteBuffer sarg,  boolean doGetFooters) throws HiveException {
+    getByExprCount.incrementAndGet();
+    ByteBuffer[] metadatas=new ByteBuffer[fileIds.size()];
+    ByteBuffer[] ppdResults=new ByteBuffer[fileIds.size()];
+    boolean[] eliminated=new boolean[fileIds.size()];
+    try {
+      byte[] bb=new byte[sarg.remaining()];
+      System.arraycopy(sarg.array(),sarg.arrayOffset(),bb,0,sarg.remaining());
+      handler.getFileMetadataByExpr(fileIds,bb,metadatas,ppdResults,eliminated);
+    }
+ catch (    IOException e) {
+      throw new HiveException(e);
+    }
+    Map<Long,MetadataPpdResult> result=new HashMap<>();
+    for (int i=0; i < metadatas.length; ++i) {
+      long fileId=fileIds.get(i);
+      ByteBuffer metadata=metadatas[i];
+      if (metadata == null)       continue;
+      getHitByExprCount.incrementAndGet();
+      metadata=eliminated[i] ? null : metadata;
+      MetadataPpdResult mpr=new MetadataPpdResult();
+      ByteBuffer bitset=eliminated[i] ? null : ppdResults[i];
+      mpr.setMetadata(doGetFooters ? metadata : null);
+      mpr.setIncludeBitset(bitset);
+      result.put(fileId,mpr);
+    }
+    return result.entrySet().iterator();
+  }
+  @Override public void clearFileMetadata(  List<Long> fileIds) throws HiveException {
+    for (    Long id : fileIds) {
+      cache.remove(id);
+    }
+  }
+  @Override public Iterator<Entry<Long,ByteBuffer>> getFileMetadata(  List<Long> fileIds) throws HiveException {
+    getCount.incrementAndGet();
+    HashMap<Long,ByteBuffer> result=new HashMap<>();
+    for (    Long id : fileIds) {
+      MockItem mi=cache.get(id);
+      if (mi == null)       continue;
+      getHitCount.incrementAndGet();
+      result.put(id,mi.data);
+    }
+    return result.entrySet().iterator();
+  }
+  @Override public void putFileMetadata(  ArrayList<Long> fileIds,  ArrayList<ByteBuffer> values) throws HiveException {
+    putCount.incrementAndGet();
+    ByteBuffer[] addedCols=handler.createAddedCols();
+    ByteBuffer[][] addedVals=null;
+    if (addedCols != null) {
+      addedVals=handler.createAddedColVals(values);
+    }
+    try {
+      storeFileMetadata(fileIds,values,addedCols,addedVals);
+    }
+ catch (    IOException|InterruptedException e) {
+      throw new HiveException(e);
+    }
+  }
+  @Override public void getFileMetadata(  List<Long> fileIds,  ByteBuffer[] result) throws IOException {
+    for (int i=0; i < fileIds.size(); ++i) {
+      MockItem mi=cache.get(fileIds.get(i));
+      result[i]=(mi == null ? null : mi.data);
+    }
+  }
+  @Override public void storeFileMetadata(  List<Long> fileIds,  List<ByteBuffer> metadataBuffers,  ByteBuffer[] addedCols,  ByteBuffer[][] addedVals) throws IOException, InterruptedException {
+    for (int i=0; i < fileIds.size(); ++i) {
+      ByteBuffer value=(metadataBuffers != null) ? metadataBuffers.get(i) : null;
+      ByteBuffer[] av=addedVals == null ? null : addedVals[i];
+      storeFileMetadata(fileIds.get(i),value,addedCols,av);
+    }
+  }
+  @Override public void storeFileMetadata(  long fileId,  ByteBuffer metadata,  ByteBuffer[] addedCols,  ByteBuffer[] addedVals) throws IOException, InterruptedException {
+    if (metadata == null) {
+      cache.remove(metadata);
+      return;
+    }
+    MockItem mi=new MockItem();
+    mi.data=metadata;
+    if (addedVals != null) {
+      mi.extraCols=addedCols;
+      mi.extraData=addedVals;
+    }
+    cache.put(fileId,mi);
+  }
+}

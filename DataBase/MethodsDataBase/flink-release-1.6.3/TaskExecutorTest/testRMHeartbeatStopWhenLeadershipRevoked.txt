@@ -1,0 +1,29 @@
+/** 
+ * Tests that the heartbeat is stopped once the TaskExecutor detects that the RM is no longer leader. <p>See FLINK-8462
+ */
+@Test public void testRMHeartbeatStopWhenLeadershipRevoked() throws Exception {
+  final long heartbeatInterval=1L;
+  final long heartbeatTimeout=10000L;
+  final long pollTimeout=1000L;
+  final RecordingHeartbeatServices heartbeatServices=new RecordingHeartbeatServices(heartbeatInterval,heartbeatTimeout);
+  final ResourceID rmResourceID=ResourceID.generate();
+  final TaskSlotTable taskSlotTable=new TaskSlotTable(Collections.singleton(ResourceProfile.UNKNOWN),timerService);
+  final String rmAddress="rm";
+  final TestingResourceManagerGateway rmGateway=new TestingResourceManagerGateway(ResourceManagerId.generate(),rmResourceID,heartbeatInterval,rmAddress,rmAddress);
+  rpc.registerGateway(rmAddress,rmGateway);
+  TaskExecutorLocalStateStoresManager localStateStoresManager=new TaskExecutorLocalStateStoresManager(false,new File[]{tmp.newFolder()},Executors.directExecutor());
+  final TaskManagerServices taskManagerServices=new TaskManagerServicesBuilder().setTaskManagerLocation(taskManagerLocation).setTaskSlotTable(taskSlotTable).setTaskStateManager(localStateStoresManager).build();
+  final TaskExecutor taskExecutor=new TaskExecutor(rpc,taskManagerConfiguration,haServices,taskManagerServices,heartbeatServices,UnregisteredMetricGroups.createUnregisteredTaskManagerMetricGroup(),dummyBlobCacheService,testingFatalErrorHandler);
+  try {
+    taskExecutor.start();
+    final BlockingQueue<ResourceID> unmonitoredTargets=heartbeatServices.getUnmonitoredTargets();
+    final BlockingQueue<ResourceID> monitoredTargets=heartbeatServices.getMonitoredTargets();
+    resourceManagerLeaderRetriever.notifyListener(rmAddress,rmGateway.getFencingToken().toUUID());
+    assertThat(monitoredTargets.poll(pollTimeout,TimeUnit.MILLISECONDS),equalTo(rmResourceID));
+    resourceManagerLeaderRetriever.notifyListener(null,null);
+    assertThat(unmonitoredTargets.poll(pollTimeout,TimeUnit.MILLISECONDS),equalTo(rmResourceID));
+  }
+  finally {
+    RpcUtils.terminateRpcEndpoint(taskExecutor,timeout);
+  }
+}

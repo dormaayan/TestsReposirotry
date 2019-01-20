@@ -1,0 +1,65 @@
+/** 
+ * Tests handling of meta-carrying region server failover.
+ */
+@Category(MediumTests.class) public class TestMetaShutdownHandler {
+  private static final Logger LOG=LoggerFactory.getLogger(TestMetaShutdownHandler.class);
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestMetaShutdownHandler.class);
+  private final static HBaseTestingUtility TEST_UTIL=new HBaseTestingUtility();
+  final static Configuration conf=TEST_UTIL.getConfiguration();
+  @BeforeClass public static void setUpBeforeClass() throws Exception {
+    TEST_UTIL.startMiniCluster(1,3,null,null,MyRegionServer.class);
+  }
+  @AfterClass public static void tearDownAfterClass() throws Exception {
+    TEST_UTIL.shutdownMiniCluster();
+  }
+  /** 
+ * This test will test the expire handling of a meta-carrying region server. After HBaseMiniCluster is up, we will delete the ephemeral node of the meta-carrying region server, which will trigger the expire of this region server on the master. On the other hand, we will slow down the abort process on the region server so that it is still up during the master SSH. We will check that the master SSH is still successfully done.
+ */
+  @Test public void testExpireMetaRegionServer() throws Exception {
+    MiniHBaseCluster cluster=TEST_UTIL.getHBaseCluster();
+    HMaster master=cluster.getMaster();
+    RegionStates regionStates=master.getAssignmentManager().getRegionStates();
+    ServerName metaServerName=regionStates.getRegionServerOfRegion(HRegionInfo.FIRST_META_REGIONINFO);
+    if (master.getServerName().equals(metaServerName) || metaServerName == null || !metaServerName.equals(cluster.getServerHoldingMeta())) {
+      metaServerName=cluster.getLiveRegionServerThreads().get(0).getRegionServer().getServerName();
+      master.move(HRegionInfo.FIRST_META_REGIONINFO.getEncodedNameAsBytes(),Bytes.toBytes(metaServerName.getServerName()));
+      TEST_UTIL.waitUntilNoRegionsInTransition(60000);
+      metaServerName=regionStates.getRegionServerOfRegion(HRegionInfo.FIRST_META_REGIONINFO);
+    }
+    RegionState metaState=MetaTableLocator.getMetaRegionState(master.getZooKeeper());
+    assertEquals("Wrong state for meta!",RegionState.State.OPEN,metaState.getState());
+    assertNotEquals("Meta is on master!",metaServerName,master.getServerName());
+    String rsEphemeralNodePath=ZNodePaths.joinZNode(master.getZooKeeper().getZNodePaths().rsZNode,metaServerName.toString());
+    ZKUtil.deleteNode(master.getZooKeeper(),rsEphemeralNodePath);
+    LOG.info("Deleted the znode for the RegionServer hosting hbase:meta; waiting on SSH");
+    final ServerManager serverManager=master.getServerManager();
+    final ServerName priorMetaServerName=metaServerName;
+    TEST_UTIL.waitFor(120000,200,new Waiter.Predicate<Exception>(){
+      @Override public boolean evaluate() throws Exception {
+        return !serverManager.isServerOnline(priorMetaServerName) && !serverManager.areDeadServersInProgress();
+      }
+    }
+);
+    LOG.info("Past wait on RIT");
+    TEST_UTIL.waitUntilNoRegionsInTransition(60000);
+    assertTrue("Meta should be assigned",regionStates.isRegionOnline(HRegionInfo.FIRST_META_REGIONINFO));
+    metaState=MetaTableLocator.getMetaRegionState(master.getZooKeeper());
+    assertEquals("Meta should not be in transition",RegionState.State.OPEN,metaState.getState());
+    assertEquals("Meta should be assigned",metaState.getServerName(),regionStates.getRegionServerOfRegion(HRegionInfo.FIRST_META_REGIONINFO));
+    assertNotEquals("Meta should be assigned on a different server",metaState.getServerName(),metaServerName);
+  }
+public static class MyRegionServer extends MiniHBaseClusterRegionServer {
+    public MyRegionServer(    Configuration conf) throws IOException, KeeperException, InterruptedException {
+      super(conf);
+    }
+    @Override public void abort(    String reason,    Throwable cause){
+      try {
+        Thread.sleep(30 * 1000);
+      }
+ catch (      InterruptedException e) {
+        return;
+      }
+      super.abort(reason,cause);
+    }
+  }
+}

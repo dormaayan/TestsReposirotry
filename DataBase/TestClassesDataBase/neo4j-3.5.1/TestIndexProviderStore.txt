@@ -1,0 +1,115 @@
+public class TestIndexProviderStore {
+  private File file;
+  private FileSystemAbstraction fileSystem;
+  @Before public void createStore(){
+    file=new File("target/test-data/index-provider-store");
+    fileSystem=new DefaultFileSystemAbstraction();
+    file.mkdirs();
+    fileSystem.deleteFile(file);
+  }
+  @After public void tearDown() throws IOException {
+    fileSystem.close();
+  }
+  @Test public void lastCommitedTxGetsStoredBetweenSessions(){
+    IndexProviderStore store=new IndexProviderStore(file,fileSystem,0,false);
+    store.setVersion(5);
+    store.setLastCommittedTx(12);
+    store.close();
+    store=new IndexProviderStore(file,fileSystem,0,false);
+    assertEquals(5,store.getVersion());
+    assertEquals(12,store.getLastCommittedTx());
+    store.close();
+  }
+  @Test public void shouldFailUpgradeIfNotAllowed(){
+    IndexProviderStore store=new IndexProviderStore(file,fileSystem,MetaDataStore.versionStringToLong("3.1"),true);
+    store.close();
+    store=new IndexProviderStore(file,fileSystem,MetaDataStore.versionStringToLong("3.1"),false);
+    store.close();
+    try {
+      new IndexProviderStore(file,fileSystem,MetaDataStore.versionStringToLong("3.5"),false);
+      fail("Shouldn't be able to upgrade there");
+    }
+ catch (    UpgradeNotAllowedByConfigurationException e) {
+    }
+    store=new IndexProviderStore(file,fileSystem,MetaDataStore.versionStringToLong("3.5"),true);
+    assertEquals("3.5",MetaDataStore.versionLongToString(store.getIndexVersion()));
+    store.close();
+  }
+  @Test(expected=NotCurrentStoreVersionException.class) public void shouldFailToGoBackToOlderVersion(){
+    String newerVersion="3.5";
+    String olderVersion="3.1";
+    try {
+      IndexProviderStore store=new IndexProviderStore(file,fileSystem,MetaDataStore.versionStringToLong(newerVersion),true);
+      store.close();
+      store=new IndexProviderStore(file,fileSystem,MetaDataStore.versionStringToLong(olderVersion),false);
+    }
+ catch (    NotCurrentStoreVersionException e) {
+      assertTrue(e.getMessage().contains(newerVersion));
+      assertTrue(e.getMessage().contains(olderVersion));
+      throw e;
+    }
+  }
+  @Test(expected=NotCurrentStoreVersionException.class) public void shouldFailToGoBackToOlderVersionEvenIfAllowUpgrade(){
+    String newerVersion="3.5";
+    String olderVersion="3.1";
+    try {
+      IndexProviderStore store=new IndexProviderStore(file,fileSystem,MetaDataStore.versionStringToLong(newerVersion),true);
+      store.close();
+      store=new IndexProviderStore(file,fileSystem,MetaDataStore.versionStringToLong(olderVersion),true);
+    }
+ catch (    NotCurrentStoreVersionException e) {
+      assertTrue(e.getMessage().contains(newerVersion));
+      assertTrue(e.getMessage().contains(olderVersion));
+      throw e;
+    }
+  }
+  @Test public void upgradeForMissingVersionRecord() throws Exception {
+    IndexProviderStore store=new IndexProviderStore(file,fileSystem,0,false);
+    store.close();
+    FileUtils.truncateFile(file,4 * 8);
+    try {
+      store=new IndexProviderStore(file,fileSystem,0,false);
+      fail("Should have thrown upgrade exception");
+    }
+ catch (    UpgradeNotAllowedByConfigurationException e) {
+    }
+    store=new IndexProviderStore(file,fileSystem,0,true);
+    store.close();
+  }
+  @Test public void shouldForceChannelAfterWritingMetadata() throws IOException {
+    final StoreChannel[] channelUsedToCreateFile={null};
+    FileSystemAbstraction fs=spy(fileSystem);
+    StoreChannel tempChannel;
+    when(tempChannel=fs.open(file,OpenMode.READ_WRITE)).then(ignored -> {
+      StoreChannel channel=fileSystem.open(file,OpenMode.READ_WRITE);
+      if (channelUsedToCreateFile[0] == null) {
+        StoreChannel channelSpy=spy(channel);
+        channelUsedToCreateFile[0]=channelSpy;
+        channel=channelSpy;
+      }
+      return channel;
+    }
+);
+    tempChannel.close();
+    fs.deleteFile(file);
+    IndexProviderStore store=new IndexProviderStore(file,fs,MetaDataStore.versionStringToLong("3.5"),false);
+    StoreChannel channel=channelUsedToCreateFile[0];
+    verify(channel).writeAll(any(ByteBuffer.class),eq(0L));
+    verify(channel).force(true);
+    verify(channel).close();
+    verifyNoMoreInteractions(channel);
+    store.close();
+  }
+  @Test(expected=IllegalArgumentException.class) public void shouldThrowWhenTryingToCreateFileThatAlreadyExists(){
+    FileSystemAbstraction fs=mock(FileSystemAbstraction.class);
+    when(fs.fileExists(file)).thenReturn(false).thenReturn(true);
+    when(fs.getFileSize(file)).thenReturn(42L);
+    new IndexProviderStore(file,fs,MetaDataStore.versionStringToLong("3.5"),false);
+  }
+  @Test public void shouldWriteNewFileWhenExistingFileHasZeroLength() throws IOException {
+    file.createNewFile();
+    IndexProviderStore store=new IndexProviderStore(file,fileSystem,MetaDataStore.versionStringToLong("3.5"),false);
+    assertTrue(fileSystem.getFileSize(file) > 0);
+    store.close();
+  }
+}

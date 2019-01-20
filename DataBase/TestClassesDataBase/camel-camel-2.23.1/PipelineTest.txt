@@ -1,0 +1,143 @@
+/** 
+ * @version 
+ */
+public class PipelineTest extends ContextTestSupport {
+  /** 
+ * Simple processor the copies the in to the out and increments a counter. Used to verify that the pipeline actually takes the output of one stage of  the pipe and feeds it in as input into the next stage.
+ */
+private static final class InToOut implements Processor {
+    public void process(    Exchange exchange) throws Exception {
+      exchange.getOut().copyFrom(exchange.getIn());
+      Integer counter=exchange.getIn().getHeader("copy-counter",Integer.class);
+      if (counter == null) {
+        counter=0;
+      }
+      exchange.getOut().setHeader("copy-counter",counter + 1);
+    }
+  }
+  /** 
+ * Simple processor the copies the in to the fault and increments a counter.
+ */
+private static final class InToFault implements Processor {
+    public void process(    Exchange exchange) throws Exception {
+      exchange.getOut().setFault(true);
+      exchange.getOut().setBody(exchange.getIn().getBody());
+      Integer counter=exchange.getIn().getHeader("copy-counter",Integer.class);
+      if (counter == null) {
+        counter=0;
+      }
+      exchange.getOut().setHeader("copy-counter",counter + 1);
+    }
+  }
+  protected MockEndpoint resultEndpoint;
+  @Test public void testSendMessageThroughAPipeline() throws Exception {
+    resultEndpoint.expectedBodiesReceived(4);
+    Exchange results=template.request("direct:a",new Processor(){
+      public void process(      Exchange exchange){
+        Message in=exchange.getIn();
+        in.setBody(1);
+        in.setHeader("foo","bar");
+      }
+    }
+);
+    resultEndpoint.assertIsSatisfied();
+    assertEquals("Result body",4,results.getOut().getBody());
+  }
+  @Test public void testResultsReturned() throws Exception {
+    Exchange exchange=template.request("direct:b",new Processor(){
+      public void process(      Exchange exchange){
+        exchange.getIn().setBody("Hello World");
+      }
+    }
+);
+    assertEquals("Hello World",exchange.getOut().getBody());
+    assertEquals(3,exchange.getOut().getHeader("copy-counter"));
+  }
+  /** 
+ * Disabled for now until we figure out fault processing in the pipeline.
+ * @throws Exception
+ */
+  @Test public void testFaultStopsPipeline() throws Exception {
+    Exchange exchange=template.request("direct:c",new Processor(){
+      public void process(      Exchange exchange){
+        exchange.getIn().setBody("Fault Message");
+      }
+    }
+);
+    assertTrue(exchange.getOut() != null && exchange.getOut().isFault());
+    assertEquals("Fault Message",exchange.getOut().getBody());
+    assertEquals(2,exchange.getOut().getHeader("copy-counter"));
+  }
+  @Test public void testOnlyProperties(){
+    Exchange exchange=template.request("direct:b",new Processor(){
+      public void process(      Exchange exchange){
+        exchange.getIn().setHeader("header","headerValue");
+      }
+    }
+);
+    assertEquals("headerValue",exchange.getOut().getHeader("header"));
+    assertEquals(3,exchange.getOut().getHeader("copy-counter"));
+  }
+  @Test public void testCopyInOutExchange(){
+    Exchange exchange=template.request("direct:start",new Processor(){
+      public void process(      Exchange exchange){
+        exchange.setPattern(ExchangePattern.InOut);
+        exchange.getIn().setBody("test");
+      }
+    }
+);
+    assertEquals("There should have no message header",1,exchange.getOut().getHeaders().size());
+    assertEquals("There should have no attachments",0,exchange.getOut().getAttachmentObjects().size());
+    assertEquals("There should have no attachments",0,exchange.getOut().getAttachments().size());
+    assertEquals("Get a wrong message body","test",exchange.getOut().getBody());
+    assertNull(exchange.getOut().getHeader("test"));
+    assertNull(exchange.getOut().getAttachmentObject("test1.xml"));
+    assertNull(exchange.getOut().getAttachment("test1.xml"));
+  }
+  @Override @Before public void setUp() throws Exception {
+    super.setUp();
+    resultEndpoint=getMockEndpoint("mock:result");
+  }
+  protected RouteBuilder createRouteBuilder(){
+    final Processor processor=new Processor(){
+      public void process(      Exchange exchange){
+        Integer number=exchange.getIn().getBody(Integer.class);
+        if (number == null) {
+          number=0;
+        }
+        number=number + 1;
+        exchange.getOut().setBody(number);
+      }
+    }
+;
+    return new RouteBuilder(){
+      public void configure(){
+        from("direct:a").pipeline("direct:x","direct:y","direct:z","mock:result");
+        from("direct:x").process(processor);
+        from("direct:y").process(processor);
+        from("direct:z").process(processor);
+        from("direct:b").process(new InToOut()).process(new InToOut()).process(new InToOut());
+        from("direct:c").process(new InToOut()).process(new InToFault()).process(new InToOut());
+        from("direct:start").process(new Processor(){
+          public void process(          Exchange exchange) throws Exception {
+            exchange.getOut().copyFrom(exchange.getIn());
+            exchange.getOut().setHeader("test","testValue");
+            exchange.getOut().addAttachment("test1.xml",new DataHandler(new FileDataSource("pom.xml")));
+          }
+        }
+).process(new Processor(){
+          public void process(          Exchange exchange) throws Exception {
+            exchange.getOut().copyFrom(exchange.getIn());
+            assertNotNull("The test attachment should not be null",exchange.getOut().getAttachmentObject("test1.xml"));
+            assertNotNull("The test attachment should not be null",exchange.getOut().getAttachment("test1.xml"));
+            assertNotNull("The test header should not be null",exchange.getOut().getHeader("test"));
+            exchange.getOut().removeAttachment("test1.xml");
+            exchange.getOut().removeHeader("test");
+          }
+        }
+);
+      }
+    }
+;
+  }
+}

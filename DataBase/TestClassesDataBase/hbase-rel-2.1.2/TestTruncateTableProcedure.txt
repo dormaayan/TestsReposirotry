@@ -1,0 +1,179 @@
+@Category({MasterTests.class,MediumTests.class}) public class TestTruncateTableProcedure extends TestTableDDLProcedureBase {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestTruncateTableProcedure.class);
+  private static final Logger LOG=LoggerFactory.getLogger(TestTruncateTableProcedure.class);
+  @Rule public TestName name=new TestName();
+  @Test public void testTruncateNotExistentTable() throws Exception {
+    final TableName tableName=TableName.valueOf(name.getMethodName());
+    final ProcedureExecutor<MasterProcedureEnv> procExec=getMasterProcedureExecutor();
+    Throwable cause=null;
+    try {
+      long procId=ProcedureTestingUtility.submitAndWait(procExec,new TruncateTableProcedure(procExec.getEnvironment(),tableName,true));
+      Procedure<?> result=procExec.getResult(procId);
+      assertTrue(result.isFailed());
+      cause=ProcedureTestingUtility.getExceptionCause(result);
+    }
+ catch (    Throwable t) {
+      cause=t;
+    }
+    LOG.debug("Truncate failed with exception: " + cause);
+    assertTrue(cause instanceof TableNotFoundException);
+  }
+  @Test public void testTruncateNotDisabledTable() throws Exception {
+    final TableName tableName=TableName.valueOf(name.getMethodName());
+    final ProcedureExecutor<MasterProcedureEnv> procExec=getMasterProcedureExecutor();
+    MasterProcedureTestingUtility.createTable(procExec,tableName,null,"f");
+    Throwable cause=null;
+    try {
+      long procId=ProcedureTestingUtility.submitAndWait(procExec,new TruncateTableProcedure(procExec.getEnvironment(),tableName,false));
+      Procedure<?> result=procExec.getResult(procId);
+      assertTrue(result.isFailed());
+      cause=ProcedureTestingUtility.getExceptionCause(result);
+    }
+ catch (    Throwable t) {
+      cause=t;
+    }
+    LOG.debug("Truncate failed with exception: " + cause);
+    assertTrue(cause instanceof TableNotDisabledException);
+  }
+  @Test public void testSimpleTruncatePreserveSplits() throws Exception {
+    final TableName tableName=TableName.valueOf(name.getMethodName());
+    testSimpleTruncate(tableName,true);
+  }
+  @Test public void testSimpleTruncateNoPreserveSplits() throws Exception {
+    final TableName tableName=TableName.valueOf(name.getMethodName());
+    testSimpleTruncate(tableName,false);
+  }
+  private void testSimpleTruncate(  final TableName tableName,  final boolean preserveSplits) throws Exception {
+    final String[] families=new String[]{"f1","f2"};
+    final byte[][] splitKeys=new byte[][]{Bytes.toBytes("a"),Bytes.toBytes("b"),Bytes.toBytes("c")};
+    RegionInfo[] regions=MasterProcedureTestingUtility.createTable(getMasterProcedureExecutor(),tableName,splitKeys,families);
+    MasterProcedureTestingUtility.loadData(UTIL.getConnection(),tableName,100,splitKeys,families);
+    assertEquals(100,UTIL.countRows(tableName));
+    UTIL.getAdmin().disableTable(tableName);
+    final ProcedureExecutor<MasterProcedureEnv> procExec=getMasterProcedureExecutor();
+    long procId=ProcedureTestingUtility.submitAndWait(procExec,new TruncateTableProcedure(procExec.getEnvironment(),tableName,preserveSplits));
+    ProcedureTestingUtility.assertProcNotFailed(procExec,procId);
+    UTIL.waitUntilAllRegionsAssigned(tableName);
+    regions=UTIL.getAdmin().getTableRegions(tableName).toArray(new RegionInfo[0]);
+    if (preserveSplits) {
+      assertEquals(1 + splitKeys.length,regions.length);
+    }
+ else {
+      assertEquals(1,regions.length);
+    }
+    MasterProcedureTestingUtility.validateTableCreation(UTIL.getHBaseCluster().getMaster(),tableName,regions,families);
+    assertEquals(0,UTIL.countRows(tableName));
+    MasterProcedureTestingUtility.loadData(UTIL.getConnection(),tableName,50,splitKeys,families);
+    assertEquals(50,UTIL.countRows(tableName));
+  }
+  @Test public void testRecoveryAndDoubleExecutionPreserveSplits() throws Exception {
+    final TableName tableName=TableName.valueOf(name.getMethodName());
+    testRecoveryAndDoubleExecution(tableName,true);
+  }
+  @Test public void testRecoveryAndDoubleExecutionNoPreserveSplits() throws Exception {
+    final TableName tableName=TableName.valueOf(name.getMethodName());
+    testRecoveryAndDoubleExecution(tableName,false);
+  }
+  private void testRecoveryAndDoubleExecution(  final TableName tableName,  final boolean preserveSplits) throws Exception {
+    final String[] families=new String[]{"f1","f2"};
+    final byte[][] splitKeys=new byte[][]{Bytes.toBytes("a"),Bytes.toBytes("b"),Bytes.toBytes("c")};
+    RegionInfo[] regions=MasterProcedureTestingUtility.createTable(getMasterProcedureExecutor(),tableName,splitKeys,families);
+    MasterProcedureTestingUtility.loadData(UTIL.getConnection(),tableName,100,splitKeys,families);
+    assertEquals(100,UTIL.countRows(tableName));
+    UTIL.getAdmin().disableTable(tableName);
+    final ProcedureExecutor<MasterProcedureEnv> procExec=getMasterProcedureExecutor();
+    ProcedureTestingUtility.waitNoProcedureRunning(procExec);
+    ProcedureTestingUtility.setKillAndToggleBeforeStoreUpdate(procExec,true);
+    long procId=procExec.submitProcedure(new TruncateTableProcedure(procExec.getEnvironment(),tableName,preserveSplits));
+    MasterProcedureTestingUtility.testRecoveryAndDoubleExecution(procExec,procId);
+    ProcedureTestingUtility.setKillAndToggleBeforeStoreUpdate(procExec,false);
+    UTIL.waitUntilAllRegionsAssigned(tableName);
+    regions=UTIL.getAdmin().getTableRegions(tableName).toArray(new RegionInfo[0]);
+    if (preserveSplits) {
+      assertEquals(1 + splitKeys.length,regions.length);
+    }
+ else {
+      assertEquals(1,regions.length);
+    }
+    MasterProcedureTestingUtility.validateTableCreation(UTIL.getHBaseCluster().getMaster(),tableName,regions,families);
+    assertEquals(0,UTIL.countRows(tableName));
+    MasterProcedureTestingUtility.loadData(UTIL.getConnection(),tableName,50,splitKeys,families);
+    assertEquals(50,UTIL.countRows(tableName));
+  }
+  @Test public void testOnHDFSFailurePreserveSplits() throws Exception {
+    final TableName tableName=TableName.valueOf(name.getMethodName());
+    testOnHDFSFailure(tableName,true);
+  }
+  @Test public void testOnHDFSFailureNoPreserveSplits() throws Exception {
+    final TableName tableName=TableName.valueOf(name.getMethodName());
+    testOnHDFSFailure(tableName,false);
+  }
+public static class TruncateTableProcedureOnHDFSFailure extends TruncateTableProcedure {
+    private boolean failOnce=false;
+    public TruncateTableProcedureOnHDFSFailure(){
+      super();
+    }
+    public TruncateTableProcedureOnHDFSFailure(    final MasterProcedureEnv env,    TableName tableName,    boolean preserveSplits) throws HBaseIOException {
+      super(env,tableName,preserveSplits);
+    }
+    @Override protected Flow executeFromState(    MasterProcedureEnv env,    MasterProcedureProtos.TruncateTableState state) throws InterruptedException {
+      if (!failOnce && state == MasterProcedureProtos.TruncateTableState.TRUNCATE_TABLE_CREATE_FS_LAYOUT) {
+        try {
+          RegionInfo regionInfo=getFirstRegionInfo();
+          Configuration conf=env.getMasterConfiguration();
+          MasterFileSystem mfs=env.getMasterServices().getMasterFileSystem();
+          Path tempdir=mfs.getTempDir();
+          Path tableDir=FSUtils.getTableDir(tempdir,regionInfo.getTable());
+          Path regionDir=FSUtils.getRegionDir(tableDir,regionInfo);
+          FileSystem fs=FileSystem.get(conf);
+          fs.mkdirs(regionDir);
+          failOnce=true;
+          return Flow.HAS_MORE_STATE;
+        }
+ catch (        IOException e) {
+          fail("failed to create a region directory: " + e);
+        }
+      }
+      return super.executeFromState(env,state);
+    }
+  }
+  private void testOnHDFSFailure(  TableName tableName,  boolean preserveSplits) throws Exception {
+    String[] families=new String[]{"f1","f2"};
+    byte[][] splitKeys=new byte[][]{Bytes.toBytes("a"),Bytes.toBytes("b"),Bytes.toBytes("c")};
+    MasterProcedureTestingUtility.createTable(getMasterProcedureExecutor(),tableName,splitKeys,families);
+    MasterProcedureTestingUtility.loadData(UTIL.getConnection(),tableName,100,splitKeys,families);
+    assertEquals(100,UTIL.countRows(tableName));
+    UTIL.getAdmin().disableTable(tableName);
+    final ProcedureExecutor<MasterProcedureEnv> procExec=getMasterProcedureExecutor();
+    long procId=ProcedureTestingUtility.submitAndWait(procExec,new TruncateTableProcedureOnHDFSFailure(procExec.getEnvironment(),tableName,preserveSplits));
+    ProcedureTestingUtility.assertProcNotFailed(procExec,procId);
+  }
+  @Test public void testTruncateWithPreserveAfterSplit() throws Exception {
+    String[] families=new String[]{"f1","f2"};
+    byte[][] splitKeys=new byte[][]{Bytes.toBytes("a"),Bytes.toBytes("b"),Bytes.toBytes("c")};
+    TableName tableName=TableName.valueOf(name.getMethodName());
+    RegionInfo[] regions=MasterProcedureTestingUtility.createTable(getMasterProcedureExecutor(),tableName,splitKeys,families);
+    splitAndTruncate(tableName,regions,1);
+  }
+  @Test public void testTruncatePreserveWithReplicaRegionAfterSplit() throws Exception {
+    String[] families=new String[]{"f1","f2"};
+    byte[][] splitKeys=new byte[][]{Bytes.toBytes("a"),Bytes.toBytes("b"),Bytes.toBytes("c")};
+    TableName tableName=TableName.valueOf(name.getMethodName());
+    TableDescriptor htd=TableDescriptorBuilder.newBuilder(tableName).setRegionReplication(3).setColumnFamilies(Arrays.stream(families).map(fam -> ColumnFamilyDescriptorBuilder.newBuilder(Bytes.toBytes(fam)).build()).collect(Collectors.toList())).build();
+    RegionInfo[] regions=ModifyRegionUtils.createRegionInfos(htd,splitKeys);
+    ProcedureExecutor<MasterProcedureEnv> procExec=getMasterProcedureExecutor();
+    long procId=ProcedureTestingUtility.submitAndWait(procExec,new CreateTableProcedure(procExec.getEnvironment(),htd,regions));
+    ProcedureTestingUtility.assertProcNotFailed(procExec.getResult(procId));
+    splitAndTruncate(tableName,regions,3);
+  }
+  private void splitAndTruncate(  TableName tableName,  RegionInfo[] regions,  int regionReplication) throws IOException, InterruptedException {
+    UTIL.getAdmin().split(tableName,new byte[]{'0'});
+    UTIL.waitFor(60000,() -> UTIL.getAdmin().getRegions(tableName).size() > regions.length * regionReplication);
+    UTIL.getAdmin().disableTable(tableName);
+    ProcedureExecutor<MasterProcedureEnv> procExec=getMasterProcedureExecutor();
+    long procId=ProcedureTestingUtility.submitAndWait(procExec,new TruncateTableProcedure(procExec.getEnvironment(),tableName,true));
+    ProcedureTestingUtility.assertProcNotFailed(procExec,procId);
+    UTIL.waitUntilAllRegionsAssigned(tableName);
+    assertEquals((regions.length + 1) * regionReplication,UTIL.getAdmin().getRegions(tableName).size());
+  }
+}

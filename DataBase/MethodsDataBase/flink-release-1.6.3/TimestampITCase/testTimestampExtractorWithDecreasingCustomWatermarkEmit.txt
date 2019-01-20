@@ -1,0 +1,42 @@
+/** 
+ * This test verifies that the timestamp extractor does not emit decreasing watermarks.
+ */
+@Test public void testTimestampExtractorWithDecreasingCustomWatermarkEmit() throws Exception {
+  final int numElements=10;
+  StreamExecutionEnvironment env=StreamExecutionEnvironment.getExecutionEnvironment();
+  env.setStreamTimeCharacteristic(TimeCharacteristic.EventTime);
+  env.getConfig().setAutoWatermarkInterval(1);
+  env.setParallelism(1);
+  env.getConfig().disableSysoutLogging();
+  DataStream<Integer> source1=env.addSource(new SourceFunction<Integer>(){
+    @Override public void run(    SourceContext<Integer> ctx) throws Exception {
+      int index=1;
+      while (index <= numElements) {
+        ctx.collect(index);
+        Thread.sleep(100);
+        ctx.collect(index - 1);
+        latch.await();
+        index++;
+      }
+    }
+    @Override public void cancel(){
+    }
+  }
+);
+  source1.assignTimestampsAndWatermarks(new AssignerWithPunctuatedWatermarks<Integer>(){
+    @Override public long extractTimestamp(    Integer element,    long previousTimestamp){
+      return element;
+    }
+    @Override public Watermark checkAndGetNextWatermark(    Integer element,    long extractedTimestamp){
+      return new Watermark(extractedTimestamp - 1);
+    }
+  }
+).transform("Watermark Check",BasicTypeInfo.INT_TYPE_INFO,new CustomOperator(true)).transform("Timestamp Check",BasicTypeInfo.INT_TYPE_INFO,new TimestampCheckingOperator());
+  env.execute();
+  for (int j=0; j < numElements; j++) {
+    if (!CustomOperator.finalWatermarks[0].get(j).equals(new Watermark(j))) {
+      Assert.fail("Wrong watermark.");
+    }
+  }
+  assertEquals(Watermark.MAX_WATERMARK,CustomOperator.finalWatermarks[0].get(CustomOperator.finalWatermarks[0].size() - 1));
+}

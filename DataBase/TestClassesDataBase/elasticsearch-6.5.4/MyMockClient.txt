@@ -1,0 +1,125 @@
+private class MyMockClient extends FilterClient {
+  private final List<String> scrollsCleared=new ArrayList<>();
+  private final AtomicInteger bulksAttempts=new AtomicInteger();
+  private final AtomicInteger searchAttempts=new AtomicInteger();
+  private final AtomicInteger scrollAttempts=new AtomicInteger();
+  private final AtomicReference<RefreshRequest> lastRefreshRequest=new AtomicReference<>();
+  /** 
+ * Last search attempt that wasn't rejected outright.
+ */
+  private final AtomicReference<RequestAndListener<SearchRequest,SearchResponse>> lastSearch=new AtomicReference<>();
+  /** 
+ * Last scroll attempt that wasn't rejected outright.
+ */
+  private final AtomicReference<RequestAndListener<SearchScrollRequest,SearchResponse>> lastScroll=new AtomicReference<>();
+  /** 
+ * Set of all scrolls we've already used. Used to check that we don't reuse the same request twice.
+ */
+  private final Set<SearchScrollRequest> usedScolls=synchronizedSet(newSetFromMap(new IdentityHashMap<>()));
+  private int bulksToReject=0;
+  private int searchesToReject=0;
+  private int scrollsToReject=0;
+  MyMockClient(  Client in){
+    super(in);
+  }
+  @Override @SuppressWarnings("unchecked") protected <Request extends ActionRequest,Response extends ActionResponse,RequestBuilder extends ActionRequestBuilder<Request,Response,RequestBuilder>>void doExecute(  Action<Request,Response,RequestBuilder> action,  Request request,  ActionListener<Response> listener){
+    if (false == expectedHeaders.equals(threadPool().getThreadContext().getHeaders())) {
+      listener.onFailure(new RuntimeException("Expected " + expectedHeaders + " but got "+ threadPool().getThreadContext().getHeaders()));
+      return;
+    }
+    if (request instanceof ClearScrollRequest) {
+      assertEquals(TaskId.EMPTY_TASK_ID,request.getParentTask());
+    }
+ else {
+      assertEquals(taskId,request.getParentTask());
+    }
+    if (request instanceof RefreshRequest) {
+      lastRefreshRequest.set((RefreshRequest)request);
+      listener.onResponse(null);
+      return;
+    }
+    if (request instanceof SearchRequest) {
+      if (searchAttempts.incrementAndGet() <= searchesToReject) {
+        listener.onFailure(wrappedRejectedException());
+        return;
+      }
+      lastSearch.set(new RequestAndListener<>((SearchRequest)request,(ActionListener<SearchResponse>)listener));
+      return;
+    }
+    if (request instanceof SearchScrollRequest) {
+      SearchScrollRequest scroll=(SearchScrollRequest)request;
+      boolean newRequest=usedScolls.add(scroll);
+      assertTrue("We can't reuse scroll requests",newRequest);
+      if (scrollAttempts.incrementAndGet() <= scrollsToReject) {
+        listener.onFailure(wrappedRejectedException());
+        return;
+      }
+      lastScroll.set(new RequestAndListener<>(scroll,(ActionListener<SearchResponse>)listener));
+      return;
+    }
+    if (request instanceof ClearScrollRequest) {
+      ClearScrollRequest clearScroll=(ClearScrollRequest)request;
+      scrollsCleared.addAll(clearScroll.getScrollIds());
+      listener.onResponse((Response)new ClearScrollResponse(true,clearScroll.getScrollIds().size()));
+      return;
+    }
+    if (request instanceof BulkRequest) {
+      BulkRequest bulk=(BulkRequest)request;
+      int toReject;
+      if (bulksAttempts.incrementAndGet() > bulksToReject) {
+        toReject=-1;
+      }
+ else {
+        toReject=randomIntBetween(0,bulk.requests().size() - 1);
+      }
+      BulkItemResponse[] responses=new BulkItemResponse[bulk.requests().size()];
+      for (int i=0; i < bulk.requests().size(); i++) {
+        DocWriteRequest<?> item=bulk.requests().get(i);
+        DocWriteResponse response;
+        ShardId shardId=new ShardId(new Index(item.index(),"uuid"),0);
+        if (item instanceof IndexRequest) {
+          IndexRequest index=(IndexRequest)item;
+          response=new IndexResponse(shardId,index.type(),index.id(),randomInt(20),randomIntBetween(1,16),randomIntBetween(0,Integer.MAX_VALUE),true);
+        }
+ else         if (item instanceof UpdateRequest) {
+          UpdateRequest update=(UpdateRequest)item;
+          response=new UpdateResponse(shardId,update.type(),update.id(),randomIntBetween(0,Integer.MAX_VALUE),Result.CREATED);
+        }
+ else         if (item instanceof DeleteRequest) {
+          DeleteRequest delete=(DeleteRequest)item;
+          response=new DeleteResponse(shardId,delete.type(),delete.id(),randomInt(20),randomIntBetween(1,16),randomIntBetween(0,Integer.MAX_VALUE),true);
+        }
+ else {
+          throw new RuntimeException("Unknown request:  " + item);
+        }
+        if (i == toReject) {
+          responses[i]=new BulkItemResponse(i,item.opType(),new Failure(response.getIndex(),response.getType(),response.getId(),new EsRejectedExecutionException()));
+        }
+ else {
+          responses[i]=new BulkItemResponse(i,item.opType(),response);
+        }
+      }
+      listener.onResponse((Response)new BulkResponse(responses,1));
+      return;
+    }
+    super.doExecute(action,request,listener);
+  }
+  private Exception wrappedRejectedException(){
+    Exception e=new EsRejectedExecutionException();
+    int wraps=randomIntBetween(0,4);
+    for (int i=0; i < wraps; i++) {
+switch (randomIntBetween(0,2)) {
+case 0:
+        e=new SearchPhaseExecutionException("test","test failure",e,new ShardSearchFailure[0]);
+      continue;
+case 1:
+    e=new ReduceSearchPhaseException("test","test failure",e,new ShardSearchFailure[0]);
+  continue;
+case 2:
+e=new ElasticsearchException(e);
+continue;
+}
+}
+return e;
+}
+}

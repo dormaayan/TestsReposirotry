@@ -1,0 +1,117 @@
+/** 
+ * Tests the sequential blockGroup ID generation mechanism and blockGroup ID collision handling.
+ */
+public class TestSequentialBlockGroupId {
+  private static final Log LOG=LogFactory.getLog("TestSequentialBlockGroupId");
+  private final ErasureCodingPolicy ecPolicy=StripedFileTestUtil.getDefaultECPolicy();
+  private final short REPLICATION=1;
+  private final long SEED=0;
+  private final int dataBlocks=ecPolicy.getNumDataUnits();
+  private final int parityBlocks=ecPolicy.getNumParityUnits();
+  private final int cellSize=ecPolicy.getCellSize();
+  private final int stripesPerBlock=2;
+  private final int blockSize=cellSize * stripesPerBlock;
+  private final int numDNs=dataBlocks + parityBlocks + 2;
+  private final int blockGrpCount=4;
+  private final int fileLen=blockSize * dataBlocks * blockGrpCount;
+  private MiniDFSCluster cluster;
+  private DistributedFileSystem fs;
+  private SequentialBlockGroupIdGenerator blockGrpIdGenerator;
+  private Path ecDir=new Path("/ecDir");
+  @Before public void setup() throws Exception {
+    Configuration conf=new HdfsConfiguration();
+    conf.setInt(DFSConfigKeys.DFS_REPLICATION_KEY,1);
+    conf.setLong(DFSConfigKeys.DFS_BLOCK_SIZE_KEY,blockSize);
+    cluster=new MiniDFSCluster.Builder(conf).numDataNodes(numDNs).build();
+    cluster.waitActive();
+    fs=cluster.getFileSystem();
+    fs.enableErasureCodingPolicy(StripedFileTestUtil.getDefaultECPolicy().getName());
+    blockGrpIdGenerator=cluster.getNamesystem().getBlockManager().getBlockIdManager().getBlockGroupIdGenerator();
+    fs.mkdirs(ecDir);
+    cluster.getFileSystem().getClient().setErasureCodingPolicy("/ecDir",StripedFileTestUtil.getDefaultECPolicy().getName());
+  }
+  @After public void teardown(){
+    if (cluster != null) {
+      cluster.shutdown();
+      cluster=null;
+    }
+  }
+  /** 
+ * Test that blockGroup IDs are generating unique value.
+ */
+  @Test(timeout=60000) public void testBlockGroupIdGeneration() throws IOException {
+    long blockGroupIdInitialValue=blockGrpIdGenerator.getCurrentValue();
+    Path path=new Path(ecDir,"testBlockGrpIdGeneration.dat");
+    DFSTestUtil.createFile(fs,path,cellSize,fileLen,blockSize,REPLICATION,SEED);
+    List<LocatedBlock> blocks=DFSTestUtil.getAllBlocks(fs,path);
+    assertThat("Wrong BlockGrps",blocks.size(),is(blockGrpCount));
+    blockGrpIdGenerator.setCurrentValue(blockGroupIdInitialValue);
+    for (int i=0; i < blocks.size(); ++i) {
+      blockGrpIdGenerator.skipTo((blockGrpIdGenerator.getCurrentValue() & ~BLOCK_GROUP_INDEX_MASK) + MAX_BLOCKS_IN_GROUP);
+      long nextBlockExpectedId=blockGrpIdGenerator.getCurrentValue();
+      long nextBlockGrpId=blocks.get(i).getBlock().getBlockId();
+      LOG.info("BlockGrp" + i + " id is "+ nextBlockGrpId);
+      assertThat("BlockGrpId mismatches!",nextBlockGrpId,is(nextBlockExpectedId));
+    }
+    cluster.getNamesystem().getBlockManager().clear();
+    assertThat("BlockGrpId mismatches!",blockGrpIdGenerator.getCurrentValue(),is(Long.MIN_VALUE));
+  }
+  /** 
+ * Test that collisions in the blockGroup ID space are handled gracefully.
+ */
+  @Test(timeout=60000) public void testTriggerBlockGroupIdCollision() throws IOException {
+    long blockGroupIdInitialValue=blockGrpIdGenerator.getCurrentValue();
+    Path path1=new Path(ecDir,"testBlockGrpIdCollisionDetection_file1.dat");
+    DFSTestUtil.createFile(fs,path1,cellSize,fileLen,blockSize,REPLICATION,SEED);
+    List<LocatedBlock> blocks1=DFSTestUtil.getAllBlocks(fs,path1);
+    assertThat("Wrong BlockGrps",blocks1.size(),is(blockGrpCount));
+    blockGrpIdGenerator.setCurrentValue(blockGroupIdInitialValue);
+    Path path2=new Path(ecDir,"testBlockGrpIdCollisionDetection_file2.dat");
+    DFSTestUtil.createFile(fs,path2,cellSize,fileLen,blockSize,REPLICATION,SEED);
+    List<LocatedBlock> blocks2=DFSTestUtil.getAllBlocks(fs,path2);
+    assertThat("Wrong BlockGrps",blocks2.size(),is(blockGrpCount));
+    for (    LocatedBlock locBlock1 : blocks1) {
+      long blockId1=locBlock1.getBlock().getBlockId();
+      for (      LocatedBlock locBlock2 : blocks2) {
+        long blockId2=locBlock2.getBlock().getBlockId();
+        assertThat("BlockGrpId mismatches!",blockId1,is(not(blockId2)));
+      }
+    }
+  }
+  /** 
+ * Test that collisions in the blockGroup ID when the id is occupied by legacy block.
+ */
+  @Test(timeout=60000) public void testTriggerBlockGroupIdCollisionWithLegacyBlockId() throws Exception {
+    long blockGroupIdInitialValue=blockGrpIdGenerator.getCurrentValue();
+    blockGrpIdGenerator.skipTo((blockGrpIdGenerator.getCurrentValue() & ~BLOCK_GROUP_INDEX_MASK) + MAX_BLOCKS_IN_GROUP);
+    final long curBlockGroupIdValue=blockGrpIdGenerator.getCurrentValue();
+    FSNamesystem fsn=cluster.getNamesystem();
+    SequentialBlockIdGenerator blockIdGenerator=spy(fsn.getBlockManager().getBlockIdManager().getBlockIdGenerator());
+    Whitebox.setInternalState(fsn.getBlockManager().getBlockIdManager(),"blockIdGenerator",blockIdGenerator);
+    SequentialBlockIdGenerator spySequentialBlockIdGenerator=new SequentialBlockIdGenerator(null){
+      @Override public long nextValue(){
+        return curBlockGroupIdValue;
+      }
+    }
+;
+    final Answer<Object> delegator=new GenericTestUtils.DelegateAnswer(spySequentialBlockIdGenerator);
+    doAnswer(delegator).when(blockIdGenerator).nextValue();
+    Path path1=new Path("/testCollisionWithLegacyBlock_file1.dat");
+    DFSTestUtil.createFile(fs,path1,1024,REPLICATION,SEED);
+    List<LocatedBlock> contiguousBlocks=DFSTestUtil.getAllBlocks(fs,path1);
+    assertThat(contiguousBlocks.size(),is(1));
+    Assert.assertEquals("Unexpected BlockId!",curBlockGroupIdValue,contiguousBlocks.get(0).getBlock().getBlockId());
+    blockGrpIdGenerator.setCurrentValue(blockGroupIdInitialValue);
+    Path path2=new Path(ecDir,"testCollisionWithLegacyBlock_file2.dat");
+    DFSTestUtil.createFile(fs,path2,cellSize,fileLen,blockSize,REPLICATION,SEED);
+    List<LocatedBlock> blocks2=DFSTestUtil.getAllBlocks(fs,path2);
+    assertThat("Wrong BlockGrps",blocks2.size(),is(blockGrpCount));
+    for (    LocatedBlock locBlock1 : contiguousBlocks) {
+      long blockId1=locBlock1.getBlock().getBlockId();
+      for (      LocatedBlock locBlock2 : blocks2) {
+        long blockId2=locBlock2.getBlock().getBlockId();
+        assertThat("BlockGrpId mismatches!",blockId1,is(not(blockId2)));
+      }
+    }
+  }
+}

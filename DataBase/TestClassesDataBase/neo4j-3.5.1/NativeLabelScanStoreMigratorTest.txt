@@ -1,0 +1,148 @@
+public class NativeLabelScanStoreMigratorTest {
+  private final TestDirectory testDirectory=TestDirectory.testDirectory();
+  private final DefaultFileSystemRule fileSystemRule=new DefaultFileSystemRule();
+  private final PageCacheRule pageCacheRule=new PageCacheRule();
+  @Rule public RuleChain ruleChain=RuleChain.outerRule(testDirectory).around(fileSystemRule).around(pageCacheRule);
+  private File storeDir;
+  private File nativeLabelIndex;
+  private DatabaseLayout migrationLayout;
+  private File luceneLabelScanStore;
+  private final ProgressReporter progressReporter=mock(ProgressReporter.class);
+  private FileSystemAbstraction fileSystem;
+  private PageCache pageCache;
+  private NativeLabelScanStoreMigrator indexMigrator;
+  private DatabaseLayout databaseLayout;
+  @Before public void setUp() throws Exception {
+    databaseLayout=testDirectory.databaseLayout();
+    storeDir=databaseLayout.databaseDirectory();
+    nativeLabelIndex=databaseLayout.labelScanStore();
+    migrationLayout=testDirectory.databaseLayout("migrationDir");
+    luceneLabelScanStore=testDirectory.databaseDir().toPath().resolve(Paths.get("schema","label","lucene")).toFile();
+    fileSystem=fileSystemRule.get();
+    pageCache=pageCacheRule.getPageCache(fileSystemRule);
+    indexMigrator=new NativeLabelScanStoreMigrator(fileSystem,pageCache,Config.defaults());
+    fileSystem.mkdirs(luceneLabelScanStore);
+  }
+  @Test public void skipMigrationIfNativeIndexExist() throws Exception {
+    ByteBuffer sourceBuffer=writeFile(nativeLabelIndex,new byte[]{1,2,3});
+    indexMigrator.migrate(databaseLayout,migrationLayout,progressReporter,StandardV3_2.STORE_VERSION,StandardV3_2.STORE_VERSION);
+    indexMigrator.moveMigratedFiles(migrationLayout,databaseLayout,StandardV3_2.STORE_VERSION,StandardV3_2.STORE_VERSION);
+    ByteBuffer resultBuffer=readFileContent(nativeLabelIndex,3);
+    assertEquals(sourceBuffer,resultBuffer);
+    assertTrue(fileSystem.fileExists(luceneLabelScanStore));
+  }
+  @Test(expected=InvalidIdGeneratorException.class) public void failMigrationWhenNodeIdFileIsBroken() throws Exception {
+    prepareEmpty23Database();
+    File nodeIdFile=databaseLayout.idNodeStore();
+    writeFile(nodeIdFile,new byte[]{1,2,3});
+    indexMigrator.migrate(databaseLayout,migrationLayout,progressReporter,StandardV3_2.STORE_VERSION,StandardV3_2.STORE_VERSION);
+  }
+  @Test public void clearMigrationDirFromAnyLabelScanStoreBeforeMigrating() throws Exception {
+    prepareEmpty23Database();
+    initializeNativeLabelScanStoreWithContent(migrationLayout);
+    File toBeDeleted=migrationLayout.labelScanStore();
+    assertTrue(fileSystem.fileExists(toBeDeleted));
+    indexMigrator.migrate(databaseLayout,migrationLayout,progressReporter,StandardV3_2.STORE_VERSION,StandardV3_2.STORE_VERSION);
+    assertNoContentInNativeLabelScanStore(migrationLayout);
+  }
+  @Test public void luceneLabelIndexRemovedAfterSuccessfulMigration() throws IOException {
+    prepareEmpty23Database();
+    indexMigrator.migrate(databaseLayout,migrationLayout,progressReporter,StandardV2_3.STORE_VERSION,StandardV3_2.STORE_VERSION);
+    indexMigrator.moveMigratedFiles(migrationLayout,databaseLayout,StandardV2_3.STORE_VERSION,StandardV3_2.STORE_VERSION);
+    assertFalse(fileSystem.fileExists(luceneLabelScanStore));
+  }
+  @Test public void moveCreatedNativeLabelIndexBackToStoreDirectory() throws IOException {
+    prepareEmpty23Database();
+    indexMigrator.migrate(databaseLayout,migrationLayout,progressReporter,StandardV2_3.STORE_VERSION,StandardV3_2.STORE_VERSION);
+    File migrationNativeIndex=migrationLayout.labelScanStore();
+    ByteBuffer migratedFileContent=writeFile(migrationNativeIndex,new byte[]{5,4,3,2,1});
+    indexMigrator.moveMigratedFiles(migrationLayout,databaseLayout,StandardV2_3.STORE_VERSION,StandardV3_2.STORE_VERSION);
+    ByteBuffer movedNativeIndex=readFileContent(nativeLabelIndex,5);
+    assertEquals(migratedFileContent,movedNativeIndex);
+  }
+  @Test public void populateNativeLabelScanIndexDuringMigration() throws IOException {
+    prepare34DatabaseWithNodes();
+    indexMigrator.migrate(databaseLayout,migrationLayout,progressReporter,StandardV3_4.STORE_VERSION,StandardV3_4.STORE_VERSION);
+    indexMigrator.moveMigratedFiles(migrationLayout,databaseLayout,StandardV2_3.STORE_VERSION,StandardV3_2.STORE_VERSION);
+    try (Lifespan lifespan=new Lifespan()){
+      NativeLabelScanStore labelScanStore=getNativeLabelScanStore(databaseLayout,true);
+      lifespan.add(labelScanStore);
+      for (int labelId=0; labelId < 10; labelId++) {
+        try (LabelScanReader labelScanReader=labelScanStore.newReader()){
+          int nodeCount=PrimitiveLongCollections.count(labelScanReader.nodesWithLabel(labelId));
+          assertEquals(format("Expected to see only one node for label %d but was %d.",labelId,nodeCount),1,nodeCount);
+        }
+       }
+    }
+   }
+  @Test public void reportProgressOnNativeIndexPopulation() throws IOException {
+    prepare34DatabaseWithNodes();
+    indexMigrator.migrate(databaseLayout,migrationLayout,progressReporter,StandardV3_4.STORE_VERSION,StandardV3_4.STORE_VERSION);
+    indexMigrator.moveMigratedFiles(migrationLayout,databaseLayout,StandardV2_3.STORE_VERSION,StandardV3_2.STORE_VERSION);
+    verify(progressReporter).start(10);
+    verify(progressReporter,times(10)).progress(1);
+  }
+  private NativeLabelScanStore getNativeLabelScanStore(  DatabaseLayout databaseLayout,  boolean readOnly){
+    return new NativeLabelScanStore(pageCache,databaseLayout,fileSystem,FullStoreChangeStream.EMPTY,readOnly,new Monitors(),RecoveryCleanupWorkCollector.ignore());
+  }
+  private void initializeNativeLabelScanStoreWithContent(  DatabaseLayout databaseLayout) throws IOException {
+    try (Lifespan lifespan=new Lifespan()){
+      NativeLabelScanStore nativeLabelScanStore=getNativeLabelScanStore(databaseLayout,false);
+      lifespan.add(nativeLabelScanStore);
+      try (LabelScanWriter labelScanWriter=nativeLabelScanStore.newWriter()){
+        labelScanWriter.write(NodeLabelUpdate.labelChanges(1,new long[0],new long[]{1}));
+      }
+       nativeLabelScanStore.force(IOLimiter.UNLIMITED);
+    }
+   }
+  private void assertNoContentInNativeLabelScanStore(  DatabaseLayout databaseLayout){
+    try (Lifespan lifespan=new Lifespan()){
+      NativeLabelScanStore nativeLabelScanStore=getNativeLabelScanStore(databaseLayout,true);
+      lifespan.add(nativeLabelScanStore);
+      try (LabelScanReader labelScanReader=nativeLabelScanStore.newReader()){
+        int count=PrimitiveLongCollections.count(labelScanReader.nodesWithLabel(1));
+        assertEquals(0,count);
+      }
+     }
+   }
+  private ByteBuffer writeFile(  File file,  byte[] content) throws IOException {
+    ByteBuffer sourceBuffer=ByteBuffer.wrap(content);
+    storeFileContent(file,sourceBuffer);
+    sourceBuffer.flip();
+    return sourceBuffer;
+  }
+  private void prepare34DatabaseWithNodes(){
+    GraphDatabaseService embeddedDatabase=new TestGraphDatabaseFactory().newEmbeddedDatabase(storeDir);
+    try {
+      try (Transaction transaction=embeddedDatabase.beginTx()){
+        for (int i=0; i < 10; i++) {
+          embeddedDatabase.createNode(Label.label("label" + i));
+        }
+        transaction.success();
+      }
+     }
+  finally {
+      embeddedDatabase.shutdown();
+    }
+    fileSystem.deleteFile(nativeLabelIndex);
+  }
+  private void prepareEmpty23Database() throws IOException {
+    new TestGraphDatabaseFactory().newEmbeddedDatabase(storeDir).shutdown();
+    fileSystem.deleteFile(nativeLabelIndex);
+    MetaDataStore.setRecord(pageCache,databaseLayout.metadataStore(),Position.STORE_VERSION,versionStringToLong(StandardV2_3.STORE_VERSION));
+  }
+  private ByteBuffer readFileContent(  File nativeLabelIndex,  int length) throws IOException {
+    try (StoreChannel storeChannel=fileSystem.open(nativeLabelIndex,OpenMode.READ)){
+      ByteBuffer readBuffer=ByteBuffer.allocate(length);
+      while (readBuffer.hasRemaining() && storeChannel.read(readBuffer) > 0) {
+      }
+      readBuffer.flip();
+      return readBuffer;
+    }
+   }
+  private void storeFileContent(  File file,  ByteBuffer sourceBuffer) throws IOException {
+    try (StoreChannel storeChannel=fileSystem.create(file)){
+      storeChannel.writeAll(sourceBuffer);
+    }
+   }
+}

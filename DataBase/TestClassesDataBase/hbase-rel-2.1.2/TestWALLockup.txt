@@ -1,0 +1,336 @@
+/** 
+ * Testing for lock up of FSHLog.
+ */
+@Category({RegionServerTests.class,MediumTests.class}) public class TestWALLockup {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestWALLockup.class);
+  private static final Logger LOG=LoggerFactory.getLogger(TestWALLockup.class);
+  @Rule public TestName name=new TestName();
+  private static final String COLUMN_FAMILY="MyCF";
+  private static final byte[] COLUMN_FAMILY_BYTES=Bytes.toBytes(COLUMN_FAMILY);
+  HRegion region=null;
+  private static HBaseTestingUtility TEST_UTIL=new HBaseTestingUtility();
+  private static Configuration CONF;
+  private String dir;
+  protected TableName tableName;
+  @Before public void setup() throws IOException {
+    CONF=TEST_UTIL.getConfiguration();
+    CONF.setFloat(HConstants.HFILE_BLOCK_CACHE_SIZE_KEY,0f);
+    dir=TEST_UTIL.getDataTestDir("TestHRegion").toString();
+    tableName=TableName.valueOf(name.getMethodName());
+  }
+  @After public void tearDown() throws Exception {
+    EnvironmentEdgeManagerTestHelper.reset();
+    LOG.info("Cleaning test directory: " + TEST_UTIL.getDataTestDir());
+    TEST_UTIL.cleanupTestDir();
+  }
+  private String getName(){
+    return name.getMethodName();
+  }
+private static final class DodgyFSLog extends FSHLog {
+    volatile boolean throwException=false;
+    CountDownLatch latch=new CountDownLatch(1);
+    public DodgyFSLog(    FileSystem fs,    Path root,    String logDir,    Configuration conf) throws IOException {
+      super(fs,root,logDir,conf);
+    }
+    @Override protected void afterCreatingZigZagLatch(){
+      if (throwException) {
+        try {
+          LOG.info("LATCHED");
+          if (!this.latch.await(5,TimeUnit.SECONDS)) {
+            LOG.warn("GIVE UP! Failed waiting on latch...Test is ABORTED!");
+          }
+        }
+ catch (        InterruptedException e) {
+        }
+      }
+    }
+    @Override protected void beforeWaitOnSafePoint(){
+      if (throwException) {
+        LOG.info("COUNTDOWN");
+        while (this.latch.getCount() <= 0)         Threads.sleep(1);
+        this.latch.countDown();
+      }
+    }
+    @Override protected Writer createWriterInstance(    Path path) throws IOException {
+      final Writer w=super.createWriterInstance(path);
+      return new Writer(){
+        @Override public void close() throws IOException {
+          w.close();
+        }
+        @Override public void sync(        boolean forceSync) throws IOException {
+          if (throwException) {
+            throw new IOException("FAKE! Failed to replace a bad datanode...SYNC");
+          }
+          w.sync(forceSync);
+        }
+        @Override public void append(        Entry entry) throws IOException {
+          if (throwException) {
+            throw new IOException("FAKE! Failed to replace a bad datanode...APPEND");
+          }
+          w.append(entry);
+        }
+        @Override public long getLength(){
+          return w.getLength();
+        }
+      }
+;
+    }
+  }
+  /** 
+ * Reproduce locking up that happens when we get an inopportune sync during setup for zigzaglatch wait. See HBASE-14317. If below is broken, we will see this test timeout because it is locked up. <p>First I need to set up some mocks for Server and RegionServerServices. I also need to set up a dodgy WAL that will throw an exception when we go to append to it.
+ */
+  @Test public void testLockupWhenSyncInMiddleOfZigZagSetup() throws IOException {
+    Server server=Mockito.mock(Server.class);
+    Mockito.when(server.getConfiguration()).thenReturn(CONF);
+    Mockito.when(server.isStopped()).thenReturn(false);
+    Mockito.when(server.isAborted()).thenReturn(false);
+    RegionServerServices services=Mockito.mock(RegionServerServices.class);
+    FileSystem fs=FileSystem.get(CONF);
+    Path rootDir=new Path(dir + getName());
+    DodgyFSLog dodgyWAL=new DodgyFSLog(fs,rootDir,getName(),CONF);
+    Path originalWAL=dodgyWAL.getCurrentFileName();
+    LogRoller logRoller=new LogRoller(server,services);
+    logRoller.addWAL(dodgyWAL);
+    logRoller.start();
+    final HRegion region=initHRegion(tableName,null,null,dodgyWAL);
+    byte[] bytes=Bytes.toBytes(getName());
+    NavigableMap<byte[],Integer> scopes=new TreeMap<>(Bytes.BYTES_COMPARATOR);
+    scopes.put(COLUMN_FAMILY_BYTES,0);
+    MultiVersionConcurrencyControl mvcc=new MultiVersionConcurrencyControl();
+    try {
+      Put put=new Put(bytes);
+      put.addColumn(COLUMN_FAMILY_BYTES,Bytes.toBytes("1"),bytes);
+      WALKeyImpl key=new WALKeyImpl(region.getRegionInfo().getEncodedNameAsBytes(),TableName.META_TABLE_NAME,System.currentTimeMillis(),mvcc,scopes);
+      WALEdit edit=new WALEdit();
+      CellScanner CellScanner=put.cellScanner();
+      assertTrue(CellScanner.advance());
+      edit.add(CellScanner.current());
+      for (int i=0; i < 1000; i++) {
+        region.put(put);
+      }
+      LOG.info("SET throwing of exception on append");
+      dodgyWAL.throwException=true;
+      dodgyWAL.append(region.getRegionInfo(),key,edit,true);
+      boolean exception=false;
+      try {
+        dodgyWAL.sync(false);
+      }
+ catch (      Exception e) {
+        exception=true;
+      }
+      assertTrue("Did not get sync exception",exception);
+      Thread t=new Thread("Flusher"){
+        @Override public void run(){
+          try {
+            if (region.getMemStoreDataSize() <= 0) {
+              throw new IOException("memstore size=" + region.getMemStoreDataSize());
+            }
+            region.flush(false);
+          }
+ catch (          IOException e) {
+            LOG.info("In flush",e);
+          }
+          LOG.info("Exiting");
+        }
+      }
+;
+      t.setDaemon(true);
+      t.start();
+      while (dodgyWAL.latch.getCount() > 0) {
+        Threads.sleep(1);
+      }
+      assertTrue(originalWAL != dodgyWAL.getCurrentFileName());
+      dodgyWAL.throwException=false;
+      try {
+        region.put(put);
+      }
+ catch (      Exception e) {
+        LOG.info("In the put",e);
+      }
+    }
+  finally {
+      Mockito.when(server.isStopped()).thenReturn(true);
+      Closeables.close(logRoller,true);
+      try {
+        if (region != null) {
+          region.close();
+        }
+        if (dodgyWAL != null) {
+          dodgyWAL.close();
+        }
+      }
+ catch (      Exception e) {
+        LOG.info("On way out",e);
+      }
+    }
+  }
+  /** 
+ * If below is broken, we will see this test timeout because RingBufferEventHandler was stuck in attainSafePoint. Everyone will wait for sync to finish forever. See HBASE-14317.
+ */
+  @Test(timeout=30000) public void testRingBufferEventHandlerStuckWhenSyncFailed() throws IOException, InterruptedException {
+class DodgyFSLog extends FSHLog {
+      private volatile boolean zigZagCreated=false;
+      public DodgyFSLog(      FileSystem fs,      Path root,      String logDir,      Configuration conf) throws IOException {
+        super(fs,root,logDir,conf);
+      }
+      @Override protected void afterCreatingZigZagLatch(){
+        zigZagCreated=true;
+        try {
+          Thread.sleep(3000);
+        }
+ catch (        InterruptedException ignore) {
+        }
+      }
+      @Override protected long getSequenceOnRingBuffer(){
+        return super.getSequenceOnRingBuffer();
+      }
+      protected void publishSyncOnRingBufferAndBlock(      long sequence){
+        try {
+          super.blockOnSync(super.publishSyncOnRingBuffer(sequence,false));
+          Assert.fail("Expect an IOException here.");
+        }
+ catch (        IOException ignore) {
+        }
+      }
+      @Override protected Writer createWriterInstance(      Path path) throws IOException {
+        final Writer w=super.createWriterInstance(path);
+        return new Writer(){
+          @Override public void close() throws IOException {
+            w.close();
+          }
+          @Override public void sync(          boolean forceSync) throws IOException {
+            throw new IOException("FAKE! Failed to replace a bad datanode...SYNC");
+          }
+          @Override public void append(          Entry entry) throws IOException {
+            w.append(entry);
+          }
+          @Override public long getLength(){
+            return w.getLength();
+          }
+        }
+;
+      }
+    }
+    final Server server=Mockito.mock(Server.class);
+    Mockito.when(server.getConfiguration()).thenReturn(CONF);
+    Mockito.when(server.isStopped()).thenReturn(false);
+    Mockito.when(server.isAborted()).thenReturn(false);
+    RegionServerServices services=Mockito.mock(RegionServerServices.class);
+    FileSystem fs=FileSystem.get(CONF);
+    Path rootDir=new Path(dir + getName());
+    final DodgyFSLog dodgyWAL=new DodgyFSLog(fs,rootDir,getName(),CONF);
+    LogRoller logRoller=new LogRoller(server,services);
+    logRoller.addWAL(dodgyWAL);
+    logRoller.start();
+    try {
+      final long seqForSync=dodgyWAL.getSequenceOnRingBuffer();
+      LOG.info("Trigger log roll for creating a ZigZagLatch.");
+      logRoller.requestRollAll();
+      while (!dodgyWAL.zigZagCreated) {
+        Thread.sleep(10);
+      }
+      LOG.info("Send sync for RingBufferEventHandler");
+      Thread syncThread=new Thread(){
+        @Override public void run(){
+          dodgyWAL.publishSyncOnRingBufferAndBlock(seqForSync);
+        }
+      }
+;
+      syncThread.start();
+      syncThread.join();
+      try {
+        LOG.info("Call sync for testing whether RingBufferEventHandler is hanging.");
+        dodgyWAL.sync(false);
+        Assert.fail("Expect an IOException here.");
+      }
+ catch (      IOException ignore) {
+      }
+    }
+  finally {
+      Mockito.when(server.isStopped()).thenReturn(true);
+      if (logRoller != null) {
+        logRoller.interrupt();
+      }
+      if (dodgyWAL != null) {
+        dodgyWAL.close();
+      }
+    }
+  }
+static class DummyServer implements Server {
+    private Configuration conf;
+    private String serverName;
+    private boolean isAborted=false;
+    public DummyServer(    Configuration conf,    String serverName){
+      this.conf=conf;
+      this.serverName=serverName;
+    }
+    @Override public Configuration getConfiguration(){
+      return conf;
+    }
+    @Override public ZKWatcher getZooKeeper(){
+      return null;
+    }
+    @Override public CoordinatedStateManager getCoordinatedStateManager(){
+      return null;
+    }
+    @Override public ClusterConnection getConnection(){
+      return null;
+    }
+    @Override public MetaTableLocator getMetaTableLocator(){
+      return null;
+    }
+    @Override public ServerName getServerName(){
+      return ServerName.valueOf(this.serverName);
+    }
+    @Override public void abort(    String why,    Throwable e){
+      LOG.info("Aborting " + serverName);
+      this.isAborted=true;
+    }
+    @Override public boolean isAborted(){
+      return this.isAborted;
+    }
+    @Override public void stop(    String why){
+      this.isAborted=true;
+    }
+    @Override public boolean isStopped(){
+      return this.isAborted;
+    }
+    @Override public ChoreService getChoreService(){
+      return null;
+    }
+    @Override public ClusterConnection getClusterConnection(){
+      return null;
+    }
+    @Override public FileSystem getFileSystem(){
+      return null;
+    }
+    @Override public boolean isStopping(){
+      return false;
+    }
+    @Override public Connection createConnection(    Configuration conf) throws IOException {
+      return null;
+    }
+  }
+static class DummyWALActionsListener implements WALActionsListener {
+    @Override public void visitLogEntryBeforeWrite(    WALKey logKey,    WALEdit logEdit) throws IOException {
+      if (logKey.getTableName().getNameAsString().equalsIgnoreCase("sleep")) {
+        try {
+          Thread.sleep(1000);
+        }
+ catch (        InterruptedException e) {
+          e.printStackTrace();
+        }
+      }
+      if (logKey.getTableName().getNameAsString().equalsIgnoreCase("DamagedWALException")) {
+        throw new DamagedWALException("Failed appending");
+      }
+    }
+  }
+  /** 
+ * @return A region on which you must call {@link HBaseTestingUtility#closeRegionAndWAL(HRegion)}when done.
+ */
+  private static HRegion initHRegion(  TableName tableName,  byte[] startKey,  byte[] stopKey,  WAL wal) throws IOException {
+    ChunkCreator.initialize(MemStoreLABImpl.CHUNK_SIZE_DEFAULT,false,0,0,0,null);
+    return TEST_UTIL.createLocalHRegion(tableName,startKey,stopKey,false,Durability.SYNC_WAL,wal,COLUMN_FAMILY_BYTES);
+  }
+}

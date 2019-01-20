@@ -1,0 +1,52 @@
+@Category({MasterTests.class,MediumTests.class}) public class TestMasterRepairMode {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestMasterRepairMode.class);
+  @Rule public TestName name=new TestName();
+  private static final Logger LOG=LoggerFactory.getLogger(TestMasterRepairMode.class);
+  private static final byte[] FAMILYNAME=Bytes.toBytes("fam");
+  private static HBaseTestingUtility TEST_UTIL;
+  @Before public void setUp() throws Exception {
+    TEST_UTIL=new HBaseTestingUtility();
+  }
+  @After public void tearDown() throws Exception {
+    TEST_UTIL.shutdownMiniCluster();
+  }
+  private void enableMaintenanceMode(){
+    Configuration c=TEST_UTIL.getConfiguration();
+    c.setBoolean(HMaster.MAINTENANCE_MODE,true);
+    c.setInt("hbase.master.init.timeout.localHBaseCluster",30000);
+  }
+  @Test public void testNewCluster() throws Exception {
+    enableMaintenanceMode();
+    TEST_UTIL.startMiniZKCluster();
+    TEST_UTIL.startMiniDFSCluster(3);
+    TEST_UTIL.startMiniHBaseCluster(1,0);
+    Connection conn=TEST_UTIL.getConnection();
+    assertTrue(conn.getAdmin().isMasterInMaintenanceMode());
+    try (Table table=conn.getTable(TableName.META_TABLE_NAME);ResultScanner scanner=table.getScanner(new Scan())){
+      assertNotNull("Could not read meta.",scanner.next());
+    }
+   }
+  @Test public void testExistingCluster() throws Exception {
+    TableName testRepairMode=TableName.valueOf(name.getMethodName());
+    TEST_UTIL.startMiniCluster();
+    Table t=TEST_UTIL.createTable(testRepairMode,FAMILYNAME);
+    Put p=new Put(Bytes.toBytes("r"));
+    p.addColumn(FAMILYNAME,Bytes.toBytes("c"),new byte[0]);
+    t.put(p);
+    TEST_UTIL.shutdownMiniHBaseCluster();
+    LOG.info("Starting master-only");
+    enableMaintenanceMode();
+    TEST_UTIL.startMiniHBaseCluster(1,0);
+    Connection conn=TEST_UTIL.getConnection();
+    assertTrue(conn.getAdmin().isMasterInMaintenanceMode());
+    try (Table table=conn.getTable(TableName.META_TABLE_NAME);ResultScanner scanner=table.getScanner(HConstants.TABLE_FAMILY);Stream<Result> results=StreamSupport.stream(scanner.spliterator(),false)){
+      assertTrue("Did not find user table records while reading hbase:meta",results.anyMatch(r -> Arrays.equals(r.getRow(),testRepairMode.getName())));
+    }
+     try (Table table=conn.getTable(testRepairMode);ResultScanner scanner=table.getScanner(new Scan())){
+      scanner.next();
+      fail("Should not be able to access user-space tables in repair mode.");
+    }
+ catch (    Exception e) {
+    }
+  }
+}

@@ -1,0 +1,69 @@
+public class ADLdapUserSearchSessionFactoryTests extends AbstractActiveDirectoryTestCase {
+  private SSLService sslService;
+  private Settings globalSettings;
+  private ThreadPool threadPool;
+  @Before public void init() throws Exception {
+    Path certPath=getDataPath("support/smb_ca.crt");
+    Environment env=TestEnvironment.newEnvironment(Settings.builder().put("path.home",createTempDir()).build());
+    globalSettings=Settings.builder().put("path.home",createTempDir()).put("xpack.ssl.certificate_authorities",certPath).build();
+    sslService=new SSLService(globalSettings,env);
+    threadPool=new TestThreadPool("ADLdapUserSearchSessionFactoryTests");
+  }
+  @After public void shutdown() throws InterruptedException {
+    terminate(threadPool);
+  }
+  private MockSecureSettings newSecureSettings(  String key,  String value){
+    MockSecureSettings secureSettings=new MockSecureSettings();
+    secureSettings.setString(key,value);
+    return secureSettings;
+  }
+  public void testUserSearchWithActiveDirectory() throws Exception {
+    String groupSearchBase="DC=ad,DC=test,DC=elasticsearch,DC=com";
+    String userSearchBase="CN=Users,DC=ad,DC=test,DC=elasticsearch,DC=com";
+    Settings settings=Settings.builder().put(LdapTestCase.buildLdapSettings(new String[]{ActiveDirectorySessionFactoryTests.AD_LDAP_URL},Strings.EMPTY_ARRAY,groupSearchBase,LdapSearchScope.SUB_TREE,null,true)).put("user_search.base_dn",userSearchBase).put("bind_dn","ironman@ad.test.elasticsearch.com").put("bind_password",ActiveDirectorySessionFactoryTests.PASSWORD).put("user_search.filter","(cn={0})").put("user_search.pool.enabled",randomBoolean()).put("follow_referrals",ActiveDirectorySessionFactoryTests.FOLLOW_REFERRALS).build();
+    Settings.Builder builder=Settings.builder().put(globalSettings);
+    settings.keySet().forEach(k -> {
+      builder.copy("xpack.security.authc.realms.ad-as-ldap-test." + k,k,settings);
+    }
+);
+    Settings fullSettings=builder.build();
+    sslService=new SSLService(fullSettings,TestEnvironment.newEnvironment(fullSettings));
+    RealmConfig config=new RealmConfig("ad-as-ldap-test",settings,globalSettings,TestEnvironment.newEnvironment(globalSettings),new ThreadContext(globalSettings));
+    LdapUserSearchSessionFactory sessionFactory=getLdapUserSearchSessionFactory(config,sslService,threadPool);
+    String user="Bruce Banner";
+    try {
+      try (LdapSession ldap=session(sessionFactory,user,new SecureString(ActiveDirectorySessionFactoryTests.PASSWORD))){
+        assertConnectionCanReconnect(ldap.getConnection());
+        List<String> groups=groups(ldap);
+        assertThat(groups,containsInAnyOrder(containsString("Avengers"),containsString("SHIELD"),containsString("Geniuses"),containsString("Philanthropists")));
+      }
+       try (LdapSession ldap=unauthenticatedSession(sessionFactory,user)){
+        assertConnectionCanReconnect(ldap.getConnection());
+        List<String> groups=groups(ldap);
+        assertThat(groups,containsInAnyOrder(containsString("Avengers"),containsString("SHIELD"),containsString("Geniuses"),containsString("Philanthropists")));
+      }
+     }
+  finally {
+      sessionFactory.close();
+    }
+  }
+  @Override protected boolean enableWarningsCheck(){
+    return false;
+  }
+  private LdapSession session(  SessionFactory factory,  String username,  SecureString password){
+    PlainActionFuture<LdapSession> future=new PlainActionFuture<>();
+    factory.session(username,password,future);
+    return future.actionGet();
+  }
+  private List<String> groups(  LdapSession ldapSession){
+    Objects.requireNonNull(ldapSession);
+    PlainActionFuture<List<String>> future=new PlainActionFuture<>();
+    ldapSession.groups(future);
+    return future.actionGet();
+  }
+  private LdapSession unauthenticatedSession(  SessionFactory factory,  String username){
+    PlainActionFuture<LdapSession> future=new PlainActionFuture<>();
+    factory.unauthenticatedSession(username,future);
+    return future.actionGet();
+  }
+}

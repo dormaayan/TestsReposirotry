@@ -1,0 +1,51 @@
+/** 
+ * Tests that eager scheduling will wait until all input locations have been set before scheduling a task.
+ */
+@Test public void testEagerSchedulingWaitsOnAllInputPreferredLocations() throws Exception {
+  final int parallelism=2;
+  final ProgrammedSlotProvider slotProvider=new ProgrammedSlotProvider(parallelism);
+  final Time timeout=Time.hours(1L);
+  final JobVertexID sourceVertexId=new JobVertexID();
+  final JobVertex sourceVertex=new JobVertex("Test source",sourceVertexId);
+  sourceVertex.setInvokableClass(NoOpInvokable.class);
+  sourceVertex.setParallelism(parallelism);
+  final JobVertexID sinkVertexId=new JobVertexID();
+  final JobVertex sinkVertex=new JobVertex("Test sink",sinkVertexId);
+  sinkVertex.setInvokableClass(NoOpInvokable.class);
+  sinkVertex.setParallelism(parallelism);
+  sinkVertex.connectNewDataSetAsInput(sourceVertex,DistributionPattern.ALL_TO_ALL,ResultPartitionType.PIPELINED);
+  final Map<JobVertexID,CompletableFuture<LogicalSlot>[]> slotFutures=new HashMap<>(2);
+  for (  JobVertexID jobVertexID : Arrays.asList(sourceVertexId,sinkVertexId)) {
+    CompletableFuture<LogicalSlot>[] slotFutureArray=new CompletableFuture[parallelism];
+    for (int i=0; i < parallelism; i++) {
+      slotFutureArray[i]=new CompletableFuture<>();
+    }
+    slotFutures.put(jobVertexID,slotFutureArray);
+    slotProvider.addSlots(jobVertexID,slotFutureArray);
+  }
+  final ScheduledExecutorService scheduledExecutorService=new ScheduledThreadPoolExecutor(3);
+  final ExecutionGraph executionGraph=ExecutionGraphTestUtils.createExecutionGraph(new JobID(),slotProvider,new NoRestartStrategy(),scheduledExecutorService,timeout,sourceVertex,sinkVertex);
+  executionGraph.setScheduleMode(ScheduleMode.EAGER);
+  executionGraph.scheduleForExecution();
+  for (  ExecutionVertex executionVertex : executionGraph.getAllExecutionVertices()) {
+    assertEquals(ExecutionState.SCHEDULED,executionVertex.getCurrentExecutionAttempt().getState());
+  }
+  assertTrue(slotProvider.getSlotRequestedFuture(sourceVertexId,0).get());
+  assertTrue(slotProvider.getSlotRequestedFuture(sourceVertexId,1).get());
+  assertFalse(slotProvider.getSlotRequestedFuture(sinkVertexId,0).isDone());
+  assertFalse(slotProvider.getSlotRequestedFuture(sinkVertexId,1).isDone());
+  final TaskManagerLocation localTaskManagerLocation=new LocalTaskManagerLocation();
+  final SimpleSlot sourceSlot1=createSlot(localTaskManagerLocation,0);
+  final SimpleSlot sourceSlot2=createSlot(localTaskManagerLocation,1);
+  final SimpleSlot sinkSlot1=createSlot(localTaskManagerLocation,0);
+  final SimpleSlot sinkSlot2=createSlot(localTaskManagerLocation,1);
+  slotFutures.get(sourceVertexId)[0].complete(sourceSlot1);
+  slotFutures.get(sourceVertexId)[1].complete(sourceSlot2);
+  assertTrue(slotProvider.getSlotRequestedFuture(sinkVertexId,0).get());
+  assertTrue(slotProvider.getSlotRequestedFuture(sinkVertexId,1).get());
+  slotFutures.get(sinkVertexId)[0].complete(sinkSlot1);
+  slotFutures.get(sinkVertexId)[1].complete(sinkSlot2);
+  for (  ExecutionVertex executionVertex : executionGraph.getAllExecutionVertices()) {
+    ExecutionGraphTestUtils.waitUntilExecutionState(executionVertex.getCurrentExecutionAttempt(),ExecutionState.DEPLOYING,5000L);
+  }
+}

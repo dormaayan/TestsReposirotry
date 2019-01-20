@@ -1,0 +1,50 @@
+/** 
+ * Tests for the TaskManagersLogHandler.
+ */
+public class TaskManagerLogHandlerTest {
+  @Test public void testGetPaths(){
+    TaskManagerLogHandler handlerLog=new TaskManagerLogHandler(mock(GatewayRetriever.class),Executors.directExecutor(),CompletableFuture.completedFuture("/jm/address"),TestingUtils.TIMEOUT(),TaskManagerLogHandler.FileMode.LOG,new Configuration());
+    String[] pathsLog=handlerLog.getPaths();
+    Assert.assertEquals(1,pathsLog.length);
+    Assert.assertEquals("/taskmanagers/:taskmanagerid/log",pathsLog[0]);
+    TaskManagerLogHandler handlerOut=new TaskManagerLogHandler(mock(GatewayRetriever.class),Executors.directExecutor(),CompletableFuture.completedFuture("/jm/address"),TestingUtils.TIMEOUT(),TaskManagerLogHandler.FileMode.STDOUT,new Configuration());
+    String[] pathsOut=handlerOut.getPaths();
+    Assert.assertEquals(1,pathsOut.length);
+    Assert.assertEquals("/taskmanagers/:taskmanagerid/stdout",pathsOut[0]);
+  }
+  @Test public void testLogFetchingFailure() throws Exception {
+    InstanceID tmID=new InstanceID();
+    ResourceID tmRID=new ResourceID(tmID.toString());
+    TaskManagerGateway taskManagerGateway=mock(TaskManagerGateway.class);
+    when(taskManagerGateway.getAddress()).thenReturn("/tm/address");
+    Instance taskManager=mock(Instance.class);
+    when(taskManager.getId()).thenReturn(tmID);
+    when(taskManager.getTaskManagerID()).thenReturn(tmRID);
+    when(taskManager.getTaskManagerGateway()).thenReturn(taskManagerGateway);
+    CompletableFuture<TransientBlobKey> future=new CompletableFuture<>();
+    future.completeExceptionally(new IOException("failure"));
+    when(taskManagerGateway.requestTaskManagerLog(any(Time.class))).thenReturn(future);
+    JobManagerGateway jobManagerGateway=mock(JobManagerGateway.class);
+    when(jobManagerGateway.requestBlobServerPort(any(Time.class))).thenReturn(CompletableFuture.completedFuture(1337));
+    when(jobManagerGateway.getHostname()).thenReturn("localhost");
+    when(jobManagerGateway.requestTaskManagerInstance(any(ResourceID.class),any(Time.class))).thenReturn(CompletableFuture.completedFuture(Optional.of(taskManager)));
+    GatewayRetriever<JobManagerGateway> retriever=mock(GatewayRetriever.class);
+    when(retriever.getNow()).thenReturn(Optional.of(jobManagerGateway));
+    TaskManagerLogHandler handler=new TaskManagerLogHandler(retriever,Executors.directExecutor(),CompletableFuture.completedFuture("/jm/address"),TestingUtils.TIMEOUT(),TaskManagerLogHandler.FileMode.LOG,new Configuration());
+    final AtomicReference<String> exception=new AtomicReference<>();
+    ChannelHandlerContext ctx=mock(ChannelHandlerContext.class);
+    when(ctx.write(isA(ByteBuf.class))).thenAnswer(new Answer<Object>(){
+      @Override public Object answer(      InvocationOnMock invocationOnMock) throws Throwable {
+        ByteBuf data=invocationOnMock.getArgumentAt(0,ByteBuf.class);
+        exception.set(new String(data.array(),ConfigConstants.DEFAULT_CHARSET));
+        return null;
+      }
+    }
+);
+    Map<String,String> pathParams=new HashMap<>();
+    pathParams.put(TaskManagersHandler.TASK_MANAGER_ID_KEY,tmID.toString());
+    RoutedRequest routedRequest=new RoutedRequest(new RouteResult("shouldn't be used","shouldn't be used either",pathParams,new HashMap<>(),new Object()),new DefaultFullHttpRequest(HttpVersion.HTTP_1_1,HttpMethod.GET,"/taskmanagers/" + tmID + "/log"));
+    handler.respondAsLeader(ctx,routedRequest,jobManagerGateway);
+    Assert.assertEquals("Fetching TaskManager log failed.",exception.get());
+  }
+}

@@ -1,0 +1,156 @@
+public class NodeConnectionsServiceTests extends ESTestCase {
+  private ThreadPool threadPool;
+  private MockTransport transport;
+  private TransportService transportService;
+  private List<DiscoveryNode> generateNodes(){
+    List<DiscoveryNode> nodes=new ArrayList<>();
+    for (int i=randomIntBetween(20,50); i > 0; i--) {
+      Set<DiscoveryNode.Role> roles=new HashSet<>(randomSubsetOf(Arrays.asList(DiscoveryNode.Role.values())));
+      nodes.add(new DiscoveryNode("node_" + i,"" + i,buildNewFakeTransportAddress(),Collections.emptyMap(),roles,Version.CURRENT));
+    }
+    return nodes;
+  }
+  private ClusterState clusterStateFromNodes(  List<DiscoveryNode> nodes){
+    final DiscoveryNodes.Builder builder=DiscoveryNodes.builder();
+    for (    DiscoveryNode node : nodes) {
+      builder.add(node);
+    }
+    return ClusterState.builder(new ClusterName("test")).nodes(builder).build();
+  }
+  public void testConnectAndDisconnect(){
+    List<DiscoveryNode> nodes=generateNodes();
+    NodeConnectionsService service=new NodeConnectionsService(Settings.EMPTY,threadPool,transportService);
+    ClusterState current=clusterStateFromNodes(Collections.emptyList());
+    ClusterChangedEvent event=new ClusterChangedEvent("test",clusterStateFromNodes(randomSubsetOf(nodes)),current);
+    service.connectToNodes(event.state().nodes());
+    assertConnected(event.state().nodes());
+    service.disconnectFromNodesExcept(event.state().nodes());
+    assertConnectedExactlyToNodes(event.state());
+    current=event.state();
+    event=new ClusterChangedEvent("test",clusterStateFromNodes(randomSubsetOf(nodes)),current);
+    service.connectToNodes(event.state().nodes());
+    assertConnected(event.state().nodes());
+    service.disconnectFromNodesExcept(event.state().nodes());
+    assertConnectedExactlyToNodes(event.state());
+  }
+  public void testReconnect(){
+    List<DiscoveryNode> nodes=generateNodes();
+    NodeConnectionsService service=new NodeConnectionsService(Settings.EMPTY,threadPool,transportService);
+    ClusterState current=clusterStateFromNodes(Collections.emptyList());
+    ClusterChangedEvent event=new ClusterChangedEvent("test",clusterStateFromNodes(randomSubsetOf(nodes)),current);
+    transport.randomConnectionExceptions=true;
+    service.connectToNodes(event.state().nodes());
+    for (int i=0; i < 3; i++) {
+      for (      DiscoveryNode node : randomSubsetOf(nodes)) {
+        transportService.disconnectFromNode(node);
+      }
+      service.new ConnectionChecker().run();
+    }
+    transport.randomConnectionExceptions=false;
+    service.new ConnectionChecker().run();
+    assertConnectedExactlyToNodes(event.state());
+  }
+  private void assertConnectedExactlyToNodes(  ClusterState state){
+    assertConnected(state.nodes());
+    assertThat(transportService.getConnectionManager().size(),equalTo(state.nodes().getSize()));
+  }
+  private void assertConnected(  Iterable<DiscoveryNode> nodes){
+    for (    DiscoveryNode node : nodes) {
+      assertTrue("not connected to " + node,transportService.nodeConnected(node));
+    }
+  }
+  @Override @Before public void setUp() throws Exception {
+    super.setUp();
+    this.threadPool=new TestThreadPool(getClass().getName());
+    this.transport=new MockTransport();
+    transportService=new NoHandshakeTransportService(Settings.EMPTY,transport,threadPool,TransportService.NOOP_TRANSPORT_INTERCEPTOR,boundAddress -> DiscoveryNode.createLocal(Settings.EMPTY,buildNewFakeTransportAddress(),UUIDs.randomBase64UUID()),null,Collections.emptySet());
+    transportService.start();
+    transportService.acceptIncomingRequests();
+  }
+  @Override @After public void tearDown() throws Exception {
+    transportService.stop();
+    ThreadPool.terminate(threadPool,30,TimeUnit.SECONDS);
+    threadPool=null;
+    super.tearDown();
+  }
+private final class NoHandshakeTransportService extends TransportService {
+    private NoHandshakeTransportService(    Settings settings,    Transport transport,    ThreadPool threadPool,    TransportInterceptor transportInterceptor,    Function<BoundTransportAddress,DiscoveryNode> localNodeFactory,    ClusterSettings clusterSettings,    Set<String> taskHeaders){
+      super(settings,transport,threadPool,transportInterceptor,localNodeFactory,clusterSettings,taskHeaders);
+    }
+    @Override public HandshakeResponse handshake(    Transport.Connection connection,    long timeout,    Predicate<ClusterName> clusterNamePredicate){
+      return new HandshakeResponse(connection.getNode(),new ClusterName(""),Version.CURRENT);
+    }
+  }
+private final class MockTransport implements Transport {
+    private ResponseHandlers responseHandlers=new ResponseHandlers();
+    private volatile boolean randomConnectionExceptions=false;
+    private TransportMessageListener listener=new TransportMessageListener(){
+    }
+;
+    @Override public <Request extends TransportRequest>void registerRequestHandler(    RequestHandlerRegistry<Request> reg){
+    }
+    @Override public RequestHandlerRegistry getRequestHandler(    String action){
+      return null;
+    }
+    @Override public void addMessageListener(    TransportMessageListener listener){
+      this.listener=listener;
+    }
+    @Override public boolean removeMessageListener(    TransportMessageListener listener){
+      throw new UnsupportedOperationException();
+    }
+    @Override public BoundTransportAddress boundAddress(){
+      return null;
+    }
+    @Override public Map<String,BoundTransportAddress> profileBoundAddresses(){
+      return null;
+    }
+    @Override public TransportAddress[] addressesFromString(    String address,    int perAddressLimit){
+      return new TransportAddress[0];
+    }
+    @Override public Connection openConnection(    DiscoveryNode node,    ConnectionProfile connectionProfile){
+      if (connectionProfile == null) {
+        if (randomConnectionExceptions && randomBoolean()) {
+          throw new ConnectTransportException(node,"simulated");
+        }
+      }
+      Connection connection=new Connection(){
+        @Override public DiscoveryNode getNode(){
+          return node;
+        }
+        @Override public void sendRequest(        long requestId,        String action,        TransportRequest request,        TransportRequestOptions options) throws TransportException {
+        }
+        @Override public void addCloseListener(        ActionListener<Void> listener){
+        }
+        @Override public void close(){
+        }
+        @Override public boolean isClosed(){
+          return false;
+        }
+      }
+;
+      return connection;
+    }
+    @Override public List<String> getLocalAddresses(){
+      return null;
+    }
+    @Override public Lifecycle.State lifecycleState(){
+      return null;
+    }
+    @Override public void addLifecycleListener(    LifecycleListener listener){
+    }
+    @Override public void removeLifecycleListener(    LifecycleListener listener){
+    }
+    @Override public void start(){
+    }
+    @Override public void stop(){
+    }
+    @Override public void close(){
+    }
+    @Override public TransportStats getStats(){
+      throw new UnsupportedOperationException();
+    }
+    @Override public ResponseHandlers getResponseHandlers(){
+      return responseHandlers;
+    }
+  }
+}

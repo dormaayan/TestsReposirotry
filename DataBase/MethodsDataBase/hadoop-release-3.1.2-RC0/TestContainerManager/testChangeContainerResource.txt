@@ -1,0 +1,62 @@
+@Test public void testChangeContainerResource() throws Exception {
+  containerManager.start();
+  File scriptFile=Shell.appendScriptExtension(tmpDir,"scriptFile");
+  PrintWriter fileWriter=new PrintWriter(scriptFile);
+  ContainerId cId=createContainerId(0);
+  if (Shell.WINDOWS) {
+    fileWriter.println("@ping -n 100 127.0.0.1 >nul");
+  }
+ else {
+    fileWriter.write("\numask 0");
+    fileWriter.write("\nexec sleep 100");
+  }
+  fileWriter.close();
+  ContainerLaunchContext containerLaunchContext=recordFactory.newRecordInstance(ContainerLaunchContext.class);
+  URL resource_alpha=URL.fromPath(localFS.makeQualified(new Path(scriptFile.getAbsolutePath())));
+  LocalResource rsrc_alpha=recordFactory.newRecordInstance(LocalResource.class);
+  rsrc_alpha.setResource(resource_alpha);
+  rsrc_alpha.setSize(-1);
+  rsrc_alpha.setVisibility(LocalResourceVisibility.APPLICATION);
+  rsrc_alpha.setType(LocalResourceType.FILE);
+  rsrc_alpha.setTimestamp(scriptFile.lastModified());
+  String destinationFile="dest_file";
+  Map<String,LocalResource> localResources=new HashMap<String,LocalResource>();
+  localResources.put(destinationFile,rsrc_alpha);
+  containerLaunchContext.setLocalResources(localResources);
+  List<String> commands=Arrays.asList(Shell.getRunScriptCommand(scriptFile));
+  containerLaunchContext.setCommands(commands);
+  StartContainerRequest scRequest=StartContainerRequest.newInstance(containerLaunchContext,createContainerToken(cId,DUMMY_RM_IDENTIFIER,context.getNodeId(),user,context.getContainerTokenSecretManager()));
+  List<StartContainerRequest> list=new ArrayList<>();
+  list.add(scRequest);
+  StartContainersRequest allRequests=StartContainersRequest.newInstance(list);
+  containerManager.startContainers(allRequests);
+  BaseContainerManagerTest.waitForNMContainerState(containerManager,cId,org.apache.hadoop.yarn.server.nodemanager.containermanager.container.ContainerState.RUNNING);
+  List<Token> increaseTokens=new ArrayList<>();
+  Resource targetResource=Resource.newInstance(4096,2);
+  Token containerToken=createContainerToken(cId,1,DUMMY_RM_IDENTIFIER,context.getNodeId(),user,targetResource,context.getContainerTokenSecretManager(),null);
+  increaseTokens.add(containerToken);
+  ContainerUpdateRequest updateRequest=ContainerUpdateRequest.newInstance(increaseTokens);
+  ContainerUpdateResponse updateResponse=containerManager.updateContainer(updateRequest);
+  Assert.assertEquals(1,updateResponse.getSuccessfullyUpdatedContainers().size());
+  Assert.assertTrue(updateResponse.getFailedRequests().isEmpty());
+  List<ContainerId> containerIds=new ArrayList<>();
+  containerIds.add(cId);
+  GetContainerStatusesRequest gcsRequest=GetContainerStatusesRequest.newInstance(containerIds);
+  ContainerStatus containerStatus=containerManager.getContainerStatuses(gcsRequest).getContainerStatuses().get(0);
+  assertEquals(targetResource,containerStatus.getCapability());
+  List<Token> decreaseTokens=new ArrayList<>();
+  targetResource=Resource.newInstance(2048,2);
+  Token token=createContainerToken(cId,2,DUMMY_RM_IDENTIFIER,context.getNodeId(),user,targetResource,context.getContainerTokenSecretManager(),null);
+  decreaseTokens.add(token);
+  updateRequest=ContainerUpdateRequest.newInstance(decreaseTokens);
+  updateResponse=containerManager.updateContainer(updateRequest);
+  Assert.assertEquals(1,updateResponse.getSuccessfullyUpdatedContainers().size());
+  Assert.assertTrue(updateResponse.getFailedRequests().isEmpty());
+  containerStatus=containerManager.getContainerStatuses(gcsRequest).getContainerStatuses().get(0);
+  int retry=0;
+  while (!targetResource.equals(containerStatus.getCapability()) && (retry++ < 5)) {
+    Thread.sleep(200);
+    containerStatus=containerManager.getContainerStatuses(gcsRequest).getContainerStatuses().get(0);
+  }
+  assertEquals(targetResource,containerStatus.getCapability());
+}

@@ -1,0 +1,61 @@
+/** 
+ * Tests fs.delete() function to delete a blob when another blob is holding a lease on it. Delete if called without a lease should fail if another process is holding a lease and throw appropriate exception This is a scenario that would happen in HMaster startup when it tries to clean up the temp dirs while the HMaster process which was killed earlier held lease on the blob when doing some DDL operation
+ */
+@Test public void testDeleteThrowsExceptionWithLeaseExistsErrorMessage() throws Exception {
+  LOG.info("Starting test");
+  Path path=methodPath();
+  fs.create(path);
+  assertPathExists("test file",path);
+  NativeAzureFileSystem nfs=fs;
+  final String fullKey=nfs.pathToKey(nfs.makeAbsolute(path));
+  final AzureNativeFileSystemStore store=nfs.getStore();
+  final CountDownLatch leaseAttemptComplete=new CountDownLatch(1);
+  final CountDownLatch beginningDeleteAttempt=new CountDownLatch(1);
+  Thread t=new Thread(){
+    @Override public void run(){
+      SelfRenewingLease lease=null;
+      try {
+        lease=store.acquireLease(fullKey);
+        LOG.info("Lease acquired: " + lease.getLeaseID());
+      }
+ catch (      AzureException e) {
+        LOG.warn("Lease acqusition thread unable to acquire lease",e);
+      }
+ finally {
+        leaseAttemptComplete.countDown();
+      }
+      try {
+        beginningDeleteAttempt.await();
+      }
+ catch (      InterruptedException e) {
+        Thread.currentThread().interrupt();
+      }
+      try {
+        Thread.sleep(SelfRenewingLease.LEASE_ACQUIRE_RETRY_INTERVAL * 3);
+      }
+ catch (      InterruptedException ex) {
+        Thread.currentThread().interrupt();
+      }
+      try {
+        if (lease != null) {
+          LOG.info("Freeing lease");
+          lease.free();
+        }
+      }
+ catch (      StorageException se) {
+        LOG.warn("Unable to free lease.",se);
+      }
+    }
+  }
+;
+  t.start();
+  try {
+    leaseAttemptComplete.await();
+  }
+ catch (  InterruptedException ex) {
+    Thread.currentThread().interrupt();
+  }
+  beginningDeleteAttempt.countDown();
+  store.delete(fullKey);
+  assertPathDoesNotExist("Leased path",path);
+}

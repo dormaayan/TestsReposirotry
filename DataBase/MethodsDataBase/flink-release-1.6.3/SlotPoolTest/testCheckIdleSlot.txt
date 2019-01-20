@@ -1,0 +1,34 @@
+@Test public void testCheckIdleSlot() throws Exception {
+  final ManualClock clock=new ManualClock();
+  final SlotPool slotPool=new SlotPool(rpcService,jobId,LocationPreferenceSchedulingStrategy.getInstance(),clock,TestingUtils.infiniteTime(),timeout);
+  try {
+    final BlockingQueue<AllocationID> freedSlots=new ArrayBlockingQueue<>(1);
+    taskManagerGateway.setFreeSlotFunction((    AllocationID allocationId,    Throwable cause) -> {
+      try {
+        freedSlots.put(allocationId);
+        return CompletableFuture.completedFuture(Acknowledge.get());
+      }
+ catch (      InterruptedException e) {
+        return FutureUtils.completedExceptionally(e);
+      }
+    }
+);
+    final SlotPoolGateway slotPoolGateway=setupSlotPool(slotPool,resourceManagerGateway);
+    final AllocationID expiredSlotID=new AllocationID();
+    final AllocationID freshSlotID=new AllocationID();
+    final SlotOffer slotToExpire=new SlotOffer(expiredSlotID,0,ResourceProfile.UNKNOWN);
+    final SlotOffer slotToNotExpire=new SlotOffer(freshSlotID,1,ResourceProfile.UNKNOWN);
+    assertThat(slotPoolGateway.registerTaskManager(taskManagerLocation.getResourceID()).get(),Matchers.is(Acknowledge.get()));
+    assertThat(slotPoolGateway.offerSlot(taskManagerLocation,taskManagerGateway,slotToExpire).get(),Matchers.is(true));
+    clock.advanceTime(timeout.toMilliseconds() - 1L,TimeUnit.MILLISECONDS);
+    assertThat(slotPoolGateway.offerSlot(taskManagerLocation,taskManagerGateway,slotToNotExpire).get(),Matchers.is(true));
+    clock.advanceTime(1L,TimeUnit.MILLISECONDS);
+    slotPool.triggerCheckIdleSlot();
+    final AllocationID freedSlot=freedSlots.poll(timeout.toMilliseconds(),TimeUnit.MILLISECONDS);
+    assertThat(freedSlot,Matchers.is(expiredSlotID));
+    assertThat(freedSlots.isEmpty(),Matchers.is(true));
+  }
+  finally {
+    RpcUtils.terminateRpcEndpoint(slotPool,timeout);
+  }
+}

@@ -1,0 +1,49 @@
+@Test(timeout=60000) public void testAppAttemptRemovalAfterNodeRemoval() throws Exception {
+  MockNM nm=new MockNM("h:1234",4096,rm.getResourceTrackerService());
+  nm.registerNode();
+  OpportunisticContainerAllocatorAMService amservice=(OpportunisticContainerAllocatorAMService)rm.getApplicationMasterService();
+  RMApp app=rm.submitApp(1 * GB,"app","user",null,"default");
+  ApplicationAttemptId attemptId=app.getCurrentAppAttempt().getAppAttemptId();
+  MockAM am=MockRM.launchAndRegisterAM(app,rm,nm);
+  ResourceScheduler scheduler=rm.getResourceScheduler();
+  SchedulerApplicationAttempt schedulerAttempt=((CapacityScheduler)scheduler).getApplicationAttempt(attemptId);
+  RMNode rmNode1=rm.getRMContext().getRMNodes().get(nm.getNodeId());
+  nm.nodeHeartbeat(true);
+  ((RMNodeImpl)rmNode1).setOpportunisticContainersStatus(getOppurtunisticStatus(-1,100));
+  amservice.handle(new NodeAddedSchedulerEvent(rmNode1));
+  amservice.handle(new NodeUpdateSchedulerEvent(rmNode1));
+  try {
+    GenericTestUtils.waitFor(new Supplier<Boolean>(){
+      @Override public Boolean get(){
+        return scheduler.getNumClusterNodes() == 1;
+      }
+    }
+,10,200 * 100);
+  }
+ catch (  TimeoutException e) {
+    fail("timed out while waiting for NM to add.");
+  }
+  AllocateResponse allocateResponse=am.allocate(Arrays.asList(ResourceRequest.newInstance(Priority.newInstance(1),"*",Resources.createResource(1 * GB),2,true,null,ExecutionTypeRequest.newInstance(ExecutionType.OPPORTUNISTIC,true))),null);
+  List<Container> allocatedContainers=allocateResponse.getAllocatedContainers();
+  Container container=allocatedContainers.get(0);
+  scheduler.handle(new NodeRemovedSchedulerEvent(rmNode1));
+  try {
+    GenericTestUtils.waitFor(new Supplier<Boolean>(){
+      @Override public Boolean get(){
+        return scheduler.getNumClusterNodes() == 0;
+      }
+    }
+,10,200 * 100);
+  }
+ catch (  TimeoutException e) {
+    fail("timed out while waiting for NM to remove.");
+  }
+  RMContainer rmContainer=null;
+  rmContainer=SchedulerUtils.createOpportunisticRmContainer(rm.getRMContext(),container,true);
+  if (rmContainer == null) {
+    rmContainer=new RMContainerImpl(container,SchedulerRequestKey.extractFrom(container),schedulerAttempt.getApplicationAttemptId(),container.getNodeId(),schedulerAttempt.getUser(),rm.getRMContext(),true);
+  }
+  assert (rmContainer != null);
+  schedulerAttempt.addRMContainer(container.getId(),rmContainer);
+  scheduler.handle(new AppAttemptRemovedSchedulerEvent(attemptId,RMAppAttemptState.FAILED,false));
+}

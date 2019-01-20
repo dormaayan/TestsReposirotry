@@ -1,0 +1,78 @@
+/** 
+ * Make sure we correctly update the quota usage for truncate. We need to cover the following cases: 1. No snapshot, truncate to 0 2. No snapshot, truncate at block boundary 3. No snapshot, not on block boundary 4~6. With snapshot, all the current blocks are included in latest snapshots, repeat 1~3 7~9. With snapshot, blocks in the latest snapshot and blocks in the current file diverged, repeat 1~3
+ */
+public class TestTruncateQuotaUpdate {
+  private static final int BLOCKSIZE=1024;
+  private static final short REPLICATION=4;
+  private long nextMockBlockId;
+  private long nextMockGenstamp;
+  private long nextMockINodeId;
+  @Test public void testTruncateWithoutSnapshot(){
+    INodeFile file=createMockFile(BLOCKSIZE * 2 + BLOCKSIZE / 2,REPLICATION);
+    QuotaCounts count=new QuotaCounts.Builder().build();
+    file.computeQuotaDeltaForTruncate(BLOCKSIZE + BLOCKSIZE / 2,null,count);
+    Assert.assertEquals(-BLOCKSIZE / 2 * REPLICATION,count.getStorageSpace());
+    count=new QuotaCounts.Builder().build();
+    file.computeQuotaDeltaForTruncate(BLOCKSIZE,null,count);
+    Assert.assertEquals(-(BLOCKSIZE + BLOCKSIZE / 2) * REPLICATION,count.getStorageSpace());
+    count=new QuotaCounts.Builder().build();
+    file.computeQuotaDeltaForTruncate(0,null,count);
+    Assert.assertEquals(-(BLOCKSIZE * 2 + BLOCKSIZE / 2) * REPLICATION,count.getStorageSpace());
+  }
+  @Test public void testTruncateWithSnapshotNoDivergence(){
+    INodeFile file=createMockFile(BLOCKSIZE * 2 + BLOCKSIZE / 2,REPLICATION);
+    addSnapshotFeature(file,file.getBlocks());
+    QuotaCounts count=new QuotaCounts.Builder().build();
+    file.computeQuotaDeltaForTruncate(BLOCKSIZE + BLOCKSIZE / 2,null,count);
+    Assert.assertEquals(BLOCKSIZE * REPLICATION,count.getStorageSpace());
+    count=new QuotaCounts.Builder().build();
+    file.computeQuotaDeltaForTruncate(BLOCKSIZE,null,count);
+    Assert.assertEquals(0,count.getStorageSpace());
+    count=new QuotaCounts.Builder().build();
+    file.computeQuotaDeltaForTruncate(0,null,count);
+    Assert.assertEquals(0,count.getStorageSpace());
+  }
+  @Test public void testTruncateWithSnapshotAndDivergence(){
+    INodeFile file=createMockFile(BLOCKSIZE * 2 + BLOCKSIZE / 2,REPLICATION);
+    BlockInfo[] blocks=new BlockInfo[file.getBlocks().length];
+    System.arraycopy(file.getBlocks(),0,blocks,0,blocks.length);
+    addSnapshotFeature(file,blocks);
+    file.getBlocks()[1]=newBlock(BLOCKSIZE,REPLICATION);
+    file.getBlocks()[2]=newBlock(BLOCKSIZE / 2,REPLICATION);
+    QuotaCounts count=new QuotaCounts.Builder().build();
+    file.computeQuotaDeltaForTruncate(BLOCKSIZE + BLOCKSIZE / 2,null,count);
+    Assert.assertEquals(-BLOCKSIZE / 2 * REPLICATION,count.getStorageSpace());
+    count=new QuotaCounts.Builder().build();
+    file.computeQuotaDeltaForTruncate(BLOCKSIZE + BLOCKSIZE / 2,null,count);
+    Assert.assertEquals(-BLOCKSIZE / 2 * REPLICATION,count.getStorageSpace());
+    count=new QuotaCounts.Builder().build();
+    file.computeQuotaDeltaForTruncate(0,null,count);
+    Assert.assertEquals(-(BLOCKSIZE + BLOCKSIZE / 2) * REPLICATION,count.getStorageSpace());
+  }
+  private INodeFile createMockFile(  long size,  short replication){
+    ArrayList<BlockInfo> blocks=new ArrayList<>();
+    long createdSize=0;
+    while (createdSize < size) {
+      long blockSize=Math.min(BLOCKSIZE,size - createdSize);
+      BlockInfo bi=newBlock(blockSize,replication);
+      blocks.add(bi);
+      createdSize+=BLOCKSIZE;
+    }
+    PermissionStatus perm=new PermissionStatus("foo","bar",FsPermission.createImmutable((short)0x1ff));
+    return new INodeFile(++nextMockINodeId,new byte[0],perm,0,0,blocks.toArray(new BlockInfo[blocks.size()]),replication,BLOCKSIZE);
+  }
+  private BlockInfo newBlock(  long size,  short replication){
+    Block b=new Block(++nextMockBlockId,size,++nextMockGenstamp);
+    return new BlockInfoContiguous(b,replication);
+  }
+  private static void addSnapshotFeature(  INodeFile file,  BlockInfo[] blocks){
+    FileDiff diff=mock(FileDiff.class);
+    when(diff.getBlocks()).thenReturn(blocks);
+    FileDiffList diffList=new FileDiffList();
+    Whitebox.setInternalState(diffList,"diffs",new DiffListByArrayList<>(0));
+    @SuppressWarnings("unchecked") DiffList<FileDiff> diffs=(DiffList<FileDiff>)Whitebox.getInternalState(diffList,"diffs");
+    diffs.addFirst(diff);
+    FileWithSnapshotFeature sf=new FileWithSnapshotFeature(diffList);
+    file.addFeature(sf);
+  }
+}

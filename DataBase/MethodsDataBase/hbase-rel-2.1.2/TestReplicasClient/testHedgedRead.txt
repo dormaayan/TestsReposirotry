@@ -1,0 +1,51 @@
+@Test public void testHedgedRead() throws Exception {
+  byte[] b1="testHedgedRead".getBytes();
+  openRegion(hriSecondary);
+  try {
+    Put p=new Put(b1);
+    p.addColumn(f,b1,b1);
+    table.put(p);
+    LOG.info("Put done");
+    Get g=new Get(b1);
+    Result r=table.get(g);
+    Assert.assertFalse(r.isStale());
+    Assert.assertFalse(r.getColumnCells(f,b1).isEmpty());
+    LOG.info("get works and is not stale done");
+    ClusterConnection connection=(ClusterConnection)HTU.getConnection();
+    Counter hedgedReadOps=connection.getConnectionMetrics().hedgedReadOps;
+    Counter hedgedReadWin=connection.getConnectionMetrics().hedgedReadWin;
+    hedgedReadOps.dec(hedgedReadOps.getCount());
+    hedgedReadWin.dec(hedgedReadWin.getCount());
+    int primaryCallTimeoutMicroSecond=connection.getConnectionConfiguration().getPrimaryCallTimeoutMicroSecond();
+    SlowMeCopro.sleepTime.set(TimeUnit.MICROSECONDS.toMillis(primaryCallTimeoutMicroSecond));
+    SlowMeCopro.getSecondaryCdl().set(new CountDownLatch(1));
+    g=new Get(b1);
+    g.setConsistency(Consistency.TIMELINE);
+    r=table.get(g);
+    Assert.assertFalse(r.isStale());
+    Assert.assertFalse(r.getColumnCells(f,b1).isEmpty());
+    Assert.assertEquals(1,hedgedReadOps.getCount());
+    Assert.assertEquals(0,hedgedReadWin.getCount());
+    SlowMeCopro.sleepTime.set(0);
+    SlowMeCopro.getSecondaryCdl().get().countDown();
+    LOG.info("hedged read occurred but not faster");
+    SlowMeCopro.getPrimaryCdl().set(new CountDownLatch(1));
+    g=new Get(b1);
+    g.setConsistency(Consistency.TIMELINE);
+    r=table.get(g);
+    Assert.assertTrue(r.isStale());
+    Assert.assertTrue(r.getColumnCells(f,b1).isEmpty());
+    Assert.assertEquals(2,hedgedReadOps.getCount());
+    Assert.assertEquals(1,hedgedReadWin.getCount());
+    SlowMeCopro.getPrimaryCdl().get().countDown();
+    LOG.info("hedged read occurred and faster");
+  }
+  finally {
+    SlowMeCopro.getPrimaryCdl().get().countDown();
+    SlowMeCopro.getSecondaryCdl().get().countDown();
+    SlowMeCopro.sleepTime.set(0);
+    Delete d=new Delete(b1);
+    table.delete(d);
+    closeRegion(hriSecondary);
+  }
+}

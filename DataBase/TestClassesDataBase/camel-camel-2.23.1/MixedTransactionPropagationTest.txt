@@ -1,0 +1,66 @@
+/** 
+ * Unit test to demonstrate the transactional client pattern.
+ */
+public class MixedTransactionPropagationTest extends SpringTestSupport {
+  protected JdbcTemplate jdbc;
+  protected AbstractXmlApplicationContext createApplicationContext(){
+    return new ClassPathXmlApplicationContext("/org/apache/camel/spring/interceptor/MixedTransactionPropagationTest.xml");
+  }
+  @Override @Before public void setUp() throws Exception {
+    this.disableJMX();
+    super.setUp();
+    final DataSource ds=getMandatoryBean(DataSource.class,"dataSource");
+    jdbc=new JdbcTemplate(ds);
+  }
+  @Test public void testOkay() throws Exception {
+    template.sendBody("direct:okay","Hello World");
+    int count=jdbc.queryForObject("select count(*) from books",Integer.class);
+    assertEquals("Number of books",3,count);
+  }
+  @Test public void testFail() throws Exception {
+    try {
+      template.sendBody("direct:fail","Hello World");
+      fail("Should have thrown exception");
+    }
+ catch (    RuntimeCamelException e) {
+      assertIsInstanceOf(RuntimeCamelException.class,e.getCause());
+      assertTrue(e.getCause().getCause() instanceof IllegalArgumentException);
+      assertEquals("We don't have Donkeys, only Camels",e.getCause().getCause().getMessage());
+    }
+    int count=jdbc.queryForObject("select count(*) from books",Integer.class);
+    assertEquals("Number of books",1,count);
+  }
+  @Test public void testMixedRollbackOnlyLast() throws Exception {
+    template.sendBody("direct:mixed","Hello World");
+    int count=jdbc.queryForObject("select count(*) from books",Integer.class);
+    assertEquals("Number of books",3,count);
+    assertEquals(new Integer(1),jdbc.queryForObject("select count(*) from books where title = 'Camel in Action'",Integer.class));
+    assertEquals(new Integer(1),jdbc.queryForObject("select count(*) from books where title = 'Tiger in Action'",Integer.class));
+    assertEquals(new Integer(1),jdbc.queryForObject("select count(*) from books where title = 'Elephant in Action'",Integer.class));
+    assertEquals(new Integer(0),jdbc.queryForObject("select count(*) from books where title = 'Lion in Action'",Integer.class));
+    assertEquals(new Integer(0),jdbc.queryForObject("select count(*) from books where title = 'Donkey in Action'",Integer.class));
+  }
+  @Test public void testMixedCommit() throws Exception {
+    template.sendBody("direct:mixed3","Hello World");
+    int count=jdbc.queryForObject("select count(*) from books",Integer.class);
+    assertEquals("Number of books",5,count);
+    assertEquals(new Integer(1),jdbc.queryForObject("select count(*) from books where title = 'Camel in Action'",Integer.class));
+    assertEquals(new Integer(1),jdbc.queryForObject("select count(*) from books where title = 'Tiger in Action'",Integer.class));
+    assertEquals(new Integer(1),jdbc.queryForObject("select count(*) from books where title = 'Elephant in Action'",Integer.class));
+    assertEquals(new Integer(1),jdbc.queryForObject("select count(*) from books where title = 'Lion in Action'",Integer.class));
+    assertEquals(new Integer(1),jdbc.queryForObject("select count(*) from books where title = 'Crocodile in Action'",Integer.class));
+  }
+  protected RouteBuilder createRouteBuilder() throws Exception {
+    return new SpringRouteBuilder(){
+      public void configure() throws Exception {
+        from("direct:okay").transacted("PROPAGATION_REQUIRED").setBody(constant("Tiger in Action")).bean("bookService").setBody(constant("Elephant in Action")).bean("bookService");
+        from("direct:fail").transacted("PROPAGATION_REQUIRED").setBody(constant("Tiger in Action")).bean("bookService").setBody(constant("Donkey in Action")).bean("bookService");
+        from("direct:mixed").transacted("PROPAGATION_REQUIRED").setBody(constant("Tiger in Action")).bean("bookService").setBody(constant("Elephant in Action")).bean("bookService").to("direct:mixed2");
+        from("direct:mixed2").onException(Exception.class).markRollbackOnlyLast().end().transacted("PROPAGATION_REQUIRES_NEW").setBody(constant("Lion in Action")).bean("bookService").setBody(constant("Donkey in Action")).bean("bookService");
+        from("direct:mixed3").transacted("PROPAGATION_REQUIRED").setBody(constant("Tiger in Action")).bean("bookService").setBody(constant("Elephant in Action")).bean("bookService").to("direct:mixed4");
+        from("direct:mixed4").onException(Exception.class).markRollbackOnlyLast().end().transacted("PROPAGATION_REQUIRES_NEW").setBody(constant("Lion in Action")).bean("bookService").setBody(constant("Crocodile in Action")).bean("bookService");
+      }
+    }
+;
+  }
+}

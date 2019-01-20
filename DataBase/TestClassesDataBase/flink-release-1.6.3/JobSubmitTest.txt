@@ -1,0 +1,103 @@
+/** 
+ * Tests that the JobManager handles Jobs correctly that fail in the initialization during the submit phase.
+ */
+public class JobSubmitTest {
+  private static final FiniteDuration timeout=new FiniteDuration(60000,TimeUnit.MILLISECONDS);
+  private static ActorSystem jobManagerSystem;
+  private static ActorGateway jmGateway;
+  private static Configuration jmConfig;
+  private static HighAvailabilityServices highAvailabilityServices;
+  @BeforeClass public static void setupJobManager(){
+    jmConfig=new Configuration();
+    int port=NetUtils.getAvailablePort();
+    jmConfig.setString(JobManagerOptions.ADDRESS,"localhost");
+    jmConfig.setInteger(JobManagerOptions.PORT,port);
+    scala.Option<Tuple2<String,Object>> listeningAddress=scala.Option.apply(new Tuple2<String,Object>("localhost",port));
+    jobManagerSystem=AkkaUtils.createActorSystem(jmConfig,listeningAddress);
+    highAvailabilityServices=new EmbeddedHaServices(TestingUtils.defaultExecutor());
+    JobManager.startJobManagerActors(jmConfig,jobManagerSystem,TestingUtils.defaultExecutor(),TestingUtils.defaultExecutor(),highAvailabilityServices,NoOpMetricRegistry.INSTANCE,Option.empty(),JobManager.class,MemoryArchivist.class)._1();
+    try {
+      LeaderRetrievalService lrs=highAvailabilityServices.getJobManagerLeaderRetriever(HighAvailabilityServices.DEFAULT_JOB_ID);
+      jmGateway=LeaderRetrievalUtils.retrieveLeaderGateway(lrs,jobManagerSystem,timeout);
+    }
+ catch (    Exception e) {
+      fail("Could not retrieve the JobManager gateway. " + e.getMessage());
+    }
+  }
+  @AfterClass public static void teardownJobmanager() throws Exception {
+    if (jobManagerSystem != null) {
+      jobManagerSystem.shutdown();
+    }
+    if (highAvailabilityServices != null) {
+      highAvailabilityServices.closeAndCleanupAllData();
+      highAvailabilityServices=null;
+    }
+  }
+  @Test public void testFailureWhenJarBlobsMissing(){
+    try {
+      JobVertex jobVertex=new JobVertex("Test Vertex");
+      jobVertex.setInvokableClass(NoOpInvokable.class);
+      JobGraph jg=new JobGraph("test job",jobVertex);
+      jg.addUserJarBlobKey(new PermanentBlobKey());
+      Future<Object> submitFuture=jmGateway.ask(new JobManagerMessages.SubmitJob(jg,ListeningBehaviour.EXECUTION_RESULT),timeout);
+      try {
+        Await.result(submitFuture,timeout);
+      }
+ catch (      JobExecutionException e) {
+        assertTrue(e.getCause() instanceof IOException);
+      }
+catch (      Exception e) {
+        fail("Wrong exception type");
+      }
+    }
+ catch (    Exception e) {
+      e.printStackTrace();
+      fail(e.getMessage());
+    }
+  }
+  /** 
+ * Verifies a correct error message when vertices with master initialization (input formats / output formats) fail.
+ */
+  @Test public void testFailureWhenInitializeOnMasterFails(){
+    try {
+      JobVertex jobVertex=new JobVertex("Vertex that fails in initializeOnMaster"){
+        private static final long serialVersionUID=-3540303593784587652L;
+        @Override public void initializeOnMaster(        ClassLoader loader) throws Exception {
+          throw new RuntimeException("test exception");
+        }
+      }
+;
+      jobVertex.setInvokableClass(NoOpInvokable.class);
+      JobGraph jg=new JobGraph("test job",jobVertex);
+      Future<Object> submitFuture=jmGateway.ask(new JobManagerMessages.SubmitJob(jg,ListeningBehaviour.EXECUTION_RESULT),timeout);
+      try {
+        Await.result(submitFuture,timeout);
+      }
+ catch (      JobExecutionException e) {
+        assertTrue(e.getCause() instanceof RuntimeException);
+      }
+catch (      Exception e) {
+        fail("Wrong exception type");
+      }
+    }
+ catch (    Exception e) {
+      e.printStackTrace();
+      fail(e.getMessage());
+    }
+  }
+  @Test public void testAnswerFailureWhenSavepointReadFails() throws Exception {
+    JobGraph jg=createSimpleJobGraph();
+    jg.setSavepointRestoreSettings(SavepointRestoreSettings.forPath("pathThatReallyDoesNotExist..."));
+    Future<Object> submitFuture=jmGateway.ask(new JobManagerMessages.SubmitJob(jg,ListeningBehaviour.DETACHED),timeout);
+    Object result=Await.result(submitFuture,timeout);
+    assertEquals(JobManagerMessages.JobResultFailure.class,result.getClass());
+  }
+  private JobGraph createSimpleJobGraph(){
+    JobVertex jobVertex=new JobVertex("Vertex");
+    jobVertex.setInvokableClass(NoOpInvokable.class);
+    List<JobVertexID> vertexIdList=Collections.singletonList(jobVertex.getID());
+    JobGraph jg=new JobGraph("test job",jobVertex);
+    jg.setSnapshotSettings(new JobCheckpointingSettings(vertexIdList,vertexIdList,vertexIdList,new CheckpointCoordinatorConfiguration(5000,5000,0L,10,CheckpointRetentionPolicy.NEVER_RETAIN_AFTER_TERMINATION,true),null));
+    return jg;
+  }
+}

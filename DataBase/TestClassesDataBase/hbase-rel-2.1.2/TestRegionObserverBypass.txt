@@ -1,0 +1,178 @@
+@Category({CoprocessorTests.class,MediumTests.class}) public class TestRegionObserverBypass {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestRegionObserverBypass.class);
+  private static HBaseTestingUtility util;
+  private static final TableName tableName=TableName.valueOf("test");
+  private static final byte[] dummy=Bytes.toBytes("dummy");
+  private static final byte[] row1=Bytes.toBytes("r1");
+  private static final byte[] row2=Bytes.toBytes("r2");
+  private static final byte[] row3=Bytes.toBytes("r3");
+  private static final byte[] test=Bytes.toBytes("test");
+  @BeforeClass public static void setUpBeforeClass() throws Exception {
+    Configuration conf=HBaseConfiguration.create();
+    conf.setStrings(CoprocessorHost.USER_REGION_COPROCESSOR_CONF_KEY,new String[]{TestCoprocessor.class.getName(),TestCoprocessor2.class.getName(),TestCoprocessor3.class.getName()});
+    util=new HBaseTestingUtility(conf);
+    util.startMiniCluster();
+  }
+  @AfterClass public static void tearDownAfterClass() throws Exception {
+    util.shutdownMiniCluster();
+  }
+  @Before public void setUp() throws Exception {
+    Admin admin=util.getAdmin();
+    if (admin.tableExists(tableName)) {
+      if (admin.isTableEnabled(tableName)) {
+        admin.disableTable(tableName);
+      }
+      admin.deleteTable(tableName);
+    }
+    util.createTable(tableName,new byte[][]{dummy,test});
+    TestCoprocessor.PREPUT_BYPASSES.set(0);
+    TestCoprocessor.PREPUT_INVOCATIONS.set(0);
+  }
+  /** 
+ * do a single put that is bypassed by a RegionObserver
+ * @throws Exception
+ */
+  @Test public void testSimple() throws Exception {
+    Table t=util.getConnection().getTable(tableName);
+    Put p=new Put(row1);
+    p.addColumn(test,dummy,dummy);
+    t.put(p);
+    checkRowAndDelete(t,row1,0);
+    t.close();
+  }
+  /** 
+ * Test various multiput operations. If the column family is 'test', then bypass is invoked.
+ * @throws Exception
+ */
+  @Test public void testMulti() throws Exception {
+    EnvironmentEdgeManagerTestHelper.injectEdge(new IncrementingEnvironmentEdge());
+    Table t=util.getConnection().getTable(tableName);
+    List<Put> puts=new ArrayList<>();
+    Put p=new Put(row1);
+    p.addColumn(dummy,dummy,dummy);
+    puts.add(p);
+    p=new Put(row2);
+    p.addColumn(test,dummy,dummy);
+    puts.add(p);
+    p=new Put(row3);
+    p.addColumn(test,dummy,dummy);
+    puts.add(p);
+    t.put(puts);
+    checkRowAndDelete(t,row1,1);
+    checkRowAndDelete(t,row2,0);
+    checkRowAndDelete(t,row3,0);
+    puts.clear();
+    p=new Put(row1);
+    p.addColumn(test,dummy,dummy);
+    puts.add(p);
+    p=new Put(row2);
+    p.addColumn(test,dummy,dummy);
+    puts.add(p);
+    p=new Put(row3);
+    p.addColumn(test,dummy,dummy);
+    puts.add(p);
+    t.put(puts);
+    checkRowAndDelete(t,row1,0);
+    checkRowAndDelete(t,row2,0);
+    checkRowAndDelete(t,row3,0);
+    puts.clear();
+    p=new Put(row1);
+    p.addColumn(test,dummy,dummy);
+    puts.add(p);
+    p=new Put(row2);
+    p.addColumn(test,dummy,dummy);
+    puts.add(p);
+    p=new Put(row3);
+    p.addColumn(dummy,dummy,dummy);
+    puts.add(p);
+    t.put(puts);
+    checkRowAndDelete(t,row1,0);
+    checkRowAndDelete(t,row2,0);
+    checkRowAndDelete(t,row3,1);
+    puts.clear();
+    p=new Put(row1);
+    p.addColumn(dummy,dummy,dummy);
+    puts.add(p);
+    p=new Put(row2);
+    p.addColumn(test,dummy,dummy);
+    puts.add(p);
+    p=new Put(row3);
+    p.addColumn(dummy,dummy,dummy);
+    puts.add(p);
+    t.put(puts);
+    checkRowAndDelete(t,row1,1);
+    checkRowAndDelete(t,row2,0);
+    checkRowAndDelete(t,row3,1);
+    puts.clear();
+    p=new Put(row1);
+    p.addColumn(test,dummy,dummy);
+    puts.add(p);
+    p=new Put(row2);
+    p.addColumn(dummy,dummy,dummy);
+    puts.add(p);
+    p=new Put(row3);
+    p.addColumn(test,dummy,dummy);
+    puts.add(p);
+    t.put(puts);
+    checkRowAndDelete(t,row1,0);
+    checkRowAndDelete(t,row2,1);
+    checkRowAndDelete(t,row3,0);
+    t.close();
+    EnvironmentEdgeManager.reset();
+  }
+  private void checkRowAndDelete(  Table t,  byte[] row,  int count) throws IOException {
+    Get g=new Get(row);
+    Result r=t.get(g);
+    assertEquals(count,r.size());
+    Delete d=new Delete(row);
+    t.delete(d);
+  }
+  /** 
+ * Test that when bypass is called, we skip out calling any other coprocessors stacked up method, in this case, a prePut. If the column family is 'test', then bypass is invoked.
+ */
+  @Test public void testBypassAlsoCompletes() throws IOException {
+    EnvironmentEdgeManagerTestHelper.injectEdge(new IncrementingEnvironmentEdge());
+    Table t=util.getConnection().getTable(tableName);
+    List<Put> puts=new ArrayList<>();
+    Put p=new Put(row1);
+    p.addColumn(dummy,dummy,dummy);
+    puts.add(p);
+    p=new Put(row2);
+    p.addColumn(test,dummy,dummy);
+    puts.add(p);
+    p=new Put(row3);
+    p.addColumn(test,dummy,dummy);
+    puts.add(p);
+    t.put(puts);
+    checkRowAndDelete(t,row1,1);
+    checkRowAndDelete(t,row2,0);
+    checkRowAndDelete(t,row3,0);
+    assertEquals("Total CP invocation count",5,TestCoprocessor.PREPUT_INVOCATIONS.get());
+    assertEquals("Total CP bypasses",2,TestCoprocessor.PREPUT_BYPASSES.get());
+  }
+public static class TestCoprocessor implements RegionCoprocessor, RegionObserver {
+    static AtomicInteger PREPUT_INVOCATIONS=new AtomicInteger(0);
+    static AtomicInteger PREPUT_BYPASSES=new AtomicInteger(0);
+    @Override public Optional<RegionObserver> getRegionObserver(){
+      return Optional.of(this);
+    }
+    @Override public void prePut(    final ObserverContext<RegionCoprocessorEnvironment> e,    final Put put,    final WALEdit edit,    final Durability durability) throws IOException {
+      PREPUT_INVOCATIONS.incrementAndGet();
+      Map<byte[],List<Cell>> familyMap=put.getFamilyCellMap();
+      if (familyMap.containsKey(test)) {
+        PREPUT_BYPASSES.incrementAndGet();
+        e.bypass();
+      }
+    }
+  }
+  /** 
+ * Calls through to TestCoprocessor.
+ */
+public static class TestCoprocessor2 extends TestRegionObserverBypass.TestCoprocessor {
+  }
+  /** 
+ * Calls through to TestCoprocessor.
+ */
+public static class TestCoprocessor3 extends TestRegionObserverBypass.TestCoprocessor {
+  }
+}

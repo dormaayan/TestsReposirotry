@@ -1,0 +1,130 @@
+/** 
+ * Tool to search missing rows in WALs and hfiles. Pass in file or dir of keys to search for. Key file must have been written by Verify step (we depend on the format it writes out. We'll read them in and then search in hbase WALs and oldWALs dirs (Some of this is TODO).
+ */
+static class Search extends Configured implements Tool {
+  private static final Logger LOG=LoggerFactory.getLogger(Search.class);
+  protected Job job;
+  private static void printUsage(  final String error){
+    if (error != null && error.length() > 0)     System.out.println("ERROR: " + error);
+    System.err.println("Usage: search <KEYS_DIR> [<MAPPERS_COUNT>]");
+  }
+  @Override public int run(  String[] args) throws Exception {
+    if (args.length < 1 || args.length > 2) {
+      printUsage(null);
+      return 1;
+    }
+    Path inputDir=new Path(args[0]);
+    int numMappers=1;
+    if (args.length > 1) {
+      numMappers=Integer.parseInt(args[1]);
+    }
+    return run(inputDir,numMappers);
+  }
+  /** 
+ * WALPlayer override that searches for keys loaded in the setup.
+ */
+public static class WALSearcher extends WALPlayer {
+    public WALSearcher(    Configuration conf){
+      super(conf);
+    }
+    /** 
+ * The actual searcher mapper.
+ */
+public static class WALMapperSearcher extends WALMapper {
+      private SortedSet<byte[]> keysToFind;
+      private AtomicInteger rows=new AtomicInteger(0);
+      @Override public void setup(      Mapper<WALKey,WALEdit,ImmutableBytesWritable,Mutation>.Context context) throws IOException {
+        super.setup(context);
+        try {
+          this.keysToFind=readKeysToSearch(context.getConfiguration());
+          LOG.info("Loaded keys to find: count=" + this.keysToFind.size());
+        }
+ catch (        InterruptedException e) {
+          throw new InterruptedIOException(e.toString());
+        }
+      }
+      @Override protected boolean filter(      Context context,      Cell cell){
+        byte[] row=new byte[cell.getRowLength()];
+        System.arraycopy(cell.getRowArray(),cell.getRowOffset(),row,0,cell.getRowLength());
+        boolean b=this.keysToFind.contains(row);
+        if (b) {
+          String keyStr=Bytes.toStringBinary(row);
+          try {
+            LOG.info("Found cell=" + cell + " , walKey="+ context.getCurrentKey());
+          }
+ catch (          IOException|InterruptedException e) {
+            LOG.warn(e.toString(),e);
+          }
+          if (rows.addAndGet(1) < MISSING_ROWS_TO_LOG) {
+            context.getCounter(FOUND_GROUP_KEY,keyStr).increment(1);
+          }
+          context.getCounter(FOUND_GROUP_KEY,"CELL_WITH_MISSING_ROW").increment(1);
+        }
+        return b;
+      }
+    }
+    @Override public Job createSubmittableJob(    String[] args) throws IOException {
+      Job job=super.createSubmittableJob(args);
+      job.setJarByClass(WALMapperSearcher.class);
+      job.setMapperClass(WALMapperSearcher.class);
+      job.setOutputFormatClass(NullOutputFormat.class);
+      return job;
+    }
+  }
+  static final String FOUND_GROUP_KEY="Found";
+  static final String SEARCHER_INPUTDIR_KEY="searcher.keys.inputdir";
+  public int run(  Path inputDir,  int numMappers) throws Exception {
+    getConf().set(SEARCHER_INPUTDIR_KEY,inputDir.toString());
+    SortedSet<byte[]> keys=readKeysToSearch(getConf());
+    if (keys.isEmpty())     throw new RuntimeException("No keys to find");
+    LOG.info("Count of keys to find: " + keys.size());
+    for (    byte[] key : keys)     LOG.info("Key: " + Bytes.toStringBinary(key));
+    Path hbaseDir=new Path(getConf().get(HConstants.HBASE_DIR));
+    Path walsDir=new Path(hbaseDir,HConstants.HREGION_LOGDIR_NAME);
+    Path oldWalsDir=new Path(hbaseDir,HConstants.HREGION_OLDLOGDIR_NAME);
+    LOG.info("Running Search with keys inputDir=" + inputDir + ", numMappers="+ numMappers+ " against "+ getConf().get(HConstants.HBASE_DIR));
+    int ret=ToolRunner.run(getConf(),new WALSearcher(getConf()),new String[]{walsDir.toString(),""});
+    if (ret != 0) {
+      return ret;
+    }
+    return ToolRunner.run(getConf(),new WALSearcher(getConf()),new String[]{oldWalsDir.toString(),""});
+  }
+  static SortedSet<byte[]> readKeysToSearch(  final Configuration conf) throws IOException, InterruptedException {
+    Path keysInputDir=new Path(conf.get(SEARCHER_INPUTDIR_KEY));
+    FileSystem fs=FileSystem.get(conf);
+    SortedSet<byte[]> result=new TreeSet<>(Bytes.BYTES_COMPARATOR);
+    if (!fs.exists(keysInputDir)) {
+      throw new FileNotFoundException(keysInputDir.toString());
+    }
+    if (!fs.isDirectory(keysInputDir)) {
+      throw new UnsupportedOperationException("TODO");
+    }
+ else {
+      RemoteIterator<LocatedFileStatus> iterator=fs.listFiles(keysInputDir,false);
+      while (iterator.hasNext()) {
+        LocatedFileStatus keyFileStatus=iterator.next();
+        if (keyFileStatus.getPath().getName().startsWith("_"))         continue;
+        result.addAll(readFileToSearch(conf,fs,keyFileStatus));
+      }
+    }
+    return result;
+  }
+  private static SortedSet<byte[]> readFileToSearch(  final Configuration conf,  final FileSystem fs,  final LocatedFileStatus keyFileStatus) throws IOException, InterruptedException {
+    SortedSet<byte[]> result=new TreeSet<>(Bytes.BYTES_COMPARATOR);
+    TaskAttemptContext context=new TaskAttemptContextImpl(conf,new TaskAttemptID());
+    try (SequenceFileAsBinaryInputFormat.SequenceFileAsBinaryRecordReader rr=new SequenceFileAsBinaryInputFormat.SequenceFileAsBinaryRecordReader()){
+      InputSplit is=new FileSplit(keyFileStatus.getPath(),0,keyFileStatus.getLen(),new String[]{});
+      rr.initialize(is,context);
+      while (rr.nextKeyValue()) {
+        rr.getCurrentKey();
+        BytesWritable bw=rr.getCurrentValue();
+        if (Verify.VerifyReducer.whichType(bw.getBytes()) == Verify.Counts.UNDEFINED) {
+          byte[] key=new byte[rr.getCurrentKey().getLength()];
+          System.arraycopy(rr.getCurrentKey().getBytes(),0,key,0,rr.getCurrentKey().getLength());
+          result.add(key);
+        }
+      }
+    }
+     return result;
+  }
+}

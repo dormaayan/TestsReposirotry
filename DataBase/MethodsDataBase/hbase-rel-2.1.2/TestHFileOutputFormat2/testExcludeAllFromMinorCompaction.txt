@@ -1,0 +1,58 @@
+/** 
+ * This test is to test the scenario happened in HBASE-6901. All files are bulk loaded and excluded from minor compaction. Without the fix of HBASE-6901, an ArrayIndexOutOfBoundsException will be thrown.
+ */
+@Ignore("Flakey: See HBASE-9051") @Test public void testExcludeAllFromMinorCompaction() throws Exception {
+  Configuration conf=util.getConfiguration();
+  conf.setInt("hbase.hstore.compaction.min",2);
+  generateRandomStartKeys(5);
+  util.startMiniCluster();
+  try (Connection conn=ConnectionFactory.createConnection();Admin admin=conn.getAdmin();Table table=util.createTable(TABLE_NAMES[0],FAMILIES);RegionLocator locator=conn.getRegionLocator(TABLE_NAMES[0])){
+    final FileSystem fs=util.getDFSCluster().getFileSystem();
+    assertEquals("Should start with empty table",0,util.countRows(table));
+    final Path storePath=new Path(FSUtils.getTableDir(FSUtils.getRootDir(conf),TABLE_NAMES[0]),new Path(admin.getTableRegions(TABLE_NAMES[0]).get(0).getEncodedName(),Bytes.toString(FAMILIES[0])));
+    assertEquals(0,fs.listStatus(storePath).length);
+    conf.setBoolean("hbase.mapreduce.hfileoutputformat.compaction.exclude",true);
+    for (int i=0; i < 2; i++) {
+      Path testDir=util.getDataTestDirOnTestFS("testExcludeAllFromMinorCompaction_" + i);
+      runIncrementalPELoad(conf,Arrays.asList(new HFileOutputFormat2.TableInfo(table.getTableDescriptor(),conn.getRegionLocator(TABLE_NAMES[0]))),testDir,false);
+      new LoadIncrementalHFiles(conf).doBulkLoad(testDir,admin,table,locator);
+    }
+    int expectedRows=2 * NMapInputFormat.getNumMapTasks(conf) * ROWSPERSPLIT;
+    assertEquals("LoadIncrementalHFiles should put expected data in table",expectedRows,util.countRows(table));
+    assertEquals(2,fs.listStatus(storePath).length);
+    admin.compact(TABLE_NAMES[0]);
+    try {
+      quickPoll(new Callable<Boolean>(){
+        @Override public Boolean call() throws Exception {
+          List<HRegion> regions=util.getMiniHBaseCluster().getRegions(TABLE_NAMES[0]);
+          for (          HRegion region : regions) {
+            for (            HStore store : region.getStores()) {
+              store.closeAndArchiveCompactedFiles();
+            }
+          }
+          return fs.listStatus(storePath).length == 1;
+        }
+      }
+,5000);
+      throw new IOException("SF# = " + fs.listStatus(storePath).length);
+    }
+ catch (    AssertionError ae) {
+    }
+    admin.majorCompact(TABLE_NAMES[0]);
+    quickPoll(new Callable<Boolean>(){
+      @Override public Boolean call() throws Exception {
+        List<HRegion> regions=util.getMiniHBaseCluster().getRegions(TABLE_NAMES[0]);
+        for (        HRegion region : regions) {
+          for (          HStore store : region.getStores()) {
+            store.closeAndArchiveCompactedFiles();
+          }
+        }
+        return fs.listStatus(storePath).length == 1;
+      }
+    }
+,5000);
+  }
+  finally {
+    util.shutdownMiniCluster();
+  }
+}

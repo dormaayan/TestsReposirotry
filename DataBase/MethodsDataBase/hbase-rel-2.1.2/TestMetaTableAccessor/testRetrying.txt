@@ -1,0 +1,62 @@
+/** 
+ * Does  {@link MetaTableAccessor#getRegion(Connection,byte[])} and a writeagainst hbase:meta while its hosted server is restarted to prove our retrying works.
+ */
+@Test public void testRetrying() throws IOException, InterruptedException {
+  final TableName tableName=TableName.valueOf(name.getMethodName());
+  LOG.info("Started " + tableName);
+  Table t=UTIL.createMultiRegionTable(tableName,HConstants.CATALOG_FAMILY);
+  int regionCount=-1;
+  try (RegionLocator r=UTIL.getConnection().getRegionLocator(tableName)){
+    regionCount=r.getStartKeys().length;
+  }
+   final List<RegionInfo> regions=testGettingTableRegions(connection,tableName,regionCount);
+  MetaTask reader=new MetaTask(connection,"reader"){
+    @Override void metaTask() throws Throwable {
+      testGetRegion(connection,regions.get(0));
+      LOG.info("Read " + regions.get(0).getEncodedName());
+    }
+  }
+;
+  MetaTask writer=new MetaTask(connection,"writer"){
+    @Override void metaTask() throws Throwable {
+      MetaTableAccessor.addRegionToMeta(connection,regions.get(0));
+      LOG.info("Wrote " + regions.get(0).getEncodedName());
+    }
+  }
+;
+  reader.start();
+  writer.start();
+  final long timeOut=180000;
+  long startTime=System.currentTimeMillis();
+  try {
+    assertTrue(reader.isProgressing());
+    assertTrue(writer.isProgressing());
+    for (int i=0; i < 2; i++) {
+      LOG.info("Restart=" + i);
+      UTIL.ensureSomeRegionServersAvailable(2);
+      int index=-1;
+      do {
+        index=UTIL.getMiniHBaseCluster().getServerWithMeta();
+      }
+ while (index == -1 && startTime + timeOut < System.currentTimeMillis());
+      if (index != -1) {
+        UTIL.getMiniHBaseCluster().abortRegionServer(index);
+        UTIL.getMiniHBaseCluster().waitOnRegionServer(index);
+      }
+    }
+    assertTrue("reader: " + reader.toString(),reader.isProgressing());
+    assertTrue("writer: " + writer.toString(),writer.isProgressing());
+  }
+ catch (  IOException e) {
+    throw e;
+  }
+ finally {
+    reader.stop=true;
+    writer.stop=true;
+    reader.join();
+    writer.join();
+    t.close();
+  }
+  long exeTime=System.currentTimeMillis() - startTime;
+  assertTrue("Timeout: test took " + exeTime / 1000 + " sec",exeTime < timeOut);
+}

@@ -1,0 +1,93 @@
+/** 
+ * Tests simple queries, of which half succeed and half fail.
+ */
+@Test public void testSimpleRequests() throws Exception {
+  Deadline deadline=TEST_TIMEOUT.fromNow();
+  AtomicKvStateRequestStats stats=new AtomicKvStateRequestStats();
+  MessageSerializer<KvStateInternalRequest,KvStateResponse> serializer=new MessageSerializer<>(new KvStateInternalRequest.KvStateInternalRequestDeserializer(),new KvStateResponse.KvStateResponseDeserializer());
+  Client<KvStateInternalRequest,KvStateResponse> client=null;
+  Channel serverChannel=null;
+  try {
+    client=new Client<>("Test Client",1,serializer,stats);
+    final byte[] expected=new byte[1024];
+    ThreadLocalRandom.current().nextBytes(expected);
+    final LinkedBlockingQueue<ByteBuf> received=new LinkedBlockingQueue<>();
+    final AtomicReference<Channel> channel=new AtomicReference<>();
+    serverChannel=createServerChannel(new ChannelInboundHandlerAdapter(){
+      @Override public void channelActive(      ChannelHandlerContext ctx) throws Exception {
+        channel.set(ctx.channel());
+      }
+      @Override public void channelRead(      ChannelHandlerContext ctx,      Object msg) throws Exception {
+        received.add((ByteBuf)msg);
+      }
+    }
+);
+    InetSocketAddress serverAddress=getKvStateServerAddress(serverChannel);
+    long numQueries=1024L;
+    List<CompletableFuture<KvStateResponse>> futures=new ArrayList<>();
+    for (long i=0L; i < numQueries; i++) {
+      KvStateInternalRequest request=new KvStateInternalRequest(new KvStateID(),new byte[0]);
+      futures.add(client.sendRequest(serverAddress,request));
+    }
+    Exception testException=new RuntimeException("Expected test Exception");
+    for (long i=0L; i < numQueries; i++) {
+      ByteBuf buf=received.poll(deadline.timeLeft().toMillis(),TimeUnit.MILLISECONDS);
+      assertNotNull("Receive timed out",buf);
+      Channel ch=channel.get();
+      assertNotNull("Channel not active",ch);
+      assertEquals(MessageType.REQUEST,MessageSerializer.deserializeHeader(buf));
+      long requestId=MessageSerializer.getRequestId(buf);
+      KvStateInternalRequest deserRequest=serializer.deserializeRequest(buf);
+      buf.release();
+      if (i % 2L == 0L) {
+        ByteBuf response=MessageSerializer.serializeResponse(serverChannel.alloc(),requestId,new KvStateResponse(expected));
+        ch.writeAndFlush(response);
+      }
+ else {
+        ByteBuf response=MessageSerializer.serializeRequestFailure(serverChannel.alloc(),requestId,testException);
+        ch.writeAndFlush(response);
+      }
+    }
+    for (long i=0L; i < numQueries; i++) {
+      if (i % 2L == 0L) {
+        KvStateResponse serializedResult=futures.get((int)i).get(deadline.timeLeft().toMillis(),TimeUnit.MILLISECONDS);
+        assertArrayEquals(expected,serializedResult.getContent());
+      }
+ else {
+        try {
+          futures.get((int)i).get(deadline.timeLeft().toMillis(),TimeUnit.MILLISECONDS);
+          fail("Did not throw expected Exception");
+        }
+ catch (        ExecutionException e) {
+          if (!(e.getCause() instanceof RuntimeException)) {
+            fail("Did not throw expected Exception");
+          }
+        }
+      }
+    }
+    assertEquals(numQueries,stats.getNumRequests());
+    long expectedRequests=numQueries / 2L;
+    while (deadline.hasTimeLeft() && (stats.getNumSuccessful() != expectedRequests || stats.getNumFailed() != expectedRequests)) {
+      Thread.sleep(100L);
+    }
+    assertEquals(expectedRequests,stats.getNumSuccessful());
+    assertEquals(expectedRequests,stats.getNumFailed());
+  }
+  finally {
+    if (client != null) {
+      Exception exc=null;
+      try {
+        client.shutdown().get(10L,TimeUnit.SECONDS);
+      }
+ catch (      Exception e) {
+        exc=e;
+        LOG.error("An exception occurred while shutting down netty.",e);
+      }
+      Assert.assertTrue(ExceptionUtils.stringifyException(exc),client.isEventGroupShutdown());
+    }
+    if (serverChannel != null) {
+      serverChannel.close();
+    }
+    assertEquals("Channel leak",0L,stats.getNumConnections());
+  }
+}

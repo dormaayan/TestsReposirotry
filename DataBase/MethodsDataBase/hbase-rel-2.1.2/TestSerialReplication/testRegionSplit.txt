@@ -1,0 +1,44 @@
+@Test public void testRegionSplit() throws Exception {
+  TableName tableName=createTable();
+  try (Table table=UTIL.getConnection().getTable(tableName)){
+    for (int i=0; i < 100; i++) {
+      table.put(new Put(Bytes.toBytes(i)).addColumn(CF,CQ,Bytes.toBytes(i)));
+    }
+  }
+   UTIL.flush(tableName);
+  RegionInfo region=UTIL.getAdmin().getRegions(tableName).get(0);
+  UTIL.getAdmin().splitRegionAsync(region.getEncodedNameAsBytes(),Bytes.toBytes(50)).get(30,TimeUnit.SECONDS);
+  UTIL.waitUntilNoRegionsInTransition(30000);
+  List<RegionInfo> regions=UTIL.getAdmin().getRegions(tableName);
+  assertEquals(2,regions.size());
+  try (Table table=UTIL.getConnection().getTable(tableName)){
+    for (int i=0; i < 100; i++) {
+      table.put(new Put(Bytes.toBytes(i)).addColumn(CF,CQ,Bytes.toBytes(i)));
+    }
+  }
+   enablePeerAndWaitUntilReplicationDone(200);
+  Map<String,Long> regionsToSeqId=new HashMap<>();
+  regionsToSeqId.put(region.getEncodedName(),-1L);
+  regions.stream().map(RegionInfo::getEncodedName).forEach(n -> regionsToSeqId.put(n,-1L));
+  try (WAL.Reader reader=WALFactory.createReader(UTIL.getTestFileSystem(),logPath,UTIL.getConfiguration())){
+    int count=0;
+    for (Entry entry; ; ) {
+      entry=reader.next();
+      if (entry == null) {
+        break;
+      }
+      String encodedName=Bytes.toString(entry.getKey().getEncodedRegionName());
+      Long seqId=regionsToSeqId.get(encodedName);
+      assertNotNull("Unexcepted entry " + entry + ", expected regions "+ region+ ", or "+ regions,seqId);
+      assertTrue("Sequence id go backwards from " + seqId + " to "+ entry.getKey().getSequenceId()+ " for "+ encodedName,entry.getKey().getSequenceId() >= seqId.longValue());
+      if (count < 100) {
+        assertEquals(encodedName + " is pushed before parent " + region.getEncodedName(),region.getEncodedName(),encodedName);
+      }
+ else {
+        assertNotEquals(region.getEncodedName(),encodedName);
+      }
+      count++;
+    }
+    assertEquals(200,count);
+  }
+ }

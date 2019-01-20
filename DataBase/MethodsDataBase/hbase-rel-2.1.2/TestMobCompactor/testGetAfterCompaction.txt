@@ -1,0 +1,51 @@
+/** 
+ * This case tests the following mob compaction and normal compaction scenario, after mob compaction, the mob reference in new bulkloaded hfile will win even after it is compacted with some other normal hfiles. This is to make sure the mvcc is included after compaction for mob enabled store files.
+ */
+@Test public void testGetAfterCompaction() throws Exception {
+  resetConf();
+  conf.setLong(TimeToLiveHFileCleaner.TTL_CONF_KEY,0);
+  String famStr="f1";
+  byte[] fam=Bytes.toBytes(famStr);
+  byte[] qualifier=Bytes.toBytes("q1");
+  byte[] mobVal=Bytes.toBytes("01234567890");
+  HTableDescriptor hdt=new HTableDescriptor(TableName.valueOf(name.getMethodName()));
+  hdt.addCoprocessor(CompactTwoLatestHfilesCopro.class.getName());
+  HColumnDescriptor hcd=new HColumnDescriptor(fam);
+  hcd.setMobEnabled(true);
+  hcd.setMobThreshold(10);
+  hcd.setMaxVersions(1);
+  hdt.addFamily(hcd);
+  try {
+    Table table=TEST_UTIL.createTable(hdt,null);
+    HRegion r=TEST_UTIL.getMiniHBaseCluster().getRegions(hdt.getTableName()).get(0);
+    Put p=new Put(Bytes.toBytes("r1"));
+    p.addColumn(fam,qualifier,mobVal);
+    table.put(p);
+    TEST_UTIL.flush(table.getName());
+    FileSystem fs=r.getRegionFileSystem().getFileSystem();
+    Path path=r.getRegionFileSystem().getStoreDir(famStr);
+    waitUntilFilesShowup(fs,path,1);
+    p=new Put(Bytes.toBytes("r2"));
+    p.addColumn(fam,qualifier,mobVal);
+    table.put(p);
+    TEST_UTIL.flush(table.getName());
+    waitUntilFilesShowup(fs,path,2);
+    TEST_UTIL.getAdmin().compact(hdt.getTableName(),fam,CompactType.MOB);
+    waitUntilFilesShowup(fs,path,3);
+    TEST_UTIL.getAdmin().compact(hdt.getTableName(),fam);
+    waitUntilFilesShowup(fs,path,2);
+    Thread.sleep(100);
+    TEST_UTIL.getMiniHBaseCluster().getMaster().getHFileCleaner().choreForTesting();
+    Get get=new Get(Bytes.toBytes("r2"));
+    try {
+      Result result=table.get(get);
+      assertTrue(Arrays.equals(result.getValue(fam,qualifier),mobVal));
+    }
+ catch (    IOException e) {
+      assertTrue("The MOB file doesn't exist",false);
+    }
+  }
+  finally {
+    TEST_UTIL.deleteTable(hdt.getTableName());
+  }
+}

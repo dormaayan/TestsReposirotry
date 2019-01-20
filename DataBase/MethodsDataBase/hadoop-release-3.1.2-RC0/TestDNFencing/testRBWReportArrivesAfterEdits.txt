@@ -1,0 +1,39 @@
+/** 
+ * Another regression test for HDFS-2742. This tests the following sequence: - DN does a block report while file is open. This BR contains the block in RBW state. - The block report is delayed in reaching the standby. - The file is closed. - The standby processes the OP_ADD and OP_CLOSE operations before the RBW block report arrives. - The standby should not mark the block as corrupt.
+ */
+@Test public void testRBWReportArrivesAfterEdits() throws Exception {
+  final CountDownLatch brFinished=new CountDownLatch(1);
+  DelayAnswer delayer=new GenericTestUtils.DelayAnswer(LOG){
+    @Override protected Object passThrough(    InvocationOnMock invocation) throws Throwable {
+      try {
+        return super.passThrough(invocation);
+      }
+  finally {
+        brFinished.countDown();
+      }
+    }
+  }
+;
+  FSDataOutputStream out=fs.create(TEST_FILE_PATH);
+  try {
+    AppendTestUtil.write(out,0,10);
+    out.hflush();
+    DataNode dn=cluster.getDataNodes().get(0);
+    DatanodeProtocolClientSideTranslatorPB spy=InternalDataNodeTestUtils.spyOnBposToNN(dn,nn2);
+    Mockito.doAnswer(delayer).when(spy).blockReport(Mockito.<DatanodeRegistration>anyObject(),Mockito.anyString(),Mockito.<StorageBlockReport[]>anyObject(),Mockito.<BlockReportContext>anyObject());
+    dn.scheduleAllBlockReport(0);
+    delayer.waitForCall();
+  }
+  finally {
+    IOUtils.closeStream(out);
+  }
+  cluster.transitionToStandby(0);
+  cluster.transitionToActive(1);
+  delayer.proceed();
+  brFinished.await();
+  BlockManagerTestUtil.updateState(nn1.getNamesystem().getBlockManager());
+  BlockManagerTestUtil.updateState(nn2.getNamesystem().getBlockManager());
+  assertEquals(0,nn1.getNamesystem().getCorruptReplicaBlocks());
+  assertEquals(0,nn2.getNamesystem().getCorruptReplicaBlocks());
+  DFSTestUtil.readFile(fs,TEST_FILE_PATH);
+}

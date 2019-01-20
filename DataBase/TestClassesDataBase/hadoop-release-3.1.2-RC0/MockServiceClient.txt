@@ -1,0 +1,73 @@
+private static final class MockServiceClient extends ServiceClient {
+  private final ApplicationId appId;
+  private final ApplicationAttemptId attemptId;
+  private final ClientAMProtocol amProxy;
+  private Object proxyResponse;
+  private Service service;
+  private ServiceContext context;
+  private MockServiceClient(){
+    amProxy=mock(ClientAMProtocol.class);
+    appId=ApplicationId.newInstance(System.currentTimeMillis(),1);
+    LOG.debug("mocking service client for {}",appId);
+    attemptId=ApplicationAttemptId.newInstance(appId,1);
+  }
+  static MockServiceClient create(  ServiceTestUtils.ServiceFSWatcher rule,  Service service,  boolean enableUpgrade) throws Exception {
+    MockServiceClient client=new MockServiceClient();
+    ApplicationId applicationId=ApplicationId.newInstance(System.currentTimeMillis(),1);
+    service.setId(applicationId.toString());
+    client.context=new MockRunningServiceContext(rule,service);
+    YarnClient yarnClient=createMockYarnClient();
+    ApplicationReport appReport=mock(ApplicationReport.class);
+    when(appReport.getHost()).thenReturn("localhost");
+    when(appReport.getYarnApplicationState()).thenReturn(YarnApplicationState.RUNNING);
+    ApplicationAttemptReport attemptReport=ApplicationAttemptReport.newInstance(client.attemptId,"localhost",0,null,null,null,YarnApplicationAttemptState.RUNNING,null);
+    when(yarnClient.getApplicationAttemptReport(Matchers.any())).thenReturn(attemptReport);
+    when(yarnClient.getApplicationReport(client.appId)).thenReturn(appReport);
+    when(client.amProxy.upgrade(Matchers.any(UpgradeServiceRequestProto.class))).thenAnswer((Answer<UpgradeServiceResponseProto>)invocation -> {
+      UpgradeServiceResponseProto response=UpgradeServiceResponseProto.newBuilder().build();
+      client.proxyResponse=response;
+      return response;
+    }
+);
+    when(client.amProxy.upgrade(Matchers.any(CompInstancesUpgradeRequestProto.class))).thenAnswer((Answer<CompInstancesUpgradeResponseProto>)invocation -> {
+      CompInstancesUpgradeResponseProto response=CompInstancesUpgradeResponseProto.newBuilder().build();
+      client.proxyResponse=response;
+      return response;
+    }
+);
+    when(client.amProxy.getCompInstances(Matchers.any(GetCompInstancesRequestProto.class))).thenAnswer((Answer<GetCompInstancesResponseProto>)invocation -> {
+      GetCompInstancesRequestProto req=(GetCompInstancesRequestProto)invocation.getArguments()[0];
+      List<Container> containers=FilterUtils.filterInstances(client.context,req);
+      GetCompInstancesResponseProto response=GetCompInstancesResponseProto.newBuilder().setCompInstances(ServiceApiUtil.CONTAINER_JSON_SERDE.toJson(containers.toArray(new Container[containers.size()]))).build();
+      client.proxyResponse=response;
+      return response;
+    }
+);
+    client.setFileSystem(rule.getFs());
+    client.setYarnClient(yarnClient);
+    client.service=service;
+    rule.getConf().setBoolean(YarnServiceConf.YARN_SERVICE_UPGRADE_ENABLED,enableUpgrade);
+    client.init(rule.getConf());
+    client.start();
+    client.actionCreate(service);
+    return client;
+  }
+  @Override protected void serviceInit(  Configuration configuration) throws Exception {
+  }
+  @Override protected ClientAMProtocol createAMProxy(  String serviceName,  ApplicationReport appReport) throws IOException, YarnException {
+    return amProxy;
+  }
+  @Override ApplicationId submitApp(  Service app) throws IOException, YarnException {
+    return appId;
+  }
+  @Override public Service getStatus(  String serviceName) throws IOException, YarnException {
+    service.setState(ServiceState.STABLE);
+    return service;
+  }
+  private <T>T getLastProxyResponse(  Class<T> clazz){
+    if (clazz.isInstance(proxyResponse)) {
+      return clazz.cast(proxyResponse);
+    }
+    return null;
+  }
+}

@@ -1,0 +1,74 @@
+@Category(MediumTests.class) public class TestWALRootDir {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestWALRootDir.class);
+  private static final Logger LOG=LoggerFactory.getLogger(TestWALRootDir.class);
+  private final static HBaseTestingUtility TEST_UTIL=new HBaseTestingUtility();
+  private static Configuration conf;
+  private static FileSystem fs;
+  private static FileSystem walFs;
+  private static final TableName tableName=TableName.valueOf("TestWALWALDir");
+  private static final byte[] rowName=Bytes.toBytes("row");
+  private static final byte[] family=Bytes.toBytes("column");
+  private static Path walRootDir;
+  private static Path rootDir;
+  private static WALFactory wals;
+  @Before public void setUp() throws Exception {
+    cleanup();
+  }
+  @BeforeClass public static void setUpBeforeClass() throws Exception {
+    conf=TEST_UTIL.getConfiguration();
+    TEST_UTIL.startMiniDFSCluster(1);
+    rootDir=TEST_UTIL.createRootDir();
+    walRootDir=TEST_UTIL.createWALRootDir();
+    fs=FSUtils.getRootDirFileSystem(conf);
+    walFs=FSUtils.getWALFileSystem(conf);
+  }
+  @AfterClass public static void tearDownAfterClass() throws Exception {
+    cleanup();
+    TEST_UTIL.shutdownMiniDFSCluster();
+  }
+  @Test public void testWALRootDir() throws Exception {
+    RegionInfo regionInfo=RegionInfoBuilder.newBuilder(tableName).build();
+    wals=new WALFactory(conf,"testWALRootDir");
+    WAL log=wals.getWAL(regionInfo);
+    assertEquals(1,getWALFiles(walFs,walRootDir).size());
+    byte[] value=Bytes.toBytes("value");
+    WALEdit edit=new WALEdit();
+    edit.add(new KeyValue(rowName,family,Bytes.toBytes("1"),System.currentTimeMillis(),value));
+    long txid=log.append(regionInfo,getWalKey(System.currentTimeMillis(),regionInfo,0),edit,true);
+    log.sync(txid);
+    assertEquals("Expect 1 log have been created",1,getWALFiles(walFs,walRootDir).size());
+    log.rollWriter();
+    assertEquals(2,getWALFiles(walFs,new Path(walRootDir,HConstants.HREGION_LOGDIR_NAME)).size());
+    edit.add(new KeyValue(rowName,family,Bytes.toBytes("2"),System.currentTimeMillis(),value));
+    txid=log.append(regionInfo,getWalKey(System.currentTimeMillis(),regionInfo,1),edit,true);
+    log.sync(txid);
+    log.rollWriter();
+    log.shutdown();
+    assertEquals("Expect 3 logs in WALs dir",3,getWALFiles(walFs,new Path(walRootDir,HConstants.HREGION_LOGDIR_NAME)).size());
+  }
+  private WALKeyImpl getWalKey(  final long time,  RegionInfo hri,  final long startPoint){
+    return new WALKeyImpl(hri.getEncodedNameAsBytes(),tableName,time,new MultiVersionConcurrencyControl(startPoint));
+  }
+  private List<FileStatus> getWALFiles(  FileSystem fs,  Path dir) throws IOException {
+    List<FileStatus> result=new ArrayList<FileStatus>();
+    LOG.debug("Scanning " + dir.toString() + " for WAL files");
+    FileStatus[] files=fs.listStatus(dir);
+    if (files == null)     return Collections.emptyList();
+    for (    FileStatus file : files) {
+      if (file.isDirectory()) {
+        result.addAll(getWALFiles(fs,file.getPath()));
+      }
+ else {
+        String name=file.getPath().toString();
+        if (!name.startsWith(".")) {
+          result.add(file);
+        }
+      }
+    }
+    return result;
+  }
+  private static void cleanup() throws Exception {
+    walFs.delete(walRootDir,true);
+    fs.delete(rootDir,true);
+  }
+}

@@ -1,0 +1,46 @@
+@Test public void test() throws Exception {
+  int numThreads=20;
+  AtomicBoolean stop=new AtomicBoolean(false);
+  ExecutorService executor=Executors.newFixedThreadPool(numThreads,Threads.newDaemonThreadFactory("TestAsyncGet-"));
+  List<Future<?>> futures=new ArrayList<>();
+  IntStream.range(0,numThreads).forEach(i -> futures.add(executor.submit(() -> {
+    run(stop);
+    return null;
+  }
+)));
+  Collections.shuffle(Arrays.asList(SPLIT_KEYS),new Random(123));
+  Admin admin=TEST_UTIL.getAdmin();
+  for (  byte[] splitPoint : SPLIT_KEYS) {
+    int oldRegionCount=admin.getRegions(TABLE_NAME).size();
+    admin.split(TABLE_NAME,splitPoint);
+    TEST_UTIL.waitFor(30000,new ExplainingPredicate<Exception>(){
+      @Override public boolean evaluate() throws Exception {
+        return TEST_UTIL.getMiniHBaseCluster().getRegions(TABLE_NAME).size() > oldRegionCount;
+      }
+      @Override public String explainFailure() throws Exception {
+        return "Split has not finished yet";
+      }
+    }
+);
+    for (    HRegion region : TEST_UTIL.getHBaseCluster().getRegions(TABLE_NAME)) {
+      region.compact(true);
+      RetryCounter retrier=new RetryCounter(30,1,TimeUnit.SECONDS);
+      while (CompactionState.NONE != admin.getCompactionStateForRegion(region.getRegionInfo().getRegionName()) && retrier.shouldRetry()) {
+        retrier.sleepUntilNextRetry();
+      }
+      region.getStores().get(0).closeAndArchiveCompactedFiles();
+    }
+    Thread.sleep(5000);
+    admin.balance(true);
+    Thread.sleep(5000);
+    ServerName metaServer=TEST_UTIL.getHBaseCluster().getServerHoldingMeta();
+    ServerName newMetaServer=TEST_UTIL.getHBaseCluster().getRegionServerThreads().stream().map(t -> t.getRegionServer().getServerName()).filter(s -> !s.equals(metaServer)).findAny().get();
+    admin.move(RegionInfoBuilder.FIRST_META_REGIONINFO.getEncodedNameAsBytes(),Bytes.toBytes(newMetaServer.getServerName()));
+    Thread.sleep(5000);
+  }
+  stop.set(true);
+  executor.shutdown();
+  for (  Future<?> future : futures) {
+    future.get();
+  }
+}

@@ -1,0 +1,42 @@
+/** 
+ * Test that the secondary doesn't have to re-download image if it hasn't changed.
+ */
+@Test public void testSecondaryImageDownload() throws IOException {
+  LOG.info("Starting testSecondaryImageDownload");
+  Configuration conf=new HdfsConfiguration();
+  conf.set(DFSConfigKeys.DFS_NAMENODE_SECONDARY_HTTP_ADDRESS_KEY,"0.0.0.0:0");
+  Path dir=new Path("/checkpoint");
+  MiniDFSCluster cluster=new MiniDFSCluster.Builder(conf).numDataNodes(numDatanodes).format(true).build();
+  cluster.waitActive();
+  FileSystem fileSys=cluster.getFileSystem();
+  FSImage image=cluster.getNameNode().getFSImage();
+  SecondaryNameNode secondary=null;
+  try {
+    assertTrue(!fileSys.exists(dir));
+    secondary=startSecondaryNameNode(conf);
+    File secondaryDir=MiniDFSCluster.getCheckpointDirectory(MiniDFSCluster.getBaseDirectory(),0,0)[0];
+    File secondaryCurrent=new File(secondaryDir,"current");
+    long expectedTxIdToDownload=cluster.getNameNode().getFSImage().getStorage().getMostRecentCheckpointTxId();
+    File secondaryFsImageBefore=new File(secondaryCurrent,NNStorage.getImageFileName(expectedTxIdToDownload));
+    File secondaryFsImageAfter=new File(secondaryCurrent,NNStorage.getImageFileName(expectedTxIdToDownload + 2));
+    assertFalse("Secondary should start with empty current/ dir " + "but " + secondaryFsImageBefore + " exists",secondaryFsImageBefore.exists());
+    assertTrue("Secondary should have loaded an image",secondary.doCheckpoint());
+    assertTrue("Secondary should have downloaded original image",secondaryFsImageBefore.exists());
+    assertTrue("Secondary should have created a new image",secondaryFsImageAfter.exists());
+    long fsimageLength=secondaryFsImageBefore.length();
+    assertEquals("Image size should not have changed",fsimageLength,secondaryFsImageAfter.length());
+    fileSys.mkdirs(dir);
+    assertFalse("Another checkpoint should not have to re-load image",secondary.doCheckpoint());
+    for (    StorageDirectory sd : image.getStorage().dirIterable(NameNodeDirType.IMAGE)) {
+      File imageFile=NNStorage.getImageFile(sd,NameNodeFile.IMAGE,expectedTxIdToDownload + 5);
+      assertTrue("Image size increased",imageFile.length() > fsimageLength);
+    }
+  }
+  finally {
+    fileSys.close();
+    cleanup(secondary);
+    secondary=null;
+    cleanup(cluster);
+    cluster=null;
+  }
+}

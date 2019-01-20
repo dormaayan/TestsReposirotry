@@ -1,0 +1,62 @@
+/** 
+ * This tests task executor receive SubmitTask before OfferSlot response.
+ */
+@Test public void testSubmitTaskBeforeAcceptSlot() throws Exception {
+  final TaskSlotTable taskSlotTable=new TaskSlotTable(Arrays.asList(mock(ResourceProfile.class),mock(ResourceProfile.class)),timerService);
+  final JobManagerTable jobManagerTable=new JobManagerTable();
+  final JobLeaderService jobLeaderService=new JobLeaderService(taskManagerLocation);
+  final TestingResourceManagerGateway resourceManagerGateway=new TestingResourceManagerGateway();
+  resourceManagerLeaderRetriever.notifyListener(resourceManagerGateway.getAddress(),resourceManagerGateway.getFencingToken().toUUID());
+  final CompletableFuture<Tuple3<InstanceID,SlotID,AllocationID>> availableSlotFuture=new CompletableFuture<>();
+  resourceManagerGateway.setNotifySlotAvailableConsumer(availableSlotFuture::complete);
+  final AllocationID allocationId1=new AllocationID();
+  final AllocationID allocationId2=new AllocationID();
+  final SlotOffer offer1=new SlotOffer(allocationId1,0,ResourceProfile.UNKNOWN);
+  final OneShotLatch offerSlotsLatch=new OneShotLatch();
+  final OneShotLatch taskInTerminalState=new OneShotLatch();
+  final CompletableFuture<Collection<SlotOffer>> offerResultFuture=new CompletableFuture<>();
+  final TestingJobMasterGateway jobMasterGateway=new TestingJobMasterGatewayBuilder().setOfferSlotsFunction((resourceID,slotOffers) -> {
+    offerSlotsLatch.trigger();
+    return offerResultFuture;
+  }
+).setUpdateTaskExecutionStateFunction(taskExecutionState -> {
+    if (taskExecutionState.getExecutionState().isTerminal()) {
+      taskInTerminalState.trigger();
+    }
+    return CompletableFuture.completedFuture(Acknowledge.get());
+  }
+).build();
+  jobManagerLeaderRetriever.notifyListener(jobMasterGateway.getAddress(),jobMasterGateway.getFencingToken().toUUID());
+  rpc.registerGateway(resourceManagerGateway.getAddress(),resourceManagerGateway);
+  rpc.registerGateway(jobMasterGateway.getAddress(),jobMasterGateway);
+  final NetworkEnvironment networkMock=mock(NetworkEnvironment.class,Mockito.RETURNS_MOCKS);
+  TaskExecutorLocalStateStoresManager localStateStoresManager=new TaskExecutorLocalStateStoresManager(false,new File[]{tmp.newFolder()},Executors.directExecutor());
+  final TaskManagerServices taskManagerServices=new TaskManagerServicesBuilder().setTaskManagerLocation(taskManagerLocation).setNetworkEnvironment(networkMock).setTaskSlotTable(taskSlotTable).setJobLeaderService(jobLeaderService).setJobManagerTable(jobManagerTable).setTaskStateManager(localStateStoresManager).build();
+  final TaskExecutor taskManager=new TaskExecutor(rpc,taskManagerConfiguration,haServices,taskManagerServices,new HeartbeatServices(1000L,1000L),UnregisteredMetricGroups.createUnregisteredTaskManagerMetricGroup(),dummyBlobCacheService,testingFatalErrorHandler);
+  try {
+    taskManager.start();
+    final TaskExecutorGateway tmGateway=taskManager.getSelfGateway(TaskExecutorGateway.class);
+    taskSlotTable.allocateSlot(0,jobId,allocationId1,Time.milliseconds(10000L));
+    taskSlotTable.allocateSlot(1,jobId,allocationId2,Time.milliseconds(10000L));
+    final JobVertexID jobVertexId=new JobVertexID();
+    JobInformation jobInformation=new JobInformation(jobId,name.getMethodName(),new SerializedValue<>(new ExecutionConfig()),new Configuration(),Collections.emptyList(),Collections.emptyList());
+    TaskInformation taskInformation=new TaskInformation(jobVertexId,"test task",1,1,NoOpInvokable.class.getName(),new Configuration());
+    SerializedValue<JobInformation> serializedJobInformation=new SerializedValue<>(jobInformation);
+    SerializedValue<TaskInformation> serializedJobVertexInformation=new SerializedValue<>(taskInformation);
+    final TaskDeploymentDescriptor tdd=new TaskDeploymentDescriptor(jobId,new TaskDeploymentDescriptor.NonOffloaded<>(serializedJobInformation),new TaskDeploymentDescriptor.NonOffloaded<>(serializedJobVertexInformation),new ExecutionAttemptID(),allocationId1,0,0,0,null,Collections.emptyList(),Collections.emptyList());
+    jobLeaderService.addJob(jobId,jobMasterGateway.getAddress());
+    offerSlotsLatch.await();
+    tmGateway.submitTask(tdd,jobMasterGateway.getFencingToken(),timeout).get();
+    offerResultFuture.complete(Collections.singleton(offer1));
+    final Tuple3<InstanceID,SlotID,AllocationID> instanceIDSlotIDAllocationIDTuple3=availableSlotFuture.get();
+    assertThat(instanceIDSlotIDAllocationIDTuple3.f1,equalTo(new SlotID(taskManagerLocation.getResourceID(),1)));
+    assertTrue(taskSlotTable.tryMarkSlotActive(jobId,allocationId1));
+    assertFalse(taskSlotTable.tryMarkSlotActive(jobId,allocationId2));
+    assertTrue(taskSlotTable.isSlotFree(1));
+    taskInTerminalState.await();
+  }
+  finally {
+    taskManager.shutDown();
+    taskManager.getTerminationFuture().get(timeout.toMilliseconds(),TimeUnit.MILLISECONDS);
+  }
+}

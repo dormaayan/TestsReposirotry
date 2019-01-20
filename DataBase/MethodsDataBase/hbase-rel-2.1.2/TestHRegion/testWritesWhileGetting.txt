@@ -1,0 +1,84 @@
+/** 
+ * Writes very wide records and gets the latest row every time.. Flushes and compacts the region aggressivly to catch issues.
+ * @throws IOException by flush / scan / compaction
+ * @throws InterruptedException when joining threads
+ */
+@Test public void testWritesWhileGetting() throws Exception {
+  int testCount=50;
+  int numRows=1;
+  int numFamilies=10;
+  int numQualifiers=100;
+  int compactInterval=100;
+  byte[][] families=new byte[numFamilies][];
+  for (int i=0; i < numFamilies; i++) {
+    families[i]=Bytes.toBytes("family" + i);
+  }
+  byte[][] qualifiers=new byte[numQualifiers][];
+  for (int i=0; i < numQualifiers; i++) {
+    qualifiers[i]=Bytes.toBytes("qual" + i);
+  }
+  Configuration conf=HBaseConfiguration.create(CONF);
+  conf.setInt("hbase.hstore.compaction.min",1);
+  conf.setInt("hbase.hstore.compaction.max",1000);
+  this.region=initHRegion(tableName,method,conf,families);
+  PutThread putThread=null;
+  MultithreadedTestUtil.TestContext ctx=new MultithreadedTestUtil.TestContext(conf);
+  try {
+    putThread=new PutThread(numRows,families,qualifiers);
+    putThread.start();
+    putThread.waitForFirstPut();
+    ctx.addThread(new RepeatingTestThread(ctx){
+      @Override public void doAnAction() throws Exception {
+        region.flush(true);
+        region.compact(false);
+        for (        HStore store : region.getStores()) {
+          store.closeAndArchiveCompactedFiles();
+        }
+      }
+    }
+);
+    ctx.startThreads();
+    Get get=new Get(Bytes.toBytes("row0"));
+    Result result=null;
+    int expectedCount=numFamilies * numQualifiers;
+    long prevTimestamp=0L;
+    for (int i=0; i < testCount; i++) {
+      LOG.info("testWritesWhileGetting verify turn " + i);
+      boolean previousEmpty=result == null || result.isEmpty();
+      result=region.get(get);
+      if (!result.isEmpty() || !previousEmpty || i > compactInterval) {
+        assertEquals("i=" + i,expectedCount,result.size());
+        long timestamp=0;
+        for (        Cell kv : result.rawCells()) {
+          if (CellUtil.matchingFamily(kv,families[0]) && CellUtil.matchingQualifier(kv,qualifiers[0])) {
+            timestamp=kv.getTimestamp();
+          }
+        }
+        assertTrue(timestamp >= prevTimestamp);
+        prevTimestamp=timestamp;
+        Cell previousKV=null;
+        for (        Cell kv : result.rawCells()) {
+          byte[] thisValue=CellUtil.cloneValue(kv);
+          if (previousKV != null) {
+            if (Bytes.compareTo(CellUtil.cloneValue(previousKV),thisValue) != 0) {
+              LOG.warn("These two KV should have the same value." + " Previous KV:" + previousKV + "(memStoreTS:"+ previousKV.getSequenceId()+ ")"+ ", New KV: "+ kv+ "(memStoreTS:"+ kv.getSequenceId()+ ")");
+              assertEquals(0,Bytes.compareTo(CellUtil.cloneValue(previousKV),thisValue));
+            }
+          }
+          previousKV=kv;
+        }
+      }
+    }
+  }
+  finally {
+    if (putThread != null)     putThread.done();
+    region.flush(true);
+    if (putThread != null) {
+      putThread.join();
+      putThread.checkNoError();
+    }
+    ctx.stop();
+    HBaseTestingUtility.closeRegionAndWAL(this.region);
+    this.region=null;
+  }
+}

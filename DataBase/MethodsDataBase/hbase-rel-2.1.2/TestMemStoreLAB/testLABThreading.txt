@@ -1,0 +1,54 @@
+/** 
+ * Test allocation from lots of threads, making sure the results don't overlap in any way
+ */
+@Test public void testLABThreading() throws Exception {
+  Configuration conf=new Configuration();
+  MultithreadedTestUtil.TestContext ctx=new MultithreadedTestUtil.TestContext(conf);
+  final AtomicInteger totalAllocated=new AtomicInteger();
+  final MemStoreLAB mslab=new MemStoreLABImpl();
+  List<List<AllocRecord>> allocations=Lists.newArrayList();
+  for (int i=0; i < 10; i++) {
+    final List<AllocRecord> allocsByThisThread=Lists.newLinkedList();
+    allocations.add(allocsByThisThread);
+    TestThread t=new MultithreadedTestUtil.RepeatingTestThread(ctx){
+      private Random r=new Random();
+      @Override public void doAnAction() throws Exception {
+        int valSize=r.nextInt(3);
+        KeyValue kv=new KeyValue(rk,cf,q,new byte[valSize]);
+        int size=KeyValueUtil.length(kv);
+        ByteBufferKeyValue newCell=(ByteBufferKeyValue)mslab.copyCellInto(kv);
+        totalAllocated.addAndGet(size);
+        allocsByThisThread.add(new AllocRecord(newCell.getBuffer(),newCell.getOffset(),size));
+      }
+    }
+;
+    ctx.addThread(t);
+  }
+  ctx.startThreads();
+  while (totalAllocated.get() < 50 * 1024 * 1000 && ctx.shouldRun()) {
+    Thread.sleep(10);
+  }
+  ctx.stop();
+  Map<ByteBuffer,Map<Integer,AllocRecord>> mapsByChunk=Maps.newHashMap();
+  int sizeCounted=0;
+  for (  AllocRecord rec : Iterables.concat(allocations)) {
+    sizeCounted+=rec.size;
+    if (rec.size == 0)     continue;
+    Map<Integer,AllocRecord> mapForThisByteArray=mapsByChunk.get(rec.alloc);
+    if (mapForThisByteArray == null) {
+      mapForThisByteArray=Maps.newTreeMap();
+      mapsByChunk.put(rec.alloc,mapForThisByteArray);
+    }
+    AllocRecord oldVal=mapForThisByteArray.put(rec.offset,rec);
+    assertNull("Already had an entry " + oldVal + " for allocation "+ rec,oldVal);
+  }
+  assertEquals("Sanity check test",sizeCounted,totalAllocated.get());
+  for (  Map<Integer,AllocRecord> allocsInChunk : mapsByChunk.values()) {
+    int expectedOff=Bytes.SIZEOF_INT;
+    for (    AllocRecord alloc : allocsInChunk.values()) {
+      assertEquals(expectedOff,alloc.offset);
+      assertTrue("Allocation overruns buffer",alloc.offset + alloc.size <= alloc.alloc.capacity());
+      expectedOff+=alloc.size;
+    }
+  }
+}

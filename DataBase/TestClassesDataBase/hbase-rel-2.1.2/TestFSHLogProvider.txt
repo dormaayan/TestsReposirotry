@@ -1,0 +1,209 @@
+@Category({RegionServerTests.class,MediumTests.class}) public class TestFSHLogProvider {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestFSHLogProvider.class);
+  private static final Logger LOG=LoggerFactory.getLogger(TestFSHLogProvider.class);
+  private static Configuration conf;
+  private static FileSystem fs;
+  private final static HBaseTestingUtility TEST_UTIL=new HBaseTestingUtility();
+  private MultiVersionConcurrencyControl mvcc;
+  @Rule public final TestName currentTest=new TestName();
+  @Before public void setUp() throws Exception {
+    mvcc=new MultiVersionConcurrencyControl();
+    FileStatus[] entries=fs.listStatus(new Path("/"));
+    for (    FileStatus dir : entries) {
+      fs.delete(dir.getPath(),true);
+    }
+  }
+  @BeforeClass public static void setUpBeforeClass() throws Exception {
+    TEST_UTIL.getConfiguration().setInt("dfs.blocksize",1024 * 1024);
+    TEST_UTIL.getConfiguration().setInt("dfs.namenode.heartbeat.recheck-interval",5000);
+    TEST_UTIL.getConfiguration().setInt("dfs.heartbeat.interval",1);
+    TEST_UTIL.getConfiguration().setInt("dfs.client.socket-timeout",5000);
+    TEST_UTIL.getConfiguration().setInt("hbase.ipc.client.connect.max.retries",1);
+    TEST_UTIL.getConfiguration().setInt("dfs.client.block.recovery.retries",1);
+    TEST_UTIL.getConfiguration().setInt("hbase.ipc.client.connection.maxidletime",500);
+    TEST_UTIL.startMiniDFSCluster(3);
+    TEST_UTIL.createRootDir();
+    conf=TEST_UTIL.getConfiguration();
+    fs=TEST_UTIL.getDFSCluster().getFileSystem();
+  }
+  @AfterClass public static void tearDownAfterClass() throws Exception {
+    TEST_UTIL.shutdownMiniCluster();
+  }
+  static String getName(){
+    return "TestDefaultWALProvider";
+  }
+  @Test public void testGetServerNameFromWALDirectoryName() throws IOException {
+    ServerName sn=ServerName.valueOf("hn",450,1398);
+    String hl=FSUtils.getRootDir(conf) + "/" + AbstractFSWALProvider.getWALDirectoryName(sn.toString());
+    assertNull(AbstractFSWALProvider.getServerNameFromWALDirectoryName(conf,null));
+    assertNull(AbstractFSWALProvider.getServerNameFromWALDirectoryName(conf,FSUtils.getRootDir(conf).toUri().toString()));
+    assertNull(AbstractFSWALProvider.getServerNameFromWALDirectoryName(conf,""));
+    assertNull(AbstractFSWALProvider.getServerNameFromWALDirectoryName(conf,"                  "));
+    assertNull(AbstractFSWALProvider.getServerNameFromWALDirectoryName(conf,hl));
+    assertNull(AbstractFSWALProvider.getServerNameFromWALDirectoryName(conf,hl + "qdf"));
+    assertNull(AbstractFSWALProvider.getServerNameFromWALDirectoryName(conf,"sfqf" + hl + "qdf"));
+    final String wals="/WALs/";
+    ServerName parsed=AbstractFSWALProvider.getServerNameFromWALDirectoryName(conf,FSUtils.getRootDir(conf).toUri().toString() + wals + sn+ "/localhost%2C32984%2C1343316388997.1343316390417");
+    assertEquals("standard",sn,parsed);
+    parsed=AbstractFSWALProvider.getServerNameFromWALDirectoryName(conf,hl + "/qdf");
+    assertEquals("subdir",sn,parsed);
+    parsed=AbstractFSWALProvider.getServerNameFromWALDirectoryName(conf,FSUtils.getRootDir(conf).toUri().toString() + wals + sn+ "-splitting/localhost%3A57020.1340474893931");
+    assertEquals("split",sn,parsed);
+  }
+  private void addEdits(  WAL log,  RegionInfo hri,  TableDescriptor htd,  int times,  NavigableMap<byte[],Integer> scopes) throws IOException {
+    final byte[] row=Bytes.toBytes("row");
+    for (int i=0; i < times; i++) {
+      long timestamp=System.currentTimeMillis();
+      WALEdit cols=new WALEdit();
+      cols.add(new KeyValue(row,row,row,timestamp,row));
+      log.append(hri,getWalKey(hri.getEncodedNameAsBytes(),htd.getTableName(),timestamp,scopes),cols,true);
+    }
+    log.sync();
+  }
+  /** 
+ * used by TestDefaultWALProviderWithHLogKey
+ * @param scopes
+ */
+  WALKeyImpl getWalKey(  final byte[] info,  final TableName tableName,  final long timestamp,  NavigableMap<byte[],Integer> scopes){
+    return new WALKeyImpl(info,tableName,timestamp,mvcc,scopes);
+  }
+  /** 
+ * helper method to simulate region flush for a WAL.
+ * @param wal
+ * @param regionEncodedName
+ */
+  protected void flushRegion(  WAL wal,  byte[] regionEncodedName,  Set<byte[]> flushedFamilyNames){
+    wal.startCacheFlush(regionEncodedName,flushedFamilyNames);
+    wal.completeCacheFlush(regionEncodedName);
+  }
+  @Test public void testLogCleaning() throws Exception {
+    LOG.info(currentTest.getMethodName());
+    TableDescriptor htd=TableDescriptorBuilder.newBuilder(TableName.valueOf(currentTest.getMethodName())).setColumnFamily(ColumnFamilyDescriptorBuilder.of("row")).build();
+    TableDescriptor htd2=TableDescriptorBuilder.newBuilder(TableName.valueOf(currentTest.getMethodName() + "2")).setColumnFamily(ColumnFamilyDescriptorBuilder.of("row")).build();
+    NavigableMap<byte[],Integer> scopes1=new TreeMap<>(Bytes.BYTES_COMPARATOR);
+    for (    byte[] fam : htd.getColumnFamilyNames()) {
+      scopes1.put(fam,0);
+    }
+    NavigableMap<byte[],Integer> scopes2=new TreeMap<>(Bytes.BYTES_COMPARATOR);
+    for (    byte[] fam : htd2.getColumnFamilyNames()) {
+      scopes2.put(fam,0);
+    }
+    Configuration localConf=new Configuration(conf);
+    localConf.set(WALFactory.WAL_PROVIDER,FSHLogProvider.class.getName());
+    WALFactory wals=new WALFactory(localConf,currentTest.getMethodName());
+    try {
+      RegionInfo hri=RegionInfoBuilder.newBuilder(htd.getTableName()).build();
+      RegionInfo hri2=RegionInfoBuilder.newBuilder(htd2.getTableName()).build();
+      WAL log=wals.getWAL(null);
+      addEdits(log,hri,htd,1,scopes1);
+      log.rollWriter();
+      assertEquals(1,AbstractFSWALProvider.getNumRolledLogFiles(log));
+      addEdits(log,hri,htd,2,scopes1);
+      log.rollWriter();
+      assertEquals(2,FSHLogProvider.getNumRolledLogFiles(log));
+      addEdits(log,hri,htd,1,scopes1);
+      addEdits(log,hri2,htd2,1,scopes2);
+      addEdits(log,hri,htd,1,scopes1);
+      addEdits(log,hri2,htd2,1,scopes2);
+      log.rollWriter();
+      assertEquals(3,AbstractFSWALProvider.getNumRolledLogFiles(log));
+      addEdits(log,hri2,htd2,1,scopes2);
+      log.startCacheFlush(hri.getEncodedNameAsBytes(),htd.getColumnFamilyNames());
+      log.completeCacheFlush(hri.getEncodedNameAsBytes());
+      log.rollWriter();
+      int count=AbstractFSWALProvider.getNumRolledLogFiles(log);
+      assertEquals(2,count);
+      addEdits(log,hri2,htd2,1,scopes2);
+      log.startCacheFlush(hri2.getEncodedNameAsBytes(),htd2.getColumnFamilyNames());
+      log.completeCacheFlush(hri2.getEncodedNameAsBytes());
+      log.rollWriter();
+      assertEquals(0,AbstractFSWALProvider.getNumRolledLogFiles(log));
+    }
+  finally {
+      if (wals != null) {
+        wals.close();
+      }
+    }
+  }
+  /** 
+ * Tests wal archiving by adding data, doing flushing/rolling and checking we archive old logs and also don't archive "live logs" (that is, a log with un-flushed entries). <p> This is what it does: It creates two regions, and does a series of inserts along with log rolling. Whenever a WAL is rolled, HLogBase checks previous wals for archiving. A wal is eligible for archiving if for all the regions which have entries in that wal file, have flushed - past their maximum sequence id in that wal file. <p>
+ * @throws IOException
+ */
+  @Test public void testWALArchiving() throws IOException {
+    LOG.debug(currentTest.getMethodName());
+    TableDescriptor table1=TableDescriptorBuilder.newBuilder(TableName.valueOf(currentTest.getMethodName() + "1")).setColumnFamily(ColumnFamilyDescriptorBuilder.of("row")).build();
+    TableDescriptor table2=TableDescriptorBuilder.newBuilder(TableName.valueOf(currentTest.getMethodName() + "2")).setColumnFamily(ColumnFamilyDescriptorBuilder.of("row")).build();
+    NavigableMap<byte[],Integer> scopes1=new TreeMap<>(Bytes.BYTES_COMPARATOR);
+    for (    byte[] fam : table1.getColumnFamilyNames()) {
+      scopes1.put(fam,0);
+    }
+    NavigableMap<byte[],Integer> scopes2=new TreeMap<>(Bytes.BYTES_COMPARATOR);
+    for (    byte[] fam : table2.getColumnFamilyNames()) {
+      scopes2.put(fam,0);
+    }
+    Configuration localConf=new Configuration(conf);
+    localConf.set(WALFactory.WAL_PROVIDER,FSHLogProvider.class.getName());
+    WALFactory wals=new WALFactory(localConf,currentTest.getMethodName());
+    try {
+      WAL wal=wals.getWAL(null);
+      assertEquals(0,AbstractFSWALProvider.getNumRolledLogFiles(wal));
+      RegionInfo hri1=RegionInfoBuilder.newBuilder(table1.getTableName()).build();
+      RegionInfo hri2=RegionInfoBuilder.newBuilder(table2.getTableName()).build();
+      addEdits(wal,hri1,table1,1,scopes1);
+      wal.rollWriter();
+      assertEquals(1,AbstractFSWALProvider.getNumRolledLogFiles(wal));
+      addEdits(wal,hri1,table1,1,scopes1);
+      wal.rollWriter();
+      assertEquals(2,AbstractFSWALProvider.getNumRolledLogFiles(wal));
+      addEdits(wal,hri1,table1,3,scopes1);
+      flushRegion(wal,hri1.getEncodedNameAsBytes(),table1.getColumnFamilyNames());
+      wal.rollWriter();
+      assertEquals(0,AbstractFSWALProvider.getNumRolledLogFiles(wal));
+      addEdits(wal,hri2,table2,1,scopes2);
+      wal.rollWriter();
+      assertEquals(1,AbstractFSWALProvider.getNumRolledLogFiles(wal));
+      addEdits(wal,hri1,table1,2,scopes1);
+      wal.rollWriter();
+      assertEquals(2,AbstractFSWALProvider.getNumRolledLogFiles(wal));
+      addEdits(wal,hri2,table2,2,scopes2);
+      flushRegion(wal,hri1.getEncodedNameAsBytes(),table2.getColumnFamilyNames());
+      wal.rollWriter();
+      assertEquals(2,AbstractFSWALProvider.getNumRolledLogFiles(wal));
+      addEdits(wal,hri2,table2,2,scopes2);
+      flushRegion(wal,hri2.getEncodedNameAsBytes(),table2.getColumnFamilyNames());
+      wal.rollWriter();
+      assertEquals(0,AbstractFSWALProvider.getNumRolledLogFiles(wal));
+    }
+  finally {
+      if (wals != null) {
+        wals.close();
+      }
+    }
+  }
+  /** 
+ * Write to a log file with three concurrent threads and verifying all data is written.
+ * @throws Exception
+ */
+  @Test public void testConcurrentWrites() throws Exception {
+    int errCode=WALPerformanceEvaluation.innerMain(new Configuration(TEST_UTIL.getConfiguration()),new String[]{"-threads","3","-verify","-noclosefs","-iterations","3000"});
+    assertEquals(0,errCode);
+  }
+  /** 
+ * Ensure that we can use Set.add to deduplicate WALs
+ */
+  @Test public void setMembershipDedups() throws IOException {
+    Configuration localConf=new Configuration(conf);
+    localConf.set(WALFactory.WAL_PROVIDER,FSHLogProvider.class.getName());
+    WALFactory wals=new WALFactory(localConf,currentTest.getMethodName());
+    try {
+      final Set<WAL> seen=new HashSet<>(1);
+      assertTrue("first attempt to add WAL from default provider should work.",seen.add(wals.getWAL(null)));
+      for (int i=0; i < 1000; i++) {
+        assertFalse("default wal provider is only supposed to return a single wal, which should " + "compare as .equals itself.",seen.add(wals.getWAL(RegionInfoBuilder.newBuilder(TableName.valueOf("Table-" + ThreadLocalRandom.current().nextInt())).build())));
+      }
+    }
+  finally {
+      wals.close();
+    }
+  }
+}

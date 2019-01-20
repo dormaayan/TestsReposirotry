@@ -1,0 +1,43 @@
+/** 
+ * Tests that the emitter handles exceptions occurring in the  {@link ResultFuture} correctly.
+ */
+@Test public void testEmitterWithExceptions() throws Exception {
+  Object lock=new Object();
+  List<StreamElement> list=new ArrayList<>();
+  Output<StreamRecord<Integer>> output=new CollectorOutput<>(list);
+  List<StreamElement> expected=Arrays.asList(new StreamRecord<>(1,0L),new Watermark(3L));
+  OperatorActions operatorActions=mock(OperatorActions.class);
+  final int capacity=3;
+  StreamElementQueue queue=new OrderedStreamElementQueue(capacity,executor,operatorActions);
+  final Emitter<Integer> emitter=new Emitter<>(lock,output,queue,operatorActions);
+  final Thread emitterThread=new Thread(emitter);
+  emitterThread.start();
+  final Exception testException=new Exception("Test exception");
+  try {
+    StreamRecordQueueEntry<Integer> record1=new StreamRecordQueueEntry<>(new StreamRecord<>(1,0L));
+    StreamRecordQueueEntry<Integer> record2=new StreamRecordQueueEntry<>(new StreamRecord<>(2,1L));
+    WatermarkQueueEntry watermark1=new WatermarkQueueEntry(new Watermark(3L));
+    queue.put(record1);
+    queue.put(record2);
+    queue.put(watermark1);
+    record2.completeExceptionally(testException);
+    record1.complete(Arrays.asList(1));
+synchronized (lock) {
+      while (!queue.isEmpty()) {
+        lock.wait();
+      }
+    }
+    Assert.assertEquals(expected,list);
+    ArgumentCaptor<Throwable> argumentCaptor=ArgumentCaptor.forClass(Throwable.class);
+    verify(operatorActions).failOperator(argumentCaptor.capture());
+    Throwable failureCause=argumentCaptor.getValue();
+    Assert.assertNotNull(failureCause.getCause());
+    Assert.assertTrue(failureCause.getCause() instanceof ExecutionException);
+    Assert.assertNotNull(failureCause.getCause().getCause());
+    Assert.assertEquals(testException,failureCause.getCause().getCause());
+  }
+  finally {
+    emitter.stop();
+    emitterThread.interrupt();
+  }
+}

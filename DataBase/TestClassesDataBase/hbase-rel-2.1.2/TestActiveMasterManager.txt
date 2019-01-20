@@ -1,0 +1,200 @@
+/** 
+ * Test the  {@link ActiveMasterManager}.
+ */
+@Category({MasterTests.class,MediumTests.class}) public class TestActiveMasterManager {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestActiveMasterManager.class);
+  private final static Logger LOG=LoggerFactory.getLogger(TestActiveMasterManager.class);
+  private final static HBaseTestingUtility TEST_UTIL=new HBaseTestingUtility();
+  @BeforeClass public static void setUpBeforeClass() throws Exception {
+    TEST_UTIL.startMiniZKCluster();
+  }
+  @AfterClass public static void tearDownAfterClass() throws Exception {
+    TEST_UTIL.shutdownMiniZKCluster();
+  }
+  @Test public void testRestartMaster() throws IOException, KeeperException {
+    ZKWatcher zk=new ZKWatcher(TEST_UTIL.getConfiguration(),"testActiveMasterManagerFromZK",null,true);
+    try {
+      ZKUtil.deleteNode(zk,zk.getZNodePaths().masterAddressZNode);
+      ZKUtil.deleteNode(zk,zk.getZNodePaths().clusterStateZNode);
+    }
+ catch (    KeeperException.NoNodeException nne) {
+    }
+    ServerName master=ServerName.valueOf("localhost",1,System.currentTimeMillis());
+    DummyMaster dummyMaster=new DummyMaster(zk,master);
+    ClusterStatusTracker clusterStatusTracker=dummyMaster.getClusterStatusTracker();
+    ActiveMasterManager activeMasterManager=dummyMaster.getActiveMasterManager();
+    assertFalse(activeMasterManager.clusterHasActiveMaster.get());
+    MonitoredTask status=Mockito.mock(MonitoredTask.class);
+    clusterStatusTracker.setClusterUp();
+    activeMasterManager.blockUntilBecomingActiveMaster(100,status);
+    assertTrue(activeMasterManager.clusterHasActiveMaster.get());
+    assertMaster(zk,master);
+    DummyMaster secondDummyMaster=new DummyMaster(zk,master);
+    ActiveMasterManager secondActiveMasterManager=secondDummyMaster.getActiveMasterManager();
+    assertFalse(secondActiveMasterManager.clusterHasActiveMaster.get());
+    activeMasterManager.blockUntilBecomingActiveMaster(100,status);
+    assertTrue(activeMasterManager.clusterHasActiveMaster.get());
+    assertMaster(zk,master);
+  }
+  /** 
+ * Unit tests that uses ZooKeeper but does not use the master-side methods but rather acts directly on ZK.
+ * @throws Exception
+ */
+  @Test public void testActiveMasterManagerFromZK() throws Exception {
+    ZKWatcher zk=new ZKWatcher(TEST_UTIL.getConfiguration(),"testActiveMasterManagerFromZK",null,true);
+    try {
+      ZKUtil.deleteNode(zk,zk.getZNodePaths().masterAddressZNode);
+      ZKUtil.deleteNode(zk,zk.getZNodePaths().clusterStateZNode);
+    }
+ catch (    KeeperException.NoNodeException nne) {
+    }
+    ServerName firstMasterAddress=ServerName.valueOf("localhost",1,System.currentTimeMillis());
+    ServerName secondMasterAddress=ServerName.valueOf("localhost",2,System.currentTimeMillis());
+    DummyMaster ms1=new DummyMaster(zk,firstMasterAddress);
+    ActiveMasterManager activeMasterManager=ms1.getActiveMasterManager();
+    assertFalse(activeMasterManager.clusterHasActiveMaster.get());
+    ClusterStatusTracker clusterStatusTracker=ms1.getClusterStatusTracker();
+    clusterStatusTracker.setClusterUp();
+    activeMasterManager.blockUntilBecomingActiveMaster(100,Mockito.mock(MonitoredTask.class));
+    assertTrue(activeMasterManager.clusterHasActiveMaster.get());
+    assertMaster(zk,firstMasterAddress);
+    WaitToBeMasterThread t=new WaitToBeMasterThread(zk,secondMasterAddress);
+    t.start();
+    int sleeps=0;
+    while (!t.manager.clusterHasActiveMaster.get() && sleeps < 100) {
+      Thread.sleep(10);
+      sleeps++;
+    }
+    assertTrue(activeMasterManager.clusterHasActiveMaster.get());
+    assertTrue(t.manager.clusterHasActiveMaster.get());
+    assertFalse(t.isActiveMaster);
+    ms1.stop("stopping first server");
+    NodeDeletionListener listener=new NodeDeletionListener(zk,zk.getZNodePaths().masterAddressZNode);
+    zk.registerListener(listener);
+    LOG.info("Deleting master node");
+    ZKUtil.deleteNode(zk,zk.getZNodePaths().masterAddressZNode);
+    LOG.info("Waiting for active master manager to be notified");
+    listener.waitForDeletion();
+    LOG.info("Master node deleted");
+    sleeps=0;
+    while (!t.isActiveMaster && sleeps < 100) {
+      Thread.sleep(10);
+      sleeps++;
+    }
+    LOG.debug("Slept " + sleeps + " times");
+    assertTrue(t.manager.clusterHasActiveMaster.get());
+    assertTrue(t.isActiveMaster);
+    LOG.info("Deleting master node");
+    ZKUtil.deleteNode(zk,zk.getZNodePaths().masterAddressZNode);
+  }
+  /** 
+ * Assert there is an active master and that it has the specified address.
+ * @param zk
+ * @param thisMasterAddress
+ * @throws KeeperException
+ * @throws IOException
+ */
+  private void assertMaster(  ZKWatcher zk,  ServerName expectedAddress) throws KeeperException, IOException {
+    ServerName readAddress=MasterAddressTracker.getMasterAddress(zk);
+    assertNotNull(readAddress);
+    assertTrue(expectedAddress.equals(readAddress));
+  }
+public static class WaitToBeMasterThread extends Thread {
+    ActiveMasterManager manager;
+    DummyMaster dummyMaster;
+    boolean isActiveMaster;
+    public WaitToBeMasterThread(    ZKWatcher zk,    ServerName address){
+      this.dummyMaster=new DummyMaster(zk,address);
+      this.manager=this.dummyMaster.getActiveMasterManager();
+      isActiveMaster=false;
+    }
+    @Override public void run(){
+      manager.blockUntilBecomingActiveMaster(100,Mockito.mock(MonitoredTask.class));
+      LOG.info("Second master has become the active master!");
+      isActiveMaster=true;
+    }
+  }
+public static class NodeDeletionListener extends ZKListener {
+    private static final Logger LOG=LoggerFactory.getLogger(NodeDeletionListener.class);
+    private Semaphore lock;
+    private String node;
+    public NodeDeletionListener(    ZKWatcher watcher,    String node){
+      super(watcher);
+      lock=new Semaphore(0);
+      this.node=node;
+    }
+    @Override public void nodeDeleted(    String path){
+      if (path.equals(node)) {
+        LOG.debug("nodeDeleted(" + path + ")");
+        lock.release();
+      }
+    }
+    public void waitForDeletion() throws InterruptedException {
+      lock.acquire();
+    }
+  }
+  /** 
+ * Dummy Master Implementation.
+ */
+public static class DummyMaster implements Server {
+    private volatile boolean stopped;
+    private ClusterStatusTracker clusterStatusTracker;
+    private ActiveMasterManager activeMasterManager;
+    public DummyMaster(    ZKWatcher zk,    ServerName master){
+      this.clusterStatusTracker=new ClusterStatusTracker(zk,this);
+      clusterStatusTracker.start();
+      this.activeMasterManager=new ActiveMasterManager(zk,master,this);
+      zk.registerListener(activeMasterManager);
+    }
+    @Override public void abort(    final String msg,    final Throwable t){
+    }
+    @Override public boolean isAborted(){
+      return false;
+    }
+    @Override public Configuration getConfiguration(){
+      return null;
+    }
+    @Override public ZKWatcher getZooKeeper(){
+      return null;
+    }
+    @Override public CoordinatedStateManager getCoordinatedStateManager(){
+      return null;
+    }
+    @Override public ServerName getServerName(){
+      return null;
+    }
+    @Override public boolean isStopped(){
+      return this.stopped;
+    }
+    @Override public void stop(    String why){
+      this.stopped=true;
+    }
+    @Override public ClusterConnection getConnection(){
+      return null;
+    }
+    @Override public MetaTableLocator getMetaTableLocator(){
+      return null;
+    }
+    public ClusterStatusTracker getClusterStatusTracker(){
+      return clusterStatusTracker;
+    }
+    public ActiveMasterManager getActiveMasterManager(){
+      return activeMasterManager;
+    }
+    @Override public ChoreService getChoreService(){
+      return null;
+    }
+    @Override public ClusterConnection getClusterConnection(){
+      return null;
+    }
+    @Override public FileSystem getFileSystem(){
+      return null;
+    }
+    @Override public boolean isStopping(){
+      return false;
+    }
+    @Override public Connection createConnection(    Configuration conf) throws IOException {
+      return null;
+    }
+  }
+}

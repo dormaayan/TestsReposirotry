@@ -1,0 +1,69 @@
+@Test(timeout=180000) public void testRateLimitingDuringDataNodeStartup() throws Exception {
+  Configuration conf=new Configuration();
+  conf.setInt(DFS_NAMENODE_MAX_FULL_BLOCK_REPORT_LEASES,1);
+  conf.setLong(DFS_NAMENODE_FULL_BLOCK_REPORT_LEASE_LENGTH_MS,20L * 60L * 1000L);
+  final Semaphore fbrSem=new Semaphore(0);
+  final HashSet<DatanodeID> expectedFbrDns=new HashSet<>();
+  final HashSet<DatanodeID> fbrDns=new HashSet<>();
+  final AtomicReference<String> failure=new AtomicReference<String>("");
+  final BlockManagerFaultInjector injector=new BlockManagerFaultInjector(){
+    private int numLeases=0;
+    @Override public void incomingBlockReportRpc(    DatanodeID nodeID,    BlockReportContext context) throws IOException {
+      LOG.info("Incoming full block report from " + nodeID + ".  Lease ID = 0x"+ Long.toHexString(context.getLeaseId()));
+      if (context.getLeaseId() == 0) {
+        setFailure(failure,"Got unexpected rate-limiting-" + "bypassing full block report RPC from " + nodeID);
+      }
+      fbrSem.acquireUninterruptibly();
+synchronized (this) {
+        fbrDns.add(nodeID);
+        if (!expectedFbrDns.remove(nodeID)) {
+          setFailure(failure,"Got unexpected full block report " + "RPC from " + nodeID + ".  expectedFbrDns = "+ Joiner.on(", ").join(expectedFbrDns));
+        }
+        LOG.info("Proceeding with full block report from " + nodeID + ".  Lease ID = 0x"+ Long.toHexString(context.getLeaseId()));
+      }
+    }
+    @Override public void requestBlockReportLease(    DatanodeDescriptor node,    long leaseId){
+      if (leaseId == 0) {
+        return;
+      }
+synchronized (this) {
+        numLeases++;
+        expectedFbrDns.add(node);
+        LOG.info("requestBlockReportLease(node=" + node + ", leaseId=0x"+ Long.toHexString(leaseId)+ ").  "+ "expectedFbrDns = "+ Joiner.on(", ").join(expectedFbrDns));
+        if (numLeases > 1) {
+          setFailure(failure,"More than 1 lease was issued at once.");
+        }
+      }
+    }
+    @Override public void removeBlockReportLease(    DatanodeDescriptor node,    long leaseId){
+      LOG.info("removeBlockReportLease(node=" + node + ", leaseId=0x"+ Long.toHexString(leaseId)+ ")");
+synchronized (this) {
+        numLeases--;
+      }
+    }
+  }
+;
+  BlockManagerFaultInjector.instance=injector;
+  final int NUM_DATANODES=5;
+  MiniDFSCluster cluster=new MiniDFSCluster.Builder(conf).numDataNodes(NUM_DATANODES).build();
+  cluster.waitActive();
+  for (int n=1; n <= NUM_DATANODES; n++) {
+    LOG.info("Waiting for " + n + " datanode(s) to report in.");
+    fbrSem.release();
+    Uninterruptibles.sleepUninterruptibly(20,TimeUnit.MILLISECONDS);
+    final int currentN=n;
+    GenericTestUtils.waitFor(new Supplier<Boolean>(){
+      @Override public Boolean get(){
+synchronized (injector) {
+          if (fbrDns.size() > currentN) {
+            setFailure(failure,"Expected at most " + currentN + " datanodes to have sent a block report, but actually "+ fbrDns.size()+ " have.");
+          }
+          return (fbrDns.size() >= currentN);
+        }
+      }
+    }
+,25,50000);
+  }
+  cluster.shutdown();
+  Assert.assertEquals("",failure.get());
+}

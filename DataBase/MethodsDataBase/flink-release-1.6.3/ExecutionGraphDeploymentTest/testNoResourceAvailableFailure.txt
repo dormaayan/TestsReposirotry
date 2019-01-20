@@ -1,0 +1,31 @@
+/** 
+ * Tests that a blocking batch job fails if there are not enough resources left to schedule the succeeding tasks. This test case is related to [FLINK-4296] where finished producing tasks swallow the fail exception when scheduling a consumer task.
+ */
+@Test public void testNoResourceAvailableFailure() throws Exception {
+  final JobID jobId=new JobID();
+  JobVertex v1=new JobVertex("source");
+  JobVertex v2=new JobVertex("sink");
+  int dop1=1;
+  int dop2=1;
+  v1.setParallelism(dop1);
+  v2.setParallelism(dop2);
+  v1.setInvokableClass(BatchTask.class);
+  v2.setInvokableClass(BatchTask.class);
+  v2.connectNewDataSetAsInput(v1,DistributionPattern.POINTWISE,ResultPartitionType.BLOCKING);
+  Scheduler scheduler=new Scheduler(TestingUtils.directExecutionContext());
+  for (int i=0; i < dop1; i++) {
+    scheduler.newInstanceAvailable(ExecutionGraphTestUtils.getInstance(new ActorTaskManagerGateway(new ExecutionGraphTestUtils.SimpleActorGateway(TestingUtils.directExecutionContext()))));
+  }
+  final JobInformation jobInformation=new DummyJobInformation(jobId,"failing test job");
+  ExecutionGraph eg=new ExecutionGraph(jobInformation,new DirectScheduledExecutorService(),TestingUtils.defaultExecutor(),AkkaUtils.getDefaultTimeout(),new NoRestartStrategy(),new RestartAllStrategy.Factory(),scheduler,ExecutionGraph.class.getClassLoader(),blobWriter,AkkaUtils.getDefaultTimeout());
+  checkJobOffloaded(eg);
+  eg.setQueuedSchedulingAllowed(false);
+  List<JobVertex> ordered=Arrays.asList(v1,v2);
+  eg.attachJobGraph(ordered);
+  assertEquals(dop1,scheduler.getNumberOfAvailableSlots());
+  eg.scheduleForExecution();
+  ExecutionAttemptID attemptID=eg.getJobVertex(v1.getID()).getTaskVertices()[0].getCurrentExecutionAttempt().getAttemptId();
+  eg.updateState(new TaskExecutionState(jobId,attemptID,ExecutionState.RUNNING));
+  eg.updateState(new TaskExecutionState(jobId,attemptID,ExecutionState.FINISHED,null));
+  assertEquals(JobStatus.FAILED,eg.getState());
+}

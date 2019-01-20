@@ -1,0 +1,81 @@
+@Test public void testSavepointForJobWithIteration() throws Exception {
+  for (int i=0; i < ITER_TEST_PARALLELISM; ++i) {
+    iterTestSnapshotWait[i]=new OneShotLatch();
+    iterTestRestoreWait[i]=new OneShotLatch();
+    iterTestCheckpointVerify[i]=0;
+  }
+  TemporaryFolder folder=new TemporaryFolder();
+  folder.create();
+  final File tmpDir=folder.newFolder();
+  final StreamExecutionEnvironment env=StreamExecutionEnvironment.getExecutionEnvironment();
+  final IntegerStreamSource source=new IntegerStreamSource();
+  IterativeStream<Integer> iteration=env.addSource(source).flatMap(new RichFlatMapFunction<Integer,Integer>(){
+    private static final long serialVersionUID=1L;
+    @Override public void flatMap(    Integer in,    Collector<Integer> clctr) throws Exception {
+      clctr.collect(in);
+    }
+  }
+).setParallelism(ITER_TEST_PARALLELISM).keyBy(new KeySelector<Integer,Object>(){
+    private static final long serialVersionUID=1L;
+    @Override public Object getKey(    Integer value) throws Exception {
+      return value;
+    }
+  }
+).flatMap(new DuplicateFilter()).setParallelism(ITER_TEST_PARALLELISM).iterate();
+  DataStream<Integer> iterationBody=iteration.map(new MapFunction<Integer,Integer>(){
+    private static final long serialVersionUID=1L;
+    @Override public Integer map(    Integer value) throws Exception {
+      return value;
+    }
+  }
+).setParallelism(ITER_TEST_PARALLELISM);
+  iteration.closeWith(iterationBody);
+  StreamGraph streamGraph=env.getStreamGraph();
+  streamGraph.setJobName("Test");
+  JobGraph jobGraph=streamGraph.getJobGraph();
+  Configuration config=new Configuration();
+  config.addAll(jobGraph.getJobConfiguration());
+  config.setString(TaskManagerOptions.MANAGED_MEMORY_SIZE,"0");
+  final File checkpointDir=new File(tmpDir,"checkpoints");
+  final File savepointDir=new File(tmpDir,"savepoints");
+  if (!checkpointDir.mkdir() || !savepointDir.mkdirs()) {
+    fail("Test setup failed: failed to create temporary directories.");
+  }
+  config.setString(CheckpointingOptions.STATE_BACKEND,"filesystem");
+  config.setString(CheckpointingOptions.CHECKPOINTS_DIRECTORY,checkpointDir.toURI().toString());
+  config.setInteger(CheckpointingOptions.FS_SMALL_FILE_THRESHOLD,0);
+  config.setString(CheckpointingOptions.SAVEPOINT_DIRECTORY,savepointDir.toURI().toString());
+  MiniClusterResource cluster=new MiniClusterResource(new MiniClusterResourceConfiguration.Builder().setConfiguration(config).setNumberTaskManagers(1).setNumberSlotsPerTaskManager(2 * jobGraph.getMaximumParallelism()).build());
+  cluster.before();
+  ClusterClient<?> client=cluster.getClusterClient();
+  String savepointPath=null;
+  try {
+    client.setDetached(true);
+    client.submitJob(jobGraph,SavepointITCase.class.getClassLoader());
+    for (    OneShotLatch latch : iterTestSnapshotWait) {
+      latch.await();
+    }
+    savepointPath=client.triggerSavepoint(jobGraph.getJobID(),null).get();
+    client.cancel(jobGraph.getJobID());
+    while (!client.getJobStatus(jobGraph.getJobID()).get().isGloballyTerminalState()) {
+      Thread.sleep(100);
+    }
+    jobGraph=streamGraph.getJobGraph();
+    jobGraph.setSavepointRestoreSettings(SavepointRestoreSettings.forPath(savepointPath));
+    client.setDetached(true);
+    client.submitJob(jobGraph,SavepointITCase.class.getClassLoader());
+    for (    OneShotLatch latch : iterTestRestoreWait) {
+      latch.await();
+    }
+    client.cancel(jobGraph.getJobID());
+    while (!client.getJobStatus(jobGraph.getJobID()).get().isGloballyTerminalState()) {
+      Thread.sleep(100);
+    }
+  }
+  finally {
+    if (null != savepointPath) {
+      client.disposeSavepoint(savepointPath);
+    }
+    cluster.after();
+  }
+}

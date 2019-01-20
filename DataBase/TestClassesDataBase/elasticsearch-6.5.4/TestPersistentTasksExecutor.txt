@@ -1,0 +1,85 @@
+public static class TestPersistentTasksExecutor extends PersistentTasksExecutor<TestParams> {
+  public static final String NAME="cluster:admin/persistent/test";
+  private final ClusterService clusterService;
+  public TestPersistentTasksExecutor(  Settings settings,  ClusterService clusterService){
+    super(settings,NAME,ThreadPool.Names.GENERIC);
+    this.clusterService=clusterService;
+  }
+  @Override public Assignment getAssignment(  TestParams params,  ClusterState clusterState){
+    if (params == null || params.getExecutorNodeAttr() == null) {
+      return super.getAssignment(params,clusterState);
+    }
+ else {
+      DiscoveryNode executorNode=selectLeastLoadedNode(clusterState,discoveryNode -> params.getExecutorNodeAttr().equals(discoveryNode.getAttributes().get("test_attr")));
+      if (executorNode != null) {
+        return new Assignment(executorNode.getId(),"test assignment");
+      }
+ else {
+        return NO_NODE_FOUND;
+      }
+    }
+  }
+  @Override protected void nodeOperation(  AllocatedPersistentTask task,  TestParams params,  PersistentTaskState state){
+    logger.info("started node operation for the task {}",task);
+    try {
+      TestTask testTask=(TestTask)task;
+      AtomicInteger phase=new AtomicInteger();
+      while (true) {
+        assertTrue(awaitBusy(() -> testTask.isCancelled() || testTask.getOperation() != null || clusterService.lifecycleState() != Lifecycle.State.STARTED,30,TimeUnit.SECONDS));
+        if (clusterService.lifecycleState() != Lifecycle.State.STARTED) {
+          return;
+        }
+        if ("finish".equals(testTask.getOperation())) {
+          task.markAsCompleted();
+          return;
+        }
+ else         if ("fail".equals(testTask.getOperation())) {
+          task.markAsFailed(new RuntimeException("Simulating failure"));
+          return;
+        }
+ else         if ("update_status".equals(testTask.getOperation())) {
+          testTask.setOperation(null);
+          CountDownLatch latch=new CountDownLatch(1);
+          State newState=new State("phase " + phase.incrementAndGet());
+          logger.info("updating the task state to {}",newState);
+          task.updatePersistentTaskState(newState,new ActionListener<PersistentTask<?>>(){
+            @Override public void onResponse(            PersistentTask<?> persistentTask){
+              logger.info("updating was successful");
+              latch.countDown();
+            }
+            @Override public void onFailure(            Exception e){
+              logger.info("updating failed",e);
+              latch.countDown();
+              fail(e.toString());
+            }
+          }
+);
+          assertTrue(latch.await(10,TimeUnit.SECONDS));
+        }
+ else         if (testTask.isCancelled()) {
+          if (randomBoolean()) {
+            if (randomBoolean()) {
+              task.markAsFailed(new TaskCancelledException(testTask.getReasonCancelled()));
+            }
+ else {
+              task.markAsCompleted();
+            }
+          }
+ else {
+            task.markAsFailed(new RuntimeException(testTask.getReasonCancelled()));
+          }
+          return;
+        }
+ else {
+          fail("We really shouldn't be here");
+        }
+      }
+    }
+ catch (    InterruptedException e) {
+      task.markAsFailed(e);
+    }
+  }
+  @Override protected AllocatedPersistentTask createTask(  long id,  String type,  String action,  TaskId parentTaskId,  PersistentTask<TestParams> task,  Map<String,String> headers){
+    return new TestTask(id,type,action,getDescription(task),parentTaskId,headers);
+  }
+}

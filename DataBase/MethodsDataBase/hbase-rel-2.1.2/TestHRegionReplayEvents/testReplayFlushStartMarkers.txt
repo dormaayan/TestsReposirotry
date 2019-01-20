@@ -1,0 +1,69 @@
+/** 
+ * Tests cases where we prepare a flush with some seqId and we receive other flush start markers equal to, greater or less than the previous flush start marker.
+ */
+@Test public void testReplayFlushStartMarkers() throws IOException {
+  putDataWithFlushes(primaryRegion,100,100,100);
+  int numRows=200;
+  reader=createWALReaderForPrimary();
+  LOG.info("-- Replaying edits and flush events in secondary");
+  FlushDescriptor startFlushDesc=null;
+  int lastReplayed=0;
+  while (true) {
+    WAL.Entry entry=reader.next();
+    if (entry == null) {
+      break;
+    }
+    FlushDescriptor flushDesc=WALEdit.getFlushDescriptor(entry.getEdit().getCells().get(0));
+    if (flushDesc != null) {
+      HStore store=secondaryRegion.getStore(Bytes.toBytes("cf1"));
+      long storeMemstoreSize=store.getMemStoreSize().getHeapSize();
+      long regionMemstoreSize=secondaryRegion.getMemStoreDataSize();
+      MemStoreSize mss=store.getFlushableSize();
+      if (flushDesc.getAction() == FlushAction.START_FLUSH) {
+        startFlushDesc=flushDesc;
+        LOG.info("-- Replaying flush start in secondary");
+        PrepareFlushResult result=secondaryRegion.replayWALFlushStartMarker(startFlushDesc);
+        assertNull(result.result);
+        assertEquals(result.flushOpSeqId,startFlushDesc.getFlushSequenceNumber());
+        assertTrue(regionMemstoreSize > 0);
+        assertTrue(mss.getHeapSize() > 0);
+        long newStoreMemstoreSize=store.getMemStoreSize().getHeapSize();
+        LOG.info("Memstore size reduced by:" + StringUtils.humanReadableInt(newStoreMemstoreSize - storeMemstoreSize));
+        assertTrue(storeMemstoreSize > newStoreMemstoreSize);
+        verifyData(secondaryRegion,0,lastReplayed + 1,cq,families);
+      }
+      verifyData(secondaryRegion,0,lastReplayed + 1,cq,families);
+    }
+ else {
+      lastReplayed=replayEdit(secondaryRegion,entry);
+    }
+  }
+  verifyData(secondaryRegion,0,numRows,cq,families);
+  LOG.info("-- Replaying same flush start in secondary again");
+  PrepareFlushResult result=secondaryRegion.replayWALFlushStartMarker(startFlushDesc);
+  assertNull(result);
+  assertNotNull(secondaryRegion.getPrepareFlushResult());
+  assertEquals(secondaryRegion.getPrepareFlushResult().flushOpSeqId,startFlushDesc.getFlushSequenceNumber());
+  assertTrue(secondaryRegion.getMemStoreDataSize() > 0);
+  verifyData(secondaryRegion,0,numRows,cq,families);
+  FlushDescriptor startFlushDescSmallerSeqId=clone(startFlushDesc,startFlushDesc.getFlushSequenceNumber() - 50);
+  LOG.info("-- Replaying same flush start in secondary again " + startFlushDescSmallerSeqId);
+  result=secondaryRegion.replayWALFlushStartMarker(startFlushDescSmallerSeqId);
+  assertNull(result);
+  assertNotNull(secondaryRegion.getPrepareFlushResult());
+  assertEquals(secondaryRegion.getPrepareFlushResult().flushOpSeqId,startFlushDesc.getFlushSequenceNumber());
+  assertTrue(secondaryRegion.getMemStoreDataSize() > 0);
+  verifyData(secondaryRegion,0,numRows,cq,families);
+  FlushDescriptor startFlushDescLargerSeqId=clone(startFlushDesc,startFlushDesc.getFlushSequenceNumber() + 50);
+  LOG.info("-- Replaying same flush start in secondary again " + startFlushDescLargerSeqId);
+  result=secondaryRegion.replayWALFlushStartMarker(startFlushDescLargerSeqId);
+  assertNull(result);
+  assertNotNull(secondaryRegion.getPrepareFlushResult());
+  assertEquals(secondaryRegion.getPrepareFlushResult().flushOpSeqId,startFlushDesc.getFlushSequenceNumber());
+  assertTrue(secondaryRegion.getMemStoreDataSize() > 0);
+  verifyData(secondaryRegion,0,numRows,cq,families);
+  LOG.info("-- Verifying edits from secondary");
+  verifyData(secondaryRegion,0,numRows,cq,families);
+  LOG.info("-- Verifying edits from primary.");
+  verifyData(primaryRegion,0,numRows,cq,families);
+}

@@ -1,0 +1,80 @@
+/** 
+ * Balancer should not move blocks with size < minBlockSize. 
+ */
+@Test(timeout=60000) public void testMinBlockSizeAndSourceNodes() throws Exception {
+  final Configuration conf=new HdfsConfiguration();
+  initConf(conf);
+  final short replication=3;
+  final long[] lengths={10,10,10,10};
+  final long[] capacities=new long[replication];
+  final long totalUsed=capacities.length * sum(lengths);
+  Arrays.fill(capacities,1000);
+  cluster=new MiniDFSCluster.Builder(conf).numDataNodes(capacities.length).simulatedCapacities(capacities).build();
+  final DistributedFileSystem dfs=cluster.getFileSystem();
+  cluster.waitActive();
+  client=NameNodeProxies.createProxy(conf,dfs.getUri(),ClientProtocol.class).getProxy();
+  for (int i=0; i < lengths.length; i++) {
+    final long size=lengths[i];
+    final Path p=new Path("/file" + i + "_size"+ size);
+    try (OutputStream out=dfs.create(p)){
+      for (int j=0; j < size; j++) {
+        out.write(j);
+      }
+    }
+   }
+  cluster.startDataNodes(conf,capacities.length,true,null,null,capacities);
+  LOG.info("capacities    = " + Arrays.toString(capacities));
+  LOG.info("totalUsedSpace= " + totalUsed);
+  LOG.info("lengths       = " + Arrays.toString(lengths) + ", #="+ lengths.length);
+  waitForHeartBeat(totalUsed,2 * capacities[0] * capacities.length,client,cluster);
+  final Collection<URI> namenodes=DFSUtil.getInternalNsRpcUris(conf);
+{
+    final BalancerParameters p=Balancer.Cli.parse(new String[]{"-policy",BalancingPolicy.Node.INSTANCE.getName(),"-threshold","1"});
+    assertEquals(p.getBalancingPolicy(),BalancingPolicy.Node.INSTANCE);
+    assertEquals(p.getThreshold(),1.0,0.001);
+    conf.setLong(DFSConfigKeys.DFS_BALANCER_GETBLOCKS_MIN_BLOCK_SIZE_KEY,50);
+    final int r=Balancer.run(namenodes,p,conf);
+    assertEquals(ExitStatus.NO_MOVE_PROGRESS.getExitCode(),r);
+  }
+  conf.setLong(DFSConfigKeys.DFS_BALANCER_GETBLOCKS_MIN_BLOCK_SIZE_KEY,1);
+{
+    final Set<String> sourceNodes=new HashSet<>();
+    final List<DataNode> datanodes=cluster.getDataNodes();
+    for (int i=capacities.length; i < datanodes.size(); i++) {
+      sourceNodes.add(datanodes.get(i).getDisplayName());
+    }
+    final BalancerParameters p=Balancer.Cli.parse(new String[]{"-policy",BalancingPolicy.Node.INSTANCE.getName(),"-threshold","1","-source",StringUtils.join(sourceNodes,',')});
+    assertEquals(p.getBalancingPolicy(),BalancingPolicy.Node.INSTANCE);
+    assertEquals(p.getThreshold(),1.0,0.001);
+    assertEquals(p.getSourceNodes(),sourceNodes);
+    conf.setLong(DFSConfigKeys.DFS_BALANCER_GETBLOCKS_MIN_BLOCK_SIZE_KEY,50);
+    final int r=Balancer.run(namenodes,p,conf);
+    assertEquals(ExitStatus.NO_MOVE_BLOCK.getExitCode(),r);
+  }
+{
+    final Set<String> sourceNodes=new HashSet<>();
+    final List<DataNode> datanodes=cluster.getDataNodes();
+    sourceNodes.add(datanodes.get(0).getDisplayName());
+    final BalancerParameters p=Balancer.Cli.parse(new String[]{"-policy",BalancingPolicy.Node.INSTANCE.getName(),"-threshold","1","-source",StringUtils.join(sourceNodes,',')});
+    assertEquals(p.getBalancingPolicy(),BalancingPolicy.Node.INSTANCE);
+    assertEquals(p.getThreshold(),1.0,0.001);
+    assertEquals(p.getSourceNodes(),sourceNodes);
+    conf.setLong(DFSConfigKeys.DFS_BALANCER_GETBLOCKS_MIN_BLOCK_SIZE_KEY,1);
+    final int r=Balancer.run(namenodes,p,conf);
+    assertEquals(ExitStatus.NO_MOVE_BLOCK.getExitCode(),r);
+  }
+{
+    final Set<String> sourceNodes=new HashSet<>();
+    final List<DataNode> datanodes=cluster.getDataNodes();
+    for (int i=0; i < capacities.length; i++) {
+      sourceNodes.add(datanodes.get(i).getDisplayName());
+    }
+    final BalancerParameters p=Balancer.Cli.parse(new String[]{"-policy",BalancingPolicy.Node.INSTANCE.getName(),"-threshold","1","-source",StringUtils.join(sourceNodes,',')});
+    assertEquals(p.getBalancingPolicy(),BalancingPolicy.Node.INSTANCE);
+    assertEquals(p.getThreshold(),1.0,0.001);
+    assertEquals(p.getSourceNodes(),sourceNodes);
+    conf.setLong(DFSConfigKeys.DFS_BALANCER_GETBLOCKS_MIN_BLOCK_SIZE_KEY,1);
+    final int r=Balancer.run(namenodes,p,conf);
+    assertEquals(ExitStatus.SUCCESS.getExitCode(),r);
+  }
+}

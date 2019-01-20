@@ -1,0 +1,52 @@
+/** 
+ * This testcase issues SSL certificates configures the HttpServer to serve HTTPS using the created certficates and calls an echo servlet using the corresponding HTTPS URL.
+ */
+@Category({MiscTests.class,SmallTests.class}) public class TestSSLHttpServer extends HttpServerFunctionalTest {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestSSLHttpServer.class);
+  private static final String BASEDIR=System.getProperty("test.build.dir","target/test-dir") + "/" + TestSSLHttpServer.class.getSimpleName();
+  private static final Logger LOG=LoggerFactory.getLogger(TestSSLHttpServer.class);
+  private static Configuration conf;
+  private static HttpServer server;
+  private static URL baseUrl;
+  private static String keystoresDir;
+  private static String sslConfDir;
+  private static SSLFactory clientSslFactory;
+  @BeforeClass public static void setup() throws Exception {
+    conf=new Configuration();
+    conf.setInt(HttpServer.HTTP_MAX_THREADS,TestHttpServer.MAX_THREADS);
+    File base=new File(BASEDIR);
+    FileUtil.fullyDelete(base);
+    base.mkdirs();
+    keystoresDir=new File(BASEDIR).getAbsolutePath();
+    sslConfDir=KeyStoreTestUtil.getClasspathDir(TestSSLHttpServer.class);
+    KeyStoreTestUtil.setupSSLConfig(keystoresDir,sslConfDir,conf,false);
+    Configuration sslConf=new Configuration(false);
+    sslConf.addResource("ssl-server.xml");
+    sslConf.addResource("ssl-client.xml");
+    clientSslFactory=new SSLFactory(SSLFactory.Mode.CLIENT,sslConf);
+    clientSslFactory.init();
+    server=new HttpServer.Builder().setName("test").addEndpoint(new URI("https://localhost")).setConf(conf).keyPassword(HBaseConfiguration.getPassword(sslConf,"ssl.server.keystore.keypassword",null)).keyStore(sslConf.get("ssl.server.keystore.location"),HBaseConfiguration.getPassword(sslConf,"ssl.server.keystore.password",null),sslConf.get("ssl.server.keystore.type","jks")).trustStore(sslConf.get("ssl.server.truststore.location"),HBaseConfiguration.getPassword(sslConf,"ssl.server.truststore.password",null),sslConf.get("ssl.server.truststore.type","jks")).build();
+    server.addServlet("echo","/echo",TestHttpServer.EchoServlet.class);
+    server.start();
+    baseUrl=new URL("https://" + NetUtils.getHostPortString(server.getConnectorAddress(0)));
+    LOG.info("HTTP server started: " + baseUrl);
+  }
+  @AfterClass public static void cleanup() throws Exception {
+    server.stop();
+    FileUtil.fullyDelete(new File(BASEDIR));
+    KeyStoreTestUtil.cleanupSSLConfig(keystoresDir,sslConfDir);
+    clientSslFactory.destroy();
+  }
+  @Test public void testEcho() throws Exception {
+    assertEquals("a:b\nc:d\n",readOut(new URL(baseUrl,"/echo?a=b&c=d")));
+    assertEquals("a:b\nc&lt;:d\ne:&gt;\n",readOut(new URL(baseUrl,"/echo?a=b&c<=d&e=>")));
+  }
+  private static String readOut(  URL url) throws Exception {
+    HttpsURLConnection conn=(HttpsURLConnection)url.openConnection();
+    conn.setSSLSocketFactory(clientSslFactory.createSSLSocketFactory());
+    InputStream in=conn.getInputStream();
+    ByteArrayOutputStream out=new ByteArrayOutputStream();
+    IOUtils.copyBytes(in,out,1024);
+    return out.toString();
+  }
+}

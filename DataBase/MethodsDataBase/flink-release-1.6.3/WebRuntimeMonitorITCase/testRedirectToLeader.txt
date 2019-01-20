@@ -1,0 +1,89 @@
+/** 
+ * Tests that the monitor associated with the following job manager redirects to the leader.
+ */
+@Test public void testRedirectToLeader() throws Exception {
+  final Deadline deadline=TEST_TIMEOUT.fromNow();
+  ActorSystem[] jobManagerSystem=new ActorSystem[2];
+  WebRuntimeMonitor[] webMonitor=new WebRuntimeMonitor[2];
+  AkkaJobManagerRetriever[] jobManagerRetrievers=new AkkaJobManagerRetriever[2];
+  HighAvailabilityServices highAvailabilityServices=null;
+  try (TestingServer zooKeeper=new TestingServer()){
+    final Configuration config=ZooKeeperTestUtils.createZooKeeperHAConfig(zooKeeper.getConnectString(),temporaryFolder.getRoot().getPath());
+    File logDir=temporaryFolder.newFolder();
+    Path logFile=Files.createFile(new File(logDir,"jobmanager.log").toPath());
+    Files.createFile(new File(logDir,"jobmanager.out").toPath());
+    config.setInteger(WebOptions.PORT,0);
+    config.setString(WebOptions.LOG_PATH,logFile.toString());
+    highAvailabilityServices=HighAvailabilityServicesUtils.createAvailableOrEmbeddedServices(config,TestingUtils.defaultExecutor());
+    for (int i=0; i < jobManagerSystem.length; i++) {
+      jobManagerSystem[i]=AkkaUtils.createActorSystem(new Configuration(),new Some<>(new Tuple2<String,Object>("localhost",0)));
+    }
+    for (int i=0; i < webMonitor.length; i++) {
+      jobManagerRetrievers[i]=new AkkaJobManagerRetriever(jobManagerSystem[i],TIMEOUT,0,Time.milliseconds(50L));
+      webMonitor[i]=new WebRuntimeMonitor(config,highAvailabilityServices.getJobManagerLeaderRetriever(HighAvailabilityServices.DEFAULT_JOB_ID),jobManagerRetrievers[i],new AkkaQueryServiceRetriever(jobManagerSystem[i],TIMEOUT),TIMEOUT,TestingUtils.defaultScheduledExecutor());
+    }
+    ActorRef[] jobManager=new ActorRef[2];
+    String[] jobManagerAddress=new String[2];
+    for (int i=0; i < jobManager.length; i++) {
+      Configuration jmConfig=config.clone();
+      jmConfig.setInteger(WebOptions.PORT,webMonitor[i].getServerPort());
+      jobManager[i]=JobManager.startJobManagerActors(jmConfig,jobManagerSystem[i],TestingUtils.defaultExecutor(),TestingUtils.defaultExecutor(),highAvailabilityServices,NoOpMetricRegistry.INSTANCE,Option.apply(webMonitor[i].getRestAddress()),JobManager.class,MemoryArchivist.class)._1();
+      jobManagerAddress[i]=AkkaUtils.getAkkaURL(jobManagerSystem[i],jobManager[i]);
+      webMonitor[i].start();
+    }
+    LeaderRetrievalService lrs=highAvailabilityServices.getJobManagerLeaderRetriever(HighAvailabilityServices.DEFAULT_JOB_ID);
+    TestingListener leaderListener=new TestingListener();
+    lrs.start(leaderListener);
+    leaderListener.waitForNewLeader(deadline.timeLeft().toMillis());
+    String leaderAddress=leaderListener.getAddress();
+    int leaderIndex=leaderAddress.equals(jobManagerAddress[0]) ? 0 : 1;
+    int followerIndex=(leaderIndex + 1) % 2;
+    ActorSystem leadingSystem=jobManagerSystem[leaderIndex];
+    WebMonitor leadingWebMonitor=webMonitor[leaderIndex];
+    WebMonitor followerWebMonitor=webMonitor[followerIndex];
+    AkkaJobManagerRetriever leadingRetriever=jobManagerRetrievers[leaderIndex];
+    AkkaJobManagerRetriever followerRetriever=jobManagerRetrievers[followerIndex];
+    waitForLeaderNotification(jobManager[leaderIndex].path().toString(),leadingRetriever,deadline);
+    waitForLeaderNotification(AkkaUtils.getAkkaURL(leadingSystem,jobManager[leaderIndex]),followerRetriever,deadline);
+    try (HttpTestClient leaderClient=new HttpTestClient("localhost",leadingWebMonitor.getServerPort());HttpTestClient followingClient=new HttpTestClient("localhost",followerWebMonitor.getServerPort())){
+      String expected=new Scanner(new File(mainResourcesPath + "/index.html")).useDelimiter("\\A").next();
+      leaderClient.sendGetRequest("index.html",deadline.timeLeft());
+      HttpTestClient.SimpleHttpResponse response=leaderClient.getNextResponse(deadline.timeLeft());
+      assertEquals(HttpResponseStatus.OK,response.getStatus());
+      assertEquals(response.getType(),MimeTypes.getMimeTypeForExtension("html"));
+      assertEquals(expected,response.getContent());
+      followingClient.sendGetRequest("index.html",deadline.timeLeft());
+      response=followingClient.getNextResponse(deadline.timeLeft());
+      assertEquals(HttpResponseStatus.TEMPORARY_REDIRECT,response.getStatus());
+      assertTrue(response.getLocation().contains(String.valueOf(leadingWebMonitor.getServerPort())));
+      leadingSystem.shutdown();
+      waitForLeaderNotification(jobManager[followerIndex].path().toString(),followerRetriever,deadline);
+      followingClient.sendGetRequest("index.html",deadline.timeLeft());
+      response=followingClient.getNextResponse(deadline.timeLeft());
+      assertEquals(HttpResponseStatus.OK,response.getStatus());
+      assertEquals(response.getType(),MimeTypes.getMimeTypeForExtension("html"));
+      assertEquals(expected,response.getContent());
+      followingClient.sendGetRequest("/overview",deadline.timeLeft());
+      response=followingClient.getNextResponse(deadline.timeLeft());
+      assertEquals(HttpResponseStatus.OK,response.getStatus());
+      assertEquals("application/json; charset=UTF-8",response.getType());
+      assertTrue(response.getContent().contains("\"taskmanagers\":1") || response.getContent().contains("\"taskmanagers\":0"));
+    }
+  finally {
+      lrs.stop();
+    }
+  }
+  finally {
+    for (    ActorSystem system : jobManagerSystem) {
+      if (system != null) {
+        system.shutdown();
+      }
+    }
+    for (    WebMonitor monitor : webMonitor) {
+      monitor.stop();
+    }
+    if (highAvailabilityServices != null) {
+      highAvailabilityServices.closeAndCleanupAllData();
+    }
+  }
+}

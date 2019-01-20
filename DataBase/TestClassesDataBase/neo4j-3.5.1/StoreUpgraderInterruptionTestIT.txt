@@ -1,0 +1,102 @@
+@RunWith(Parameterized.class) public class StoreUpgraderInterruptionTestIT {
+  private final TestDirectory directory=TestDirectory.testDirectory();
+  private final DefaultFileSystemRule fileSystemRule=new DefaultFileSystemRule();
+  private final PageCacheRule pageCacheRule=new PageCacheRule();
+  @Rule public RuleChain ruleChain=RuleChain.outerRule(directory).around(fileSystemRule).around(pageCacheRule);
+  @Parameterized.Parameter public String version;
+  private static final Config CONFIG=Config.defaults(GraphDatabaseSettings.pagecache_memory,"8m");
+  @Parameters(name="{0}") public static Collection<String> versions(){
+    return Collections.singletonList(StandardV2_3.STORE_VERSION);
+  }
+  private final FileSystemAbstraction fs=fileSystemRule.get();
+  private JobScheduler jobScheduler;
+  private DatabaseLayout workingDatabaseLayout;
+  private File prepareDirectory;
+  @Before public void setUpLabelScanStore(){
+    jobScheduler=new ThreadPoolJobScheduler();
+    workingDatabaseLayout=directory.databaseLayout();
+    prepareDirectory=directory.directory("prepare");
+  }
+  @After public void tearDown() throws Exception {
+    jobScheduler.close();
+  }
+  @Test public void shouldSucceedWithUpgradeAfterPreviousAttemptDiedDuringMigration() throws IOException, ConsistencyCheckIncompleteException {
+    MigrationTestUtils.prepareSampleLegacyDatabase(version,fs,workingDatabaseLayout.databaseDirectory(),prepareDirectory);
+    PageCache pageCache=pageCacheRule.getPageCache(fs);
+    StoreVersionCheck check=new StoreVersionCheck(pageCache);
+    UpgradableDatabase upgradableDatabase=getUpgradableDatabase(check);
+    SilentMigrationProgressMonitor progressMonitor=new SilentMigrationProgressMonitor();
+    LogService logService=NullLogService.getInstance();
+    StoreMigrator failingStoreMigrator=new StoreMigrator(fs,pageCache,CONFIG,logService,jobScheduler){
+      @Override public void migrate(      DatabaseLayout directoryLayout,      DatabaseLayout migrationLayout,      ProgressReporter progressReporter,      String versionToMigrateFrom,      String versionToMigrateTo) throws IOException {
+        super.migrate(directoryLayout,migrationLayout,progressReporter,versionToMigrateFrom,versionToMigrateTo);
+        throw new RuntimeException("This upgrade is failing");
+      }
+    }
+;
+    try {
+      newUpgrader(upgradableDatabase,pageCache,progressMonitor,createIndexMigrator(),failingStoreMigrator).migrateIfNeeded(workingDatabaseLayout);
+      fail("Should throw exception");
+    }
+ catch (    RuntimeException e) {
+      assertEquals("This upgrade is failing",e.getMessage());
+    }
+    progressMonitor=new SilentMigrationProgressMonitor();
+    StoreMigrator migrator=new StoreMigrator(fs,pageCache,CONFIG,logService,jobScheduler);
+    SchemaIndexMigrator indexMigrator=createIndexMigrator();
+    newUpgrader(upgradableDatabase,pageCache,progressMonitor,indexMigrator,migrator).migrateIfNeeded(workingDatabaseLayout);
+    assertTrue(checkNeoStoreHasDefaultFormatVersion(check,workingDatabaseLayout));
+    startStopDatabase(workingDatabaseLayout.databaseDirectory());
+    assertConsistentStore(workingDatabaseLayout);
+  }
+  private UpgradableDatabase getUpgradableDatabase(  StoreVersionCheck check) throws IOException {
+    VersionAwareLogEntryReader<ReadableClosablePositionAwareChannel> logEntryReader=new VersionAwareLogEntryReader<>();
+    LogFiles logFiles=LogFilesBuilder.logFilesBasedOnlyBuilder(workingDatabaseLayout.databaseDirectory(),fs).build();
+    LogTailScanner tailScanner=new LogTailScanner(logFiles,logEntryReader,new Monitors());
+    return new UpgradableDatabase(check,Standard.LATEST_RECORD_FORMATS,tailScanner);
+  }
+  private SchemaIndexMigrator createIndexMigrator(){
+    return new SchemaIndexMigrator(fs,IndexProvider.EMPTY);
+  }
+  @Test public void shouldSucceedWithUpgradeAfterPreviousAttemptDiedDuringMovingFiles() throws IOException, ConsistencyCheckIncompleteException {
+    MigrationTestUtils.prepareSampleLegacyDatabase(version,fs,workingDatabaseLayout.databaseDirectory(),prepareDirectory);
+    PageCache pageCache=pageCacheRule.getPageCache(fs);
+    StoreVersionCheck check=new StoreVersionCheck(pageCache);
+    UpgradableDatabase upgradableDatabase=getUpgradableDatabase(check);
+    SilentMigrationProgressMonitor progressMonitor=new SilentMigrationProgressMonitor();
+    LogService logService=NullLogService.getInstance();
+    StoreMigrator failingStoreMigrator=new StoreMigrator(fs,pageCache,CONFIG,logService,jobScheduler){
+      @Override public void moveMigratedFiles(      DatabaseLayout migrationLayout,      DatabaseLayout directoryLayout,      String versionToUpgradeFrom,      String versionToMigrateTo) throws IOException {
+        super.moveMigratedFiles(migrationLayout,directoryLayout,versionToUpgradeFrom,versionToMigrateTo);
+        throw new RuntimeException("This upgrade is failing");
+      }
+    }
+;
+    try {
+      newUpgrader(upgradableDatabase,pageCache,progressMonitor,createIndexMigrator(),failingStoreMigrator).migrateIfNeeded(workingDatabaseLayout);
+      fail("Should throw exception");
+    }
+ catch (    RuntimeException e) {
+      assertEquals("This upgrade is failing",e.getMessage());
+    }
+    assertTrue(checkNeoStoreHasDefaultFormatVersion(check,workingDatabaseLayout));
+    progressMonitor=new SilentMigrationProgressMonitor();
+    StoreMigrator migrator=new StoreMigrator(fs,pageCache,CONFIG,logService,jobScheduler);
+    newUpgrader(upgradableDatabase,pageCache,progressMonitor,createIndexMigrator(),migrator).migrateIfNeeded(workingDatabaseLayout);
+    assertTrue(checkNeoStoreHasDefaultFormatVersion(check,workingDatabaseLayout));
+    pageCache.close();
+    startStopDatabase(workingDatabaseLayout.databaseDirectory());
+    assertConsistentStore(workingDatabaseLayout);
+  }
+  private StoreUpgrader newUpgrader(  UpgradableDatabase upgradableDatabase,  PageCache pageCache,  MigrationProgressMonitor progressMonitor,  SchemaIndexMigrator indexMigrator,  StoreMigrator migrator){
+    Config allowUpgrade=Config.defaults(GraphDatabaseSettings.allow_upgrade,"true");
+    StoreUpgrader upgrader=new StoreUpgrader(upgradableDatabase,progressMonitor,allowUpgrade,fs,pageCache,NullLogProvider.getInstance());
+    upgrader.addParticipant(indexMigrator);
+    upgrader.addParticipant(migrator);
+    return upgrader;
+  }
+  private static void startStopDatabase(  File storeDir){
+    GraphDatabaseService databaseService=new TestGraphDatabaseFactory().newEmbeddedDatabaseBuilder(storeDir).setConfig(GraphDatabaseSettings.allow_upgrade,"true").newGraphDatabase();
+    databaseService.shutdown();
+  }
+}

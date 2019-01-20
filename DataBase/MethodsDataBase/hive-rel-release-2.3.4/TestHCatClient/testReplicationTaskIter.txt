@@ -1,0 +1,130 @@
+/** 
+ * Test for event-based replication scenario Does not test if replication actually happened, merely tests if we're able to consume a repl task iter appropriately, calling all the functions expected of the interface, without errors.
+ */
+@Test public void testReplicationTaskIter() throws Exception {
+  Configuration cfg=new Configuration(hcatConf);
+  cfg.set(HiveConf.ConfVars.METASTORE_BATCH_RETRIEVE_MAX.varname,"10");
+  cfg.set(HiveConf.ConfVars.HIVE_REPL_TASK_FACTORY.varname,EximReplicationTaskFactory.class.getName());
+  HCatClient sourceMetastore=HCatClient.create(cfg);
+  String dbName="testReplicationTaskIter";
+  long baseId=sourceMetastore.getCurrentNotificationEventId();
+{
+    sourceMetastore.dropDatabase(dbName,true,HCatClient.DropDBMode.CASCADE);
+    sourceMetastore.createDatabase(HCatCreateDBDesc.create(dbName).ifNotExists(false).build());
+    String tblName1="T1";
+    List<HCatFieldSchema> cols1=HCatSchemaUtils.getHCatSchema("a:int,b:string").getFields();
+    HCatTable table1=(new HCatTable(dbName,tblName1)).cols(cols1);
+    sourceMetastore.createTable(HCatCreateTableDesc.create(table1).build());
+    String tblName2="T2";
+    List<HCatFieldSchema> cols2=HCatSchemaUtils.getHCatSchema("a:int").getFields();
+    List<HCatFieldSchema> pcols2=HCatSchemaUtils.getHCatSchema("b:string").getFields();
+    HCatTable table2=(new HCatTable(dbName,tblName2)).cols(cols2).partCols(pcols2);
+    sourceMetastore.createTable(HCatCreateTableDesc.create(table2).build());
+    HCatTable table2Created=sourceMetastore.getTable(dbName,tblName2);
+    Map<String,String> ptnDesc1=new HashMap<String,String>();
+    ptnDesc1.put("b","test1");
+    HCatPartition ptn1=(new HCatPartition(table2Created,ptnDesc1,makePartLocation(table2Created,ptnDesc1)));
+    sourceMetastore.addPartition(HCatAddPartitionDesc.create(ptn1).build());
+    for (int i=0; i < 20; i++) {
+      Map<String,String> ptnDesc=new HashMap<String,String>();
+      ptnDesc.put("b","testmul" + i);
+      HCatPartition ptn=(new HCatPartition(table2Created,ptnDesc,makePartLocation(table2Created,ptnDesc)));
+      sourceMetastore.addPartition(HCatAddPartitionDesc.create(ptn).build());
+      sourceMetastore.dropPartitions(dbName,tblName2,ptnDesc,true);
+    }
+    sourceMetastore.dropTable(dbName,tblName1,true);
+    sourceMetastore.dropTable(dbName,tblName2,true);
+    long currId=sourceMetastore.getCurrentNotificationEventId();
+    assertTrue("currId[" + currId + "] must be more than 25 greater than baseId["+ baseId+ "]",currId > baseId + 25);
+  }
+  List<HCatNotificationEvent> notifs=sourceMetastore.getNextNotification(0,0,new IMetaStoreClient.NotificationFilter(){
+    @Override public boolean accept(    NotificationEvent event){
+      return true;
+    }
+  }
+);
+  for (  HCatNotificationEvent n : notifs) {
+    LOG.info("notif from dblistener:" + n.getEventId() + ":"+ n.getEventTime()+ ",t:"+ n.getEventType()+ ",o:"+ n.getDbName()+ "."+ n.getTableName());
+  }
+  Iterator<ReplicationTask> taskIter=sourceMetastore.getReplicationTasks(0,-1,dbName,null);
+  while (taskIter.hasNext()) {
+    ReplicationTask task=taskIter.next();
+    HCatNotificationEvent n=task.getEvent();
+    LOG.info("notif from tasks:" + n.getEventId() + ":"+ n.getEventTime()+ ",t:"+ n.getEventType()+ ",o:"+ n.getDbName()+ "."+ n.getTableName()+ ",s:"+ n.getEventScope());
+    LOG.info("task :" + task.getClass().getName());
+    if (task.needsStagingDirs()) {
+      StagingDirectoryProvider provider=new StagingDirectoryProvider(){
+        @Override public String getStagingDirectory(        String key){
+          LOG.info("getStagingDirectory(" + key + ") called!");
+          return "/tmp/" + key.replaceAll(" ","_");
+        }
+      }
+;
+      task.withSrcStagingDirProvider(provider).withDstStagingDirProvider(provider);
+    }
+    if (task.isActionable()) {
+      LOG.info("task was actionable!");
+      Function<Command,String> commandDebugPrinter=new Function<Command,String>(){
+        @Override public String apply(        @Nullable Command cmd){
+          StringBuilder sb=new StringBuilder();
+          String serializedCmd=null;
+          try {
+            serializedCmd=ReplicationUtils.serializeCommand(cmd);
+          }
+ catch (          IOException e) {
+            e.printStackTrace();
+            throw new RuntimeException(e);
+          }
+          sb.append("SERIALIZED:" + serializedCmd + "\n");
+          Command command=null;
+          try {
+            command=ReplicationUtils.deserializeCommand(serializedCmd);
+          }
+ catch (          IOException e) {
+            e.printStackTrace();
+            throw new RuntimeException(e);
+          }
+          sb.append("CMD:[" + command.getClass().getName() + "]\n");
+          sb.append("EVENTID:[" + command.getEventId() + "]\n");
+          for (          String s : command.get()) {
+            sb.append("CMD:" + s);
+            sb.append("\n");
+          }
+          sb.append("Retriable:" + command.isRetriable() + "\n");
+          sb.append("Undoable:" + command.isUndoable() + "\n");
+          if (command.isUndoable()) {
+            for (            String s : command.getUndo()) {
+              sb.append("UNDO:" + s);
+              sb.append("\n");
+            }
+          }
+          List<String> locns=command.cleanupLocationsPerRetry();
+          sb.append("cleanupLocationsPerRetry entries :" + locns.size());
+          for (          String s : locns) {
+            sb.append("RETRY_CLEANUP:" + s);
+            sb.append("\n");
+          }
+          locns=command.cleanupLocationsAfterEvent();
+          sb.append("cleanupLocationsAfterEvent entries :" + locns.size());
+          for (          String s : locns) {
+            sb.append("AFTER_EVENT_CLEANUP:" + s);
+            sb.append("\n");
+          }
+          return sb.toString();
+        }
+      }
+;
+      LOG.info("On src:");
+      for (      String s : Iterables.transform(task.getSrcWhCommands(),commandDebugPrinter)) {
+        LOG.info(s);
+      }
+      LOG.info("On dest:");
+      for (      String s : Iterables.transform(task.getDstWhCommands(),commandDebugPrinter)) {
+        LOG.info(s);
+      }
+    }
+ else {
+      LOG.info("task was not actionable.");
+    }
+  }
+}

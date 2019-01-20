@@ -1,0 +1,83 @@
+@Category({RegionServerTests.class,SmallTests.class}) public class TestWideScanner extends HBaseTestCase {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestWideScanner.class);
+  private static final Logger LOG=LoggerFactory.getLogger(TestWideScanner.class);
+  static final byte[] A=Bytes.toBytes("A");
+  static final byte[] B=Bytes.toBytes("B");
+  static final byte[] C=Bytes.toBytes("C");
+  static byte[][] COLUMNS={A,B,C};
+  static final Random rng=new Random();
+  static final HTableDescriptor TESTTABLEDESC=new HTableDescriptor(TableName.valueOf("testwidescan"));
+static {
+    for (    byte[] cfName : new byte[][]{A,B,C}) {
+      TESTTABLEDESC.addFamily(new HColumnDescriptor(cfName).setMaxVersions(100).setBlocksize(8 * 1024));
+    }
+  }
+  /** 
+ * HRegionInfo for root region 
+ */
+  HRegion r;
+  private int addWideContent(  HRegion region) throws IOException {
+    int count=0;
+    for (char c='a'; c <= 'c'; c++) {
+      byte[] row=Bytes.toBytes("ab" + c);
+      int i, j;
+      long ts=System.currentTimeMillis();
+      for (i=0; i < 100; i++) {
+        byte[] b=Bytes.toBytes(String.format("%10d",i));
+        for (j=0; j < 100; j++) {
+          Put put=new Put(row);
+          put.setDurability(Durability.SKIP_WAL);
+          long ts1=++ts;
+          put.addColumn(COLUMNS[rng.nextInt(COLUMNS.length)],b,ts1,b);
+          region.put(put);
+          count++;
+        }
+      }
+    }
+    return count;
+  }
+  @Test public void testWideScanBatching() throws IOException {
+    final int batch=256;
+    try {
+      this.r=createNewHRegion(TESTTABLEDESC,null,null);
+      int inserted=addWideContent(this.r);
+      List<Cell> results=new ArrayList<>();
+      Scan scan=new Scan();
+      scan.addFamily(A);
+      scan.addFamily(B);
+      scan.addFamily(C);
+      scan.setMaxVersions(100);
+      scan.setBatch(batch);
+      InternalScanner s=r.getScanner(scan);
+      int total=0;
+      int i=0;
+      boolean more;
+      do {
+        more=s.next(results);
+        i++;
+        LOG.info("iteration #" + i + ", results.size="+ results.size());
+        assertTrue(results.size() <= batch);
+        total+=results.size();
+        if (results.size() > 0) {
+          byte[] row=CellUtil.cloneRow(results.get(0));
+          for (          Cell kv : results) {
+            assertTrue(Bytes.equals(row,CellUtil.cloneRow(kv)));
+          }
+        }
+        results.clear();
+        Iterator<KeyValueScanner> scanners=((HRegion.RegionScannerImpl)s).storeHeap.getHeap().iterator();
+        while (scanners.hasNext()) {
+          StoreScanner ss=(StoreScanner)scanners.next();
+          ss.updateReaders(Collections.EMPTY_LIST,Collections.EMPTY_LIST);
+        }
+      }
+ while (more);
+      LOG.info("inserted " + inserted + ", scanned "+ total);
+      assertEquals(total,inserted);
+      s.close();
+    }
+  finally {
+      HBaseTestingUtility.closeRegionAndWAL(this.r);
+    }
+  }
+}

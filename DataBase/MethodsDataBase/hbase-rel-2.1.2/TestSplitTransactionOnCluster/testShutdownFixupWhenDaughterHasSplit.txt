@@ -1,0 +1,73 @@
+/** 
+ * Test that if daughter split on us, we won't do the shutdown handler fixup just because we can't find the immediate daughter of an offlined parent.
+ * @throws IOException
+ * @throws InterruptedException
+ */
+@Test public void testShutdownFixupWhenDaughterHasSplit() throws IOException, InterruptedException {
+  final TableName tableName=TableName.valueOf(name.getMethodName());
+  Table t=createTableAndWait(tableName,HConstants.CATALOG_FAMILY);
+  List<HRegion> regions=cluster.getRegions(tableName);
+  RegionInfo hri=getAndCheckSingleTableRegion(regions);
+  int tableRegionIndex=ensureTableRegionNotOnSameServerAsMeta(admin,hri);
+  this.admin.setBalancerRunning(false,true);
+  cluster.getMaster().setCatalogJanitorEnabled(false);
+  try {
+    TESTING_UTIL.loadTable(t,HConstants.CATALOG_FAMILY);
+    HRegionServer server=cluster.getRegionServer(tableRegionIndex);
+    printOutRegions(server,"Initial regions: ");
+    int regionCount=cluster.getRegions(hri.getTable()).size();
+    split(hri,server,regionCount);
+    List<HRegion> daughters=checkAndGetDaughters(tableName);
+    regionCount=cluster.getRegions(hri.getTable()).size();
+    RegionInfo daughter=daughters.get(0).getRegionInfo();
+    LOG.info("Daughter we are going to split: " + daughter);
+    this.admin.compactRegion(daughter.getRegionName());
+    RetryCounter retrier=new RetryCounter(30,1,TimeUnit.SECONDS);
+    while (CompactionState.NONE != admin.getCompactionStateForRegion(daughter.getRegionName()) && retrier.shouldRetry()) {
+      retrier.sleepUntilNextRetry();
+    }
+    daughters=cluster.getRegions(tableName);
+    HRegion daughterRegion=null;
+    for (    HRegion r : daughters) {
+      if (RegionInfo.COMPARATOR.compare(r.getRegionInfo(),daughter) == 0) {
+        daughterRegion=r;
+        r.getStores().get(0).closeAndArchiveCompactedFiles();
+        LOG.info("Found matching HRI: " + daughterRegion);
+        break;
+      }
+    }
+    assertTrue(daughterRegion != null);
+    for (int i=0; i < 100; i++) {
+      if (!daughterRegion.hasReferences())       break;
+      Threads.sleep(100);
+    }
+    assertFalse("Waiting for reference to be compacted",daughterRegion.hasReferences());
+    LOG.info("Daughter hri before split (has been compacted): " + daughter);
+    split(daughter,server,regionCount);
+    daughters=cluster.getRegions(tableName);
+    for (    HRegion d : daughters) {
+      LOG.info("Regions before crash: " + d);
+    }
+    cluster.abortRegionServer(tableRegionIndex);
+    waitUntilRegionServerDead();
+    awaitDaughters(tableName,daughters.size());
+    regions=cluster.getRegions(tableName);
+    for (    HRegion d : daughters) {
+      LOG.info("Regions after crash: " + d);
+    }
+    if (daughters.size() != regions.size()) {
+      LOG.info("Daughters=" + daughters.size() + ", regions="+ regions.size());
+    }
+    assertEquals(daughters.size(),regions.size());
+    for (    HRegion r : regions) {
+      LOG.info("Regions post crash " + r + ", contains="+ daughters.contains(r));
+      assertTrue("Missing region post crash " + r,daughters.contains(r));
+    }
+  }
+  finally {
+    LOG.info("EXITING");
+    admin.setBalancerRunning(true,false);
+    cluster.getMaster().setCatalogJanitorEnabled(true);
+    t.close();
+  }
+}

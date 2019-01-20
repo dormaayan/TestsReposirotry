@@ -1,0 +1,89 @@
+private static class TestUnicastZenPing extends UnicastZenPing {
+  TestUnicastZenPing(  Settings settings,  ThreadPool threadPool,  NetworkHandle networkHandle,  PingContextProvider contextProvider){
+    super(Settings.builder().put("node.name",networkHandle.node.getName()).put(settings).build(),threadPool,networkHandle.transportService,new SettingsBasedHostsProvider(settings,networkHandle.transportService),contextProvider);
+  }
+  volatile CountDownLatch allTasksCompleted;
+  volatile AtomicInteger pendingTasks;
+  volatile CountDownLatch pingingRoundClosed;
+  PingCollection pingAndWait() throws ExecutionException, InterruptedException {
+    allTasksCompleted=new CountDownLatch(1);
+    pingingRoundClosed=new CountDownLatch(1);
+    pendingTasks=new AtomicInteger();
+    markTaskAsStarted("send pings");
+    markTaskAsStarted("send pings");
+    markTaskAsStarted("send pings");
+    final AtomicReference<PingCollection> response=new AtomicReference<>();
+    ping(response::set,TimeValue.timeValueMillis(1),TimeValue.timeValueSeconds(1));
+    pingingRoundClosed.await();
+    final PingCollection result=response.get();
+    assertNotNull("pinging didn't complete",result);
+    return result;
+  }
+  @Override protected void finishPingingRound(  PingingRound pingingRound){
+    try {
+      allTasksCompleted.await();
+    }
+ catch (    InterruptedException e) {
+    }
+    super.finishPingingRound(pingingRound);
+    pingingRoundClosed.countDown();
+  }
+  @Override protected void sendPings(  TimeValue timeout,  PingingRound pingingRound){
+    super.sendPings(timeout,pingingRound);
+    markTaskAsCompleted("send pings");
+  }
+  @Override protected void submitToExecutor(  AbstractRunnable abstractRunnable){
+    markTaskAsStarted("executor runnable");
+    super.submitToExecutor(new AbstractRunnable(){
+      @Override public void onRejection(      Exception e){
+        try {
+          super.onRejection(e);
+        }
+  finally {
+          markTaskAsCompleted("executor runnable (rejected)");
+        }
+      }
+      @Override public void onAfter(){
+        markTaskAsCompleted("executor runnable");
+      }
+      @Override protected void doRun() throws Exception {
+        abstractRunnable.run();
+      }
+      @Override public void onFailure(      Exception e){
+        throw new AssertionError("unexpected error",e);
+      }
+    }
+);
+  }
+  private void markTaskAsStarted(  String task){
+    logger.trace("task [{}] started. count [{}]",task,pendingTasks.incrementAndGet());
+  }
+  private void markTaskAsCompleted(  String task){
+    final int left=pendingTasks.decrementAndGet();
+    logger.trace("task [{}] completed. count [{}]",task,left);
+    if (left == 0) {
+      allTasksCompleted.countDown();
+    }
+  }
+  @Override protected TransportResponseHandler<UnicastPingResponse> getPingResponseHandler(  PingingRound pingingRound,  DiscoveryNode node){
+    markTaskAsStarted("ping [" + node + "]");
+    TransportResponseHandler<UnicastPingResponse> original=super.getPingResponseHandler(pingingRound,node);
+    return new TransportResponseHandler<UnicastPingResponse>(){
+      @Override public UnicastPingResponse read(      StreamInput in) throws IOException {
+        return original.read(in);
+      }
+      @Override public void handleResponse(      UnicastPingResponse response){
+        original.handleResponse(response);
+        markTaskAsCompleted("ping [" + node + "]");
+      }
+      @Override public void handleException(      TransportException exp){
+        original.handleException(exp);
+        markTaskAsCompleted("ping [" + node + "] (error)");
+      }
+      @Override public String executor(){
+        return original.executor();
+      }
+    }
+;
+  }
+}

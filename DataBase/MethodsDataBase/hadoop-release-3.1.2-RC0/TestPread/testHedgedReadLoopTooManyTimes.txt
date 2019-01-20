@@ -1,0 +1,66 @@
+@Test public void testHedgedReadLoopTooManyTimes() throws IOException {
+  Configuration conf=new Configuration();
+  int numHedgedReadPoolThreads=5;
+  final int hedgedReadTimeoutMillis=50;
+  conf.setInt(HdfsClientConfigKeys.HedgedRead.THREADPOOL_SIZE_KEY,numHedgedReadPoolThreads);
+  conf.setLong(HdfsClientConfigKeys.HedgedRead.THRESHOLD_MILLIS_KEY,hedgedReadTimeoutMillis);
+  conf.setInt(HdfsClientConfigKeys.Retry.WINDOW_BASE_KEY,0);
+  DFSClientFaultInjector.set(Mockito.mock(DFSClientFaultInjector.class));
+  DFSClientFaultInjector injector=DFSClientFaultInjector.get();
+  final int sleepMs=100;
+  Mockito.doAnswer(new Answer<Void>(){
+    @Override public Void answer(    InvocationOnMock invocation) throws Throwable {
+      if (true) {
+        Thread.sleep(hedgedReadTimeoutMillis + sleepMs);
+        if (DFSClientFaultInjector.exceptionNum.compareAndSet(0,1)) {
+          System.out.println("-------------- throw Checksum Exception");
+          throw new ChecksumException("ChecksumException test",100);
+        }
+      }
+      return null;
+    }
+  }
+).when(injector).fetchFromDatanodeException();
+  Mockito.doAnswer(new Answer<Void>(){
+    @Override public Void answer(    InvocationOnMock invocation) throws Throwable {
+      if (true) {
+        Thread.sleep(sleepMs * 2);
+      }
+      return null;
+    }
+  }
+).when(injector).readFromDatanodeDelay();
+  MiniDFSCluster cluster=new MiniDFSCluster.Builder(conf).numDataNodes(2).format(true).build();
+  DistributedFileSystem fileSys=cluster.getFileSystem();
+  DFSClient dfsClient=fileSys.getClient();
+  FSDataOutputStream output=null;
+  DFSInputStream input=null;
+  String filename="/hedgedReadMaxOut.dat";
+  try {
+    Path file=new Path(filename);
+    output=fileSys.create(file,(short)2);
+    byte[] data=new byte[64 * 1024];
+    output.write(data);
+    output.flush();
+    output.write(data);
+    output.flush();
+    output.write(data);
+    output.flush();
+    output.close();
+    byte[] buffer=new byte[64 * 1024];
+    input=dfsClient.open(filename);
+    input.read(0,buffer,0,1024);
+    input.close();
+    assertEquals(3,input.getHedgedReadOpsLoopNumForTesting());
+  }
+ catch (  BlockMissingException e) {
+    assertTrue(false);
+  }
+ finally {
+    Mockito.reset(injector);
+    IOUtils.cleanup(null,input);
+    IOUtils.cleanup(null,output);
+    fileSys.close();
+    cluster.shutdown();
+  }
+}

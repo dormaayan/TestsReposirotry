@@ -1,0 +1,188 @@
+/** 
+ * Abstract base class for tests against checkpointing streams.
+ */
+public abstract class AbstractCheckpointStateOutputStreamTestBase extends TestLogger {
+  @Rule public final TemporaryFolder tmp=new TemporaryFolder();
+  /** 
+ * Validates that even empty streams create a file and a file state handle.
+ */
+  @Test public void testEmptyState() throws Exception {
+    final FileSystem fs=FileSystem.getLocalFileSystem();
+    final Path folder=baseFolder();
+    final String fileName="myFileName";
+    final Path filePath=new Path(folder,fileName);
+    final FileStateHandle handle;
+    try (FSDataOutputStream stream=createTestStream(fs,folder,fileName)){
+      handle=closeAndGetResult(stream);
+    }
+     assertNotNull(handle);
+    assertEquals(filePath,handle.getFilePath());
+    assertTrue(fs.exists(handle.getFilePath()));
+    assertFalse(fs.getFileStatus(filePath).isDir());
+    try (FSDataInputStream in=handle.openInputStream()){
+      assertEquals(-1,in.read());
+    }
+   }
+  /** 
+ * Simple write and read test
+ */
+  @Test public void testWriteAndRead() throws Exception {
+    final FileSystem fs=FileSystem.getLocalFileSystem();
+    final Path folder=baseFolder();
+    final String fileName="fooBarName";
+    final Random rnd=new Random();
+    final byte[] data=new byte[1694523];
+    final FileStateHandle handle;
+    try (FSDataOutputStream stream=createTestStream(fs,folder,fileName)){
+      for (int i=0; i < data.length; ) {
+        if (rnd.nextBoolean()) {
+          stream.write(data[i++]);
+        }
+ else {
+          int len=rnd.nextInt(Math.min(data.length - i,32));
+          stream.write(data,i,len);
+          i+=len;
+        }
+      }
+      handle=closeAndGetResult(stream);
+    }
+     try (FSDataInputStream in=handle.openInputStream()){
+      byte[] buffer=new byte[data.length];
+      readFully(in,buffer);
+      assertArrayEquals(data,buffer);
+    }
+     try (FSDataInputStream in=fs.open(handle.getFilePath())){
+      byte[] buffer=new byte[data.length];
+      readFully(in,buffer);
+      assertArrayEquals(data,buffer);
+    }
+   }
+  /** 
+ * Tests that the underlying stream file is deleted upon calling close.
+ */
+  @Test public void testCleanupWhenClosingStream() throws IOException {
+    final FileSystem fs=FileSystem.getLocalFileSystem();
+    final Path folder=new Path(tmp.newFolder().toURI());
+    final String fileName="nonCreativeTestFileName";
+    final Path path=new Path(folder,fileName);
+    try (FSDataOutputStream stream=createTestStream(fs,folder,fileName)){
+      Random rnd=new Random();
+      for (int i=0; i < rnd.nextInt(1000); i++) {
+        stream.write(rnd.nextInt(100));
+      }
+      assertTrue(fs.exists(path));
+    }
+     assertFalse(fs.exists(path));
+  }
+  /** 
+ * Tests that the underlying stream file is deleted if the closeAndGetHandle method fails.
+ */
+  @Test public void testCleanupWhenFailingCloseAndGetHandle() throws IOException {
+    final Path folder=new Path(tmp.newFolder().toURI());
+    final String fileName="test_name";
+    final Path filePath=new Path(folder,fileName);
+    final FileSystem fs=spy(new TestFs((path) -> new FailingCloseStream(new File(path.getPath()))));
+    FSDataOutputStream stream=createTestStream(fs,folder,fileName);
+    stream.write(new byte[]{1,2,3,4,5});
+    try {
+      closeAndGetResult(stream);
+      fail("Expected IOException");
+    }
+ catch (    IOException ignored) {
+    }
+    verify(fs).delete(filePath,false);
+  }
+  /** 
+ * This test validates that a close operation can happen even while a 'closeAndGetHandle()' call is in progress. <p> <p>That behavior is essential for fast cancellation (concurrent cleanup).
+ */
+  @Test public void testCloseDoesNotLock() throws Exception {
+    final Path folder=new Path(tmp.newFolder().toURI());
+    final String fileName="this-is-ignored-anyways.file";
+    final FileSystem fileSystem=spy(new TestFs((path) -> new BlockerStream()));
+    final FSDataOutputStream checkpointStream=createTestStream(fileSystem,folder,fileName);
+    final OneShotLatch sync=new OneShotLatch();
+    final CheckedThread thread=new CheckedThread(){
+      @Override public void go() throws Exception {
+        sync.trigger();
+        closeAndGetResult(checkpointStream);
+      }
+    }
+;
+    thread.start();
+    sync.await();
+    checkpointStream.close();
+    try {
+      thread.sync();
+    }
+ catch (    IOException ignored) {
+    }
+  }
+  /** 
+ * Creates a new test stream instance.
+ */
+  protected abstract FSDataOutputStream createTestStream(  FileSystem fs,  Path dir,  String fileName) throws IOException ;
+  /** 
+ * Closes the stream successfully and returns a FileStateHandle to the result.
+ */
+  protected abstract FileStateHandle closeAndGetResult(  FSDataOutputStream stream) throws IOException ;
+  private Path baseFolder() throws Exception {
+    return new Path(new File(tmp.newFolder(),UUID.randomUUID().toString()).toURI());
+  }
+  private static void readFully(  InputStream in,  byte[] buffer) throws IOException {
+    int pos=0;
+    int remaining=buffer.length;
+    while (remaining > 0) {
+      int read=in.read(buffer,pos,remaining);
+      if (read == -1) {
+        throw new EOFException();
+      }
+      pos+=read;
+      remaining-=read;
+    }
+  }
+private static class BlockerStream extends FSDataOutputStream {
+    private final OneShotLatch blocker=new OneShotLatch();
+    @Override public long getPos() throws IOException {
+      block();
+      return 0L;
+    }
+    @Override public void write(    int b) throws IOException {
+      block();
+    }
+    @Override public void flush() throws IOException {
+      block();
+    }
+    @Override public void sync() throws IOException {
+      block();
+    }
+    @Override public void close() throws IOException {
+      blocker.trigger();
+    }
+    private void block() throws IOException {
+      try {
+        blocker.await();
+      }
+ catch (      InterruptedException e) {
+        throw new IOException("interrupted");
+      }
+      throw new IOException("closed");
+    }
+  }
+private static class FailingCloseStream extends LocalDataOutputStream {
+    FailingCloseStream(    File file) throws IOException {
+      super(file);
+    }
+    @Override public void close() throws IOException {
+      throw new IOException();
+    }
+  }
+private static class TestFs extends LocalFileSystem {
+    private final FunctionWithException<Path,FSDataOutputStream,IOException> streamFactory;
+    TestFs(    FunctionWithException<Path,FSDataOutputStream,IOException> streamFactory){
+      this.streamFactory=streamFactory;
+    }
+    @Override public FSDataOutputStream create(    Path filePath,    WriteMode overwrite) throws IOException {
+      return streamFactory.apply(filePath);
+    }
+  }
+}

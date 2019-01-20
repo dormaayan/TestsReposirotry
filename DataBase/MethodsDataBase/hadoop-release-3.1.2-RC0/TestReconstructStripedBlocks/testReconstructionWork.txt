@@ -1,0 +1,42 @@
+@Test(timeout=120000) public void testReconstructionWork() throws Exception {
+  Configuration conf=new HdfsConfiguration();
+  conf.setLong(DFSConfigKeys.DFS_NAMENODE_MIN_BLOCK_SIZE_KEY,0);
+  conf.setLong(DFSConfigKeys.DFS_BLOCK_SIZE_KEY,1);
+  conf.setInt(DFSConfigKeys.DFS_BYTES_PER_CHECKSUM_KEY,1);
+  conf.setInt(DFSConfigKeys.DFS_HEARTBEAT_INTERVAL_KEY,1000);
+  conf.setInt(DFSConfigKeys.DFS_NAMENODE_REDUNDANCY_INTERVAL_SECONDS_KEY,1000);
+  conf.setInt(DFSConfigKeys.DFS_NAMENODE_REPLICATION_WORK_MULTIPLIER_PER_ITERATION,5);
+  ErasureCodingPolicy policy=SystemErasureCodingPolicies.getByID(SystemErasureCodingPolicies.XOR_2_1_POLICY_ID);
+  Path ecDir=new Path("/ec");
+  Path ecFilePath=new Path(ecDir,"ec-file");
+  int blockGroups=2;
+  int totalDataNodes=policy.getNumDataUnits() + policy.getNumParityUnits() + 1;
+  MiniDFSCluster dfsCluster=new MiniDFSCluster.Builder(conf).numDataNodes(totalDataNodes).build();
+  try {
+    final DistributedFileSystem fs=dfsCluster.getFileSystem();
+    fs.enableErasureCodingPolicy(policy.getName());
+    fs.mkdirs(ecDir);
+    fs.setErasureCodingPolicy(ecDir,policy.getName());
+    DFSTestUtil.createStripedFile(dfsCluster,ecFilePath,ecDir,blockGroups,2,false,policy);
+    final BlockManager bm=dfsCluster.getNamesystem().getBlockManager();
+    LocatedBlocks lbs=fs.getClient().getNamenode().getBlockLocations(ecFilePath.toString(),0,blockGroups);
+    assert lbs.get(0) instanceof LocatedStripedBlock;
+    LocatedStripedBlock bg=(LocatedStripedBlock)(lbs.get(0));
+    Iterator<DatanodeStorageInfo> storageInfos=bm.getStorages(bg.getBlock().getLocalBlock()).iterator();
+    DatanodeDescriptor firstDn=storageInfos.next().getDatanodeDescriptor();
+    BlockManagerTestUtil.updateState(bm);
+    DFSTestUtil.verifyClientStats(conf,dfsCluster);
+    bm.getDatanodeManager().removeDatanode(firstDn);
+    BlockManagerTestUtil.updateState(bm);
+    assertEquals(blockGroups,bm.getLowRedundancyECBlockGroups());
+    DFSTestUtil.verifyClientStats(conf,dfsCluster);
+    BlockManagerTestUtil.getComputedDatanodeWork(bm);
+    BlockManagerTestUtil.updateState(bm);
+    assertEquals(blockGroups,getNumberOfBlocksToBeErasureCoded(dfsCluster));
+    assertEquals(0,bm.getLowRedundancyECBlockGroups());
+    DFSTestUtil.verifyClientStats(conf,dfsCluster);
+  }
+  finally {
+    dfsCluster.shutdown();
+  }
+}

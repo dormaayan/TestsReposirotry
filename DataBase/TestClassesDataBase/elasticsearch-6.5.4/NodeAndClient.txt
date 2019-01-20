@@ -1,0 +1,141 @@
+private final class NodeAndClient implements Closeable {
+  private MockNode node;
+  private Client nodeClient;
+  private Client transportClient;
+  private final AtomicBoolean closed=new AtomicBoolean(false);
+  private final String name;
+  private final int nodeAndClientId;
+  NodeAndClient(  String name,  MockNode node,  int nodeAndClientId){
+    this.node=node;
+    this.name=name;
+    this.nodeAndClientId=nodeAndClientId;
+    markNodeDataDirsAsNotEligableForWipe(node);
+  }
+  Node node(){
+    if (closed.get()) {
+      throw new RuntimeException("already closed");
+    }
+    return node;
+  }
+  public int nodeAndClientId(){
+    return nodeAndClientId;
+  }
+  public String getName(){
+    return name;
+  }
+  public boolean isMasterEligible(){
+    return Node.NODE_MASTER_SETTING.get(node.settings());
+  }
+  Client client(  Random random){
+    if (closed.get()) {
+      throw new RuntimeException("already closed");
+    }
+    double nextDouble=random.nextDouble();
+    if (nextDouble < transportClientRatio) {
+      if (logger.isTraceEnabled()) {
+        logger.trace("Using transport client for node [{}] sniff: [{}]",node.settings().get("node.name"),false);
+      }
+      return getOrBuildTransportClient();
+    }
+ else {
+      return getOrBuildNodeClient();
+    }
+  }
+  Client nodeClient(){
+    if (closed.get()) {
+      throw new RuntimeException("already closed");
+    }
+    return getOrBuildNodeClient();
+  }
+  Client transportClient(){
+    if (closed.get()) {
+      throw new RuntimeException("already closed");
+    }
+    return getOrBuildTransportClient();
+  }
+  private Client getOrBuildNodeClient(){
+    if (nodeClient == null) {
+      nodeClient=node.client();
+    }
+    return clientWrapper.apply(nodeClient);
+  }
+  private Client getOrBuildTransportClient(){
+    if (transportClient == null) {
+      transportClient=new TransportClientFactory(false,nodeConfigurationSource.transportClientSettings(),baseDir,nodeConfigurationSource.transportClientPlugins()).client(node,clusterName);
+    }
+    return clientWrapper.apply(transportClient);
+  }
+  void resetClient() throws IOException {
+    if (closed.get() == false) {
+      Releasables.close(nodeClient,transportClient);
+      nodeClient=null;
+      transportClient=null;
+    }
+  }
+  void startNode(){
+    try {
+      node.start();
+    }
+ catch (    NodeValidationException e) {
+      throw new RuntimeException(e);
+    }
+  }
+  /** 
+ * closes the node and prepares it to be restarted
+ */
+  Settings closeForRestart(  RestartCallback callback,  int minMasterNodes) throws Exception {
+    assert callback != null;
+    close();
+    Settings callbackSettings=callback.onNodeStopped(name);
+    Settings.Builder newSettings=Settings.builder();
+    if (callbackSettings != null) {
+      newSettings.put(callbackSettings);
+    }
+    if (minMasterNodes >= 0) {
+      assert DISCOVERY_ZEN_MINIMUM_MASTER_NODES_SETTING.exists(newSettings.build()) == false : "min master nodes is auto managed";
+      newSettings.put(DISCOVERY_ZEN_MINIMUM_MASTER_NODES_SETTING.getKey(),minMasterNodes).build();
+    }
+    clearDataIfNeeded(callback);
+    return newSettings.build();
+  }
+  private void clearDataIfNeeded(  RestartCallback callback) throws IOException {
+    if (callback.clearData(name)) {
+      NodeEnvironment nodeEnv=node.getNodeEnvironment();
+      if (nodeEnv.hasNodeFile()) {
+        final Path[] locations=nodeEnv.nodeDataPaths();
+        logger.debug("removing node data paths: [{}]",Arrays.toString(locations));
+        IOUtils.rm(locations);
+      }
+    }
+  }
+  private void recreateNode(  final Settings newSettings,  final Runnable onTransportServiceStarted){
+    if (closed.get() == false) {
+      throw new IllegalStateException("node " + name + " should be closed before recreating it");
+    }
+    final long newIdSeed=NodeEnvironment.NODE_ID_SEED_SETTING.get(node.settings()) + 1;
+    Settings finalSettings=Settings.builder().put(node.originalSettings()).put(newSettings).put(NodeEnvironment.NODE_ID_SEED_SETTING.getKey(),newIdSeed).build();
+    if (DISCOVERY_ZEN_MINIMUM_MASTER_NODES_SETTING.exists(finalSettings) == false) {
+      throw new IllegalStateException(DISCOVERY_ZEN_MINIMUM_MASTER_NODES_SETTING.getKey() + " is not configured after restart of [" + name+ "]");
+    }
+    Collection<Class<? extends Plugin>> plugins=node.getClasspathPlugins();
+    node=new MockNode(finalSettings,plugins);
+    node.injector().getInstance(TransportService.class).addLifecycleListener(new LifecycleListener(){
+      @Override public void afterStart(){
+        onTransportServiceStarted.run();
+      }
+    }
+);
+    closed.set(false);
+    markNodeDataDirsAsNotEligableForWipe(node);
+  }
+  @Override public void close() throws IOException {
+    try {
+      resetClient();
+    }
+  finally {
+      closed.set(true);
+      markNodeDataDirsAsPendingForWipe(node);
+      node.close();
+    }
+  }
+}

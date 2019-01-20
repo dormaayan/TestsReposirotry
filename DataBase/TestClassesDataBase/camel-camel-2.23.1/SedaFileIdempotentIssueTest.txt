@@ -1,0 +1,56 @@
+/** 
+ */
+public class SedaFileIdempotentIssueTest extends ContextTestSupport {
+  private final CountDownLatch latch=new CountDownLatch(1);
+  private FileIdempotentRepository repository=new FileIdempotentRepository();
+  @Override @Before public void setUp() throws Exception {
+    deleteDirectory("target/inbox");
+    createDirectory("target/inbox");
+    File file=new File("target/inbox/hello.txt");
+    FileOutputStream fos=new FileOutputStream(file,true);
+    fos.write("Hello World".getBytes());
+    fos.flush();
+    fos.close();
+    super.setUp();
+  }
+  @Override protected JndiRegistry createRegistry() throws Exception {
+    JndiRegistry jndi=super.createRegistry();
+    repository.setFileStore(new File("target/repo.txt"));
+    jndi.bind("repo",repository);
+    return jndi;
+  }
+  @Override protected RouteBuilder createRouteBuilder() throws Exception {
+    return new RouteBuilder(){
+      @Override public void configure() throws Exception {
+        onException(RuntimeException.class).process(new ShutDown());
+        from("file:target/inbox?idempotent=true&noop=true&idempotentRepository=#repo&initialDelay=0&delay=10").to("log:begin").inOut("seda:process");
+        from("seda:process").throwException(new RuntimeException("Testing with exception"));
+      }
+    }
+;
+  }
+  @Test public void testRepo() throws Exception {
+    boolean done=latch.await(10,TimeUnit.SECONDS);
+    assertTrue("Should stop Camel",done);
+    assertEquals("No file should be reported consumed",0,repository.getCache().keySet().size());
+  }
+protected class ShutDown implements Processor {
+    @Override public void process(    final Exchange exchange) throws Exception {
+      Thread thread=new Thread(){
+        @Override public void run(){
+          try {
+            log.info("Stopping Camel");
+            exchange.getContext().stop();
+            log.info("Stopped Camel complete");
+            latch.countDown();
+          }
+ catch (          Exception e) {
+            e.printStackTrace();
+          }
+        }
+      }
+;
+      thread.start();
+    }
+  }
+}

@@ -1,0 +1,39 @@
+@Ignore @Test public void testMisplacedRegions() throws Exception {
+  TableName tableName=TableName.valueOf("testMisplacedRegions");
+  HTableDescriptor desc=new HTableDescriptor(tableName);
+  desc.addFamily(new HColumnDescriptor(HConstants.CATALOG_FAMILY));
+  admin.createTable(desc,Bytes.toBytes("aaa"),Bytes.toBytes("zzz"),REGION_NUM);
+  TEST_UTIL.waitTableAvailable(tableName);
+  final RegionInfo misplacedRegion=admin.getTableRegions(tableName).get(0);
+  FavoredNodesManager fnm=master.getFavoredNodesManager();
+  List<ServerName> currentFN=fnm.getFavoredNodes(misplacedRegion);
+  assertNotNull(currentFN);
+  List<ServerName> serversForNewFN=Lists.newArrayList();
+  for (  ServerName sn : admin.getClusterMetrics(EnumSet.of(Option.LIVE_SERVERS)).getLiveServerMetrics().keySet()) {
+    serversForNewFN.add(ServerName.valueOf(sn.getHostname(),sn.getPort(),NON_STARTCODE));
+  }
+  for (  ServerName sn : currentFN) {
+    serversForNewFN.remove(sn);
+  }
+  FavoredNodeAssignmentHelper helper=new FavoredNodeAssignmentHelper(serversForNewFN,conf);
+  helper.initialize();
+  List<ServerName> newFavoredNodes=helper.generateFavoredNodes(misplacedRegion);
+  assertNotNull(newFavoredNodes);
+  assertEquals(FavoredNodeAssignmentHelper.FAVORED_NODES_NUM,newFavoredNodes.size());
+  Map<RegionInfo,List<ServerName>> regionFNMap=Maps.newHashMap();
+  regionFNMap.put(misplacedRegion,newFavoredNodes);
+  fnm.updateFavoredNodes(regionFNMap);
+  final RegionStates regionStates=master.getAssignmentManager().getRegionStates();
+  final ServerName current=regionStates.getRegionServerOfRegion(misplacedRegion);
+  assertNull("Misplaced region is still hosted on favored node, not expected.",FavoredNodesPlan.getFavoredServerPosition(fnm.getFavoredNodes(misplacedRegion),current));
+  admin.setBalancerRunning(true,true);
+  assertTrue("Balancer did not run",admin.balancer());
+  TEST_UTIL.waitFor(120000,30000,new Waiter.Predicate<Exception>(){
+    @Override public boolean evaluate() throws Exception {
+      ServerName host=regionStates.getRegionServerOfRegion(misplacedRegion);
+      return !ServerName.isSameAddress(host,current);
+    }
+  }
+);
+  checkFavoredNodeAssignments(tableName,fnm,regionStates);
+}

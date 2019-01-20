@@ -1,0 +1,58 @@
+public static class FencedTestEndpoint extends FencedRpcEndpoint<UUID> implements FencedTestGateway {
+  private final ReentrantLock lock;
+  private final AtomicBoolean concurrentAccess;
+  private final OneShotLatch enteringSetNewFencingToken;
+  private final OneShotLatch triggerSetNewFencingToken;
+  protected FencedTestEndpoint(  RpcService rpcService,  ReentrantLock lock,  AtomicBoolean concurrentAccess){
+    this(rpcService,lock,concurrentAccess,UUID.randomUUID(),new OneShotLatch(),new OneShotLatch());
+  }
+  protected FencedTestEndpoint(  RpcService rpcService,  UUID initialFencingToken,  OneShotLatch enteringSetNewFencingToken,  OneShotLatch triggerSetNewFencingToken){
+    this(rpcService,new ReentrantLock(),new AtomicBoolean(false),initialFencingToken,enteringSetNewFencingToken,triggerSetNewFencingToken);
+  }
+  private FencedTestEndpoint(  RpcService rpcService,  ReentrantLock lock,  AtomicBoolean concurrentAccess,  UUID initialFencingToken,  OneShotLatch enteringSetNewFencingToken,  OneShotLatch triggerSetNewFencingToken){
+    super(rpcService);
+    this.lock=lock;
+    this.concurrentAccess=concurrentAccess;
+    this.enteringSetNewFencingToken=enteringSetNewFencingToken;
+    this.triggerSetNewFencingToken=triggerSetNewFencingToken;
+    currentMainThread.set(Thread.currentThread());
+    try {
+      setFencingToken(initialFencingToken);
+    }
+  finally {
+      currentMainThread.set(null);
+    }
+  }
+  @Override public CompletableFuture<Acknowledge> setNewFencingToken(  UUID fencingToken,  Time timeout){
+    enteringSetNewFencingToken.trigger();
+    try {
+      triggerSetNewFencingToken.await();
+    }
+ catch (    InterruptedException e) {
+      throw new RuntimeException("TriggerSetNewFencingToken OneShotLatch was interrupted.");
+    }
+    setFencingToken(fencingToken);
+    return CompletableFuture.completedFuture(Acknowledge.get());
+  }
+  @Override public CompletableFuture<Void> postStop(){
+    return CompletableFuture.completedFuture(null);
+  }
+  @Override public void someCall(){
+    boolean holdsLock=lock.tryLock();
+    if (holdsLock) {
+      lock.unlock();
+    }
+ else {
+      concurrentAccess.set(true);
+    }
+  }
+  @Override public void anotherCall(){
+    boolean holdsLock=lock.tryLock();
+    if (holdsLock) {
+      lock.unlock();
+    }
+ else {
+      concurrentAccess.set(true);
+    }
+  }
+}

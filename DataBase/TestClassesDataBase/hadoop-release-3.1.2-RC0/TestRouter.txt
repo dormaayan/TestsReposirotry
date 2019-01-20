@@ -1,0 +1,104 @@
+/** 
+ * The the safe mode for the  {@link Router} controlled by{@link SafeModeTimer}.
+ */
+public class TestRouter {
+  private static Configuration conf;
+  @BeforeClass public static void create() throws IOException {
+    conf=new Configuration();
+    conf.setInt(RBFConfigKeys.DFS_ROUTER_CACHE_TIME_TO_LIVE_MS,1);
+    conf.setClass(RBFConfigKeys.FEDERATION_NAMENODE_RESOLVER_CLIENT_CLASS,MockResolver.class,ActiveNamenodeResolver.class);
+    conf.setClass(RBFConfigKeys.FEDERATION_FILE_RESOLVER_CLIENT_CLASS,MockResolver.class,FileSubclusterResolver.class);
+    conf.set(RBFConfigKeys.DFS_ROUTER_RPC_BIND_HOST_KEY,"0.0.0.0");
+    conf.set(RBFConfigKeys.DFS_ROUTER_RPC_ADDRESS_KEY,"127.0.0.1:0");
+    conf.set(RBFConfigKeys.DFS_ROUTER_ADMIN_ADDRESS_KEY,"127.0.0.1:0");
+    conf.set(RBFConfigKeys.DFS_ROUTER_ADMIN_BIND_HOST_KEY,"0.0.0.0");
+    conf.set(RBFConfigKeys.DFS_ROUTER_HTTP_ADDRESS_KEY,"127.0.0.1:0");
+    conf.set(RBFConfigKeys.DFS_ROUTER_HTTPS_ADDRESS_KEY,"127.0.0.1:0");
+    conf.set(RBFConfigKeys.DFS_ROUTER_HTTP_BIND_HOST_KEY,"0.0.0.0");
+    conf.set(DFSConfigKeys.DFS_NAMESERVICES,"ns0");
+    conf.set(CommonConfigurationKeys.FS_DEFAULT_NAME_KEY,"hdfs://" + "ns0");
+    conf.set(DFSConfigKeys.DFS_NAMENODE_RPC_ADDRESS_KEY + "." + "ns0","127.0.0.1:0" + 0);
+    conf.set(DFSConfigKeys.DFS_NAMENODE_HTTP_ADDRESS_KEY + "." + "ns0","127.0.0.1:" + 0);
+    conf.set(DFSConfigKeys.DFS_NAMENODE_RPC_BIND_HOST_KEY + "." + "ns0","0.0.0.0");
+  }
+  private static void testRouterStartup(  Configuration routerConfig) throws InterruptedException, IOException {
+    Router router=new Router();
+    assertEquals(STATE.NOTINITED,router.getServiceState());
+    assertEquals(RouterServiceState.UNINITIALIZED,router.getRouterState());
+    router.init(routerConfig);
+    if (routerConfig.getBoolean(RBFConfigKeys.DFS_ROUTER_SAFEMODE_ENABLE,RBFConfigKeys.DFS_ROUTER_SAFEMODE_ENABLE_DEFAULT)) {
+      assertEquals(RouterServiceState.SAFEMODE,router.getRouterState());
+    }
+ else {
+      assertEquals(RouterServiceState.INITIALIZING,router.getRouterState());
+    }
+    assertEquals(STATE.INITED,router.getServiceState());
+    router.start();
+    if (routerConfig.getBoolean(RBFConfigKeys.DFS_ROUTER_SAFEMODE_ENABLE,RBFConfigKeys.DFS_ROUTER_SAFEMODE_ENABLE_DEFAULT)) {
+      assertEquals(RouterServiceState.SAFEMODE,router.getRouterState());
+    }
+ else {
+      assertEquals(RouterServiceState.RUNNING,router.getRouterState());
+    }
+    assertEquals(STATE.STARTED,router.getServiceState());
+    router.stop();
+    assertEquals(RouterServiceState.SHUTDOWN,router.getRouterState());
+    assertEquals(STATE.STOPPED,router.getServiceState());
+    router.close();
+  }
+  @Test public void testRouterService() throws InterruptedException, IOException {
+    testRouterStartup(new RouterConfigBuilder(conf).admin().build());
+    testRouterStartup(new RouterConfigBuilder(conf).http().build());
+    testRouterStartup(new RouterConfigBuilder(conf).rpc().build());
+    testRouterStartup(new RouterConfigBuilder(conf).rpc().safemode().build());
+    testRouterStartup(new RouterConfigBuilder(conf).metrics().build());
+    testRouterStartup(new RouterConfigBuilder(conf).stateStore().build());
+    testRouterStartup(new RouterConfigBuilder(conf).heartbeat().build());
+    testRouterStartup(new RouterConfigBuilder(conf).all().build());
+  }
+  @Test public void testRouterRestartRpcService() throws IOException {
+    Router router=new Router();
+    router.init(new RouterConfigBuilder(conf).rpc().build());
+    router.start();
+    assertNotNull(router.getRpcServerAddress());
+    RouterRpcServer rpcServer=router.getRpcServer();
+    assertNotNull(rpcServer);
+    assertEquals(STATE.STARTED,rpcServer.getServiceState());
+    router.stop();
+    assertEquals(STATE.STOPPED,rpcServer.getServiceState());
+    router.close();
+  }
+  @Test public void testRouterRpcWithNoSubclusters() throws IOException {
+    Router router=new Router();
+    router.init(new RouterConfigBuilder(conf).rpc().build());
+    router.start();
+    InetSocketAddress serverAddress=router.getRpcServerAddress();
+    DFSClient dfsClient=new DFSClient(serverAddress,conf);
+    try {
+      dfsClient.create("/test.txt",false);
+      fail("Create with no subclusters should fail");
+    }
+ catch (    RemoteException e) {
+      assertExceptionContains("Cannot find locations for /test.txt",e);
+    }
+    try {
+      dfsClient.datanodeReport(DatanodeReportType.LIVE);
+      fail("Get datanode reports with no subclusters should fail");
+    }
+ catch (    IOException e) {
+      assertExceptionContains("No remote locations available",e);
+    }
+    dfsClient.close();
+    router.stop();
+    router.close();
+  }
+  @Test public void testRouterIDInRouterRpcClient() throws Exception {
+    Router router=new Router();
+    router.init(new RouterConfigBuilder(conf).rpc().build());
+    router.setRouterId("Router-0");
+    RemoteMethod remoteMethod=mock(RemoteMethod.class);
+    intercept(IOException.class,"Router-0",() -> router.getRpcServer().getRPCClient().invokeSingle("ns0",remoteMethod));
+    router.stop();
+    router.close();
+  }
+}

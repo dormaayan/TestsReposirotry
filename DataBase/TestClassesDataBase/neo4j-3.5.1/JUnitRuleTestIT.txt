@@ -1,0 +1,60 @@
+public class JUnitRuleTestIT {
+  @Rule public TestDirectory testDirectory=TestDirectory.testDirectory();
+  @Rule public SuppressOutput suppressOutput=SuppressOutput.suppressAll();
+  @Rule public Neo4jRule neo4j=new Neo4jRule().withFixture("CREATE (u:User)").withConfig(GraphDatabaseSettings.db_timezone.name(),LogTimeZone.SYSTEM.toString()).withConfig(LegacySslPolicyConfig.certificates_directory.name(),getRelativePath(getSharedTestTemporaryFolder(),LegacySslPolicyConfig.certificates_directory)).withFixture(graphDatabaseService -> {
+    try (Transaction tx=graphDatabaseService.beginTx()){
+      graphDatabaseService.createNode(Label.label("User"));
+      tx.success();
+    }
+     return null;
+  }
+).withExtension("/test",MyUnmanagedExtension.class);
+  @Test public void shouldExtensionWork(){
+    assertThat(HTTP.GET(neo4j.httpURI().resolve("test/myExtension").toString()).status(),equalTo(234));
+  }
+  @Test public void shouldFixturesWork() throws Exception {
+    HTTP.Response response=HTTP.POST(neo4j.httpURI().toString() + "db/data/transaction/commit",quotedJson("{'statements':[{'statement':'MATCH (n:User) RETURN n'}]}"));
+    assertThat(response.get("results").get(0).get("data").size(),equalTo(2));
+  }
+  @Test public void shouldGraphDatabaseServiceBeAccessible(){
+    assertEquals(2,Iterators.count(neo4j.getGraphDatabaseService().execute("MATCH (n:User) RETURN n")));
+  }
+  @Test public void shouldRuleWorkWithExistingDirectory() throws Throwable {
+    File oldDir=testDirectory.directory("old");
+    File storeDir=Config.defaults(GraphDatabaseSettings.data_directory,oldDir.toPath().toString()).get(GraphDatabaseSettings.database_path);
+    GraphDatabaseService db=new TestGraphDatabaseFactory().newEmbeddedDatabase(storeDir);
+    try {
+      db.execute("CREATE ()");
+    }
+  finally {
+      db.shutdown();
+    }
+    File newDir=testDirectory.directory("new");
+    final Neo4jRule ruleWithDirectory=new Neo4jRule(newDir).copyFrom(oldDir);
+    Statement statement=ruleWithDirectory.apply(new Statement(){
+      @Override public void evaluate(){
+        Result result=ruleWithDirectory.getGraphDatabaseService().execute("MATCH (n) RETURN count(n) AS " + "count");
+        List<Object> column=Iterators.asList(result.columnAs("count"));
+        assertEquals(1,column.size());
+        assertEquals(1L,column.get(0));
+      }
+    }
+,null);
+    statement.evaluate();
+  }
+  @Test public void shouldUseSystemTimeZoneForLogging() throws Exception {
+    String currentOffset=currentTimeZoneOffsetString();
+    assertThat(contentOf("neo4j.log"),containsString(currentOffset));
+    assertThat(contentOf("debug.log"),containsString(currentOffset));
+  }
+  private String contentOf(  String file) throws IOException {
+    GraphDatabaseAPI api=(GraphDatabaseAPI)neo4j.getGraphDatabaseService();
+    Config config=api.getDependencyResolver().resolveDependency(Config.class);
+    File dataDirectory=config.get(GraphDatabaseSettings.data_directory);
+    return new String(Files.readAllBytes(new File(dataDirectory,file).toPath()),UTF_8);
+  }
+  private static String currentTimeZoneOffsetString(){
+    ZoneOffset offset=OffsetDateTime.now().getOffset();
+    return offset.equals(UTC) ? "+0000" : offset.toString().replace(":","");
+  }
+}

@@ -1,0 +1,92 @@
+/** 
+ * Testing the region snapshot task on a cluster.
+ * @see org.apache.hadoop.hbase.regionserver.snapshot.FlushSnapshotSubprocedure.RegionSnapshotTask
+ */
+@Category({MediumTests.class,RegionServerTests.class}) public class TestRegionSnapshotTask {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestRegionSnapshotTask.class);
+  private final Logger LOG=LoggerFactory.getLogger(getClass());
+  private static HBaseTestingUtility TEST_UTIL;
+  private static Configuration conf;
+  private static FileSystem fs;
+  private static Path rootDir;
+  @BeforeClass public static void setupBeforeClass() throws Exception {
+    TEST_UTIL=new HBaseTestingUtility();
+    conf=TEST_UTIL.getConfiguration();
+    conf.setInt("hbase.hfile.compaction.discharger.interval",1000);
+    conf.setInt("hbase.master.hfilecleaner.ttl",1000);
+    TEST_UTIL.startMiniCluster(1);
+    TEST_UTIL.getHBaseCluster().waitForActiveAndReadyMaster();
+    TEST_UTIL.waitUntilAllRegionsAssigned(TableName.META_TABLE_NAME);
+    rootDir=FSUtils.getRootDir(conf);
+    fs=TEST_UTIL.getTestFileSystem();
+  }
+  @AfterClass public static void tearDown() throws Exception {
+    TEST_UTIL.shutdownMiniCluster();
+  }
+  /** 
+ * Tests adding a region to the snapshot manifest while compactions are running on the region. The idea is to slow down the process of adding a store file to the manifest while triggering compactions on the region, allowing the store files to be marked for archival while snapshot operation is running. This test checks for the correct behavior in such a case that the compacted files should not be moved around if a snapshot operation is in progress. See HBASE-18398
+ */
+  @Test public void testAddRegionWithCompactions() throws Exception {
+    final TableName tableName=TableName.valueOf("test_table");
+    Table table=setupTable(tableName);
+    List<HRegion> hRegions=TEST_UTIL.getHBaseCluster().getRegions(tableName);
+    final SnapshotProtos.SnapshotDescription snapshot=SnapshotProtos.SnapshotDescription.newBuilder().setTable(tableName.getNameAsString()).setType(SnapshotProtos.SnapshotDescription.Type.FLUSH).setName("test_table_snapshot").setVersion(SnapshotManifestV2.DESCRIPTOR_VERSION).build();
+    ForeignExceptionDispatcher monitor=new ForeignExceptionDispatcher(snapshot.getName());
+    final HRegion region=spy(hRegions.get(0));
+    Path workingDir=SnapshotDescriptionUtils.getWorkingSnapshotDir(snapshot,rootDir);
+    final SnapshotManifest manifest=SnapshotManifest.create(conf,fs,workingDir,snapshot,monitor);
+    manifest.addTableDescriptor(table.getTableDescriptor());
+    if (!fs.exists(workingDir)) {
+      fs.mkdirs(workingDir);
+    }
+    assertTrue(fs.exists(workingDir));
+    SnapshotDescriptionUtils.writeSnapshotInfo(snapshot,workingDir,fs);
+    doAnswer(__ -> {
+      addRegionToSnapshot(snapshot,region,manifest);
+      return null;
+    }
+).when(region).addRegionToSnapshot(snapshot,monitor);
+    FlushSnapshotSubprocedure.RegionSnapshotTask snapshotTask=new FlushSnapshotSubprocedure.RegionSnapshotTask(region,snapshot,true,monitor);
+    ExecutorService executor=Executors.newFixedThreadPool(1);
+    Future f=executor.submit(snapshotTask);
+    LOG.info("Starting major compaction");
+    region.compact(true);
+    LOG.info("Finished major compaction");
+    f.get();
+    manifest.consolidate();
+    assertNotNull(manifest.getRegionManifests());
+    assertEquals(1,manifest.getRegionManifests().size());
+    SnapshotReferenceUtil.verifySnapshot(conf,fs,manifest);
+  }
+  private void addRegionToSnapshot(  SnapshotProtos.SnapshotDescription snapshot,  HRegion region,  SnapshotManifest manifest) throws Exception {
+    LOG.info("Adding region to snapshot: " + region.getRegionInfo().getRegionNameAsString());
+    Path workingDir=SnapshotDescriptionUtils.getWorkingSnapshotDir(snapshot,rootDir);
+    SnapshotManifest.RegionVisitor visitor=createRegionVisitorWithDelay(snapshot,workingDir);
+    manifest.addRegion(region,visitor);
+    LOG.info("Added the region to snapshot: " + region.getRegionInfo().getRegionNameAsString());
+  }
+  private SnapshotManifest.RegionVisitor createRegionVisitorWithDelay(  SnapshotProtos.SnapshotDescription desc,  Path workingDir){
+    return new SnapshotManifestV2.ManifestBuilder(conf,fs,workingDir){
+      @Override public void storeFile(      final SnapshotProtos.SnapshotRegionManifest.Builder region,      final SnapshotProtos.SnapshotRegionManifest.FamilyFiles.Builder family,      final StoreFileInfo storeFile) throws IOException {
+        try {
+          LOG.debug("Introducing delay before adding store file to manifest");
+          Thread.sleep(2000);
+        }
+ catch (        InterruptedException ex) {
+          LOG.error("Interrupted due to error: " + ex);
+        }
+        super.storeFile(region,family,storeFile);
+      }
+    }
+;
+  }
+  private Table setupTable(  TableName tableName) throws Exception {
+    TableDescriptorBuilder builder=TableDescriptorBuilder.newBuilder(tableName);
+    builder.setMemStoreFlushSize(5000).setRegionSplitPolicyClassName(ConstantSizeRegionSplitPolicy.class.getName()).setMaxFileSize(100 * 1024 * 1024).setValue("hbase.hstore.compactionThreshold","250");
+    TableDescriptor td=builder.build();
+    byte[] fam=Bytes.toBytes("fam");
+    Table table=TEST_UTIL.createTable(td,new byte[][]{fam},TEST_UTIL.getConfiguration());
+    TEST_UTIL.loadTable(table,fam);
+    return table;
+  }
+}

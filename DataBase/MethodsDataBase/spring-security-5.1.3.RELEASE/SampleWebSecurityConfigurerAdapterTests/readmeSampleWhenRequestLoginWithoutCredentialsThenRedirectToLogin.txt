@@ -1,0 +1,7 @@
+@Test public void readmeSampleWhenRequestLoginWithoutCredentialsThenRedirectToLogin() throws Exception {
+  this.spring.register(SampleWebSecurityConfigurerAdapter.class).autowire();
+  this.request.setServletPath("/login");
+  this.request.setMethod("POST");
+  this.springSecurityFilterChain.doFilter(this.request,this.response,this.chain);
+  assertThat(this.response.getRedirectedUrl()).isEqualTo("/login?error");
+}

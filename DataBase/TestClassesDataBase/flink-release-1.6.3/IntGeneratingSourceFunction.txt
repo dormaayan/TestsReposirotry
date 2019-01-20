@@ -1,0 +1,55 @@
+/** 
+ * A source that generates a sequence of integers and throttles down until a checkpoint has happened.
+ */
+private static class IntGeneratingSourceFunction extends RichParallelSourceFunction<Integer> implements ListCheckpointed<Integer>, CheckpointListener {
+  private final int numElements;
+  private final int checkpointLatestAt;
+  private int lastEmitted=-1;
+  private boolean checkpointHappened;
+  private volatile boolean isRunning=true;
+  IntGeneratingSourceFunction(  int numElements,  int checkpointLatestAt){
+    this.numElements=numElements;
+    this.checkpointLatestAt=checkpointLatestAt;
+  }
+  @Override public void run(  SourceContext<Integer> ctx) throws Exception {
+    final Object lockingObject=ctx.getCheckpointLock();
+    final int step=getRuntimeContext().getNumberOfParallelSubtasks();
+    int nextElement=lastEmitted >= 0 ? lastEmitted + step : getRuntimeContext().getIndexOfThisSubtask();
+    while (isRunning && nextElement < numElements) {
+      if (!checkpointHappened) {
+        if (nextElement < checkpointLatestAt) {
+          Thread.sleep(1);
+        }
+ else {
+synchronized (this) {
+            while (!checkpointHappened) {
+              this.wait();
+            }
+          }
+        }
+      }
+synchronized (lockingObject) {
+        ctx.collect(nextElement % NUM_KEYS);
+        lastEmitted=nextElement;
+      }
+      nextElement+=step;
+    }
+  }
+  @Override public void cancel(){
+    isRunning=false;
+  }
+  @Override public List<Integer> snapshotState(  long checkpointId,  long timestamp) throws Exception {
+    return Collections.singletonList(lastEmitted);
+  }
+  @Override public void restoreState(  List<Integer> state) throws Exception {
+    assertEquals("Test failed due to unexpected recovered state size",1,state.size());
+    lastEmitted=state.get(0);
+    checkpointHappened=true;
+  }
+  @Override public void notifyCheckpointComplete(  long checkpointId) throws Exception {
+synchronized (this) {
+      checkpointHappened=true;
+      this.notifyAll();
+    }
+  }
+}

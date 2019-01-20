@@ -1,0 +1,58 @@
+/** 
+ * Tests that the AysncWaitOperator can restart if checkpointed queue was full. <p>See FLINK-7949
+ */
+@Test(timeout=10000) public void testRestartWithFullQueue() throws Exception {
+  int capacity=10;
+  final CompletableFuture<Void> trigger=new CompletableFuture<>();
+  final ControllableAsyncFunction<Integer> controllableAsyncFunction=new ControllableAsyncFunction<>(trigger);
+  final OneInputStreamOperatorTestHarness<Integer,Integer> snapshotHarness=new OneInputStreamOperatorTestHarness<>(new AsyncWaitOperator<>(controllableAsyncFunction,1000L,capacity,AsyncDataStream.OutputMode.ORDERED),IntSerializer.INSTANCE);
+  snapshotHarness.open();
+  final OperatorSubtaskState snapshot;
+  final ArrayList<Integer> expectedOutput=new ArrayList<>(capacity + 1);
+  try {
+synchronized (snapshotHarness.getCheckpointLock()) {
+      for (int i=0; i < capacity; i++) {
+        snapshotHarness.processElement(i,0L);
+        expectedOutput.add(i);
+      }
+    }
+    expectedOutput.add(capacity);
+    final OneShotLatch lastElement=new OneShotLatch();
+    final CheckedThread lastElementWriter=new CheckedThread(){
+      @Override public void go() throws Exception {
+synchronized (snapshotHarness.getCheckpointLock()) {
+          lastElement.trigger();
+          snapshotHarness.processElement(capacity,0L);
+        }
+      }
+    }
+;
+    lastElementWriter.start();
+    lastElement.await();
+synchronized (snapshotHarness.getCheckpointLock()) {
+      snapshot=snapshotHarness.snapshot(0L,0L);
+    }
+    trigger.complete(null);
+  }
+  finally {
+synchronized (snapshotHarness.getCheckpointLock()) {
+      snapshotHarness.close();
+    }
+  }
+  final OneInputStreamOperatorTestHarness<Integer,Integer> recoverHarness=new OneInputStreamOperatorTestHarness<>(new AsyncWaitOperator<>(new ControllableAsyncFunction<>(CompletableFuture.completedFuture(null)),1000L,capacity,AsyncDataStream.OutputMode.ORDERED),IntSerializer.INSTANCE);
+  recoverHarness.initializeState(snapshot);
+synchronized (recoverHarness.getCheckpointLock()) {
+    recoverHarness.open();
+  }
+synchronized (recoverHarness.getCheckpointLock()) {
+    recoverHarness.close();
+  }
+  final ConcurrentLinkedQueue<Object> output=recoverHarness.getOutput();
+  assertThat(output.size(),Matchers.equalTo(capacity + 1));
+  final ArrayList<Integer> outputElements=new ArrayList<>(capacity + 1);
+  for (int i=0; i < capacity + 1; i++) {
+    StreamRecord<Integer> streamRecord=((StreamRecord<Integer>)output.poll());
+    outputElements.add(streamRecord.getValue());
+  }
+  assertThat(outputElements,Matchers.equalTo(expectedOutput));
+}

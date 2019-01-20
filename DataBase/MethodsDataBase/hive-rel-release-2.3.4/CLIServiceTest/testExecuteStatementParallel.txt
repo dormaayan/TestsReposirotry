@@ -1,0 +1,36 @@
+@Test public void testExecuteStatementParallel() throws Exception {
+  Map<String,String> confOverlay=new HashMap<String,String>();
+  String tableName="TEST_EXEC_PARALLEL";
+  String columnDefinitions="(ID STRING)";
+  SessionHandle sessionHandle=setupTestData(tableName,columnDefinitions,confOverlay);
+  assertNotNull(sessionHandle);
+  long longPollingTimeout=HiveConf.getTimeVar(new HiveConf(),HiveConf.ConfVars.HIVE_SERVER2_LONG_POLLING_TIMEOUT,TimeUnit.MILLISECONDS);
+  confOverlay.put(HiveConf.ConfVars.HIVE_SERVER2_LONG_POLLING_TIMEOUT.varname,longPollingTimeout + "ms");
+  int THREAD_COUNT=10, QUERY_COUNT=10;
+  ExecutorService executor=Executors.newFixedThreadPool(THREAD_COUNT);
+  CountDownLatch cdlIn=new CountDownLatch(THREAD_COUNT), cdlOut=new CountDownLatch(1);
+  @SuppressWarnings("unchecked") Callable<Void>[] cs=new Callable[3];
+  String query="SELECT ID + %1$d FROM " + tableName;
+  cs[0]=createQueryCallable(query,confOverlay,longPollingTimeout,QUERY_COUNT,OperationState.FINISHED,true,cdlIn,cdlOut);
+  query="SELECT t1.ID, SUM(t2.ID) + %1$d FROM  " + tableName + " t1 CROSS JOIN "+ tableName+ " t2 GROUP BY t1.ID HAVING t1.ID > 1";
+  cs[1]=createQueryCallable(query,confOverlay,longPollingTimeout,QUERY_COUNT,OperationState.FINISHED,true,cdlIn,cdlOut);
+  query="SELECT b.a FROM (SELECT (t1.ID + %1$d) as a , t2.* FROM  " + tableName + " t1 INNER JOIN "+ tableName+ " t2 ON t1.ID = t2.ID WHERE t2.ID > 2) b";
+  cs[2]=createQueryCallable(query,confOverlay,longPollingTimeout,QUERY_COUNT,OperationState.FINISHED,true,cdlIn,cdlOut);
+  @SuppressWarnings("unchecked") FutureTask<Void>[] tasks=new FutureTask[THREAD_COUNT];
+  for (int i=0; i < THREAD_COUNT; ++i) {
+    tasks[i]=new FutureTask<Void>(cs[i % cs.length]);
+    executor.execute(tasks[i]);
+  }
+  try {
+    cdlIn.await();
+    cdlOut.countDown();
+    for (int i=0; i < THREAD_COUNT; ++i) {
+      tasks[i].get();
+    }
+  }
+ catch (  Throwable t) {
+    throw new RuntimeException(t);
+  }
+  client.executeStatement(sessionHandle,"DROP TABLE " + tableName,confOverlay);
+  client.closeSession(sessionHandle);
+}

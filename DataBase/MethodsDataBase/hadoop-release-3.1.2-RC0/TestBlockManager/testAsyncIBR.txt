@@ -1,0 +1,60 @@
+@Test public void testAsyncIBR() throws Exception {
+  Logger.getRootLogger().setLevel(Level.WARN);
+  final int blkSize=4 * 1024;
+  final int fileSize=blkSize * 100;
+  final byte[] buf=new byte[2 * blkSize];
+  final int numWriters=4;
+  final int repl=3;
+  final CyclicBarrier barrier=new CyclicBarrier(numWriters);
+  final CountDownLatch writeLatch=new CountDownLatch(numWriters);
+  final AtomicBoolean failure=new AtomicBoolean();
+  final Configuration conf=new HdfsConfiguration();
+  conf.getLong(DFSConfigKeys.DFS_NAMENODE_MIN_BLOCK_SIZE_KEY,blkSize);
+  final MiniDFSCluster cluster=new MiniDFSCluster.Builder(conf).numDataNodes(8).build();
+  try {
+    cluster.waitActive();
+    Thread[] writers=new Thread[numWriters];
+    for (int i=0; i < writers.length; i++) {
+      final Path p=new Path("/writer" + i);
+      writers[i]=new Thread(new Runnable(){
+        @Override public void run(){
+          try {
+            FileSystem fs=cluster.getFileSystem();
+            FSDataOutputStream os=fs.create(p,true,buf.length,(short)repl,blkSize);
+            barrier.await();
+            int remaining=fileSize;
+            while (remaining > 0) {
+              os.write(buf);
+              remaining-=buf.length;
+            }
+            os.close();
+          }
+ catch (          Exception e) {
+            e.printStackTrace();
+            failure.set(true);
+          }
+          writeLatch.countDown();
+        }
+      }
+);
+      writers[i].start();
+    }
+    boolean sawQueued=false;
+    while (!writeLatch.await(10,TimeUnit.MILLISECONDS)) {
+      assertFalse(failure.get());
+      MetricsRecordBuilder rb=getMetrics("NameNodeActivity");
+      long queued=MetricsAsserts.getIntGauge("BlockOpsQueued",rb);
+      sawQueued|=(queued > 0);
+    }
+    assertFalse(failure.get());
+    assertTrue(sawQueued);
+    MetricsRecordBuilder rb=getMetrics("NameNodeActivity");
+    long batched=MetricsAsserts.getLongCounter("BlockOpsBatched",rb);
+    assertTrue(batched > 0);
+  }
+  finally {
+    if (cluster != null) {
+      cluster.shutdown();
+    }
+  }
+}

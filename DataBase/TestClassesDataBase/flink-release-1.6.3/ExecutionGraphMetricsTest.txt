@@ -1,0 +1,105 @@
+public class ExecutionGraphMetricsTest extends TestLogger {
+  /** 
+ * This test tests that the restarting time metric correctly displays restarting times.
+ */
+  @Test public void testExecutionGraphRestartTimeMetric() throws JobException, IOException, InterruptedException {
+    final ScheduledExecutorService executor=Executors.newSingleThreadScheduledExecutor();
+    try {
+      int parallelism=1;
+      JobVertex jobVertex=new JobVertex("TestVertex");
+      jobVertex.setParallelism(parallelism);
+      jobVertex.setInvokableClass(NoOpInvokable.class);
+      JobGraph jobGraph=new JobGraph("Test Job",jobVertex);
+      Configuration jobConfig=new Configuration();
+      Time timeout=Time.seconds(10L);
+      Scheduler scheduler=mock(Scheduler.class);
+      CompletableFuture<LogicalSlot> slotFuture1=CompletableFuture.completedFuture(new TestingLogicalSlot());
+      CompletableFuture<LogicalSlot> slotFuture2=CompletableFuture.completedFuture(new TestingLogicalSlot());
+      when(scheduler.allocateSlot(any(SlotRequestId.class),any(ScheduledUnit.class),anyBoolean(),any(SlotProfile.class),any(Time.class))).thenReturn(slotFuture1,slotFuture2);
+      TestingRestartStrategy testingRestartStrategy=new TestingRestartStrategy();
+      ExecutionGraph executionGraph=new ExecutionGraph(executor,executor,jobGraph.getJobID(),jobGraph.getName(),jobConfig,new SerializedValue<>(null),timeout,testingRestartStrategy,scheduler);
+      RestartTimeGauge restartingTime=new RestartTimeGauge(executionGraph);
+      assertEquals(0L,restartingTime.getValue().longValue());
+      executionGraph.attachJobGraph(jobGraph.getVerticesSortedTopologicallyFromSources());
+      executionGraph.scheduleForExecution();
+      assertEquals(0L,restartingTime.getValue().longValue());
+      List<ExecutionAttemptID> executionIDs=new ArrayList<>();
+      for (      ExecutionVertex executionVertex : executionGraph.getAllExecutionVertices()) {
+        executionIDs.add(executionVertex.getCurrentExecutionAttempt().getAttemptId());
+      }
+      for (      ExecutionAttemptID executionID : executionIDs) {
+        executionGraph.updateState(new TaskExecutionState(jobGraph.getJobID(),executionID,ExecutionState.RUNNING));
+      }
+      assertEquals(JobStatus.RUNNING,executionGraph.getState());
+      assertEquals(0L,restartingTime.getValue().longValue());
+      Thread.sleep(1L);
+      for (      ExecutionAttemptID executionID : executionIDs) {
+        executionGraph.updateState(new TaskExecutionState(jobGraph.getJobID(),executionID,ExecutionState.FAILED,new Exception()));
+      }
+      assertEquals(JobStatus.RESTARTING,executionGraph.getState());
+      long firstRestartingTimestamp=executionGraph.getStatusTimestamp(JobStatus.RESTARTING);
+      long previousRestartingTime=restartingTime.getValue();
+      for (int i=0; i < 2; i++) {
+        Thread.sleep(1L);
+        long currentRestartingTime=restartingTime.getValue();
+        assertTrue(currentRestartingTime >= previousRestartingTime);
+        previousRestartingTime=currentRestartingTime;
+      }
+      assertTrue(previousRestartingTime > 0);
+      testingRestartStrategy.restartExecutionGraph();
+      executionIDs.clear();
+      for (      ExecutionVertex executionVertex : executionGraph.getAllExecutionVertices()) {
+        executionIDs.add(executionVertex.getCurrentExecutionAttempt().getAttemptId());
+      }
+      for (      ExecutionAttemptID executionID : executionIDs) {
+        executionGraph.updateState(new TaskExecutionState(jobGraph.getJobID(),executionID,ExecutionState.RUNNING));
+      }
+      assertEquals(JobStatus.RUNNING,executionGraph.getState());
+      assertTrue(firstRestartingTimestamp != 0);
+      previousRestartingTime=restartingTime.getValue();
+      for (int i=0; i < 2; i++) {
+        long currentRestartingTime=restartingTime.getValue();
+        assertTrue(currentRestartingTime == previousRestartingTime);
+        previousRestartingTime=currentRestartingTime;
+      }
+      Thread.sleep(1L);
+      for (      ExecutionAttemptID executionID : executionIDs) {
+        executionGraph.updateState(new TaskExecutionState(jobGraph.getJobID(),executionID,ExecutionState.FAILED,new Exception()));
+      }
+      assertEquals(JobStatus.RESTARTING,executionGraph.getState());
+      long secondRestartingTimestamp=executionGraph.getStatusTimestamp(JobStatus.RESTARTING);
+      assertTrue(firstRestartingTimestamp != secondRestartingTimestamp);
+      previousRestartingTime=restartingTime.getValue();
+      for (int i=0; i < 2; i++) {
+        Thread.sleep(1L);
+        long currentRestartingTime=restartingTime.getValue();
+        assertTrue(currentRestartingTime >= previousRestartingTime);
+        previousRestartingTime=currentRestartingTime;
+      }
+      assertTrue(previousRestartingTime > 0);
+      executionGraph.failGlobal(new SuppressRestartsException(new Exception()));
+      assertEquals(JobStatus.FAILED,executionGraph.getState());
+      previousRestartingTime=restartingTime.getValue();
+      for (int i=0; i < 10; i++) {
+        long currentRestartingTime=restartingTime.getValue();
+        assertTrue(currentRestartingTime == previousRestartingTime);
+        previousRestartingTime=currentRestartingTime;
+      }
+    }
+  finally {
+      executor.shutdownNow();
+    }
+  }
+static class TestingRestartStrategy implements RestartStrategy {
+    private RestartCallback restarter;
+    @Override public boolean canRestart(){
+      return true;
+    }
+    @Override public void restart(    RestartCallback restarter,    ScheduledExecutor executor){
+      this.restarter=restarter;
+    }
+    public void restartExecutionGraph(){
+      restarter.triggerFullRecovery();
+    }
+  }
+}

@@ -1,0 +1,43 @@
+@Test @SuppressWarnings("unchecked") public void testKryoRestoreResilienceWithDifferentRegistrationOrder() throws Exception {
+  CheckpointStreamFactory streamFactory=createStreamFactory();
+  Environment env=new DummyEnvironment();
+  SharedStateRegistry sharedStateRegistry=new SharedStateRegistry();
+  env.getExecutionConfig().registerKryoType(TestNestedPojoClassA.class);
+  env.getExecutionConfig().registerKryoType(TestNestedPojoClassB.class);
+  AbstractKeyedStateBackend<Integer> backend=createKeyedBackend(IntSerializer.INSTANCE,env);
+  try {
+    TypeInformation<TestPojo> pojoType=new GenericTypeInfo<>(TestPojo.class);
+    assertTrue(pojoType.createSerializer(env.getExecutionConfig()) instanceof KryoSerializer);
+    ValueStateDescriptor<TestPojo> kvId=new ValueStateDescriptor<>("id",pojoType);
+    ValueState<TestPojo> state=backend.getPartitionedState(VoidNamespace.INSTANCE,VoidNamespaceSerializer.INSTANCE,kvId);
+    InternalKvState internalKvState=(InternalKvState)state;
+    KryoSerializer<TestPojo> kryoSerializer=(KryoSerializer<TestPojo>)internalKvState.getValueSerializer();
+    int mainPojoClassRegistrationId=kryoSerializer.getKryo().getRegistration(TestPojo.class).getId();
+    int nestedPojoClassARegistrationId=kryoSerializer.getKryo().getRegistration(TestNestedPojoClassA.class).getId();
+    int nestedPojoClassBRegistrationId=kryoSerializer.getKryo().getRegistration(TestNestedPojoClassB.class).getId();
+    backend.setCurrentKey(1);
+    state.update(new TestPojo("u1",1,new TestNestedPojoClassA(1.0,2),new TestNestedPojoClassB(2.3,"foo")));
+    backend.setCurrentKey(2);
+    state.update(new TestPojo("u2",2,new TestNestedPojoClassA(2.0,5),new TestNestedPojoClassB(3.1,"bar")));
+    KeyedStateHandle snapshot=runSnapshot(backend.snapshot(682375462378L,2,streamFactory,CheckpointOptions.forCheckpointWithDefaultLocation()),sharedStateRegistry);
+    backend.dispose();
+    env=new DummyEnvironment();
+    env.getExecutionConfig().registerKryoType(TestNestedPojoClassB.class);
+    env.getExecutionConfig().registerKryoType(TestNestedPojoClassA.class);
+    backend=restoreKeyedBackend(IntSerializer.INSTANCE,snapshot,env);
+    kvId=new ValueStateDescriptor<>("id",pojoType);
+    state=backend.getPartitionedState(VoidNamespace.INSTANCE,VoidNamespaceSerializer.INSTANCE,kvId);
+    internalKvState=(InternalKvState)state;
+    kryoSerializer=(KryoSerializer<TestPojo>)internalKvState.getValueSerializer();
+    assertEquals(mainPojoClassRegistrationId,kryoSerializer.getKryo().getRegistration(TestPojo.class).getId());
+    assertEquals(nestedPojoClassARegistrationId,kryoSerializer.getKryo().getRegistration(TestNestedPojoClassA.class).getId());
+    assertEquals(nestedPojoClassBRegistrationId,kryoSerializer.getKryo().getRegistration(TestNestedPojoClassB.class).getId());
+    backend.setCurrentKey(1);
+    state.update(new TestPojo("u1",11,new TestNestedPojoClassA(22.1,12),new TestNestedPojoClassB(1.23,"foobar")));
+    runSnapshot(backend.snapshot(682375462378L,2,streamFactory,CheckpointOptions.forCheckpointWithDefaultLocation()),sharedStateRegistry);
+    snapshot.discardState();
+  }
+  finally {
+    backend.dispose();
+  }
+}

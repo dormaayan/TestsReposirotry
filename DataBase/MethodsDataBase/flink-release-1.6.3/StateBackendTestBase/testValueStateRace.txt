@@ -1,0 +1,63 @@
+/** 
+ * Tests  {@link ValueState#value()} and{@link InternalKvState#getSerializedValue(byte[],TypeSerializer,TypeSerializer,TypeSerializer)}accessing the state concurrently. They should not get in the way of each other.
+ */
+@Test @SuppressWarnings("unchecked") public void testValueStateRace() throws Exception {
+  final AbstractKeyedStateBackend<Integer> backend=createKeyedBackend(IntSerializer.INSTANCE);
+  final Integer namespace=1;
+  final ValueStateDescriptor<String> kvId=new ValueStateDescriptor<>("id",String.class);
+  final TypeSerializer<Integer> keySerializer=IntSerializer.INSTANCE;
+  final TypeSerializer<Integer> namespaceSerializer=IntSerializer.INSTANCE;
+  final ValueState<String> state=backend.getPartitionedState(namespace,IntSerializer.INSTANCE,kvId);
+  final TypeSerializer<String> valueSerializer=kvId.getSerializer();
+  @SuppressWarnings("unchecked") final InternalKvState<Integer,Integer,String> kvState=(InternalKvState<Integer,Integer,String>)state;
+  final int key1=1;
+  backend.setCurrentKey(key1);
+  kvState.setCurrentNamespace(2);
+  state.update("2");
+  assertEquals("2",state.value());
+  assertNull(getSerializedValue(kvState,3,keySerializer,namespace,IntSerializer.INSTANCE,valueSerializer));
+  assertEquals("2",state.value());
+  kvState.setCurrentNamespace(namespace);
+  final int key2=10;
+  backend.setCurrentKey(key2);
+  assertNull(state.value());
+  assertNull(getSerializedValue(kvState,key2,keySerializer,namespace,namespaceSerializer,valueSerializer));
+  state.update("1");
+  final CheckedThread getter=new CheckedThread("State getter"){
+    @Override public void go() throws Exception {
+      while (!isInterrupted()) {
+        assertEquals("1",state.value());
+      }
+    }
+  }
+;
+  final CheckedThread serializedGetter=new CheckedThread("Serialized state getter"){
+    @Override public void go() throws Exception {
+      while (!isInterrupted() && getter.isAlive()) {
+        final String serializedValue=getSerializedValue(kvState,key2,keySerializer,namespace,namespaceSerializer,valueSerializer);
+        assertEquals("1",serializedValue);
+      }
+    }
+  }
+;
+  getter.start();
+  serializedGetter.start();
+  Timer t=new Timer("stopper");
+  t.schedule(new TimerTask(){
+    @Override public void run(){
+      getter.interrupt();
+      serializedGetter.interrupt();
+      this.cancel();
+    }
+  }
+,100);
+  try {
+    serializedGetter.sync();
+    getter.interrupt();
+    getter.sync();
+    t.cancel();
+  }
+  finally {
+    backend.dispose();
+  }
+}

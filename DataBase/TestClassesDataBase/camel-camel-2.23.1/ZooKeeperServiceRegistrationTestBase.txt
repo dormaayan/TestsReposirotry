@@ -1,0 +1,58 @@
+public abstract class ZooKeeperServiceRegistrationTestBase extends CamelTestSupport {
+  protected static final String SERVICE_ID=UUID.randomUUID().toString();
+  protected static final String SERVICE_NAME="my-service";
+  protected static final String SERVICE_HOST="localhost";
+  protected static final String SERVICE_PATH="/camel";
+  protected static final int SERVICE_PORT=AvailablePortFinder.getNextAvailable();
+  protected static final int SERVER_PORT=AvailablePortFinder.getNextAvailable();
+  protected ZooKeeperTestSupport.TestZookeeperServer server;
+  protected CuratorFramework curator;
+  protected ServiceDiscovery<ZooKeeperServiceRegistry.MetaData> discovery;
+  @Override protected void doPreSetup() throws Exception {
+    super.doPreSetup();
+    server=new ZooKeeperTestSupport.TestZookeeperServer(SERVER_PORT,true);
+    ZooKeeperTestSupport.waitForServerUp("127.0.0.1:" + SERVER_PORT,1000);
+    curator=CuratorFrameworkFactory.builder().connectString("127.0.0.1:" + SERVER_PORT).retryPolicy(new ExponentialBackoffRetry(1000,3)).build();
+    discovery=ServiceDiscoveryBuilder.builder(ZooKeeperServiceRegistry.MetaData.class).client(curator).basePath(SERVICE_PATH).serializer(new JsonInstanceSerializer<>(ZooKeeperServiceRegistry.MetaData.class)).build();
+    curator.start();
+    discovery.start();
+  }
+  @Override @After public void tearDown() throws Exception {
+    super.tearDown();
+    CloseableUtils.closeQuietly(discovery);
+    CloseableUtils.closeQuietly(curator);
+    server.shutdown();
+  }
+  protected Map<String,String> getMetadata(){
+    return Collections.emptyMap();
+  }
+  @Override protected CamelContext createCamelContext() throws Exception {
+    final CamelContext context=super.createCamelContext();
+    ZooKeeperServiceRegistry registry=new ZooKeeperServiceRegistry();
+    registry.setId(context.getUuidGenerator().generateUuid());
+    registry.setCamelContext(context());
+    registry.setNodes("localhost:" + SERVER_PORT);
+    registry.setBasePath(SERVICE_PATH);
+    registry.setServiceHost(SERVICE_HOST);
+    registry.setOverrideServiceHost(true);
+    context.addService(registry,true,false);
+    return context;
+  }
+  @Test public void testRegistrationFromRoute() throws Exception {
+    assertTrue(discovery.queryForInstances(SERVICE_NAME).isEmpty());
+    context().startRoute(SERVICE_ID);
+    Collection<ServiceInstance<ZooKeeperServiceRegistry.MetaData>> services=discovery.queryForInstances(SERVICE_NAME);
+    assertEquals(1,services.size());
+    ServiceInstance<ZooKeeperServiceRegistry.MetaData> instance=services.iterator().next();
+    assertEquals(SERVICE_PORT,(int)instance.getPort());
+    assertEquals("localhost",instance.getAddress());
+    assertEquals("http",instance.getPayload().get(ServiceDefinition.SERVICE_META_PROTOCOL));
+    assertEquals("/service/endpoint",instance.getPayload().get(ServiceDefinition.SERVICE_META_PATH));
+    getMetadata().forEach((k,v) -> {
+      assertEquals(v,instance.getPayload().get(k));
+    }
+);
+    context().stopRoute(SERVICE_ID);
+    assertTrue(discovery.queryForInstances(SERVICE_NAME).isEmpty());
+  }
+}

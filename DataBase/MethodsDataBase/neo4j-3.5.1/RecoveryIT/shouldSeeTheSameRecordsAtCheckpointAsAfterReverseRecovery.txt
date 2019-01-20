@@ -1,0 +1,54 @@
+@Test public void shouldSeeTheSameRecordsAtCheckpointAsAfterReverseRecovery() throws Exception {
+  EphemeralFileSystemAbstraction fs=new EphemeralFileSystemAbstraction();
+  GraphDatabaseService db=new TestGraphDatabaseFactory().setFileSystem(fs).newImpermanentDatabase(directory.databaseDir());
+  produceRandomGraphUpdates(db,100);
+  checkPoint(db);
+  EphemeralFileSystemAbstraction checkPointFs=fs.snapshot();
+  produceRandomGraphUpdates(db,100);
+  flush(db);
+  EphemeralFileSystemAbstraction crashedFs=fs.snapshot();
+  db.shutdown();
+  fs.close();
+  Monitors monitors=new Monitors();
+  AtomicReference<PageCache> pageCache=new AtomicReference<>();
+  AtomicReference<EphemeralFileSystemAbstraction> reversedFs=new AtomicReference<>();
+  monitors.addMonitorListener(new RecoveryMonitor(){
+    @Override public void reverseStoreRecoveryCompleted(    long checkpointTxId){
+      try {
+        pageCache.get().flushAndForce();
+      }
+ catch (      IOException e) {
+        throw new UncheckedIOException(e);
+      }
+      reversedFs.set(crashedFs.snapshot());
+    }
+  }
+);
+  new TestGraphDatabaseFactory(){
+    @Override protected DatabaseCreator createImpermanentDatabaseCreator(    File storeDir,    TestGraphDatabaseFactoryState state){
+      return new GraphDatabaseBuilder.DatabaseCreator(){
+        @Override public GraphDatabaseService newDatabase(        @Nonnull Config config){
+          TestGraphDatabaseFacadeFactory factory=new TestGraphDatabaseFacadeFactory(state,true){
+            @Override protected PlatformModule createPlatform(            File storeDir,            Config config,            Dependencies dependencies){
+              PlatformModule platform=super.createPlatform(storeDir,config,dependencies);
+              pageCache.set(platform.pageCache);
+              return platform;
+            }
+          }
+;
+          return factory.newFacade(storeDir,config,newDependencies(state.databaseDependencies()));
+        }
+      }
+;
+    }
+  }
+.setFileSystem(crashedFs).setMonitors(monitors).newImpermanentDatabase(directory.databaseDir()).shutdown();
+  fs.close();
+  try {
+    assertSameStoreContents(checkPointFs,reversedFs.get(),directory.databaseLayout());
+  }
+  finally {
+    checkPointFs.close();
+    reversedFs.get().close();
+  }
+}

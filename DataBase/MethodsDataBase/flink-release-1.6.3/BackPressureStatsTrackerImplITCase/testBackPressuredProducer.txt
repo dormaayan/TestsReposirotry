@@ -1,0 +1,119 @@
+/** 
+ * Tests a simple fake-back pressured task. Back pressure is assumed when sampled stack traces are in blocking buffer requests.
+ */
+@Test public void testBackPressuredProducer() throws Exception {
+  new JavaTestKit(testActorSystem){
+{
+      final FiniteDuration deadline=new FiniteDuration(60,TimeUnit.SECONDS);
+      final JobGraph jobGraph=new JobGraph();
+      final int parallelism=4;
+      final JobVertex task=new JobVertex("Task");
+      task.setInvokableClass(BackPressuredTask.class);
+      task.setParallelism(parallelism);
+      jobGraph.addVertex(task);
+      final Configuration config=new Configuration();
+      final HighAvailabilityServices highAvailabilityServices=HighAvailabilityServicesUtils.createAvailableOrEmbeddedServices(config,TestingUtils.defaultExecutor());
+      ActorGateway jobManger=null;
+      ActorGateway taskManager=null;
+      testBufferPool=networkBufferPool.createBufferPool(1,Integer.MAX_VALUE);
+      final List<Buffer> buffers=new ArrayList<>();
+      while (true) {
+        Buffer buffer=testBufferPool.requestBuffer();
+        if (buffer != null) {
+          buffers.add(buffer);
+        }
+ else {
+          break;
+        }
+      }
+      try {
+        jobManger=TestingUtils.createJobManager(testActorSystem,TestingUtils.defaultExecutor(),TestingUtils.defaultExecutor(),config,highAvailabilityServices);
+        config.setInteger(TaskManagerOptions.NUM_TASK_SLOTS,parallelism);
+        taskManager=TestingUtils.createTaskManager(testActorSystem,highAvailabilityServices,config,true,true);
+        final ActorGateway jm=jobManger;
+        new Within(deadline){
+          @Override protected void run(){
+            try {
+              ActorGateway testActor=new AkkaActorGateway(getTestActor(),HighAvailabilityServices.DEFAULT_LEADER_ID);
+              JobClient.submitJobDetached(new AkkaJobManagerGateway(jm),config,jobGraph,Time.milliseconds(deadline.toMillis()),ClassLoader.getSystemClassLoader());
+              jm.tell(new WaitForAllVerticesToBeRunning(jobGraph.getJobID()),testActor);
+              expectMsgEquals(new AllVerticesRunning(jobGraph.getJobID()));
+              jm.tell(new RequestExecutionGraph(jobGraph.getJobID()),testActor);
+              ExecutionGraphFound executionGraphResponse=expectMsgClass(ExecutionGraphFound.class);
+              ExecutionGraph executionGraph=(ExecutionGraph)executionGraphResponse.executionGraph();
+              ExecutionJobVertex vertex=executionGraph.getJobVertex(task.getID());
+              StackTraceSampleCoordinator coordinator=new StackTraceSampleCoordinator(testActorSystem.dispatcher(),60000);
+              BackPressureStatsTrackerImpl statsTracker=new BackPressureStatsTrackerImpl(coordinator,100 * 1000,20,Integer.MAX_VALUE,Time.milliseconds(10L));
+              int numAttempts=10;
+              int nextSampleId=0;
+              for (int attempt=0; attempt < numAttempts; attempt++) {
+                try {
+                  OperatorBackPressureStats stats=triggerStatsSample(statsTracker,vertex);
+                  Assert.assertEquals(nextSampleId + attempt,stats.getSampleId());
+                  Assert.assertEquals(parallelism,stats.getNumberOfSubTasks());
+                  Assert.assertEquals(1.0,stats.getMaxBackPressureRatio(),0.0);
+                  for (int i=0; i < parallelism; i++) {
+                    Assert.assertEquals(1.0,stats.getBackPressureRatio(i),0.0);
+                  }
+                  nextSampleId=stats.getSampleId() + 1;
+                  break;
+                }
+ catch (                Throwable t) {
+                  if (attempt == numAttempts - 1) {
+                    throw t;
+                  }
+ else {
+                    Thread.sleep(500);
+                  }
+                }
+              }
+              for (              Buffer buf : buffers) {
+                buf.recycleBuffer();
+                Assert.assertTrue(buf.isRecycled());
+              }
+              while (testBufferPool.getNumberOfAvailableMemorySegments() < 100) {
+                Thread.sleep(100);
+              }
+              for (int attempt=0; attempt < numAttempts; attempt++) {
+                try {
+                  OperatorBackPressureStats stats=triggerStatsSample(statsTracker,vertex);
+                  Assert.assertEquals(nextSampleId + attempt,stats.getSampleId());
+                  Assert.assertEquals(parallelism,stats.getNumberOfSubTasks());
+                  for (int i=0; i < parallelism; i++) {
+                    Assert.assertEquals(0.0,stats.getBackPressureRatio(i),0.0);
+                  }
+                  break;
+                }
+ catch (                Throwable t) {
+                  if (attempt == numAttempts - 1) {
+                    throw t;
+                  }
+ else {
+                    Thread.sleep(500);
+                  }
+                }
+              }
+              jm.tell(new TestingJobManagerMessages.NotifyWhenJobRemoved(jobGraph.getJobID()),testActor);
+              jm.tell(new JobManagerMessages.CancelJob(jobGraph.getJobID()));
+              expectMsgEquals(true);
+              statsTracker.invalidateOperatorStatsCache();
+              Assert.assertFalse("Unexpected trigger",statsTracker.triggerStackTraceSample(vertex));
+            }
+ catch (            Exception e) {
+              e.printStackTrace();
+              Assert.fail(e.getMessage());
+            }
+          }
+        }
+;
+      }
+  finally {
+        TestingUtils.stopActor(jobManger);
+        TestingUtils.stopActor(taskManager);
+        highAvailabilityServices.closeAndCleanupAllData();
+        testBufferPool.lazyDestroy();
+      }
+    }
+  }
+;
+}

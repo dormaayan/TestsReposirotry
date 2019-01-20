@@ -1,0 +1,58 @@
+/** 
+ * @author Tomasz Bak
+ */
+public class RedirectingEurekaHttpClientTest {
+  private static final String SERVICE_URL="http://mydiscovery.test";
+  private final TransportClientFactory factory=mock(TransportClientFactory.class);
+  private final EurekaHttpClient sourceClient=mock(EurekaHttpClient.class);
+  private final EurekaHttpClient redirectedClient=mock(EurekaHttpClient.class);
+  private final DnsService dnsService=mock(DnsService.class);
+  public void setupRedirect(){
+    when(factory.newClient(Matchers.<EurekaEndpoint>anyVararg())).thenReturn(sourceClient,redirectedClient);
+    when(sourceClient.getApplications()).thenReturn(anEurekaHttpResponse(302,Applications.class).headers(HttpHeaders.LOCATION,"http://another.discovery.test/eureka/v2/apps").build());
+    when(dnsService.resolveIp("another.discovery.test")).thenReturn("192.168.0.1");
+    when(redirectedClient.getApplications()).thenReturn(anEurekaHttpResponse(200,new Applications()).type(MediaType.APPLICATION_JSON_TYPE).build());
+  }
+  @Test public void testNonRedirectedRequestsAreServedByFirstClient() throws Exception {
+    when(factory.newClient(Matchers.<EurekaEndpoint>anyVararg())).thenReturn(sourceClient);
+    when(sourceClient.getApplications()).thenReturn(anEurekaHttpResponse(200,new Applications()).type(MediaType.APPLICATION_JSON_TYPE).build());
+    RedirectingEurekaHttpClient httpClient=new RedirectingEurekaHttpClient(SERVICE_URL,factory,dnsService);
+    httpClient.getApplications();
+    verify(factory,times(1)).newClient(Matchers.<EurekaEndpoint>anyVararg());
+    verify(sourceClient,times(1)).getApplications();
+  }
+  @Test public void testRedirectsAreFollowedAndClientIsPinnedToTheLastServer() throws Exception {
+    setupRedirect();
+    RedirectingEurekaHttpClient httpClient=new RedirectingEurekaHttpClient(SERVICE_URL,factory,dnsService);
+    httpClient.getApplications();
+    verify(factory,times(2)).newClient(Matchers.<EurekaEndpoint>anyVararg());
+    verify(sourceClient,times(1)).getApplications();
+    verify(dnsService,times(1)).resolveIp("another.discovery.test");
+    verify(redirectedClient,times(1)).getApplications();
+    httpClient.getApplications();
+    verify(factory,times(2)).newClient(Matchers.<EurekaEndpoint>anyVararg());
+    verify(sourceClient,times(1)).getApplications();
+    verify(dnsService,times(1)).resolveIp("another.discovery.test");
+    verify(redirectedClient,times(2)).getApplications();
+  }
+  @Test public void testOnConnectionErrorPinnedClientIsDestroyed() throws Exception {
+    setupRedirect();
+    RedirectingEurekaHttpClient httpClient=new RedirectingEurekaHttpClient(SERVICE_URL,factory,dnsService);
+    httpClient.getApplications();
+    verify(redirectedClient,times(1)).getApplications();
+    when(redirectedClient.getApplications()).thenThrow(new TransportException("simulated network error"));
+    try {
+      httpClient.getApplications();
+      fail("Expected transport error");
+    }
+ catch (    Exception ignored) {
+    }
+    reset(factory,sourceClient,dnsService,redirectedClient);
+    setupRedirect();
+    httpClient.getApplications();
+    verify(factory,times(2)).newClient(Matchers.<EurekaEndpoint>anyVararg());
+    verify(sourceClient,times(1)).getApplications();
+    verify(dnsService,times(1)).resolveIp("another.discovery.test");
+    verify(redirectedClient,times(1)).getApplications();
+  }
+}

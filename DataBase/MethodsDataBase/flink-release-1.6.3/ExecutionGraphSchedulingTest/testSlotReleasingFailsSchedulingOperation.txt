@@ -1,0 +1,26 @@
+/** 
+ * Tests that a partially completed eager scheduling operation fails if a completed slot is released. See FLINK-9099.
+ */
+@Test public void testSlotReleasingFailsSchedulingOperation() throws Exception {
+  final int parallelism=2;
+  final JobVertex jobVertex=new JobVertex("Testing job vertex");
+  jobVertex.setInvokableClass(NoOpInvokable.class);
+  jobVertex.setParallelism(parallelism);
+  final JobGraph jobGraph=new JobGraph(jobVertex);
+  jobGraph.setAllowQueuedScheduling(true);
+  jobGraph.setScheduleMode(ScheduleMode.EAGER);
+  final ProgrammedSlotProvider slotProvider=new ProgrammedSlotProvider(parallelism);
+  final SimpleSlot slot=createSlot(new SimpleAckingTaskManagerGateway(),jobGraph.getJobID(),new DummySlotOwner());
+  slotProvider.addSlot(jobVertex.getID(),0,CompletableFuture.completedFuture(slot));
+  final CompletableFuture<LogicalSlot> slotFuture=new CompletableFuture<>();
+  slotProvider.addSlot(jobVertex.getID(),1,slotFuture);
+  final ExecutionGraph executionGraph=createExecutionGraph(jobGraph,slotProvider);
+  executionGraph.scheduleForExecution();
+  assertThat(executionGraph.getState(),is(JobStatus.RUNNING));
+  final ExecutionJobVertex executionJobVertex=executionGraph.getJobVertex(jobVertex.getID());
+  final ExecutionVertex[] taskVertices=executionJobVertex.getTaskVertices();
+  assertThat(taskVertices[0].getExecutionState(),is(ExecutionState.SCHEDULED));
+  assertThat(taskVertices[1].getExecutionState(),is(ExecutionState.SCHEDULED));
+  slot.releaseSlot(new FlinkException("Test failure"));
+  assertThat(executionGraph.getTerminationFuture().get(),is(JobStatus.FAILED));
+}

@@ -1,0 +1,51 @@
+/** 
+ * Test for blockIdCK with block corruption.
+ */
+@Test public void testBlockIdCKCorruption() throws Exception {
+  short numDn=1;
+  final long blockSize=512;
+  Random random=new Random();
+  ExtendedBlock block;
+  short repFactor=1;
+  String[] racks={"/rack1"};
+  String[] hosts={"host1"};
+  conf.setLong(DFSConfigKeys.DFS_BLOCKREPORT_INTERVAL_MSEC_KEY,1000);
+  conf.setInt(HdfsClientConfigKeys.Retry.WINDOW_BASE_KEY,10);
+  conf.setLong(DFSConfigKeys.DFS_BLOCK_SIZE_KEY,blockSize);
+  conf.setInt(DFSConfigKeys.DFS_REPLICATION_KEY,1);
+  DistributedFileSystem dfs=null;
+  File builderBaseDir=new File(GenericTestUtils.getRandomizedTempPath());
+  cluster=new MiniDFSCluster.Builder(conf,builderBaseDir).numDataNodes(numDn).hosts(hosts).racks(racks).build();
+  assertNotNull("Failed Cluster Creation",cluster);
+  cluster.waitClusterUp();
+  dfs=cluster.getFileSystem();
+  assertNotNull("Failed to get FileSystem",dfs);
+  DFSTestUtil util=new DFSTestUtil.Builder().setName(getClass().getSimpleName()).setNumFiles(1).build();
+  final String pathString=new String("/testfile");
+  final Path path=new Path(pathString);
+  util.createFile(dfs,path,1024,repFactor,1000L);
+  util.waitReplication(dfs,path,repFactor);
+  StringBuilder sb=new StringBuilder();
+  for (  LocatedBlock lb : util.getAllBlocks(dfs,path)) {
+    sb.append(lb.getBlock().getLocalBlock().getBlockName() + " ");
+  }
+  String[] bIds=sb.toString().split(" ");
+  String outStr=runFsck(conf,0,true,"/","-blockId",bIds[0]);
+  System.out.println(outStr);
+  assertTrue(outStr.contains(NamenodeFsck.HEALTHY_STATUS));
+  block=DFSTestUtil.getFirstBlock(dfs,path);
+  File blockFile=cluster.getBlockFile(0,block);
+  if (blockFile != null && blockFile.exists()) {
+    RandomAccessFile raFile=new RandomAccessFile(blockFile,"rw");
+    FileChannel channel=raFile.getChannel();
+    String badString="BADBAD";
+    int rand=random.nextInt((int)channel.size() / 2);
+    raFile.seek(rand);
+    raFile.write(badString.getBytes());
+    raFile.close();
+  }
+  util.waitCorruptReplicas(dfs,cluster.getNamesystem(),path,block,1);
+  outStr=runFsck(conf,1,false,"/","-blockId",block.getBlockName());
+  System.out.println(outStr);
+  assertTrue(outStr.contains(NamenodeFsck.CORRUPT_STATUS));
+}

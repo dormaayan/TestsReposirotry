@@ -1,0 +1,72 @@
+/** 
+ * Custom LoadTestDataGenerator. Uses key generation and verification from LoadTestKVGenerator. Creates 3 column families; one with an integer column to filter on, the 2nd one with an integer column that matches the first integer column (for test-specific verification), and byte[] value that is used for general verification; and the third one with just the value.
+ */
+private static class DataGenerator extends LoadTestDataGenerator {
+  private static final int MIN_DATA_SIZE=4096;
+  private static final int MAX_DATA_SIZE=65536;
+  public static final byte[] ESSENTIAL_CF=Bytes.toBytes("essential");
+  public static final byte[] JOINED_CF1=Bytes.toBytes("joined");
+  public static final byte[] JOINED_CF2=Bytes.toBytes("joined2");
+  public static final byte[] FILTER_COLUMN=Bytes.toBytes("filter");
+  public static final byte[] VALUE_COLUMN=Bytes.toBytes("val");
+  public static final long ACCEPTED_VALUE=1L;
+  private static final Map<byte[],byte[][]> columnMap=new TreeMap<>(Bytes.BYTES_COMPARATOR);
+  private final AtomicLong expectedNumberOfKeys=new AtomicLong(0);
+  private final AtomicLong totalNumberOfKeys=new AtomicLong(0);
+  public DataGenerator(){
+    super(MIN_DATA_SIZE,MAX_DATA_SIZE);
+    columnMap.put(ESSENTIAL_CF,new byte[][]{FILTER_COLUMN});
+    columnMap.put(JOINED_CF1,new byte[][]{FILTER_COLUMN,VALUE_COLUMN});
+    columnMap.put(JOINED_CF2,new byte[][]{VALUE_COLUMN});
+  }
+  public long getExpectedNumberOfKeys(){
+    return expectedNumberOfKeys.get();
+  }
+  public long getTotalNumberOfKeys(){
+    return totalNumberOfKeys.get();
+  }
+  @Override public byte[] getDeterministicUniqueKey(  long keyBase){
+    return LoadTestKVGenerator.md5PrefixedKey(keyBase).getBytes();
+  }
+  @Override public byte[][] getColumnFamilies(){
+    return columnMap.keySet().toArray(new byte[columnMap.size()][]);
+  }
+  @Override public byte[][] generateColumnsForCf(  byte[] rowKey,  byte[] cf){
+    return columnMap.get(cf);
+  }
+  @Override public byte[] generateValue(  byte[] rowKey,  byte[] cf,  byte[] column){
+    if (Bytes.BYTES_COMPARATOR.compare(column,FILTER_COLUMN) == 0) {
+      long value=Long.parseLong(Bytes.toString(rowKey,0,4),16) & ACCEPTED_VALUE;
+      if (Bytes.BYTES_COMPARATOR.compare(cf,ESSENTIAL_CF) == 0) {
+        totalNumberOfKeys.incrementAndGet();
+        if (value == ACCEPTED_VALUE) {
+          expectedNumberOfKeys.incrementAndGet();
+        }
+      }
+      return Bytes.toBytes(value);
+    }
+ else     if (Bytes.BYTES_COMPARATOR.compare(column,VALUE_COLUMN) == 0) {
+      return kvGenerator.generateRandomSizeValue(rowKey,cf,column);
+    }
+    String error="Unknown column " + Bytes.toString(column);
+    assert false : error;
+    throw new InvalidParameterException(error);
+  }
+  @Override public boolean verify(  byte[] rowKey,  byte[] cf,  byte[] column,  byte[] value){
+    if (Bytes.BYTES_COMPARATOR.compare(column,FILTER_COLUMN) == 0) {
+      return Bytes.toLong(value) == ACCEPTED_VALUE;
+    }
+ else     if (Bytes.BYTES_COMPARATOR.compare(column,VALUE_COLUMN) == 0) {
+      return LoadTestKVGenerator.verify(value,rowKey,cf,column);
+    }
+    return false;
+  }
+  @Override public boolean verify(  byte[] rowKey,  byte[] cf,  Set<byte[]> columnSet){
+    return columnMap.get(cf).length == columnSet.size();
+  }
+  public Filter getScanFilter(){
+    SingleColumnValueFilter scf=new SingleColumnValueFilter(ESSENTIAL_CF,FILTER_COLUMN,CompareOperator.EQUAL,Bytes.toBytes(ACCEPTED_VALUE));
+    scf.setFilterIfMissing(true);
+    return scf;
+  }
+}

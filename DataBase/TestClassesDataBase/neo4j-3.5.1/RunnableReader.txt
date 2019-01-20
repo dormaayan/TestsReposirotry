@@ -1,0 +1,67 @@
+private class RunnableReader implements Runnable {
+  private final CountDownLatch readerReadySignal;
+  private final CountDownLatch readerStartSignal;
+  private final AtomicBoolean endSignal;
+  private final AtomicBoolean failHalt;
+  private final AtomicReference<Throwable> readerError;
+  private final TestCoordinator testCoordinator;
+  RunnableReader(  TestCoordinator testCoordinator,  CountDownLatch readerReadySignal,  CountDownLatch readerStartSignal,  AtomicBoolean endSignal,  AtomicBoolean failHalt,  AtomicReference<Throwable> readerError){
+    this.readerReadySignal=readerReadySignal;
+    this.readerStartSignal=readerStartSignal;
+    this.endSignal=endSignal;
+    this.failHalt=failHalt;
+    this.readerError=readerError;
+    this.testCoordinator=testCoordinator;
+  }
+  @Override public void run(){
+    try {
+      readerReadySignal.countDown();
+      readerStartSignal.await();
+      while (!endSignal.get() && !failHalt.get()) {
+        doRead();
+      }
+    }
+ catch (    Throwable e) {
+      readerError.set(e);
+      failHalt.set(true);
+    }
+  }
+  private void doRead() throws IOException {
+    ReaderInstruction readerInstruction=testCoordinator.get();
+    Iterator<Long> expectToSee=readerInstruction.expectToSee().iterator();
+    long start=readerInstruction.start();
+    long end=readerInstruction.end();
+    boolean forward=start <= end;
+    try (RawCursor<Hit<KEY,VALUE>,IOException> cursor=index.seek(key(start),key(end))){
+      if (expectToSee.hasNext()) {
+        long nextToSee=expectToSee.next();
+        while (cursor.next()) {
+          long lastSeenKey=keySeed(cursor.get().key());
+          long lastSeenValue=valueSeed(cursor.get().value());
+          if (lastSeenKey != lastSeenValue) {
+            fail(String.format("Read mismatching key value pair, key=%d, value=%d%n",lastSeenKey,lastSeenValue));
+          }
+          while ((forward && lastSeenKey > nextToSee) || (!forward && lastSeenKey < nextToSee)) {
+            if (testCoordinator.isReallyExpected(nextToSee)) {
+              fail(String.format("Expected to see %d but went straight to %d. ",nextToSee,lastSeenKey));
+            }
+            if (expectToSee.hasNext()) {
+              nextToSee=expectToSee.next();
+            }
+ else {
+              break;
+            }
+          }
+          if (nextToSee == lastSeenKey) {
+            if (expectToSee.hasNext()) {
+              nextToSee=expectToSee.next();
+            }
+ else {
+              break;
+            }
+          }
+        }
+      }
+    }
+   }
+}

@@ -1,0 +1,175 @@
+/** 
+ * Tests sampling of task stack traces.
+ */
+@Test @SuppressWarnings("unchecked") public void testTriggerStackTraceSampleMessage() throws Exception {
+  new JavaTestKit(system){
+{
+      ActorGateway taskManagerActorGateway=null;
+      ActorRef jm=system.actorOf(Props.create(new SimpleLookupJobManagerCreator(HighAvailabilityServices.DEFAULT_LEADER_ID)));
+      ActorGateway jobManagerActorGateway=new AkkaActorGateway(jm,HighAvailabilityServices.DEFAULT_LEADER_ID);
+      final ActorGateway testActorGateway=new AkkaActorGateway(getTestActor(),HighAvailabilityServices.DEFAULT_LEADER_ID);
+      try {
+        final ActorGateway jobManager=jobManagerActorGateway;
+        highAvailabilityServices.setJobMasterLeaderRetriever(HighAvailabilityServices.DEFAULT_JOB_ID,new StandaloneLeaderRetrievalService(jobManager.path(),jobManager.leaderSessionID()));
+        final ActorGateway taskManager=TestingUtils.createTaskManager(system,highAvailabilityServices,new Configuration(),true,false);
+        final JobID jobId=new JobID();
+        final TaskDeploymentDescriptor tdd=createTaskDeploymentDescriptor(jobId,"Job",new JobVertexID(),new ExecutionAttemptID(),new SerializedValue<>(new ExecutionConfig()),"Task",1,0,1,0,new Configuration(),new Configuration(),BlockingNoOpInvokable.class.getName(),Collections.<ResultPartitionDeploymentDescriptor>emptyList(),Collections.<InputGateDeploymentDescriptor>emptyList(),Collections.emptyList(),Collections.emptyList(),0);
+        new Within(d){
+          @Override protected void run(){
+            try {
+              Future<?> connectFuture=taskManager.ask(new TestingTaskManagerMessages.NotifyWhenRegisteredAtJobManager(jobManager.actor()),remaining());
+              Await.ready(connectFuture,remaining());
+              Future<Object> taskRunningFuture=taskManager.ask(new TestingTaskManagerMessages.NotifyWhenTaskIsRunning(tdd.getExecutionAttemptId()),timeout);
+              taskManager.tell(new SubmitTask(tdd));
+              Await.ready(taskRunningFuture,d);
+            }
+ catch (            Exception e) {
+              e.printStackTrace();
+              fail(e.getMessage());
+            }
+          }
+        }
+;
+        new Within(d){
+          @Override protected void run(){
+            try {
+              ExecutionAttemptID taskId=new ExecutionAttemptID();
+              taskManager.tell(new TriggerStackTraceSample(112223,taskId,100,timeD,0),testActorGateway);
+              Object[] msg=receiveN(1);
+              while (!(msg[0] instanceof Status.Failure)) {
+                msg=receiveN(1);
+              }
+              Status.Failure response=(Status.Failure)msg[0];
+              assertEquals(IllegalStateException.class,response.cause().getClass());
+            }
+ catch (            Exception e) {
+              e.printStackTrace();
+              fail(e.getMessage());
+            }
+          }
+        }
+;
+        new Within(d){
+          @Override protected void run(){
+            boolean success=false;
+            Throwable lastError=null;
+            for (int i=0; i < 100 && !success; i++) {
+              try {
+                int numSamples=5;
+                taskManager.tell(new TriggerStackTraceSample(19230,tdd.getExecutionAttemptId(),numSamples,Time.milliseconds(100L),0),testActorGateway);
+                Object[] msg=receiveN(1);
+                while (!(msg[0] instanceof StackTraceSampleResponse)) {
+                  msg=receiveN(1);
+                }
+                StackTraceSampleResponse response=(StackTraceSampleResponse)msg[0];
+                assertEquals(19230,response.getSampleId());
+                assertEquals(tdd.getExecutionAttemptId(),response.getExecutionAttemptID());
+                List<StackTraceElement[]> traces=response.getSamples();
+                assertEquals("Number of samples",numSamples,traces.size());
+                for (                StackTraceElement[] trace : traces) {
+                  for (                  StackTraceElement elem : trace) {
+                    if (elem.getClassName().equals(BlockingNoOpInvokable.class.getName())) {
+                      assertEquals("invoke",elem.getMethodName());
+                      success=true;
+                      break;
+                    }
+                  }
+                  assertTrue("Unexpected stack trace: " + Arrays.toString(trace),success);
+                }
+              }
+ catch (              Throwable t) {
+                lastError=t;
+                LOG.warn("Failed to find invokable.",t);
+              }
+              try {
+                Thread.sleep(100);
+              }
+ catch (              InterruptedException e) {
+                LOG.error("Interrupted while sleeping before retry.",e);
+                break;
+              }
+            }
+            if (!success) {
+              if (lastError == null) {
+                fail("Failed to find invokable");
+              }
+ else {
+                fail(lastError.getMessage());
+              }
+            }
+          }
+        }
+;
+        new Within(d){
+          @Override protected void run(){
+            try {
+              int numSamples=5;
+              int maxDepth=2;
+              taskManager.tell(new TriggerStackTraceSample(1337,tdd.getExecutionAttemptId(),numSamples,Time.milliseconds(100L),maxDepth),testActorGateway);
+              Object[] msg=receiveN(1);
+              while (!(msg[0] instanceof StackTraceSampleResponse)) {
+                msg=receiveN(1);
+              }
+              StackTraceSampleResponse response=(StackTraceSampleResponse)msg[0];
+              assertEquals(1337,response.getSampleId());
+              assertEquals(tdd.getExecutionAttemptId(),response.getExecutionAttemptID());
+              List<StackTraceElement[]> traces=response.getSamples();
+              assertEquals("Number of samples",numSamples,traces.size());
+              for (              StackTraceElement[] trace : traces) {
+                assertEquals("Max depth",maxDepth,trace.length);
+              }
+            }
+ catch (            Exception e) {
+              e.printStackTrace();
+              fail(e.getMessage());
+            }
+          }
+        }
+;
+        new Within(d){
+          @Override protected void run(){
+            try {
+              int maxAttempts=10;
+              int sleepTime=100;
+              for (int i=0; i < maxAttempts; i++, sleepTime*=2) {
+                taskManager.tell(new TriggerStackTraceSample(44,tdd.getExecutionAttemptId(),Integer.MAX_VALUE,Time.milliseconds(10L),0),testActorGateway);
+                Thread.sleep(sleepTime);
+                Future<?> removeFuture=taskManager.ask(new TestingJobManagerMessages.NotifyWhenJobRemoved(jobId),remaining());
+                taskManager.tell(new CancelTask(tdd.getExecutionAttemptId()));
+                while (true) {
+                  Object[] msg=receiveN(1);
+                  if (msg[0] instanceof StackTraceSampleResponse) {
+                    StackTraceSampleResponse response=(StackTraceSampleResponse)msg[0];
+                    assertEquals(tdd.getExecutionAttemptId(),response.getExecutionAttemptID());
+                    assertEquals(44,response.getSampleId());
+                    return;
+                  }
+ else                   if (msg[0] instanceof Failure) {
+                    Await.ready(removeFuture,remaining());
+                    Future<?> taskRunningFuture=taskManager.ask(new TestingTaskManagerMessages.NotifyWhenTaskIsRunning(tdd.getExecutionAttemptId()),timeout);
+                    taskManager.tell(new SubmitTask(tdd));
+                    Await.ready(taskRunningFuture,remaining());
+                    break;
+                  }
+ else {
+                    continue;
+                  }
+                }
+              }
+            }
+ catch (            Exception e) {
+              e.printStackTrace();
+              fail(e.getMessage());
+            }
+          }
+        }
+;
+      }
+  finally {
+        TestingUtils.stopActor(taskManagerActorGateway);
+        TestingUtils.stopActor(jobManagerActorGateway);
+      }
+    }
+  }
+;
+}

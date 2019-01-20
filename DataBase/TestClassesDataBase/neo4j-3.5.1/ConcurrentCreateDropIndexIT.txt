@@ -1,0 +1,163 @@
+public class ConcurrentCreateDropIndexIT {
+  private static final String KEY="key";
+  @Rule public final DatabaseRule db=new ImpermanentDatabaseRule();
+  @Rule public final CleanupRule cleanupRule=new CleanupRule();
+  private final int threads=Runtime.getRuntime().availableProcessors();
+  @Before public void createTokens(){
+    try (Transaction tx=db.beginTx()){
+      for (int i=0; i < threads; i++) {
+        db.createNode(label(i)).setProperty(KEY,i);
+      }
+      tx.success();
+    }
+   }
+  @Test public void concurrentCreatingOfIndexesShouldNotInterfere() throws Throwable {
+    Race race=new Race();
+    for (int i=0; i < threads; i++) {
+      race.addContestant(indexCreate(i),1);
+    }
+    race.go();
+    try (Transaction tx=db.beginTx()){
+      List<IndexDefinition> indexes=asList(db.schema().getIndexes());
+      assertEquals(threads,indexes.size());
+      Set<String> labels=new HashSet<>();
+      for (      IndexDefinition index : indexes) {
+        assertTrue(labels.add(single(index.getLabels()).name()));
+      }
+      tx.success();
+    }
+   }
+  @Test public void concurrentDroppingOfIndexesShouldNotInterfere() throws Throwable {
+    List<IndexDefinition> indexes=new ArrayList<>();
+    try (Transaction tx=db.beginTx()){
+      for (int i=0; i < threads; i++) {
+        indexes.add(db.schema().indexFor(label(i)).on(KEY).create());
+      }
+      tx.success();
+    }
+     Race race=new Race();
+    for (    IndexDefinition index : indexes) {
+      race.addContestant(indexDrop(index),1);
+    }
+    race.go();
+    try (Transaction tx=db.beginTx()){
+      assertEquals(0,asList(db.schema().getIndexes()).size());
+      tx.success();
+    }
+   }
+  @Test public void concurrentMixedCreatingAndDroppingOfIndexesShouldNotInterfere() throws Throwable {
+    List<IndexDefinition> indexesToDrop=new ArrayList<>();
+    int creates=threads / 2;
+    int drops=threads - creates;
+    try (Transaction tx=db.beginTx()){
+      for (int i=0; i < drops; i++) {
+        indexesToDrop.add(db.schema().indexFor(label(i)).on(KEY).create());
+      }
+      tx.success();
+    }
+     Race race=new Race();
+    Set<String> expectedIndexedLabels=new HashSet<>();
+    for (int i=0; i < creates; i++) {
+      expectedIndexedLabels.add(label(drops + i).name());
+      race.addContestant(indexCreate(drops + i),1);
+    }
+    for (    IndexDefinition index : indexesToDrop) {
+      race.addContestant(indexDrop(index),1);
+    }
+    race.go();
+    try (Transaction tx=db.beginTx()){
+      List<IndexDefinition> indexes=asList(db.schema().getIndexes());
+      assertEquals(creates,indexes.size());
+      tx.success();
+      for (      IndexDefinition index : indexes) {
+        assertTrue(expectedIndexedLabels.remove(single(index.getLabels()).name()));
+      }
+    }
+   }
+  @Test public void concurrentCreatingUniquenessConstraint() throws Throwable {
+    Race race=new Race().withMaxDuration(10,SECONDS);
+    Label label=label(0);
+    race.addContestants(10,() -> {
+      try (Transaction tx=db.beginTx()){
+        db.schema().constraintFor(label).assertPropertyIsUnique(KEY).create();
+        tx.success();
+      }
+ catch (      TransientFailureException|ConstraintViolationException e) {
+      }
+    }
+,300);
+    race.go();
+    try (Transaction tx=db.beginTx()){
+      ConstraintDefinition constraint=single(db.schema().getConstraints(label));
+      assertNotNull(constraint);
+      IndexDefinition index=single(db.schema().getIndexes(label));
+      assertNotNull(index);
+      tx.success();
+    }
+   }
+  @Test public void concurrentCreatingUniquenessConstraintOnNonUniqueData() throws Throwable {
+    Label label=label(0);
+    try (Transaction tx=db.beginTx()){
+      for (int i=0; i < 2; i++) {
+        db.createNode(label).setProperty(KEY,"A");
+      }
+      tx.success();
+    }
+     Race race=new Race().withMaxDuration(10,SECONDS);
+    race.addContestants(3,() -> {
+      try (Transaction tx=db.beginTx()){
+        db.schema().constraintFor(label).assertPropertyIsUnique(KEY).create();
+        tx.success();
+      }
+ catch (      TransientFailureException|ConstraintViolationException e) {
+      }
+    }
+,100);
+    race.go();
+    try (Transaction tx=db.beginTx()){
+      ConstraintDefinition constraint=singleOrNull(db.schema().getConstraints(label));
+      assertNull(constraint);
+      IndexDefinition index=singleOrNull(db.schema().getIndexes(label));
+      assertNull(index);
+      tx.success();
+    }
+   }
+  @Test public void concurrentCreatingAndAwaitingIndexesOnline() throws Exception {
+    ExecutorService executor=cleanupRule.add(Executors.newSingleThreadExecutor());
+    Future<?> indexCreate=executor.submit(() -> {
+      try (Transaction tx=db.beginTx()){
+        db.schema().indexFor(label(0)).on(KEY).create();
+        tx.success();
+      }
+     }
+);
+    while (!indexCreate.isDone()) {
+      try (Transaction tx=db.beginTx()){
+        db.schema().awaitIndexesOnline(1,TimeUnit.MINUTES);
+        tx.success();
+      }
+     }
+    indexCreate.get();
+  }
+  private Runnable indexCreate(  int labelIndex){
+    return () -> {
+      try (Transaction tx=db.beginTx()){
+        db.schema().indexFor(label(labelIndex)).on(KEY).create();
+        tx.success();
+      }
+     }
+;
+  }
+  private Runnable indexDrop(  IndexDefinition index){
+    return () -> {
+      try (Transaction tx=db.beginTx()){
+        index.drop();
+        tx.success();
+      }
+     }
+;
+  }
+  private static Label label(  int i){
+    return Label.label("L" + i);
+  }
+}

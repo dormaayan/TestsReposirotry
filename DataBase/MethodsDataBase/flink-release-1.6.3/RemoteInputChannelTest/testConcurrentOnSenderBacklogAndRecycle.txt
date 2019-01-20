@@ -1,0 +1,38 @@
+/** 
+ * Tests to verify that there is no race condition with two things running in parallel: requesting floating buffers on sender backlog and some other thread recycling floating or exclusive buffers.
+ */
+@Test public void testConcurrentOnSenderBacklogAndRecycle() throws Exception {
+  final NetworkBufferPool networkBufferPool=new NetworkBufferPool(248,32);
+  final int numExclusiveSegments=120;
+  final int numFloatingBuffers=128;
+  final int backlog=128;
+  final ExecutorService executor=Executors.newFixedThreadPool(3);
+  final SingleInputGate inputGate=createSingleInputGate();
+  final RemoteInputChannel inputChannel=createRemoteInputChannel(inputGate);
+  inputGate.setInputChannel(inputChannel.partitionId.getPartitionId(),inputChannel);
+  Throwable thrown=null;
+  try {
+    final BufferPool bufferPool=networkBufferPool.createBufferPool(numFloatingBuffers,numFloatingBuffers);
+    inputGate.setBufferPool(bufferPool);
+    inputGate.assignExclusiveSegments(networkBufferPool,numExclusiveSegments);
+    inputChannel.requestSubpartition(0);
+    final Callable<Void> requestBufferTask=new Callable<Void>(){
+      @Override public Void call() throws Exception {
+        for (int j=1; j <= backlog; j++) {
+          inputChannel.onSenderBacklog(j);
+        }
+        return null;
+      }
+    }
+;
+    submitTasksAndWaitForResults(executor,new Callable[]{recycleExclusiveBufferTask(inputChannel,numExclusiveSegments),recycleFloatingBufferTask(bufferPool,numFloatingBuffers),requestBufferTask});
+    assertEquals("There should be " + inputChannel.getNumberOfRequiredBuffers() + " buffers available in channel.",inputChannel.getNumberOfRequiredBuffers(),inputChannel.getNumberOfAvailableBuffers());
+    assertEquals("There should be no buffers available in local pool.",0,bufferPool.getNumberOfAvailableMemorySegments());
+  }
+ catch (  Throwable t) {
+    thrown=t;
+  }
+ finally {
+    cleanup(networkBufferPool,executor,null,thrown,inputChannel);
+  }
+}

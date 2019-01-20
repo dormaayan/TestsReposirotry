@@ -1,0 +1,47 @@
+@Test public void testCacheEvictionThreadSafe() throws Exception {
+  long maxSize=100000;
+  int numBlocks=9;
+  int testRuns=10;
+  final long blockSize=calculateBlockSizeDefault(maxSize,numBlocks);
+  assertTrue("calculateBlockSize appears broken.",blockSize * numBlocks <= maxSize);
+  final Configuration conf=HBaseConfiguration.create();
+  final LruBlockCache cache=new LruBlockCache(maxSize,blockSize);
+  EvictionThread evictionThread=cache.getEvictionThread();
+  assertTrue(evictionThread != null);
+  while (!evictionThread.isEnteringRun()) {
+    Thread.sleep(1);
+  }
+  final String hfileName="hfile";
+  int threads=10;
+  final int blocksPerThread=5 * numBlocks;
+  for (int run=0; run != testRuns; ++run) {
+    final AtomicInteger blockCount=new AtomicInteger(0);
+    ExecutorService service=Executors.newFixedThreadPool(threads);
+    for (int i=0; i != threads; ++i) {
+      service.execute(new Runnable(){
+        @Override public void run(){
+          for (int blockIndex=0; blockIndex < blocksPerThread || (!cache.isEvictionInProgress()); ++blockIndex) {
+            CachedItem block=new CachedItem(hfileName,(int)blockSize,blockCount.getAndIncrement());
+            boolean inMemory=Math.random() > 0.5;
+            cache.cacheBlock(block.cacheKey,block,inMemory);
+          }
+          cache.evictBlocksByHfileName(hfileName);
+        }
+      }
+);
+    }
+    service.shutdown();
+    service.awaitTermination(10,TimeUnit.MINUTES);
+    Waiter.waitFor(conf,10000,100,new ExplainingPredicate<Exception>(){
+      @Override public boolean evaluate() throws Exception {
+        return cache.getBlockCount() == 0;
+      }
+      @Override public String explainFailure() throws Exception {
+        return "Cache block count failed to return to 0";
+      }
+    }
+);
+    assertEquals(0,cache.getBlockCount());
+    assertEquals(cache.getOverhead(),cache.getCurrentSize());
+  }
+}

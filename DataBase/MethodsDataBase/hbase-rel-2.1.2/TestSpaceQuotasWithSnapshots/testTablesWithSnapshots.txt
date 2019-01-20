@@ -1,0 +1,40 @@
+@Test public void testTablesWithSnapshots() throws Exception {
+  final Connection conn=TEST_UTIL.getConnection();
+  final SpaceViolationPolicy policy=SpaceViolationPolicy.NO_INSERTS;
+  final TableName tn=helper.createTableWithRegions(10);
+  final long tableLimit=3L * SpaceQuotaHelperForTests.ONE_MEGABYTE;
+  TEST_UTIL.getAdmin().setQuota(QuotaSettingsFactory.limitTableSpace(tn,tableLimit,policy));
+  LOG.info("Writing first data set");
+  helper.writeData(tn,1L * SpaceQuotaHelperForTests.ONE_MEGABYTE,"q1");
+  LOG.info("Creating snapshot");
+  TEST_UTIL.getAdmin().snapshot(tn.toString() + "snap1",tn,SnapshotType.FLUSH);
+  LOG.info("Writing second data set");
+  helper.writeData(tn,1L * SpaceQuotaHelperForTests.ONE_MEGABYTE,"q2");
+  LOG.info("Flushing and major compacting table");
+  TEST_UTIL.getAdmin().flush(tn);
+  TEST_UTIL.compact(tn,true);
+  LOG.info("Checking for quota violation");
+  TEST_UTIL.waitFor(60_000,1_000,new Predicate<Exception>(){
+    @Override public boolean evaluate() throws Exception {
+      Scan s=QuotaTableUtil.makeQuotaSnapshotScanForTable(tn);
+      try (Table t=conn.getTable(QuotaTableUtil.QUOTA_TABLE_NAME)){
+        ResultScanner rs=t.getScanner(s);
+        try {
+          Result r=Iterables.getOnlyElement(rs);
+          CellScanner cs=r.cellScanner();
+          assertTrue(cs.advance());
+          Cell c=cs.current();
+          SpaceQuotaSnapshot snapshot=SpaceQuotaSnapshot.toSpaceQuotaSnapshot(QuotaProtos.SpaceQuotaSnapshot.parseFrom(UnsafeByteOperations.unsafeWrap(c.getValueArray(),c.getValueOffset(),c.getValueLength())));
+          LOG.info(snapshot.getUsage() + "/" + snapshot.getLimit()+ " "+ snapshot.getQuotaStatus());
+          return snapshot.getQuotaStatus().isInViolation();
+        }
+  finally {
+          if (null != rs) {
+            rs.close();
+          }
+        }
+      }
+     }
+  }
+);
+}

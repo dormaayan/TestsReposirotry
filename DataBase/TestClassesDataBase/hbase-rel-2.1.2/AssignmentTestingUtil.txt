@@ -1,0 +1,80 @@
+@InterfaceAudience.Private @InterfaceStability.Evolving public final class AssignmentTestingUtil {
+  private static final Logger LOG=LoggerFactory.getLogger(AssignmentTestingUtil.class);
+  private AssignmentTestingUtil(){
+  }
+  public static void waitForRegionToBeInTransition(  final HBaseTestingUtility util,  final RegionInfo hri) throws Exception {
+    while (!getMaster(util).getAssignmentManager().getRegionStates().isRegionInTransition(hri)) {
+      Threads.sleep(10);
+    }
+  }
+  public static void waitForRsToBeDead(  final HBaseTestingUtility util,  final ServerName serverName) throws Exception {
+    util.waitFor(60000,new ExplainingPredicate<Exception>(){
+      @Override public boolean evaluate(){
+        return getMaster(util).getServerManager().isServerDead(serverName);
+      }
+      @Override public String explainFailure(){
+        return "Server " + serverName + " is not dead";
+      }
+    }
+);
+  }
+  public static void stopRs(  final HBaseTestingUtility util,  final ServerName serverName) throws Exception {
+    LOG.info("STOP REGION SERVER " + serverName);
+    util.getMiniHBaseCluster().stopRegionServer(serverName);
+    waitForRsToBeDead(util,serverName);
+  }
+  public static void killRs(  final HBaseTestingUtility util,  final ServerName serverName) throws Exception {
+    LOG.info("KILL REGION SERVER " + serverName);
+    util.getMiniHBaseCluster().killRegionServer(serverName);
+    waitForRsToBeDead(util,serverName);
+  }
+  public static void crashRs(  final HBaseTestingUtility util,  final ServerName serverName,  final boolean kill) throws Exception {
+    if (kill) {
+      killRs(util,serverName);
+    }
+ else {
+      stopRs(util,serverName);
+    }
+  }
+  public static ServerName crashRsWithRegion(  final HBaseTestingUtility util,  final RegionInfo hri,  final boolean kill) throws Exception {
+    ServerName serverName=getServerHoldingRegion(util,hri);
+    crashRs(util,serverName,kill);
+    return serverName;
+  }
+  public static ServerName getServerHoldingRegion(  final HBaseTestingUtility util,  final RegionInfo hri) throws Exception {
+    ServerName serverName=util.getMiniHBaseCluster().getServerHoldingRegion(hri.getTable(),hri.getRegionName());
+    ServerName amServerName=getMaster(util).getAssignmentManager().getRegionStates().getRegionServerOfRegion(hri);
+    assertEquals(amServerName,serverName);
+    assertEquals(true,getMaster(util).getServerManager().isServerOnline(serverName));
+    return serverName;
+  }
+  public static boolean isServerHoldingMeta(  final HBaseTestingUtility util,  final ServerName serverName) throws Exception {
+    for (    RegionInfo hri : getMetaRegions(util)) {
+      if (serverName.equals(getServerHoldingRegion(util,hri))) {
+        return true;
+      }
+    }
+    return false;
+  }
+  public static Set<RegionInfo> getMetaRegions(  final HBaseTestingUtility util){
+    return getMaster(util).getAssignmentManager().getMetaRegionSet();
+  }
+  private static HMaster getMaster(  final HBaseTestingUtility util){
+    return util.getMiniHBaseCluster().getMaster();
+  }
+  public static boolean waitForAssignment(  AssignmentManager am,  RegionInfo regionInfo) throws IOException {
+    Waiter.waitFor(am.getConfiguration(),10000,() -> am.getRegionStates().getRegionStateNode(regionInfo) != null);
+    RegionStateNode regionNode=am.getRegionStates().getRegionStateNode(regionInfo);
+    Waiter.waitFor(am.getConfiguration(),30000,() -> regionNode.isInState(State.OPEN) || regionNode.isInTransition());
+    RegionTransitionProcedure proc=regionNode.getProcedure();
+synchronized (regionNode) {
+      if (regionNode.isInState(State.OPEN)) {
+        return true;
+      }
+      proc=regionNode.getProcedure();
+    }
+    assertNotNull(proc);
+    ProcedureSyncWait.waitForProcedureToCompleteIOE(am.getMaster().getMasterProcedureExecutor(),proc,5L * 60 * 1000);
+    return true;
+  }
+}

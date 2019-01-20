@@ -1,0 +1,182 @@
+public class ClearRealmsCacheTests extends SecurityIntegTestCase {
+  private static String[] usernames;
+  @BeforeClass public static void init() throws Exception {
+    usernames=new String[randomIntBetween(5,10)];
+    for (int i=0; i < usernames.length; i++) {
+      usernames[i]=randomAlphaOfLength(6) + "_" + i;
+    }
+  }
+  enum Scenario {  EVICT_ALL{
+    @Override public void assertEviction(    User prevUser,    User newUser){
+      assertThat(prevUser,not(sameInstance(newUser)));
+    }
+    @Override public void executeRequest() throws Exception {
+      executeTransportRequest(new ClearRealmCacheRequest());
+    }
+  }
+,   EVICT_SOME{
+    private final String[] evicted_usernames=randomSelection(usernames);
+{
+      Arrays.sort(evicted_usernames);
+    }
+    @Override public void assertEviction(    User prevUser,    User newUser){
+      if (Arrays.stream(evicted_usernames).anyMatch(prevUser.principal()::equals)) {
+        assertThat(prevUser,not(sameInstance(newUser)));
+      }
+ else {
+        assertThat(prevUser,sameInstance(newUser));
+      }
+    }
+    @Override public void executeRequest() throws Exception {
+      executeTransportRequest(new ClearRealmCacheRequest().usernames(evicted_usernames));
+    }
+  }
+,   EVICT_ALL_HTTP{
+    @Override public void assertEviction(    User prevUser,    User newUser){
+      assertThat(prevUser,not(sameInstance(newUser)));
+    }
+    @Override public void executeRequest() throws Exception {
+      executeHttpRequest("/_xpack/security/realm/" + (randomBoolean() ? "*" : "_all") + "/_clear_cache",Collections.<String,String>emptyMap());
+    }
+  }
+,   EVICT_SOME_HTTP{
+    private final String[] evicted_usernames=randomSelection(usernames);
+{
+      Arrays.sort(evicted_usernames);
+    }
+    @Override public void assertEviction(    User prevUser,    User newUser){
+      if (Arrays.stream(evicted_usernames).anyMatch(prevUser.principal()::equals)) {
+        assertThat(prevUser,not(sameInstance(newUser)));
+      }
+ else {
+        assertThat(prevUser,sameInstance(newUser));
+      }
+    }
+    @Override public void executeRequest() throws Exception {
+      String path="/_xpack/security/realm/" + (randomBoolean() ? "*" : "_all") + "/_clear_cache";
+      Map<String,String> params=Collections.singletonMap("usernames",String.join(",",evicted_usernames));
+      executeHttpRequest(path,params);
+    }
+  }
+;   public abstract void assertEviction(  User prevUser,  User newUser);
+  public abstract void executeRequest() throws Exception ;
+  static void executeTransportRequest(  ClearRealmCacheRequest request) throws Exception {
+    SecurityClient securityClient=securityClient(client());
+    final CountDownLatch latch=new CountDownLatch(1);
+    final AtomicReference<Throwable> error=new AtomicReference<>();
+    securityClient.clearRealmCache(request,new ActionListener<ClearRealmCacheResponse>(){
+      @Override public void onResponse(      ClearRealmCacheResponse response){
+        assertThat(response.getNodes().size(),equalTo(internalCluster().getNodeNames().length));
+        latch.countDown();
+      }
+      @Override public void onFailure(      Exception e){
+        error.set(e);
+        latch.countDown();
+      }
+    }
+);
+    if (!latch.await(5,TimeUnit.SECONDS)) {
+      fail("waiting for clear realms cache request too long");
+    }
+    if (error.get() != null) {
+      fail("failed to clear realm caches" + error.get().getMessage());
+    }
+  }
+  static void executeHttpRequest(  String path,  Map<String,String> params) throws Exception {
+    Request request=new Request("POST",path);
+    for (    Map.Entry<String,String> param : params.entrySet()) {
+      request.addParameter(param.getKey(),param.getValue());
+    }
+    RequestOptions.Builder options=request.getOptions().toBuilder();
+    options.addHeader("Authorization",UsernamePasswordToken.basicAuthHeaderValue(SecuritySettingsSource.TEST_USER_NAME,new SecureString(SecuritySettingsSourceField.TEST_PASSWORD.toCharArray())));
+    request.setOptions(options);
+    Response response=getRestClient().performRequest(request);
+    assertNotNull(response.getEntity());
+    assertTrue(EntityUtils.toString(response.getEntity()).contains("cluster_name"));
+  }
+}
+  @Override public Settings nodeSettings(  int nodeOrdinal){
+    return Settings.builder().put(super.nodeSettings(nodeOrdinal)).put(NetworkModule.HTTP_ENABLED.getKey(),true).build();
+  }
+  @Override protected String configRoles(){
+    return SecuritySettingsSource.CONFIG_ROLE_ALLOW_ALL + "\n" + "r1:\n"+ "  cluster: all\n";
+  }
+  @Override protected String configUsers(){
+    StringBuilder builder=new StringBuilder(SecuritySettingsSource.CONFIG_STANDARD_USER);
+    final String usersPasswdHashed=new String(getFastStoredHashAlgoForTests().hash(new SecureString("passwd".toCharArray())));
+    for (    String username : usernames) {
+      builder.append(username).append(":").append(usersPasswdHashed).append("\n");
+    }
+    return builder.toString();
+  }
+  @Override protected String configUsersRoles(){
+    return SecuritySettingsSource.CONFIG_STANDARD_USER_ROLES + "r1:" + Strings.arrayToCommaDelimitedString(usernames);
+  }
+  public void testEvictAll() throws Exception {
+    testScenario(Scenario.EVICT_ALL);
+  }
+  public void testEvictSome() throws Exception {
+    testScenario(Scenario.EVICT_SOME);
+  }
+  public void testEvictAllHttp() throws Exception {
+    testScenario(Scenario.EVICT_ALL_HTTP);
+  }
+  public void testEvictSomeHttp() throws Exception {
+    testScenario(Scenario.EVICT_SOME_HTTP);
+  }
+  private void testScenario(  Scenario scenario) throws Exception {
+    Map<String,UsernamePasswordToken> tokens=new HashMap<>();
+    for (    String user : usernames) {
+      tokens.put(user,new UsernamePasswordToken(user,new SecureString("passwd")));
+    }
+    List<Realm> realms=new ArrayList<>();
+    for (    Realms nodeRealms : internalCluster().getInstances(Realms.class)) {
+      realms.add(nodeRealms.realm("file"));
+    }
+    Map<String,Map<Realm,User>> users=new HashMap<>();
+    for (    Realm realm : realms) {
+      for (      String username : usernames) {
+        PlainActionFuture<AuthenticationResult> future=new PlainActionFuture<>();
+        realm.authenticate(tokens.get(username),future);
+        User user=future.actionGet().getUser();
+        assertThat(user,notNullValue());
+        Map<Realm,User> realmToUser=users.get(username);
+        if (realmToUser == null) {
+          realmToUser=new HashMap<>();
+          users.put(username,realmToUser);
+        }
+        realmToUser.put(realm,user);
+      }
+    }
+    for (    String username : usernames) {
+      for (      Realm realm : realms) {
+        PlainActionFuture<AuthenticationResult> future=new PlainActionFuture<>();
+        realm.authenticate(tokens.get(username),future);
+        User user=future.actionGet().getUser();
+        assertThat(user,sameInstance(users.get(username).get(realm)));
+      }
+    }
+    scenario.executeRequest();
+    for (    String username : usernames) {
+      for (      Realm realm : realms) {
+        PlainActionFuture<AuthenticationResult> future=new PlainActionFuture<>();
+        realm.authenticate(tokens.get(username),future);
+        User user=future.actionGet().getUser();
+        assertThat(user,notNullValue());
+        scenario.assertEviction(users.get(username).get(realm),user);
+      }
+    }
+  }
+  private static String[] randomSelection(  String[] values){
+    List<String> list=new ArrayList<>();
+    while (list.isEmpty()) {
+      double base=randomDouble();
+      for (      String value : values) {
+        if (randomDouble() < base) {
+          list.add(value);
+        }
+      }
+    }
+    return list.toArray(new String[list.size()]);
+  }
+}

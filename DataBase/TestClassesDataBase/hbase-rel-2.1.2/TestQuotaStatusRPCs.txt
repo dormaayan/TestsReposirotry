@@ -1,0 +1,187 @@
+/** 
+ * Test class for the quota status RPCs in the master and regionserver.
+ */
+@Category({MediumTests.class}) public class TestQuotaStatusRPCs {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestQuotaStatusRPCs.class);
+  private static final Logger LOG=LoggerFactory.getLogger(TestQuotaStatusRPCs.class);
+  private static final HBaseTestingUtility TEST_UTIL=new HBaseTestingUtility();
+  private static final AtomicLong COUNTER=new AtomicLong(0);
+  @Rule public TestName testName=new TestName();
+  private SpaceQuotaHelperForTests helper;
+  @BeforeClass public static void setUp() throws Exception {
+    Configuration conf=TEST_UTIL.getConfiguration();
+    SpaceQuotaHelperForTests.updateConfigForQuotas(conf);
+    TEST_UTIL.startMiniCluster(1);
+  }
+  @AfterClass public static void tearDown() throws Exception {
+    TEST_UTIL.shutdownMiniCluster();
+  }
+  @Before public void setupForTest() throws Exception {
+    helper=new SpaceQuotaHelperForTests(TEST_UTIL,testName,COUNTER);
+  }
+  @Test public void testRegionSizesFromMaster() throws Exception {
+    final long tableSize=1024L * 10L;
+    final int numRegions=10;
+    final TableName tn=helper.createTableWithRegions(numRegions);
+    helper.writeData(tn,tableSize);
+    final HMaster master=TEST_UTIL.getMiniHBaseCluster().getMaster();
+    final MasterQuotaManager quotaManager=master.getMasterQuotaManager();
+    Waiter.waitFor(TEST_UTIL.getConfiguration(),30 * 1000,new Predicate<Exception>(){
+      @Override public boolean evaluate() throws Exception {
+        Map<RegionInfo,Long> regionSizes=quotaManager.snapshotRegionSizes();
+        LOG.trace("Region sizes=" + regionSizes);
+        return numRegions == countRegionsForTable(tn,regionSizes) && tableSize <= getTableSize(tn,regionSizes);
+      }
+    }
+);
+    Map<TableName,Long> sizes=QuotaTableUtil.getMasterReportedTableSizes(TEST_UTIL.getConnection());
+    Long size=sizes.get(tn);
+    assertNotNull("No reported size for " + tn,size);
+    assertTrue("Reported table size was " + size,size.longValue() >= tableSize);
+  }
+  @Test public void testQuotaSnapshotsFromRS() throws Exception {
+    final long sizeLimit=1024L * 1024L;
+    final long tableSize=1024L * 10L;
+    final int numRegions=10;
+    final TableName tn=helper.createTableWithRegions(numRegions);
+    QuotaSettings settings=QuotaSettingsFactory.limitTableSpace(tn,sizeLimit,SpaceViolationPolicy.NO_INSERTS);
+    TEST_UTIL.getAdmin().setQuota(settings);
+    helper.writeData(tn,tableSize);
+    final HRegionServer rs=TEST_UTIL.getMiniHBaseCluster().getRegionServer(0);
+    final RegionServerSpaceQuotaManager manager=rs.getRegionServerSpaceQuotaManager();
+    Waiter.waitFor(TEST_UTIL.getConfiguration(),30 * 1000,new Predicate<Exception>(){
+      @Override public boolean evaluate() throws Exception {
+        SpaceQuotaSnapshot snapshot=manager.copyQuotaSnapshots().get(tn);
+        if (snapshot == null) {
+          return false;
+        }
+        return snapshot.getUsage() >= tableSize;
+      }
+    }
+);
+    Map<TableName,SpaceQuotaSnapshot> snapshots=QuotaTableUtil.getRegionServerQuotaSnapshots(TEST_UTIL.getConnection(),rs.getServerName());
+    SpaceQuotaSnapshot snapshot=snapshots.get(tn);
+    assertNotNull("Did not find snapshot for " + tn,snapshot);
+    assertTrue("Observed table usage was " + snapshot.getUsage(),snapshot.getUsage() >= tableSize);
+    assertEquals(sizeLimit,snapshot.getLimit());
+    SpaceQuotaStatus pbStatus=snapshot.getQuotaStatus();
+    assertFalse(pbStatus.isInViolation());
+  }
+  @Test public void testQuotaEnforcementsFromRS() throws Exception {
+    final long sizeLimit=1024L * 8L;
+    final long tableSize=1024L * 10L;
+    final int numRegions=10;
+    final TableName tn=helper.createTableWithRegions(numRegions);
+    QuotaSettings settings=QuotaSettingsFactory.limitTableSpace(tn,sizeLimit,SpaceViolationPolicy.NO_INSERTS);
+    TEST_UTIL.getAdmin().setQuota(settings);
+    try {
+      helper.writeData(tn,tableSize);
+    }
+ catch (    RetriesExhaustedWithDetailsException|SpaceLimitingException e) {
+    }
+    final HRegionServer rs=TEST_UTIL.getMiniHBaseCluster().getRegionServer(0);
+    final RegionServerSpaceQuotaManager manager=rs.getRegionServerSpaceQuotaManager();
+    Waiter.waitFor(TEST_UTIL.getConfiguration(),30 * 1000,new Predicate<Exception>(){
+      @Override public boolean evaluate() throws Exception {
+        ActivePolicyEnforcement enforcements=manager.getActiveEnforcements();
+        SpaceViolationPolicyEnforcement enforcement=enforcements.getPolicyEnforcement(tn);
+        if (enforcement instanceof MissingSnapshotViolationPolicyEnforcement) {
+          return false;
+        }
+        return enforcement.getQuotaSnapshot().getQuotaStatus().isInViolation();
+      }
+    }
+);
+    Map<TableName,SpaceQuotaSnapshot> snapshots=QuotaTableUtil.getRegionServerQuotaSnapshots(TEST_UTIL.getConnection(),rs.getServerName());
+    SpaceQuotaSnapshot snapshot=snapshots.get(tn);
+    assertNotNull("Did not find snapshot for " + tn,snapshot);
+    assertTrue(snapshot.getQuotaStatus().isInViolation());
+    assertEquals(SpaceViolationPolicy.NO_INSERTS,snapshot.getQuotaStatus().getPolicy());
+  }
+  @Test public void testQuotaStatusFromMaster() throws Exception {
+    final long sizeLimit=1024L * 25L;
+    final long tableSize=1024L * 1;
+    final long nsLimit=Long.MAX_VALUE;
+    final int numRegions=10;
+    final TableName tn=helper.createTableWithRegions(numRegions);
+    QuotaSettings settings=QuotaSettingsFactory.limitTableSpace(tn,sizeLimit,SpaceViolationPolicy.NO_INSERTS);
+    TEST_UTIL.getAdmin().setQuota(settings);
+    QuotaSettings nsSettings=QuotaSettingsFactory.limitNamespaceSpace(tn.getNamespaceAsString(),nsLimit,SpaceViolationPolicy.NO_INSERTS);
+    TEST_UTIL.getAdmin().setQuota(nsSettings);
+    helper.writeData(tn,tableSize);
+    final Connection conn=TEST_UTIL.getConnection();
+    Waiter.waitFor(TEST_UTIL.getConfiguration(),30 * 1000,new Predicate<Exception>(){
+      @Override public boolean evaluate() throws Exception {
+        SpaceQuotaSnapshot snapshot=QuotaTableUtil.getCurrentSnapshot(conn,tn);
+        LOG.info("Table snapshot after initial ingest: " + snapshot);
+        if (snapshot == null) {
+          return false;
+        }
+        return snapshot.getLimit() == sizeLimit && snapshot.getUsage() > 0L;
+      }
+    }
+);
+    final AtomicReference<Long> nsUsage=new AtomicReference<>();
+    Waiter.waitFor(TEST_UTIL.getConfiguration(),30 * 1000 * 1000,new Predicate<Exception>(){
+      @Override public boolean evaluate() throws Exception {
+        SpaceQuotaSnapshot snapshot=QuotaTableUtil.getCurrentSnapshot(conn,tn.getNamespaceAsString());
+        LOG.debug("Namespace snapshot after initial ingest: " + snapshot);
+        if (snapshot == null) {
+          return false;
+        }
+        nsUsage.set(snapshot.getUsage());
+        return snapshot.getLimit() == nsLimit && snapshot.getUsage() > 0;
+      }
+    }
+);
+    SpaceQuotaSnapshot snapshot=QuotaTableUtil.getCurrentSnapshot(conn,tn);
+    assertTrue("QuotaSnapshot for " + tn + " should be non-null and not in violation",snapshot != null && !snapshot.getQuotaStatus().isInViolation());
+    try {
+      helper.writeData(tn,tableSize * 2L);
+    }
+ catch (    RetriesExhaustedWithDetailsException|SpaceLimitingException e) {
+    }
+    Waiter.waitFor(TEST_UTIL.getConfiguration(),30 * 1000,new Predicate<Exception>(){
+      @Override public boolean evaluate() throws Exception {
+        SpaceQuotaSnapshot snapshot=QuotaTableUtil.getCurrentSnapshot(conn,tn);
+        LOG.info("Table snapshot after second ingest: " + snapshot);
+        if (snapshot == null) {
+          return false;
+        }
+        return snapshot.getQuotaStatus().isInViolation();
+      }
+    }
+);
+    Waiter.waitFor(TEST_UTIL.getConfiguration(),30 * 1000,new Predicate<Exception>(){
+      @Override public boolean evaluate() throws Exception {
+        SpaceQuotaSnapshot snapshot=QuotaTableUtil.getCurrentSnapshot(conn,tn.getNamespaceAsString());
+        LOG.debug("Namespace snapshot after second ingest: " + snapshot);
+        if (snapshot == null) {
+          return false;
+        }
+        return snapshot.getUsage() > nsUsage.get() && !snapshot.getQuotaStatus().isInViolation();
+      }
+    }
+);
+  }
+  private int countRegionsForTable(  TableName tn,  Map<RegionInfo,Long> regionSizes){
+    int size=0;
+    for (    RegionInfo regionInfo : regionSizes.keySet()) {
+      if (tn.equals(regionInfo.getTable())) {
+        size++;
+      }
+    }
+    return size;
+  }
+  private int getTableSize(  TableName tn,  Map<RegionInfo,Long> regionSizes){
+    int tableSize=0;
+    for (    Entry<RegionInfo,Long> entry : regionSizes.entrySet()) {
+      RegionInfo regionInfo=entry.getKey();
+      long regionSize=entry.getValue();
+      if (tn.equals(regionInfo.getTable())) {
+        tableSize+=regionSize;
+      }
+    }
+    return tableSize;
+  }
+}

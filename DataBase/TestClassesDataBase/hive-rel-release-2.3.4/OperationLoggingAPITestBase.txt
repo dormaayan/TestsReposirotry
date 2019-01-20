@@ -1,0 +1,151 @@
+/** 
+ * OperationLoggingAPITestBase Test the FetchResults of TFetchType.LOG in thrift level. This is the base class.
+ */
+@Ignore public abstract class OperationLoggingAPITestBase {
+  protected static HiveConf hiveConf;
+  protected static String tableName;
+  private File dataFile;
+  protected CLIServiceClient client;
+  protected static MiniHS2 miniHS2=null;
+  protected static Map<String,String> confOverlay;
+  protected SessionHandle sessionHandle;
+  protected final String sql="select * from " + tableName;
+  private final String sqlCntStar="select count(*) from " + tableName;
+  protected static String[] expectedLogsVerbose;
+  protected static String[] expectedLogsExecution;
+  protected static String[] expectedLogsPerformance;
+  /** 
+ * Open a session, and create a table for cases usage
+ * @throws Exception
+ */
+  @Before public void setUp() throws Exception {
+    dataFile=new File(hiveConf.get("test.data.files"),"kv1.txt");
+    client=miniHS2.getServiceClient();
+    sessionHandle=setupSession();
+  }
+  @After public void tearDown() throws Exception {
+    String queryString="DROP TABLE " + tableName;
+    client.executeStatement(sessionHandle,queryString,null);
+    client.closeSession(sessionHandle);
+  }
+  @AfterClass public static void tearDownAfterClass() throws Exception {
+    miniHS2.stop();
+  }
+  @Test public void testFetchResultsOfLogWithVerboseMode() throws Exception {
+    String queryString="set hive.server2.logging.operation.level=verbose";
+    client.executeStatement(sessionHandle,queryString,null);
+    OperationHandle operationHandle=client.executeStatement(sessionHandle,sqlCntStar,null);
+    RowSet rowSetLog=client.fetchResults(operationHandle,FetchOrientation.FETCH_FIRST,1000,FetchType.LOG);
+    verifyFetchedLog(rowSetLog,expectedLogsVerbose);
+    verifyFetchedLog(rowSetLog,expectedLogsExecution);
+    verifyFetchedLog(rowSetLog,expectedLogsPerformance);
+  }
+  @Test public void testFetchResultsOfLogWithPerformanceMode() throws Exception {
+    try {
+      String queryString="set hive.server2.logging.operation.level=performance";
+      client.executeStatement(sessionHandle,queryString,null);
+      OperationHandle operationHandle=client.executeStatement(sessionHandle,sqlCntStar,null);
+      RowSet rowSetLog=client.fetchResults(operationHandle,FetchOrientation.FETCH_FIRST,1000,FetchType.LOG);
+      verifyFetchedLog(rowSetLog,expectedLogsExecution);
+      verifyFetchedLog(rowSetLog,expectedLogsPerformance);
+      verifyMissingContentsInFetchedLog(rowSetLog,expectedLogsVerbose);
+    }
+  finally {
+      String queryString2="set hive.server2.logging.operation.level=verbose";
+      client.executeStatement(sessionHandle,queryString2,null);
+    }
+  }
+  @Test public void testFetchResultsOfLogWithExecutionMode() throws Exception {
+    try {
+      String queryString="set hive.server2.logging.operation.level=execution";
+      client.executeStatement(sessionHandle,queryString,null);
+      OperationHandle operationHandle=client.executeStatement(sessionHandle,sqlCntStar,null);
+      RowSet rowSetLog=client.fetchResults(operationHandle,FetchOrientation.FETCH_FIRST,1000,FetchType.LOG);
+      verifyFetchedLog(rowSetLog,expectedLogsExecution);
+      verifyMissingContentsInFetchedLog(rowSetLog,expectedLogsPerformance);
+      verifyMissingContentsInFetchedLog(rowSetLog,expectedLogsVerbose);
+    }
+  finally {
+      String queryString2="set hive.server2.logging.operation.level=verbose";
+      client.executeStatement(sessionHandle,queryString2,null);
+    }
+  }
+  @Test public void testFetchResultsOfLogWithNoneMode() throws Exception {
+    try {
+      String queryString="set hive.server2.logging.operation.level=none";
+      client.executeStatement(sessionHandle,queryString,null);
+      OperationHandle operationHandle=client.executeStatement(sessionHandle,sqlCntStar,null);
+      RowSet rowSetLog=client.fetchResults(operationHandle,FetchOrientation.FETCH_FIRST,1000,FetchType.LOG);
+      assert (rowSetLog.numRows() == 0);
+    }
+  finally {
+      String queryString2="set hive.server2.logging.operation.level=verbose";
+      client.executeStatement(sessionHandle,queryString2,null);
+    }
+  }
+  @Test public void testFetchResultsOfLogCleanup() throws Exception {
+    SessionHandle sessionHandleCleanup=setupSession();
+    OperationHandle operationHandle=client.executeStatement(sessionHandleCleanup,sql,null);
+    RowSet rowSetLog=client.fetchResults(operationHandle,FetchOrientation.FETCH_FIRST,1000,FetchType.LOG);
+    verifyFetchedLog(rowSetLog,expectedLogsVerbose);
+    File sessionLogDir=new File(hiveConf.getVar(HiveConf.ConfVars.HIVE_SERVER2_LOGGING_OPERATION_LOG_LOCATION) + File.separator + sessionHandleCleanup.getHandleIdentifier());
+    File operationLogFile=new File(sessionLogDir,operationHandle.getHandleIdentifier().toString());
+    client.closeOperation(operationHandle);
+    try {
+      client.fetchResults(operationHandle,FetchOrientation.FETCH_FIRST,1000,FetchType.LOG);
+      Assert.fail("Fetch should fail");
+    }
+ catch (    HiveSQLException e) {
+      Assert.assertTrue(e.getMessage().contains("Invalid OperationHandle:"));
+    }
+    if (operationLogFile.exists()) {
+      Assert.fail("Operation log file should be deleted.");
+    }
+    client.closeSession(sessionHandleCleanup);
+    if (sessionLogDir.exists()) {
+      Assert.fail("Session log dir should be deleted.");
+    }
+  }
+  private SessionHandle setupSession() throws Exception {
+    SessionHandle sessionHandle=client.openSession(null,null,null);
+    String queryString="SET hive.lock.manager=" + "org.apache.hadoop.hive.ql.lockmgr.EmbeddedLockManager";
+    client.executeStatement(sessionHandle,queryString,null);
+    queryString="DROP TABLE IF EXISTS " + tableName;
+    client.executeStatement(sessionHandle,queryString,null);
+    queryString="create table " + tableName + " (key int, value string)";
+    client.executeStatement(sessionHandle,queryString,null);
+    queryString="load data local inpath '" + dataFile + "' into table "+ tableName;
+    client.executeStatement(sessionHandle,queryString,null);
+    OperationHandle operationHandle=client.executeStatement(sessionHandle,sql,null);
+    RowSet rowSetResult=client.fetchResults(operationHandle);
+    Assert.assertEquals(500,rowSetResult.numRows());
+    Assert.assertEquals(238,rowSetResult.iterator().next()[0]);
+    Assert.assertEquals("val_238",rowSetResult.iterator().next()[1]);
+    return sessionHandle;
+  }
+  private String verifyFetchedLogPre(  RowSet rowSet,  String[] el){
+    StringBuilder stringBuilder=new StringBuilder();
+    for (    Object[] row : rowSet) {
+      stringBuilder.append(row[0]);
+    }
+    return stringBuilder.toString();
+  }
+  protected void verifyFetchedLog(  RowSet rowSet,  String[] el){
+    String logs=verifyFetchedLogPre(rowSet,el);
+    verifyFetchedLogPost(logs,el,true);
+  }
+  private void verifyMissingContentsInFetchedLog(  RowSet rowSet,  String[] el){
+    String logs=verifyFetchedLogPre(rowSet,el);
+    verifyFetchedLogPost(logs,el,false);
+  }
+  protected void verifyFetchedLogPost(  String logs,  String[] el,  boolean contains){
+    for (    String log : el) {
+      if (contains) {
+        Assert.assertTrue("Checking for presence of " + log,logs.contains(log));
+      }
+ else {
+        Assert.assertFalse("Checking for absence of " + log,logs.contains(log));
+      }
+    }
+  }
+}

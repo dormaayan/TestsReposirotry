@@ -1,0 +1,72 @@
+/** 
+ * Test that partition-definitions can be replicated between HCat-instances, independently of table-metadata replication. 2 identical tables are created on 2 different HCat instances ("source" and "target"). On the source instance, 1. One partition is added with the old format ("TEXTFILE"). 2. The table is updated with an additional column and the data-format changed to ORC. 3. Another partition is added with the new format. 4. The partitions' metadata is copied to the target HCat instance, without updating the target table definition. 5. The partitions' metadata is tested to be an exact replica of that on the source.
+ * @throws Exception
+ */
+@Test public void testPartitionRegistrationWithCustomSchema() throws Exception {
+  try {
+    startReplicationTargetMetaStoreIfRequired();
+    HCatClient sourceMetaStore=HCatClient.create(new Configuration(hcatConf));
+    final String dbName="myDb";
+    final String tableName="myTable";
+    sourceMetaStore.dropDatabase(dbName,true,HCatClient.DropDBMode.CASCADE);
+    sourceMetaStore.createDatabase(HCatCreateDBDesc.create(dbName).build());
+    List<HCatFieldSchema> columnSchema=new ArrayList<HCatFieldSchema>(Arrays.asList(new HCatFieldSchema("foo",Type.INT,""),new HCatFieldSchema("bar",Type.STRING,"")));
+    List<HCatFieldSchema> partitionSchema=Arrays.asList(new HCatFieldSchema("dt",Type.STRING,""),new HCatFieldSchema("grid",Type.STRING,""));
+    HCatTable sourceTable=new HCatTable(dbName,tableName).cols(columnSchema).partCols(partitionSchema).comment("Source table.");
+    sourceMetaStore.createTable(HCatCreateTableDesc.create(sourceTable).build());
+    sourceTable=sourceMetaStore.getTable(dbName,tableName);
+    assertNotNull("Table couldn't be queried for. ",sourceTable);
+    Map<String,String> partitionSpec_1=new HashMap<String,String>();
+    partitionSpec_1.put("grid","AB");
+    partitionSpec_1.put("dt","2011_12_31");
+    HCatPartition sourcePartition_1=new HCatPartition(sourceTable,partitionSpec_1,makePartLocation(sourceTable,partitionSpec_1));
+    sourceMetaStore.addPartition(HCatAddPartitionDesc.create(sourcePartition_1).build());
+    assertEquals("Unexpected number of partitions. ",1,sourceMetaStore.getPartitions(dbName,tableName).size());
+    HCatPartition addedPartition_1=sourceMetaStore.getPartition(dbName,tableName,partitionSpec_1);
+    assertEquals("Column schema doesn't match.",sourceTable.getCols(),addedPartition_1.getColumns());
+    assertEquals("InputFormat doesn't match.",sourceTable.getInputFileFormat(),addedPartition_1.getInputFormat());
+    assertEquals("OutputFormat doesn't match.",sourceTable.getOutputFileFormat(),addedPartition_1.getOutputFormat());
+    assertEquals("SerDe doesn't match.",sourceTable.getSerdeLib(),addedPartition_1.getSerDe());
+    assertEquals("SerDe params don't match.",sourceTable.getSerdeParams(),addedPartition_1.getSerdeParams());
+    HCatClient targetMetaStore=HCatClient.create(new Configuration(replicationTargetHCatConf));
+    targetMetaStore.dropDatabase(dbName,true,HCatClient.DropDBMode.CASCADE);
+    targetMetaStore.createDatabase(HCatCreateDBDesc.create(dbName).build());
+    HCatTable targetTable=targetMetaStore.deserializeTable(sourceMetaStore.serializeTable(sourceTable));
+    targetMetaStore.createTable(HCatCreateTableDesc.create(targetTable).build());
+    targetTable=targetMetaStore.getTable(dbName,tableName);
+    assertEquals("Created table doesn't match the source.",HCatTable.NO_DIFF,targetTable.diff(sourceTable));
+    List<HCatFieldSchema> newColumnSchema=new ArrayList<HCatFieldSchema>(columnSchema);
+    newColumnSchema.add(new HCatFieldSchema("goo_new",Type.DOUBLE,""));
+    Map<String,String> tableParams=new HashMap<String,String>(1);
+    tableParams.put("orc.compress","ZLIB");
+    sourceTable.cols(newColumnSchema).fileFormat("orcfile").tblProps(tableParams).serdeParam(serdeConstants.FIELD_DELIM,Character.toString('\001'));
+    sourceMetaStore.updateTableSchema(dbName,tableName,sourceTable);
+    sourceTable=sourceMetaStore.getTable(dbName,tableName);
+    Map<String,String> partitionSpec_2=new HashMap<String,String>();
+    partitionSpec_2.put("grid","AB");
+    partitionSpec_2.put("dt","2012_01_01");
+    HCatPartition sourcePartition_2=new HCatPartition(sourceTable,partitionSpec_2,makePartLocation(sourceTable,partitionSpec_2));
+    sourceMetaStore.addPartition(HCatAddPartitionDesc.create(sourcePartition_2).build());
+    List<HCatPartition> sourcePartitions=sourceMetaStore.getPartitions(dbName,tableName);
+    assertEquals("Unexpected number of source partitions.",2,sourcePartitions.size());
+    List<HCatAddPartitionDesc> addPartitionDescs=new ArrayList<HCatAddPartitionDesc>(sourcePartitions.size());
+    for (    HCatPartition partition : sourcePartitions) {
+      addPartitionDescs.add(HCatAddPartitionDesc.create(partition).build());
+    }
+    targetMetaStore.addPartitions(addPartitionDescs);
+    List<HCatPartition> targetPartitions=targetMetaStore.getPartitions(dbName,tableName);
+    assertEquals("Expected the same number of partitions. ",sourcePartitions.size(),targetPartitions.size());
+    for (int i=0; i < targetPartitions.size(); ++i) {
+      HCatPartition sourcePartition=sourcePartitions.get(i), targetPartition=targetPartitions.get(i);
+      assertEquals("Column schema doesn't match.",sourcePartition.getColumns(),targetPartition.getColumns());
+      assertEquals("InputFormat doesn't match.",sourcePartition.getInputFormat(),targetPartition.getInputFormat());
+      assertEquals("OutputFormat doesn't match.",sourcePartition.getOutputFormat(),targetPartition.getOutputFormat());
+      assertEquals("SerDe doesn't match.",sourcePartition.getSerDe(),targetPartition.getSerDe());
+      assertEquals("SerDe params don't match.",sourcePartition.getSerdeParams(),targetPartition.getSerdeParams());
+    }
+  }
+ catch (  Exception unexpected) {
+    LOG.error("Unexpected exception! ",unexpected);
+    assertTrue("Unexpected exception! " + unexpected.getMessage(),false);
+  }
+}

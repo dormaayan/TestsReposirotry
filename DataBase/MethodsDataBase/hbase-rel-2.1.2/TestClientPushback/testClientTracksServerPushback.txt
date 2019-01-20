@@ -1,0 +1,50 @@
+@Test public void testClientTracksServerPushback() throws Exception {
+  Configuration conf=UTIL.getConfiguration();
+  ClusterConnection conn=(ClusterConnection)ConnectionFactory.createConnection(conf);
+  BufferedMutatorImpl mutator=(BufferedMutatorImpl)conn.getBufferedMutator(tableName);
+  HRegionServer rs=UTIL.getHBaseCluster().getRegionServer(0);
+  Region region=rs.getRegions(tableName).get(0);
+  LOG.debug("Writing some data to " + tableName);
+  Put p=new Put(Bytes.toBytes("row"));
+  p.addColumn(family,qualifier,Bytes.toBytes("value1"));
+  mutator.mutate(p);
+  mutator.flush();
+  int load=(int)((region.getMemStoreHeapSize() * 100) / flushSizeBytes);
+  LOG.debug("Done writing some data to " + tableName);
+  ClientBackoffPolicy backoffPolicy=conn.getBackoffPolicy();
+  assertTrue("Backoff policy is not correctly configured",backoffPolicy instanceof ExponentialClientBackoffPolicy);
+  ServerStatisticTracker stats=conn.getStatisticsTracker();
+  assertNotNull("No stats configured for the client!",stats);
+  ServerName server=rs.getServerName();
+  byte[] regionName=region.getRegionInfo().getRegionName();
+  ServerStatistics serverStats=stats.getServerStatsForTesting(server);
+  ServerStatistics.RegionStatistics regionStats=serverStats.getStatsForRegion(regionName);
+  assertEquals("We did not find some load on the memstore",load,regionStats.getMemStoreLoadPercent());
+  long backoffTime=backoffPolicy.getBackoffTime(server,regionName,serverStats);
+  assertNotEquals("Reported load does not produce a backoff",0,backoffTime);
+  LOG.debug("Backoff calculated for " + region.getRegionInfo().getRegionNameAsString() + " @ "+ server+ " is "+ backoffTime);
+  List<Row> ops=new ArrayList<>(1);
+  ops.add(p);
+  final CountDownLatch latch=new CountDownLatch(1);
+  final AtomicLong endTime=new AtomicLong();
+  long startTime=EnvironmentEdgeManager.currentTime();
+  Batch.Callback<Result> callback=(  byte[] r,  byte[] row,  Result result) -> {
+    endTime.set(EnvironmentEdgeManager.currentTime());
+    latch.countDown();
+  }
+;
+  AsyncProcessTask<Result> task=AsyncProcessTask.newBuilder(callback).setPool(mutator.getPool()).setTableName(tableName).setRowAccess(ops).setSubmittedRows(AsyncProcessTask.SubmittedRows.AT_LEAST_ONE).setOperationTimeout(conn.getConnectionConfiguration().getOperationTimeout()).setRpcTimeout(60 * 1000).build();
+  mutator.getAsyncProcess().submit(task);
+  String name=server.getServerName() + "," + Bytes.toStringBinary(regionName);
+  MetricsConnection.RegionStats rsStats=conn.getConnectionMetrics().serverStats.get(server).get(regionName);
+  assertEquals(name,rsStats.name);
+  assertEquals(rsStats.heapOccupancyHist.getSnapshot().getMean(),(double)regionStats.getHeapOccupancyPercent(),0.1);
+  assertEquals(rsStats.memstoreLoadHist.getSnapshot().getMean(),(double)regionStats.getMemStoreLoadPercent(),0.1);
+  MetricsConnection.RunnerStats runnerStats=conn.getConnectionMetrics().runnerStats;
+  assertEquals(1,runnerStats.delayRunners.getCount());
+  assertEquals(1,runnerStats.normalRunners.getCount());
+  assertEquals("",runnerStats.delayIntevalHist.getSnapshot().getMean(),(double)backoffTime,0.1);
+  latch.await(backoffTime * 2,TimeUnit.MILLISECONDS);
+  assertNotEquals("AsyncProcess did not submit the work time",0,endTime.get());
+  assertTrue("AsyncProcess did not delay long enough",endTime.get() - startTime >= backoffTime);
+}

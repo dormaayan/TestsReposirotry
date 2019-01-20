@@ -1,0 +1,129 @@
+/** 
+ * Abstract test base for all format-specific Kafka table sources with builders.
+ * @deprecated Ensures backwards compatibility with Flink 1.5. Can be removed once wedrop support for format-specific table sources.
+ */
+@Deprecated public abstract class KafkaTableSourceBuilderTestBase {
+  static final String[] FIELD_NAMES=new String[]{"field1","field2","time1","time2","field3"};
+  static final TypeInformation[] FIELD_TYPES=new TypeInformation[]{Types.LONG(),Types.STRING(),Types.SQL_TIMESTAMP(),Types.SQL_TIMESTAMP(),Types.DOUBLE()};
+  private static final String TOPIC="testTopic";
+  private static final TableSchema SCHEMA=new TableSchema(FIELD_NAMES,FIELD_TYPES);
+  private static final Properties PROPS=createSourceProperties();
+  @Test @SuppressWarnings("unchecked") public void testKafkaConsumer(){
+    KafkaTableSource.Builder b=getBuilder();
+    configureBuilder(b);
+    KafkaTableSource observed=spy(b.build());
+    StreamExecutionEnvironment env=mock(StreamExecutionEnvironment.class);
+    when(env.addSource(any(SourceFunction.class))).thenReturn(mock(DataStreamSource.class));
+    observed.getDataStream(env);
+    verify(env).addSource(any(getFlinkKafkaConsumer()));
+    verify(observed).getKafkaConsumer(eq(TOPIC),eq(PROPS),any(getDeserializationSchema()));
+  }
+  @Test public void testTableSchema(){
+    KafkaTableSource.Builder b=getBuilder();
+    configureBuilder(b);
+    KafkaTableSource source=b.build();
+    TableSchema schema=source.getTableSchema();
+    assertNotNull(schema);
+    assertEquals(5,schema.getColumnNames().length);
+    assertEquals("field1",schema.getColumnNames()[0]);
+    assertEquals("field2",schema.getColumnNames()[1]);
+    assertEquals("time1",schema.getColumnNames()[2]);
+    assertEquals("time2",schema.getColumnNames()[3]);
+    assertEquals("field3",schema.getColumnNames()[4]);
+    assertEquals(Types.LONG(),schema.getTypes()[0]);
+    assertEquals(Types.STRING(),schema.getTypes()[1]);
+    assertEquals(Types.SQL_TIMESTAMP(),schema.getTypes()[2]);
+    assertEquals(Types.SQL_TIMESTAMP(),schema.getTypes()[3]);
+    assertEquals(Types.DOUBLE(),schema.getTypes()[4]);
+  }
+  @Test public void testNoTimeAttributes(){
+    KafkaTableSource.Builder b=getBuilder();
+    configureBuilder(b);
+    KafkaTableSource source=b.build();
+    assertNull(source.getProctimeAttribute());
+    assertNotNull(source.getRowtimeAttributeDescriptors());
+    assertTrue(source.getRowtimeAttributeDescriptors().isEmpty());
+  }
+  @Test public void testProctimeAttribute(){
+    KafkaTableSource.Builder b=getBuilder();
+    configureBuilder(b);
+    b.withProctimeAttribute("time1");
+    KafkaTableSource source=b.build();
+    assertEquals(source.getProctimeAttribute(),"time1");
+    assertNotNull(source.getRowtimeAttributeDescriptors());
+    assertTrue(source.getRowtimeAttributeDescriptors().isEmpty());
+  }
+  @Test public void testRowtimeAttribute(){
+    KafkaTableSource.Builder b=getBuilder();
+    configureBuilder(b);
+    b.withRowtimeAttribute("time2",new ExistingField("time2"),new AscendingTimestamps());
+    KafkaTableSource source=b.build();
+    assertNull(source.getProctimeAttribute());
+    List<RowtimeAttributeDescriptor> descs=source.getRowtimeAttributeDescriptors();
+    assertNotNull(descs);
+    assertEquals(1,descs.size());
+    RowtimeAttributeDescriptor desc=descs.get(0);
+    assertEquals("time2",desc.getAttributeName());
+    assertTrue(desc.getTimestampExtractor() instanceof ExistingField);
+    assertEquals(1,desc.getTimestampExtractor().getArgumentFields().length);
+    assertEquals("time2",desc.getTimestampExtractor().getArgumentFields()[0]);
+    assertTrue(desc.getWatermarkStrategy() instanceof AscendingTimestamps);
+  }
+  @Test public void testRowtimeAttribute2(){
+    KafkaTableSource.Builder b=getBuilder();
+    configureBuilder(b);
+    try {
+      b.withKafkaTimestampAsRowtimeAttribute("time2",new AscendingTimestamps());
+      KafkaTableSource source=b.build();
+      assertNull(source.getProctimeAttribute());
+      List<RowtimeAttributeDescriptor> descs=source.getRowtimeAttributeDescriptors();
+      assertNotNull(descs);
+      assertEquals(1,descs.size());
+      RowtimeAttributeDescriptor desc=descs.get(0);
+      assertEquals("time2",desc.getAttributeName());
+      assertTrue(desc.getTimestampExtractor() instanceof StreamRecordTimestamp);
+      assertTrue(desc.getTimestampExtractor().getArgumentFields().length == 0);
+      assertTrue(desc.getWatermarkStrategy() instanceof AscendingTimestamps);
+    }
+ catch (    Exception e) {
+      if (b.supportsKafkaTimestamps()) {
+        fail();
+      }
+    }
+  }
+  @Test @SuppressWarnings("unchecked") public void testConsumerOffsets(){
+    KafkaTableSource.Builder b=getBuilder();
+    configureBuilder(b);
+    KafkaTableSource source=spy(b.build());
+    when(source.createKafkaConsumer(TOPIC,PROPS,null)).thenReturn(mock(getFlinkKafkaConsumer()));
+    verify(source.getKafkaConsumer(TOPIC,PROPS,null)).setStartFromGroupOffsets();
+    b.fromEarliest();
+    source=spy(b.build());
+    when(source.createKafkaConsumer(TOPIC,PROPS,null)).thenReturn(mock(getFlinkKafkaConsumer()));
+    verify(source.getKafkaConsumer(TOPIC,PROPS,null)).setStartFromEarliest();
+    b.fromLatest();
+    source=spy(b.build());
+    when(source.createKafkaConsumer(TOPIC,PROPS,null)).thenReturn(mock(getFlinkKafkaConsumer()));
+    verify(source.getKafkaConsumer(TOPIC,PROPS,null)).setStartFromLatest();
+    b.fromGroupOffsets();
+    source=spy(b.build());
+    when(source.createKafkaConsumer(TOPIC,PROPS,null)).thenReturn(mock(getFlinkKafkaConsumer()));
+    verify(source.getKafkaConsumer(TOPIC,PROPS,null)).setStartFromGroupOffsets();
+    b.fromSpecificOffsets(mock(Map.class));
+    source=spy(b.build());
+    when(source.createKafkaConsumer(TOPIC,PROPS,null)).thenReturn(mock(getFlinkKafkaConsumer()));
+    verify(source.getKafkaConsumer(TOPIC,PROPS,null)).setStartFromSpecificOffsets(any(Map.class));
+  }
+  protected abstract KafkaTableSource.Builder getBuilder();
+  protected abstract Class<DeserializationSchema<Row>> getDeserializationSchema();
+  protected abstract Class<FlinkKafkaConsumerBase<Row>> getFlinkKafkaConsumer();
+  protected void configureBuilder(  KafkaTableSource.Builder builder){
+    builder.forTopic(TOPIC).withKafkaProperties(PROPS).withSchema(SCHEMA);
+  }
+  private static Properties createSourceProperties(){
+    Properties properties=new Properties();
+    properties.setProperty("zookeeper.connect","dummy");
+    properties.setProperty("group.id","dummy");
+    return properties;
+  }
+}

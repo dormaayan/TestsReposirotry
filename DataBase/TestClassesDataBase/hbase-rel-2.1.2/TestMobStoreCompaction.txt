@@ -1,0 +1,314 @@
+/** 
+ * Test mob store compaction
+ */
+@Category(MediumTests.class) public class TestMobStoreCompaction {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestMobStoreCompaction.class);
+  @Rule public TestName name=new TestName();
+  static final Logger LOG=LoggerFactory.getLogger(TestMobStoreCompaction.class.getName());
+  private final static HBaseTestingUtility UTIL=new HBaseTestingUtility();
+  private Configuration conf=null;
+  private HRegion region=null;
+  private HTableDescriptor htd=null;
+  private HColumnDescriptor hcd=null;
+  private long mobCellThreshold=1000;
+  private FileSystem fs;
+  private static final byte[] COLUMN_FAMILY=fam1;
+  private final byte[] STARTROW=Bytes.toBytes(START_KEY);
+  private int compactionThreshold;
+  @BeforeClass public static void setUpBeforeClass() throws Exception {
+    UTIL.startMiniCluster(1);
+  }
+  @AfterClass public static void tearDownAfterClass() throws Exception {
+    UTIL.shutdownMiniCluster();
+  }
+  private void init(  Configuration conf,  long mobThreshold) throws Exception {
+    this.conf=conf;
+    this.mobCellThreshold=mobThreshold;
+    HBaseTestingUtility UTIL=new HBaseTestingUtility(conf);
+    compactionThreshold=conf.getInt("hbase.hstore.compactionThreshold",3);
+    htd=UTIL.createTableDescriptor(name.getMethodName());
+    hcd=new HColumnDescriptor(COLUMN_FAMILY);
+    hcd.setMobEnabled(true);
+    hcd.setMobThreshold(mobThreshold);
+    hcd.setMaxVersions(1);
+    htd.modifyFamily(hcd);
+    region=UTIL.createLocalHRegion(htd,null,null);
+    fs=FileSystem.get(conf);
+  }
+  @After public void tearDown() throws Exception {
+    region.close();
+    fs.delete(UTIL.getDataTestDir(),true);
+  }
+  /** 
+ * During compaction, cells smaller than the threshold won't be affected.
+ */
+  @Test public void testSmallerValue() throws Exception {
+    init(UTIL.getConfiguration(),500);
+    byte[] dummyData=makeDummyData(300);
+    Table loader=new RegionAsTable(region);
+    for (int i=0; i < compactionThreshold; i++) {
+      Put p=createPut(i,dummyData);
+      loader.put(p);
+      region.flush(true);
+    }
+    assertEquals("Before compaction: store files",compactionThreshold,countStoreFiles());
+    assertEquals("Before compaction: mob file count",0,countMobFiles());
+    assertEquals("Before compaction: rows",compactionThreshold,UTIL.countRows(region));
+    assertEquals("Before compaction: mob rows",0,countMobRows());
+    region.compactStores();
+    assertEquals("After compaction: store files",1,countStoreFiles());
+    assertEquals("After compaction: mob file count",0,countMobFiles());
+    assertEquals("After compaction: referenced mob file count",0,countReferencedMobFiles());
+    assertEquals("After compaction: rows",compactionThreshold,UTIL.countRows(region));
+    assertEquals("After compaction: mob rows",0,countMobRows());
+  }
+  /** 
+ * During compaction, the mob threshold size is changed.
+ */
+  @Test public void testLargerValue() throws Exception {
+    init(UTIL.getConfiguration(),200);
+    byte[] dummyData=makeDummyData(300);
+    Table loader=new RegionAsTable(region);
+    for (int i=0; i < compactionThreshold; i++) {
+      Put p=createPut(i,dummyData);
+      loader.put(p);
+      region.flush(true);
+    }
+    assertEquals("Before compaction: store files",compactionThreshold,countStoreFiles());
+    assertEquals("Before compaction: mob file count",compactionThreshold,countMobFiles());
+    assertEquals("Before compaction: rows",compactionThreshold,UTIL.countRows(region));
+    assertEquals("Before compaction: mob rows",compactionThreshold,countMobRows());
+    assertEquals("Before compaction: number of mob cells",compactionThreshold,countMobCellsInMetadata());
+    setMobThreshold(region,COLUMN_FAMILY,500);
+    region.initialize();
+    region.compactStores();
+    assertEquals("After compaction: store files",1,countStoreFiles());
+    assertEquals("After compaction: mob file count",compactionThreshold,countMobFiles());
+    assertEquals("After compaction: referenced mob file count",0,countReferencedMobFiles());
+    assertEquals("After compaction: rows",compactionThreshold,UTIL.countRows(region));
+    assertEquals("After compaction: mob rows",0,countMobRows());
+  }
+  private static HRegion setMobThreshold(  HRegion region,  byte[] cfName,  long modThreshold){
+    ColumnFamilyDescriptor cfd=ColumnFamilyDescriptorBuilder.newBuilder(region.getTableDescriptor().getColumnFamily(cfName)).setMobThreshold(modThreshold).build();
+    TableDescriptor td=TableDescriptorBuilder.newBuilder(region.getTableDescriptor()).removeColumnFamily(cfName).setColumnFamily(cfd).build();
+    region.setTableDescriptor(td);
+    return region;
+  }
+  /** 
+ * This test will first generate store files, then bulk load them and trigger the compaction. When compaction, the cell value will be larger than the threshold.
+ */
+  @Test public void testMobCompactionWithBulkload() throws Exception {
+    init(UTIL.getConfiguration(),300);
+    byte[] dummyData=makeDummyData(600);
+    Path hbaseRootDir=FSUtils.getRootDir(conf);
+    Path basedir=new Path(hbaseRootDir,htd.getNameAsString());
+    List<Pair<byte[],String>> hfiles=new ArrayList<>(1);
+    for (int i=0; i < compactionThreshold; i++) {
+      Path hpath=new Path(basedir,"hfile" + i);
+      hfiles.add(Pair.newPair(COLUMN_FAMILY,hpath.toString()));
+      createHFile(hpath,i,dummyData);
+    }
+    Map<byte[],List<Path>> map=region.bulkLoadHFiles(hfiles,true,null);
+    assertTrue("Bulkload result:",!map.isEmpty());
+    assertEquals("Before compaction: store files",compactionThreshold,countStoreFiles());
+    assertEquals("Before compaction: mob file count",0,countMobFiles());
+    assertEquals("Before compaction: rows",compactionThreshold,UTIL.countRows(region));
+    assertEquals("Before compaction: mob rows",0,countMobRows());
+    assertEquals("Before compaction: referenced mob file count",0,countReferencedMobFiles());
+    region.compactStores();
+    assertEquals("After compaction: store files",1,countStoreFiles());
+    assertEquals("After compaction: mob file count:",1,countMobFiles());
+    assertEquals("After compaction: rows",compactionThreshold,UTIL.countRows(region));
+    assertEquals("After compaction: mob rows",compactionThreshold,countMobRows());
+    assertEquals("After compaction: referenced mob file count",1,countReferencedMobFiles());
+    assertEquals("After compaction: number of mob cells",compactionThreshold,countMobCellsInMetadata());
+  }
+  @Test public void testMajorCompactionAfterDelete() throws Exception {
+    init(UTIL.getConfiguration(),100);
+    byte[] dummyData=makeDummyData(200);
+    Table loader=new RegionAsTable(region);
+    int numHfiles=compactionThreshold - 1;
+    byte[] deleteRow=Bytes.add(STARTROW,Bytes.toBytes(0));
+    for (int i=0; i < numHfiles; i++) {
+      Put p=createPut(i,dummyData);
+      loader.put(p);
+      region.flush(true);
+    }
+    assertEquals("Before compaction: store files",numHfiles,countStoreFiles());
+    assertEquals("Before compaction: mob file count",numHfiles,countMobFiles());
+    assertEquals("Before compaction: rows",numHfiles,UTIL.countRows(region));
+    assertEquals("Before compaction: mob rows",numHfiles,countMobRows());
+    assertEquals("Before compaction: number of mob cells",numHfiles,countMobCellsInMetadata());
+    Delete delete=new Delete(deleteRow);
+    delete.addFamily(COLUMN_FAMILY);
+    region.delete(delete);
+    region.flush(true);
+    assertEquals("Before compaction: store files",numHfiles + 1,countStoreFiles());
+    assertEquals("Before compaction: mob files",numHfiles,countMobFiles());
+    region.compact(true);
+    assertEquals("After compaction: store files",1,countStoreFiles());
+    assertEquals("After compaction: mob files",numHfiles + 1,countMobFiles());
+    Scan scan=new Scan();
+    scan.setRaw(true);
+    InternalScanner scanner=region.getScanner(scan);
+    List<Cell> results=new ArrayList<>();
+    scanner.next(results);
+    int deleteCount=0;
+    while (!results.isEmpty()) {
+      for (      Cell c : results) {
+        if (c.getTypeByte() == KeyValue.Type.DeleteFamily.getCode()) {
+          deleteCount++;
+          assertTrue(Bytes.equals(CellUtil.cloneRow(c),deleteRow));
+        }
+      }
+      results.clear();
+      scanner.next(results);
+    }
+    assertEquals(1,deleteCount);
+    scanner.close();
+    assertEquals("The cells in mob files",numHfiles - 1,countMobCellsInMobFiles(1));
+  }
+  private int countStoreFiles() throws IOException {
+    HStore store=region.getStore(COLUMN_FAMILY);
+    return store.getStorefilesCount();
+  }
+  private int countMobFiles() throws IOException {
+    Path mobDirPath=MobUtils.getMobFamilyPath(conf,htd.getTableName(),hcd.getNameAsString());
+    if (fs.exists(mobDirPath)) {
+      FileStatus[] files=UTIL.getTestFileSystem().listStatus(mobDirPath);
+      return files.length;
+    }
+    return 0;
+  }
+  private long countMobCellsInMetadata() throws IOException {
+    long mobCellsCount=0;
+    Path mobDirPath=MobUtils.getMobFamilyPath(conf,htd.getTableName(),hcd.getNameAsString());
+    Configuration copyOfConf=new Configuration(conf);
+    copyOfConf.setFloat(HConstants.HFILE_BLOCK_CACHE_SIZE_KEY,0f);
+    CacheConfig cacheConfig=new CacheConfig(copyOfConf);
+    if (fs.exists(mobDirPath)) {
+      FileStatus[] files=UTIL.getTestFileSystem().listStatus(mobDirPath);
+      for (      FileStatus file : files) {
+        HStoreFile sf=new HStoreFile(fs,file.getPath(),conf,cacheConfig,BloomType.NONE,true);
+        sf.initReader();
+        Map<byte[],byte[]> fileInfo=sf.getReader().loadFileInfo();
+        byte[] count=fileInfo.get(MOB_CELLS_COUNT);
+        assertTrue(count != null);
+        mobCellsCount+=Bytes.toLong(count);
+      }
+    }
+    return mobCellsCount;
+  }
+  private Put createPut(  int rowIdx,  byte[] dummyData) throws IOException {
+    Put p=new Put(Bytes.add(STARTROW,Bytes.toBytes(rowIdx)));
+    p.setDurability(Durability.SKIP_WAL);
+    p.addColumn(COLUMN_FAMILY,Bytes.toBytes("colX"),dummyData);
+    return p;
+  }
+  /** 
+ * Create an HFile with the given number of bytes
+ */
+  private void createHFile(  Path path,  int rowIdx,  byte[] dummyData) throws IOException {
+    HFileContext meta=new HFileContextBuilder().build();
+    HFile.Writer writer=HFile.getWriterFactory(conf,new CacheConfig(conf)).withPath(fs,path).withFileContext(meta).create();
+    long now=System.currentTimeMillis();
+    try {
+      KeyValue kv=new KeyValue(Bytes.add(STARTROW,Bytes.toBytes(rowIdx)),COLUMN_FAMILY,Bytes.toBytes("colX"),now,dummyData);
+      writer.append(kv);
+    }
+  finally {
+      writer.appendFileInfo(BULKLOAD_TIME_KEY,Bytes.toBytes(System.currentTimeMillis()));
+      writer.close();
+    }
+  }
+  private int countMobRows() throws IOException {
+    Scan scan=new Scan();
+    scan.setAttribute(MobConstants.MOB_SCAN_RAW,Bytes.toBytes(Boolean.TRUE));
+    InternalScanner scanner=region.getScanner(scan);
+    int scannedCount=0;
+    List<Cell> results=new ArrayList<>();
+    boolean hasMore=true;
+    while (hasMore) {
+      hasMore=scanner.next(results);
+      for (      Cell c : results) {
+        if (MobUtils.isMobReferenceCell(c)) {
+          scannedCount++;
+        }
+      }
+      results.clear();
+    }
+    scanner.close();
+    return scannedCount;
+  }
+  private byte[] makeDummyData(  int size){
+    byte[] dummyData=new byte[size];
+    new Random().nextBytes(dummyData);
+    return dummyData;
+  }
+  private int countReferencedMobFiles() throws IOException {
+    Scan scan=new Scan();
+    scan.setAttribute(MobConstants.MOB_SCAN_RAW,Bytes.toBytes(Boolean.TRUE));
+    InternalScanner scanner=region.getScanner(scan);
+    List<Cell> kvs=new ArrayList<>();
+    boolean hasMore=true;
+    String fileName;
+    Set<String> files=new HashSet<>();
+    do {
+      kvs.clear();
+      hasMore=scanner.next(kvs);
+      for (      Cell kv : kvs) {
+        if (!MobUtils.isMobReferenceCell(kv)) {
+          continue;
+        }
+        if (!MobUtils.hasValidMobRefCellValue(kv)) {
+          continue;
+        }
+        int size=MobUtils.getMobValueLength(kv);
+        if (size <= mobCellThreshold) {
+          continue;
+        }
+        fileName=MobUtils.getMobFileName(kv);
+        if (fileName.isEmpty()) {
+          continue;
+        }
+        files.add(fileName);
+        Path familyPath=MobUtils.getMobFamilyPath(conf,htd.getTableName(),hcd.getNameAsString());
+        assertTrue(fs.exists(new Path(familyPath,fileName)));
+      }
+    }
+ while (hasMore);
+    scanner.close();
+    return files.size();
+  }
+  private int countMobCellsInMobFiles(  int expectedNumDelfiles) throws IOException {
+    Configuration copyOfConf=new Configuration(conf);
+    copyOfConf.setFloat(HConstants.HFILE_BLOCK_CACHE_SIZE_KEY,0f);
+    CacheConfig cacheConfig=new CacheConfig(copyOfConf);
+    Path mobDirPath=MobUtils.getMobFamilyPath(conf,htd.getTableName(),hcd.getNameAsString());
+    List<HStoreFile> sfs=new ArrayList<>();
+    int numDelfiles=0;
+    int size=0;
+    if (fs.exists(mobDirPath)) {
+      for (      FileStatus f : fs.listStatus(mobDirPath)) {
+        HStoreFile sf=new HStoreFile(fs,f.getPath(),conf,cacheConfig,BloomType.NONE,true);
+        sfs.add(sf);
+        if (StoreFileInfo.isDelFile(sf.getPath())) {
+          numDelfiles++;
+        }
+      }
+      List<StoreFileScanner> scanners=StoreFileScanner.getScannersForStoreFiles(sfs,false,true,false,false,HConstants.LATEST_TIMESTAMP);
+      long timeToPurgeDeletes=Math.max(conf.getLong("hbase.hstore.time.to.purge.deletes",0),0);
+      long ttl=HStore.determineTTLFromFamily(hcd);
+      ScanInfo scanInfo=new ScanInfo(copyOfConf,hcd,ttl,timeToPurgeDeletes,CellComparatorImpl.COMPARATOR);
+      StoreScanner scanner=new StoreScanner(scanInfo,ScanType.COMPACT_DROP_DELETES,scanners);
+      try {
+        size+=UTIL.countRows(scanner);
+      }
+  finally {
+        scanner.close();
+      }
+    }
+    assertEquals(expectedNumDelfiles,numDelfiles);
+    return size;
+  }
+}

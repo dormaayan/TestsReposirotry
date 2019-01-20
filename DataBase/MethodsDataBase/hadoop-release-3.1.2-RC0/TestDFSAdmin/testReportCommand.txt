@@ -1,0 +1,90 @@
+@Test(timeout=180000) public void testReportCommand() throws Exception {
+  tearDown();
+  redirectStream();
+  final Configuration dfsConf=new HdfsConfiguration();
+  ErasureCodingPolicy ecPolicy=SystemErasureCodingPolicies.getByID(SystemErasureCodingPolicies.XOR_2_1_POLICY_ID);
+  dfsConf.setInt(DFSConfigKeys.DFS_NAMENODE_HEARTBEAT_RECHECK_INTERVAL_KEY,500);
+  dfsConf.setLong(DFS_HEARTBEAT_INTERVAL_KEY,1);
+  final Path baseDir=new Path(PathUtils.getTestDir(getClass()).getAbsolutePath(),GenericTestUtils.getMethodName());
+  dfsConf.set(MiniDFSCluster.HDFS_MINIDFS_BASEDIR,baseDir.toString());
+  final int numDn=ecPolicy.getNumDataUnits() + ecPolicy.getNumParityUnits();
+  try (MiniDFSCluster miniCluster=new MiniDFSCluster.Builder(dfsConf).numDataNodes(numDn).build()){
+    miniCluster.waitActive();
+    assertEquals(numDn,miniCluster.getDataNodes().size());
+    final DFSAdmin dfsAdmin=new DFSAdmin(dfsConf);
+    final DFSClient client=miniCluster.getFileSystem().getClient();
+    resetStream();
+    assertEquals(0,ToolRunner.run(dfsAdmin,new String[]{"-report"}));
+    verifyNodesAndCorruptBlocks(numDn,numDn,0,0,client,0L,0L);
+    final short replFactor=1;
+    final long fileLength=512L;
+    final DistributedFileSystem fs=miniCluster.getFileSystem();
+    final Path file=new Path(baseDir,"/corrupted");
+    fs.enableErasureCodingPolicy(ecPolicy.getName());
+    DFSTestUtil.createFile(fs,file,fileLength,replFactor,12345L);
+    DFSTestUtil.waitReplication(fs,file,replFactor);
+    final ExtendedBlock block=DFSTestUtil.getFirstBlock(fs,file);
+    LocatedBlocks lbs=miniCluster.getFileSystem().getClient().getNamenode().getBlockLocations(file.toString(),0,fileLength);
+    assertTrue("Unexpected block type: " + lbs.get(0),lbs.get(0) instanceof LocatedBlock);
+    LocatedBlock locatedBlock=lbs.get(0);
+    DatanodeInfo locatedDataNode=locatedBlock.getLocations()[0];
+    LOG.info("Replica block located on: " + locatedDataNode);
+    Path ecDir=new Path(baseDir,"ec");
+    fs.mkdirs(ecDir);
+    fs.getClient().setErasureCodingPolicy(ecDir.toString(),ecPolicy.getName());
+    Path ecFile=new Path(ecDir,"ec-file");
+    int stripesPerBlock=2;
+    int cellSize=ecPolicy.getCellSize();
+    int blockSize=stripesPerBlock * cellSize;
+    int blockGroupSize=ecPolicy.getNumDataUnits() * blockSize;
+    int totalBlockGroups=1;
+    DFSTestUtil.createStripedFile(miniCluster,ecFile,ecDir,totalBlockGroups,stripesPerBlock,false,ecPolicy);
+    resetStream();
+    assertEquals(0,ToolRunner.run(dfsAdmin,new String[]{"-report"}));
+    verifyNodesAndCorruptBlocks(numDn,numDn,0,0,client,0L,0L);
+    final List<DataNode> datanodes=miniCluster.getDataNodes();
+    DataNode dataNodeToShutdown=null;
+    for (    DataNode dn : datanodes) {
+      if (!dn.getDatanodeId().getDatanodeUuid().equals(locatedDataNode.getDatanodeUuid())) {
+        dataNodeToShutdown=dn;
+        break;
+      }
+    }
+    assertTrue("Unable to choose a DataNode to shutdown!",dataNodeToShutdown != null);
+    LOG.info("Shutting down: " + dataNodeToShutdown);
+    dataNodeToShutdown.shutdown();
+    miniCluster.setDataNodeDead(dataNodeToShutdown.getDatanodeId());
+    assertEquals(0,ToolRunner.run(dfsAdmin,new String[]{"-report"}));
+    verifyNodesAndCorruptBlocks(numDn,numDn - 1,0,0,client,0L,1L);
+    final int blockFilesCorrupted=miniCluster.corruptBlockOnDataNodes(block);
+    assertEquals("Fail to corrupt all replicas for block " + block,replFactor,blockFilesCorrupted);
+    try {
+      IOUtils.copyBytes(fs.open(file),new IOUtils.NullOutputStream(),conf,true);
+      fail("Should have failed to read the file with corrupted blocks.");
+    }
+ catch (    ChecksumException ignored) {
+    }
+    fs.setReplication(file,(short)(replFactor + 1));
+    BlockManagerTestUtil.updateState(miniCluster.getNameNode().getNamesystem().getBlockManager());
+    waitForCorruptBlock(miniCluster,client,file);
+    resetStream();
+    assertEquals(0,ToolRunner.run(dfsAdmin,new String[]{"-report"}));
+    verifyNodesAndCorruptBlocks(numDn,numDn - 1,1,0,client,0L,1L);
+    lbs=miniCluster.getFileSystem().getClient().getNamenode().getBlockLocations(ecFile.toString(),0,blockGroupSize);
+    assertTrue("Unexpected block type: " + lbs.get(0),lbs.get(0) instanceof LocatedStripedBlock);
+    LocatedStripedBlock bg=(LocatedStripedBlock)(lbs.get(0));
+    miniCluster.getNamesystem().writeLock();
+    try {
+      BlockManager bm=miniCluster.getNamesystem().getBlockManager();
+      bm.findAndMarkBlockAsCorrupt(bg.getBlock(),bg.getLocations()[0],"STORAGE_ID","TEST");
+      BlockManagerTestUtil.updateState(bm);
+    }
+  finally {
+      miniCluster.getNamesystem().writeUnlock();
+    }
+    waitForCorruptBlock(miniCluster,client,file);
+    resetStream();
+    assertEquals(0,ToolRunner.run(dfsAdmin,new String[]{"-report"}));
+    verifyNodesAndCorruptBlocks(numDn,numDn - 1,1,1,client,0L,0L);
+  }
+ }

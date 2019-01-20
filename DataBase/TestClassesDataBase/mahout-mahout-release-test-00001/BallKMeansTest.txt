@@ -1,0 +1,104 @@
+public class BallKMeansTest {
+  private static final int NUM_DATA_POINTS=10000;
+  private static final int NUM_DIMENSIONS=4;
+  private static final int NUM_ITERATIONS=20;
+  private static final double DISTRIBUTION_RADIUS=0.01;
+  @BeforeClass public static void setUp(){
+    RandomUtils.useTestSeed();
+    syntheticData=DataUtils.sampleMultiNormalHypercube(NUM_DIMENSIONS,NUM_DATA_POINTS,DISTRIBUTION_RADIUS);
+  }
+  private static Pair<List<Centroid>,List<Centroid>> syntheticData;
+  private static final int K1=100;
+  @Test public void testClusteringMultipleRuns(){
+    for (int i=1; i <= 10; ++i) {
+      BallKMeans clusterer=new BallKMeans(new BruteSearch(new SquaredEuclideanDistanceMeasure()),1 << NUM_DIMENSIONS,NUM_ITERATIONS,true,i);
+      clusterer.cluster(syntheticData.getFirst());
+      double costKMeansPlusPlus=ClusteringUtils.totalClusterCost(syntheticData.getFirst(),clusterer);
+      clusterer=new BallKMeans(new BruteSearch(new SquaredEuclideanDistanceMeasure()),1 << NUM_DIMENSIONS,NUM_ITERATIONS,false,i);
+      clusterer.cluster(syntheticData.getFirst());
+      double costKMeansRandom=ClusteringUtils.totalClusterCost(syntheticData.getFirst(),clusterer);
+      System.out.printf("%d runs; kmeans++: %f; random: %f\n",i,costKMeansPlusPlus,costKMeansRandom);
+      assertTrue("kmeans++ cost should be less than random cost",costKMeansPlusPlus < costKMeansRandom);
+    }
+  }
+  @Test public void testClustering(){
+    UpdatableSearcher searcher=new BruteSearch(new SquaredEuclideanDistanceMeasure());
+    BallKMeans clusterer=new BallKMeans(searcher,1 << NUM_DIMENSIONS,NUM_ITERATIONS);
+    long startTime=System.currentTimeMillis();
+    Pair<List<Centroid>,List<Centroid>> data=syntheticData;
+    clusterer.cluster(data.getFirst());
+    long endTime=System.currentTimeMillis();
+    long hash=0;
+    for (    Centroid centroid : data.getFirst()) {
+      for (      Vector.Element element : centroid.all()) {
+        hash=31 * hash + 17 * element.index() + Double.toHexString(element.get()).hashCode();
+      }
+    }
+    System.out.printf("Hash = %08x\n",hash);
+    assertEquals("Total weight not preserved",totalWeight(syntheticData.getFirst()),totalWeight(clusterer),1.0e-9);
+    OnlineSummarizer summarizer=new OnlineSummarizer();
+    for (    Vector mean : syntheticData.getSecond()) {
+      WeightedThing<Vector> v=searcher.search(mean,1).get(0);
+      summarizer.add(v.getWeight());
+    }
+    assertTrue(String.format("Median weight [%f] too large [>%f]",summarizer.getMedian(),DISTRIBUTION_RADIUS),summarizer.getMedian() < DISTRIBUTION_RADIUS);
+    double clusterTime=(endTime - startTime) / 1000.0;
+    System.out.printf("%s\n%.2f for clustering\n%.1f us per row\n\n",searcher.getClass().getName(),clusterTime,clusterTime / syntheticData.getFirst().size() * 1.0e6);
+    double[] cornerWeights=new double[1 << NUM_DIMENSIONS];
+    Searcher trueFinder=new BruteSearch(new EuclideanDistanceMeasure());
+    for (    Vector trueCluster : syntheticData.getSecond()) {
+      trueFinder.add(trueCluster);
+    }
+    for (    Centroid centroid : clusterer) {
+      WeightedThing<Vector> closest=trueFinder.search(centroid,1).get(0);
+      cornerWeights[((Centroid)closest.getValue()).getIndex()]+=centroid.getWeight();
+    }
+    int expectedNumPoints=NUM_DATA_POINTS / (1 << NUM_DIMENSIONS);
+    for (    double v : cornerWeights) {
+      System.out.printf("%f ",v);
+    }
+    System.out.println();
+    for (    double v : cornerWeights) {
+      assertEquals(expectedNumPoints,v,0);
+    }
+  }
+  @Test public void testInitialization(){
+    List<? extends WeightedVector> data=cubishTestData(0.01);
+    BallKMeans r=new BallKMeans(new BruteSearch(new SquaredEuclideanDistanceMeasure()),6,20);
+    r.cluster(data);
+    Matrix x=new DenseMatrix(6,5);
+    int row=0;
+    for (    Centroid c : r) {
+      x.viewRow(row).assign(c.viewPart(0,5));
+      row++;
+    }
+    final Vector columnNorms=x.aggregateColumns(new VectorFunction(){
+      @Override public double apply(      Vector f){
+        return Math.abs(f.minValue()) + Math.abs(f.maxValue() - 6) + Math.abs(f.norm(1) - 6);
+      }
+    }
+);
+    assertEquals(0,columnNorms.norm(1) / columnNorms.size(),0.1);
+    SingularValueDecomposition svd=new SingularValueDecomposition(x);
+    Vector s=svd.getS().viewDiagonal().assign(Functions.div(6));
+    assertEquals(5,s.getLengthSquared(),0.05);
+    assertEquals(5,s.norm(1),0.05);
+  }
+  private static List<? extends WeightedVector> cubishTestData(  double radius){
+    List<WeightedVector> data=Lists.newArrayListWithCapacity(K1 + 5000);
+    int row=0;
+    MultiNormal g=new MultiNormal(radius,new ConstantVector(0,10));
+    for (int i=0; i < K1; i++) {
+      data.add(new WeightedVector(g.sample(),1,row++));
+    }
+    for (int i=0; i < 5; i++) {
+      Vector m=new DenseVector(10);
+      m.set(i,6);
+      MultiNormal gx=new MultiNormal(radius,m);
+      for (int j=0; j < 1000; j++) {
+        data.add(new WeightedVector(gx.sample(),1,row++));
+      }
+    }
+    return data;
+  }
+}

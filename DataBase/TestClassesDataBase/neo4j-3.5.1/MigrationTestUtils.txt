@@ -1,0 +1,79 @@
+public class MigrationTestUtils {
+  private MigrationTestUtils(){
+  }
+  static void changeVersionNumber(  FileSystemAbstraction fileSystem,  File storeFile,  String versionString) throws IOException {
+    byte[] versionBytes=UTF8.encode(versionString);
+    try (StoreChannel fileChannel=fileSystem.open(storeFile,OpenMode.READ_WRITE)){
+      fileChannel.position(fileSystem.getFileSize(storeFile) - versionBytes.length);
+      fileChannel.write(ByteBuffer.wrap(versionBytes));
+    }
+   }
+  public static void prepareSampleLegacyDatabase(  String version,  FileSystemAbstraction workingFs,  File workingDirectory,  File prepareDirectory) throws IOException {
+    if (!prepareDirectory.exists()) {
+      throw new IllegalArgumentException("bad prepare directory");
+    }
+    File resourceDirectory=findFormatStoreDirectoryForVersion(version,prepareDirectory);
+    workingFs.deleteRecursively(workingDirectory);
+    workingFs.mkdirs(workingDirectory);
+    workingFs.copyRecursively(resourceDirectory,workingDirectory);
+  }
+  static File findFormatStoreDirectoryForVersion(  String version,  File targetDir) throws IOException {
+    if (StandardV2_3.STORE_VERSION.equals(version)) {
+      return find23FormatStoreDirectory(targetDir);
+    }
+ else     if (StandardV3_0.STORE_VERSION.equals(version)) {
+      return find30FormatStoreDirectory(targetDir);
+    }
+ else {
+      throw new IllegalArgumentException("Unknown version");
+    }
+  }
+  private static File find30FormatStoreDirectory(  File targetDir) throws IOException {
+    return Unzip.unzip(Legacy30Store.class,"upgradeTest30Db.zip",targetDir);
+  }
+  public static File find23FormatStoreDirectory(  File targetDir) throws IOException {
+    return Unzip.unzip(Legacy23Store.class,"upgradeTest23Db.zip",targetDir);
+  }
+  public static boolean checkNeoStoreHasDefaultFormatVersion(  StoreVersionCheck check,  DatabaseLayout databaseLayout){
+    File metadataStore=databaseLayout.metadataStore();
+    return check.hasVersion(metadataStore,RecordFormatSelector.defaultFormat().storeVersion()).outcome.isSuccessful();
+  }
+  public static void verifyFilesHaveSameContent(  FileSystemAbstraction fileSystem,  File original,  File other) throws IOException {
+    final int bufferBatchSize=32 * 1024;
+    File[] files=fileSystem.listFiles(original);
+    for (    File originalFile : files) {
+      File otherFile=new File(other,originalFile.getName());
+      if (!fileSystem.isDirectory(originalFile)) {
+        try (StoreChannel originalChannel=fileSystem.open(originalFile,OpenMode.READ);StoreChannel otherChannel=fileSystem.open(otherFile,OpenMode.READ)){
+          ByteBuffer buffer=ByteBuffer.allocate(bufferBatchSize);
+          while (true) {
+            if (!readAndFlip(originalChannel,buffer,bufferBatchSize)) {
+              break;
+            }
+            byte[] originalBytes=new byte[buffer.limit()];
+            buffer.get(originalBytes);
+            if (!readAndFlip(otherChannel,buffer,bufferBatchSize)) {
+              fail("Files have different sizes");
+            }
+            byte[] otherBytes=new byte[buffer.limit()];
+            buffer.get(otherBytes);
+            assertArrayEquals("Different content in " + originalFile,originalBytes,otherBytes);
+          }
+        }
+       }
+    }
+  }
+  public static void removeCheckPointFromTxLog(  FileSystemAbstraction fileSystem,  File databaseDirectory) throws IOException {
+    LogFiles logFiles=LogFilesBuilder.logFilesBasedOnlyBuilder(databaseDirectory,fileSystem).build();
+    LogEntryReader<ReadableClosablePositionAwareChannel> logEntryReader=new VersionAwareLogEntryReader<>();
+    LogTailScanner tailScanner=new LogTailScanner(logFiles,logEntryReader,new Monitors());
+    LogTailScanner.LogTailInformation logTailInformation=tailScanner.getTailInformation();
+    if (logTailInformation.commitsAfterLastCheckpoint()) {
+      return;
+    }
+    assertNotNull(logTailInformation.lastCheckPoint);
+    LogPosition logPosition=logTailInformation.lastCheckPoint.getLogPosition();
+    File logFile=logFiles.getLogFileForVersion(logPosition.getLogVersion());
+    fileSystem.truncate(logFile,logPosition.getByteOffset());
+  }
+}

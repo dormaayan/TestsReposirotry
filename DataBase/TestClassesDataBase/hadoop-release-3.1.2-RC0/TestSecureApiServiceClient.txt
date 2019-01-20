@@ -1,0 +1,96 @@
+/** 
+ * Test Spnego Client Login.
+ */
+public class TestSecureApiServiceClient extends KerberosSecurityTestcase {
+  private String clientPrincipal="client";
+  private String server1Protocol="HTTP";
+  private String server2Protocol="server2";
+  private String host="localhost";
+  private String server1Principal=server1Protocol + "/" + host;
+  private String server2Principal=server2Protocol + "/" + host;
+  private File keytabFile;
+  private Configuration testConf=new Configuration();
+  private Map<String,String> props;
+  private static Server server;
+  private static Logger LOG=Logger.getLogger(TestSecureApiServiceClient.class);
+  private ApiServiceClient asc;
+  /** 
+ * A mocked version of API Service for testing purpose.
+ */
+@SuppressWarnings("serial") public static class TestServlet extends HttpServlet {
+    private static boolean headerFound=false;
+    @Override protected void doGet(    HttpServletRequest req,    HttpServletResponse resp) throws ServletException, IOException {
+      Enumeration<String> headers=req.getHeaderNames();
+      while (headers.hasMoreElements()) {
+        String header=headers.nextElement();
+        LOG.info(header);
+      }
+      if (req.getHeader("Authorization") != null) {
+        headerFound=true;
+        resp.setStatus(HttpServletResponse.SC_OK);
+      }
+ else {
+        headerFound=false;
+        resp.setStatus(HttpServletResponse.SC_NOT_FOUND);
+      }
+    }
+    @Override protected void doPost(    HttpServletRequest req,    HttpServletResponse resp) throws ServletException, IOException {
+      resp.setStatus(HttpServletResponse.SC_OK);
+    }
+    @Override protected void doPut(    HttpServletRequest req,    HttpServletResponse resp) throws ServletException, IOException {
+      resp.setStatus(HttpServletResponse.SC_OK);
+    }
+    @Override protected void doDelete(    HttpServletRequest req,    HttpServletResponse resp) throws ServletException, IOException {
+      resp.setStatus(HttpServletResponse.SC_OK);
+    }
+    public static boolean isHeaderExist(){
+      return headerFound;
+    }
+  }
+  @Before public void setUp() throws Exception {
+    keytabFile=new File(getWorkDir(),"keytab");
+    getKdc().createPrincipal(keytabFile,clientPrincipal,server1Principal,server2Principal);
+    SecurityUtil.setAuthenticationMethod(AuthenticationMethod.KERBEROS,testConf);
+    UserGroupInformation.setConfiguration(testConf);
+    UserGroupInformation.setShouldRenewImmediatelyForTests(true);
+    props=new HashMap<String,String>();
+    props.put(Sasl.QOP,QualityOfProtection.AUTHENTICATION.saslQop);
+    server=new Server(8088);
+    ((QueuedThreadPool)server.getThreadPool()).setMaxThreads(10);
+    ServletContextHandler context=new ServletContextHandler();
+    context.setContextPath("/app");
+    server.setHandler(context);
+    context.addServlet(new ServletHolder(TestServlet.class),"/*");
+    ((ServerConnector)server.getConnectors()[0]).setHost("localhost");
+    server.start();
+    List<String> rmServers=new ArrayList<String>();
+    rmServers.add("localhost:8088");
+    testConf.set("yarn.resourcemanager.webapp.address","localhost:8088");
+    asc=new ApiServiceClient(){
+      @Override List<String> getRMHAWebAddresses(      Configuration conf){
+        return rmServers;
+      }
+    }
+;
+    asc.serviceInit(testConf);
+  }
+  @After public void tearDown() throws Exception {
+    server.stop();
+  }
+  @Test public void testHttpSpnegoChallenge() throws Exception {
+    UserGroupInformation.loginUserFromKeytab(clientPrincipal,keytabFile.getCanonicalPath());
+    asc=new ApiServiceClient();
+    String challenge=asc.generateToken("localhost");
+    assertNotNull(challenge);
+  }
+  @Test public void testAuthorizationHeader() throws Exception {
+    UserGroupInformation.loginUserFromKeytab(clientPrincipal,keytabFile.getCanonicalPath());
+    String rmAddress=asc.getRMWebAddress();
+    if (TestServlet.isHeaderExist()) {
+      assertEquals(rmAddress,"http://localhost:8088");
+    }
+ else {
+      fail("Did not see Authorization header.");
+    }
+  }
+}

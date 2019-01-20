@@ -1,0 +1,242 @@
+public class DynamicTaskExecutorTest {
+  private static final Park PARK=new ParkStrategy.Park(1,MILLISECONDS);
+  @Rule public final RepeatRule repeater=new RepeatRule();
+  @Test public void shouldExecuteTasksInParallel(){
+    TaskExecutor<Void> executor=new DynamicTaskExecutor<>(2,0,5,PARK,getClass().getSimpleName());
+    ControlledTask task1=new ControlledTask();
+    TestTask task2=new TestTask();
+    executor.submit(task1);
+    task1.latch.waitForAllToStart();
+    executor.submit(task2);
+    while (task2.executed == 0) {
+    }
+    task1.latch.finish();
+    while (task1.executed == 0) {
+    }
+    executor.close();
+    assertEquals(1,task1.executed);
+    assertEquals(1,task2.executed);
+  }
+  @Test public void shouldIncrementNumberOfProcessorsWhenRunning(){
+    TaskExecutor<Void> executor=new DynamicTaskExecutor<>(1,0,5,PARK,getClass().getSimpleName());
+    ControlledTask task1=new ControlledTask();
+    TestTask task2=new TestTask();
+    executor.submit(task1);
+    task1.latch.waitForAllToStart();
+    executor.submit(task2);
+    executor.processors(1);
+    while (task2.executed == 0) {
+    }
+    task1.latch.finish();
+    while (task1.executed == 0) {
+    }
+    executor.close();
+    assertEquals(1,task1.executed);
+    assertEquals(1,task2.executed);
+  }
+  @Test public void shouldDecrementNumberOfProcessorsWhenRunning() throws Exception {
+    TaskExecutor<Void> executor=new DynamicTaskExecutor<>(2,0,5,PARK,getClass().getSimpleName());
+    ControlledTask task1=new ControlledTask();
+    ControlledTask task2=new ControlledTask();
+    ControlledTask task3=new ControlledTask();
+    TestTask task4=new TestTask();
+    executor.submit(task1);
+    executor.submit(task2);
+    task1.latch.waitForAllToStart();
+    task2.latch.waitForAllToStart();
+    executor.submit(task3);
+    executor.submit(task4);
+    executor.processors(-1);
+    task1.latch.finish();
+    task2.latch.finish();
+    task3.latch.waitForAllToStart();
+    Thread.sleep(200);
+    assertEquals(0,task4.executed);
+    task3.latch.finish();
+    executor.close();
+    assertEquals(1,task1.executed);
+    assertEquals(1,task2.executed);
+    assertEquals(1,task3.executed);
+    assertEquals(1,task4.executed);
+  }
+  @Test public void shouldExecuteMultipleTasks(){
+    TaskExecutor<Void> executor=new DynamicTaskExecutor<>(30,0,5,PARK,getClass().getSimpleName());
+    ExpensiveTask[] tasks=new ExpensiveTask[1000];
+    for (int i=0; i < tasks.length; i++) {
+      executor.submit(tasks[i]=new ExpensiveTask(10));
+    }
+    executor.close();
+    for (    ExpensiveTask task : tasks) {
+      assertEquals(1,task.executed);
+    }
+  }
+  @Test public void shouldShutDownOnTaskFailure() throws Exception {
+    TaskExecutor<Void> executor=new DynamicTaskExecutor<>(30,0,5,PARK,getClass().getSimpleName());
+    IOException exception=new IOException("Test message");
+    FailingTask task=new FailingTask(exception);
+    executor.submit(task);
+    task.latch.await();
+    task.latch.release();
+    assertExceptionOnSubmit(executor,exception);
+  }
+  @Test public void shouldShutDownOnTaskFailureEvenIfOtherTasksArePending() throws Exception {
+    TaskExecutor<Void> executor=new DynamicTaskExecutor<>(2,0,10,PARK,getClass().getSimpleName());
+    IOException exception=new IOException("Test message");
+    ControlledTask firstBlockingTask=new ControlledTask();
+    ControlledTask secondBlockingTask=new ControlledTask();
+    executor.submit(firstBlockingTask);
+    executor.submit(secondBlockingTask);
+    firstBlockingTask.latch.waitForAllToStart();
+    secondBlockingTask.latch.waitForAllToStart();
+    FailingTask failingTask=new FailingTask(exception);
+    executor.submit(failingTask);
+    ControlledTask thirdBlockingTask=new ControlledTask();
+    executor.submit(thirdBlockingTask);
+    firstBlockingTask.latch.finish();
+    failingTask.latch.await();
+    failingTask.latch.release();
+    assertExceptionOnSubmit(executor,exception);
+    executor.close();
+    secondBlockingTask.latch.finish();
+  }
+  @Test public void shouldSurfaceTaskErrorInAssertHealthy() throws Exception {
+    TaskExecutor<Void> executor=new DynamicTaskExecutor<>(2,0,10,PARK,getClass().getSimpleName());
+    IOException exception=new IOException("Failure");
+    FailingTask failingTask=new FailingTask(exception);
+    executor.submit(failingTask);
+    failingTask.latch.await();
+    failingTask.latch.release();
+    for (int i=0; i < 5; i++) {
+      try {
+        executor.assertHealthy();
+        Thread.sleep(100);
+      }
+ catch (      Exception e) {
+        assertTrue(Exceptions.contains(e,exception.getMessage(),exception.getClass()));
+        return;
+      }
+    }
+    fail("Should not be considered healthy after failing task");
+  }
+  @Test public void shouldLetShutdownCompleteInEventOfPanic() throws Exception {
+    final TaskExecutor<Void> executor=new DynamicTaskExecutor<>(2,0,10,PARK,getClass().getSimpleName());
+    IOException exception=new IOException("Failure");
+    FailingTask failingTask=new FailingTask(exception);
+    executor.submit(failingTask);
+    failingTask.latch.await();
+    try (OtherThreadExecutor<Void> closer=new OtherThreadExecutor<>("closer",null)){
+      Future<Void> shutdown=closer.executeDontWait(state -> {
+        executor.close();
+        return null;
+      }
+);
+      while (!closer.waitUntilWaiting().isAt(DynamicTaskExecutor.class,"close")) {
+        Thread.sleep(10);
+      }
+      failingTask.latch.release();
+      shutdown.get();
+    }
+   }
+  @Test public void shouldRespectMaxProcessors(){
+    int maxProcessors=4;
+    final TaskExecutor<Void> executor=new DynamicTaskExecutor<>(1,maxProcessors,10,PARK,getClass().getSimpleName());
+    assertEquals(1,executor.processors(0));
+    assertEquals(2,executor.processors(1));
+    assertEquals(4,executor.processors(3));
+    assertEquals(4,executor.processors(0));
+    assertEquals(4,executor.processors(1));
+    assertEquals(3,executor.processors(-1));
+    assertEquals(1,executor.processors(-2));
+    assertEquals(1,executor.processors(-2));
+    assertEquals(1,executor.processors(0));
+    executor.close();
+  }
+  @Repeat(times=10) @Test public void shouldCopeWithConcurrentIncrementOfProcessorsAndShutdown() throws Throwable {
+    TaskExecutor<Void> executor=new DynamicTaskExecutor<>(1,2,2,PARK,"test");
+    Race race=new Race().withRandomStartDelays();
+    race.addContestant(executor::close);
+    race.addContestant(() -> executor.processors(1));
+    race.go(10,SECONDS);
+  }
+  @Test public void shouldNoticeBadHealthBeforeBeingClosed(){
+    TaskExecutor<Void> executor=new DynamicTaskExecutor<>(1,2,2,PARK,"test");
+    RuntimeException panic=new RuntimeException("My failure");
+    executor.receivePanic(panic);
+    try {
+      executor.assertHealthy();
+      fail("Should have failed");
+    }
+ catch (    TaskExecutionPanicException e) {
+      assertSame(panic,e.getCause());
+    }
+    executor.close();
+    try {
+      executor.assertHealthy();
+      fail("Should have failed");
+    }
+ catch (    TaskExecutionPanicException e) {
+      assertSame(panic,e.getCause());
+    }
+  }
+  private void assertExceptionOnSubmit(  TaskExecutor<Void> executor,  IOException exception){
+    Exception submitException=null;
+    for (int i=0; i < 5 && submitException == null; i++) {
+      try {
+        executor.submit(new EmptyTask());
+        Thread.sleep(100);
+      }
+ catch (      Exception e) {
+        submitException=e;
+      }
+    }
+    assertNotNull(submitException);
+    assertEquals(exception,submitException.getCause());
+  }
+private static class TestTask implements Task<Void> {
+    protected volatile int executed;
+    @Override public void run(    Void nothing){
+      executed++;
+    }
+  }
+private static class EmptyTask implements Task<Void> {
+    @Override public void run(    Void nothing){
+    }
+  }
+private static class FailingTask implements Task<Void> {
+    private final Exception exception;
+    private final Barrier.Control latch=new Barrier.Control();
+    FailingTask(    Exception exception){
+      this.exception=exception;
+    }
+    @Override public void run(    Void nothing) throws Exception {
+      try {
+        throw exception;
+      }
+  finally {
+        latch.reached();
+      }
+    }
+  }
+private static class ExpensiveTask extends TestTask {
+    private final int millis;
+    ExpensiveTask(    int millis){
+      this.millis=millis;
+    }
+    @Override public void run(    Void nothing){
+      try {
+        Thread.sleep(millis);
+      }
+ catch (      InterruptedException e) {
+        throw new RuntimeException(e);
+      }
+      super.run(nothing);
+    }
+  }
+private static class ControlledTask extends TestTask {
+    private final DoubleLatch latch=new DoubleLatch();
+    @Override public void run(    Void nothing){
+      latch.startAndWaitForAllToStartAndFinish();
+      super.run(nothing);
+    }
+  }
+}

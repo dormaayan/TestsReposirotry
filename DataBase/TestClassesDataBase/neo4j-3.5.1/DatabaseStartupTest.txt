@@ -1,0 +1,68 @@
+@ExtendWith(TestDirectoryExtension.class) class DatabaseStartupTest {
+  @Inject private TestDirectory testDirectory;
+  @Test void startTheDatabaseWithWrongVersionShouldFailWithUpgradeNotAllowed() throws Throwable {
+    File databaseDir=testDirectory.databaseDir();
+    GraphDatabaseService db=new TestGraphDatabaseFactory().newEmbeddedDatabase(databaseDir);
+    try (Transaction tx=db.beginTx()){
+      db.createNode();
+      tx.success();
+    }
+     db.shutdown();
+    try (FileSystemAbstraction fileSystem=new DefaultFileSystemAbstraction();ThreadPoolJobScheduler scheduler=new ThreadPoolJobScheduler();PageCache pageCache=createPageCache(fileSystem,scheduler)){
+      MetaDataStore.setRecord(pageCache,testDirectory.databaseLayout().metadataStore(),MetaDataStore.Position.STORE_VERSION,MetaDataStore.versionStringToLong("bad"));
+    }
+     RuntimeException exception=assertThrows(RuntimeException.class,() -> new TestGraphDatabaseFactory().newEmbeddedDatabase(databaseDir));
+    assertTrue(exception.getCause() instanceof LifecycleException);
+    assertTrue(exception.getCause().getCause() instanceof IllegalArgumentException);
+    assertEquals("Unknown store version 'bad'",exception.getCause().getCause().getMessage());
+  }
+  @Test void startTheDatabaseWithWrongVersionShouldFailAlsoWhenUpgradeIsAllowed() throws Throwable {
+    File databaseDirectory=testDirectory.databaseDir();
+    GraphDatabaseService db=new TestGraphDatabaseFactory().newEmbeddedDatabase(databaseDirectory);
+    try (Transaction tx=db.beginTx()){
+      db.createNode();
+      tx.success();
+    }
+     db.shutdown();
+    String badStoreVersion="bad";
+    try (FileSystemAbstraction fileSystem=new DefaultFileSystemAbstraction();ThreadPoolJobScheduler scheduler=new ThreadPoolJobScheduler();PageCache pageCache=createPageCache(fileSystem,scheduler)){
+      MetaDataStore.setRecord(pageCache,testDirectory.databaseLayout().metadataStore(),MetaDataStore.Position.STORE_VERSION,MetaDataStore.versionStringToLong(badStoreVersion));
+    }
+     RuntimeException exception=assertThrows(RuntimeException.class,() -> new TestGraphDatabaseFactory().newEmbeddedDatabaseBuilder(databaseDirectory).setConfig(GraphDatabaseSettings.allow_upgrade,"true").newGraphDatabase());
+    assertTrue(exception.getCause() instanceof LifecycleException);
+    assertTrue(exception.getCause().getCause() instanceof StoreUpgrader.UnexpectedUpgradingStoreVersionException);
+  }
+  @Test void startTestDatabaseOnProvidedNonAbsoluteFile(){
+    File directory=new File("notAbsoluteDirectory");
+    new TestGraphDatabaseFactory().newImpermanentDatabase(directory).shutdown();
+  }
+  @Test void startCommunityDatabaseOnProvidedNonAbsoluteFile(){
+    File directory=new File("notAbsoluteDirectory");
+    EphemeralCommunityFacadeFactory factory=new EphemeralCommunityFacadeFactory();
+    GraphDatabaseFactory databaseFactory=new EphemeralGraphDatabaseFactory(factory);
+    GraphDatabaseService service=databaseFactory.newEmbeddedDatabase(directory);
+    service.shutdown();
+  }
+private static class EphemeralCommunityFacadeFactory extends GraphDatabaseFacadeFactory {
+    EphemeralCommunityFacadeFactory(){
+      super(DatabaseInfo.COMMUNITY,CommunityEditionModule::new);
+    }
+    @Override protected PlatformModule createPlatform(    File storeDir,    Config config,    Dependencies dependencies){
+      return new PlatformModule(storeDir,config,databaseInfo,dependencies){
+        @Override protected FileSystemAbstraction createFileSystemAbstraction(){
+          return new EphemeralFileSystemAbstraction();
+        }
+      }
+;
+    }
+  }
+private static class EphemeralGraphDatabaseFactory extends GraphDatabaseFactory {
+    private final EphemeralCommunityFacadeFactory factory;
+    EphemeralGraphDatabaseFactory(    EphemeralCommunityFacadeFactory factory){
+      this.factory=factory;
+    }
+    @Override protected GraphDatabaseFacadeFactory getGraphDatabaseFacadeFactory(){
+      return factory;
+    }
+  }
+}

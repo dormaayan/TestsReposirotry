@@ -1,0 +1,166 @@
+@ExtendWith(TestDirectoryExtension.class) class ParallelNativeIndexPopulatorTest {
+  private static final int THREADS=4;
+  private static final StoreIndexDescriptor DESCRIPTOR=forSchema(forLabel(1,1),GenericNativeIndexProvider.DESCRIPTOR).withId(1);
+  @Inject TestDirectory directory;
+  private final Config defaults=defaults();
+  private final ConfiguredSpaceFillingCurveSettingsCache settingsCache=new ConfiguredSpaceFillingCurveSettingsCache(defaults);
+  private final IndexSpecificSpaceFillingCurveSettingsCache spatialSettings=new IndexSpecificSpaceFillingCurveSettingsCache(settingsCache,new HashMap<>());
+  private final GenericLayout layout=new GenericLayout(1,spatialSettings);
+  private final AtomicLong next=new AtomicLong();
+  private ExecutorService executorService;
+  private File baseIndexFile;
+  @BeforeEach void startExecutor(){
+    executorService=Executors.newFixedThreadPool(THREADS);
+    baseIndexFile=directory.file("index");
+  }
+  @AfterEach void stopExecutor(){
+    executorService.shutdown();
+  }
+  @Test void shouldCreateThreadLocalParts() throws ExecutionException, InterruptedException, IndexEntryConflictException {
+    Thread mainThread=Thread.currentThread();
+    ConcurrentMap<Thread,NativeIndexPopulator> partPopulators=new ConcurrentHashMap<>();
+    ParallelNativeIndexPopulator<GenericKey,NativeIndexValue> populator=new ParallelNativeIndexPopulator<>(baseIndexFile,layout,mockPartSupplier(partPopulators,this::mockNativeIndexPopulator));
+    int batchCountPerThread=10;
+    applyBatchesInParallel(populator,batchCountPerThread);
+    assertEquals(THREADS,partPopulators.size());
+    for (    Thread thread : partPopulators.keySet()) {
+      if (thread != mainThread) {
+        NativeIndexPopulator partPopulator=partPopulators.get(thread);
+        verify(partPopulator,times(batchCountPerThread)).add(anyCollection());
+      }
+    }
+  }
+  @Test void shouldApplyUpdatesOnEachPart() throws ExecutionException, InterruptedException, IndexEntryConflictException {
+    Thread mainThread=Thread.currentThread();
+    ConcurrentMap<Thread,NativeIndexPopulator> partPopulators=new ConcurrentHashMap<>();
+    ParallelNativeIndexPopulator<GenericKey,NativeIndexValue> populator=new ParallelNativeIndexPopulator<>(baseIndexFile,layout,mockPartSupplier(partPopulators,this::mockNativeIndexPopulator));
+    int batchCountPerThread=10;
+    applyBatchesInParallel(populator,batchCountPerThread);
+    applyUpdates(populator,next);
+    applyBatchesInParallel(populator,batchCountPerThread);
+    applyUpdates(populator,next);
+    applyBatchesInParallel(populator,batchCountPerThread);
+    assertEquals(THREADS,partPopulators.size());
+    for (    Thread thread : partPopulators.keySet()) {
+      if (thread != mainThread) {
+        NativeIndexPopulator partPopulator=partPopulators.get(thread);
+        verify(partPopulator,times(batchCountPerThread * 3)).add(anyCollection());
+        CountingIndexUpdater updater=(CountingIndexUpdater)partPopulator.newPopulatingUpdater();
+        assertEquals(10,updater.count);
+      }
+    }
+  }
+  @Test void shouldDropAllPartsOnClose() throws ExecutionException, InterruptedException {
+    shouldDropAllParts(populator -> populator.close(false));
+  }
+  @Test void shouldDropAllPartsOnDrop() throws ExecutionException, InterruptedException {
+    shouldDropAllParts(ParallelNativeIndexPopulator::drop);
+  }
+  private void shouldDropAllParts(  Consumer<ParallelNativeIndexPopulator<GenericKey,NativeIndexValue>> method) throws ExecutionException, InterruptedException {
+    ConcurrentMap<Thread,NativeIndexPopulator> partPopulators=new ConcurrentHashMap<>();
+    ParallelNativeIndexPopulator<GenericKey,NativeIndexValue> populator=new ParallelNativeIndexPopulator<>(baseIndexFile,layout,mockPartSupplier(partPopulators,this::failOnDropNativeIndexPopulator));
+    populator.create();
+    applyBatchesInParallel(populator,1);
+    try {
+      method.accept(populator);
+      fail("Should have failed");
+    }
+ catch (    CustomFailure e) {
+    }
+    for (    NativeIndexPopulator part : partPopulators.values()) {
+      verify(part).drop();
+    }
+  }
+  @Test void shouldMergePartsOnAccessingVerifyDeferredConstraintsAfterPopulation() throws Exception {
+    shouldMergePartsOnAccessingFirstCompleteMethodAfterPopulation(populator -> populator.verifyDeferredConstraints(mock(NodePropertyAccessor.class)));
+  }
+  @Test void shouldMergePartsOnAccessingSampleResultAfterPopulation() throws Exception {
+    shouldMergePartsOnAccessingFirstCompleteMethodAfterPopulation(ParallelNativeIndexPopulator::sampleResult);
+  }
+  private void shouldMergePartsOnAccessingFirstCompleteMethodAfterPopulation(  ThrowingConsumer<ParallelNativeIndexPopulator<GenericKey,NativeIndexValue>,IndexEntryConflictException> method) throws Exception {
+    try (EphemeralFileSystemAbstraction fs=new EphemeralFileSystemAbstraction();JobScheduler jobScheduler=createInitialisedScheduler()){
+      SingleFilePageSwapperFactory swapper=new SingleFilePageSwapperFactory();
+      swapper.open(fs,defaults);
+      try (PageCache pageCache=new MuninnPageCache(swapper,1_000,PageCacheTracer.NULL,PageCursorTracerSupplier.NULL,EMPTY,jobScheduler)){
+        NativeIndexPopulatorPartSupplier<GenericKey,NativeIndexValue> partSupplier=file -> new GenericNativeIndexPopulator(pageCache,(FileSystemAbstraction)fs,file,layout,IndexProvider.Monitor.EMPTY,DESCRIPTOR,spatialSettings,directoriesByProvider(directory.directory()).forProvider(GenericNativeIndexProvider.DESCRIPTOR),mock(SpaceFillingCurveConfiguration.class),false,!file.equals(baseIndexFile));
+        ParallelNativeIndexPopulator<GenericKey,NativeIndexValue> populator=new ParallelNativeIndexPopulator<>(baseIndexFile,layout,partSupplier);
+        try {
+          populator.create();
+          applyBatchesInParallel(populator,100);
+          method.accept(populator);
+          NodeValueIterator results=new NodeValueIterator();
+          try (NativeIndexReader<GenericKey,NativeIndexValue> reader=populator.newReader()){
+            reader.query(results,IndexOrder.NONE,true,IndexQuery.exists(1));
+            long nextExpectedId=0;
+            while (results.hasNext()) {
+              long id=results.next();
+              assertEquals(nextExpectedId++,id);
+            }
+            assertEquals(nextExpectedId,next.get());
+          }
+         }
+  finally {
+          populator.close(true);
+        }
+      }
+     }
+   }
+  private NativeIndexPopulatorPartSupplier<GenericKey,NativeIndexValue> mockPartSupplier(  ConcurrentMap<Thread,NativeIndexPopulator> partPopulators,  Supplier<NativeIndexPopulator<GenericKey,NativeIndexValue>> partSupplier){
+    return file -> {
+      NativeIndexPopulator<GenericKey,NativeIndexValue> part=partSupplier.get();
+      if (!file.equals(baseIndexFile)) {
+        assertNull(partPopulators.put(Thread.currentThread(),part));
+      }
+      return part;
+    }
+;
+  }
+  private NativeIndexPopulator<GenericKey,NativeIndexValue> mockNativeIndexPopulator(){
+    NativeIndexPopulator<GenericKey,NativeIndexValue> populator=mock(NativeIndexPopulator.class);
+    when(populator.newPopulatingUpdater()).thenReturn(new CountingIndexUpdater());
+    return populator;
+  }
+  private NativeIndexPopulator<GenericKey,NativeIndexValue> failOnDropNativeIndexPopulator(){
+    NativeIndexPopulator<GenericKey,NativeIndexValue> populator=mockNativeIndexPopulator();
+    doThrow(CustomFailure.class).when(populator).drop();
+    return populator;
+  }
+  private void applyUpdates(  ParallelNativeIndexPopulator<GenericKey,NativeIndexValue> populator,  AtomicLong next) throws IndexEntryConflictException {
+    try (IndexUpdater updater=populator.newPopulatingUpdater(mock(NodePropertyAccessor.class))){
+      for (int i=0; i < 5; i++) {
+        updater.process(update(next.incrementAndGet()));
+      }
+    }
+   }
+  private void applyBatchesInParallel(  ParallelNativeIndexPopulator<GenericKey,NativeIndexValue> populator,  int batchCountPerThread) throws ExecutionException, InterruptedException {
+    CountDownLatch startSignal=new CountDownLatch(THREADS);
+    List<Future<Void>> futures=new ArrayList<>();
+    for (int i=0; i < THREADS; i++) {
+      futures.add(executorService.submit(() -> {
+        startSignal.countDown();
+        startSignal.await();
+        for (int j=0; j < batchCountPerThread; j++) {
+          populator.add(asList(update(next.getAndIncrement())));
+        }
+        return null;
+      }
+));
+    }
+    for (    Future<Void> future : futures) {
+      future.get();
+    }
+  }
+  private IndexEntryUpdate<?> update(  long id){
+    return add(id,DESCRIPTOR,longValue(id));
+  }
+private static class CustomFailure extends RuntimeException {
+  }
+private static class CountingIndexUpdater implements IndexUpdater {
+    private int count;
+    @Override public void process(    IndexEntryUpdate<?> update){
+      count++;
+    }
+    @Override public void close(){
+    }
+  }
+}

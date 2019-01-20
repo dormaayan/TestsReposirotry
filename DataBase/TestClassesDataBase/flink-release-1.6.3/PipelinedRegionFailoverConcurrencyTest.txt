@@ -1,0 +1,144 @@
+/** 
+ * These tests make sure that global failover (restart all) always takes precedence over local recovery strategies for the  {@link RestartPipelinedRegionStrategy}<p>This test must be in the package it resides in, because it uses package-private methods from the ExecutionGraph classes.
+ */
+public class PipelinedRegionFailoverConcurrencyTest extends TestLogger {
+  /** 
+ * Tests that a cancellation concurrent to a local failover leads to a properly cancelled state.
+ */
+  @Test public void testCancelWhileInLocalFailover() throws Exception {
+    final JobID jid=new JobID();
+    final int parallelism=2;
+    final ManuallyTriggeredDirectExecutor executor=new ManuallyTriggeredDirectExecutor();
+    final SimpleSlotProvider slotProvider=new SimpleSlotProvider(jid,parallelism);
+    final ExecutionGraph graph=createSampleGraph(jid,new FailoverPipelinedRegionWithCustomExecutor(executor),new FixedDelayRestartStrategy(Integer.MAX_VALUE,0),slotProvider,2);
+    final ExecutionJobVertex ejv=graph.getVerticesTopologically().iterator().next();
+    final ExecutionVertex vertex1=ejv.getTaskVertices()[0];
+    final ExecutionVertex vertex2=ejv.getTaskVertices()[1];
+    graph.scheduleForExecution();
+    assertEquals(JobStatus.RUNNING,graph.getState());
+    vertex1.getCurrentExecutionAttempt().fail(new Exception("test failure"));
+    assertEquals(ExecutionState.FAILED,vertex1.getCurrentExecutionAttempt().getState());
+    assertEquals(JobStatus.RUNNING,graph.getState());
+    assertEquals(1,executor.numQueuedRunnables());
+    graph.cancel();
+    assertEquals(JobStatus.CANCELLING,graph.getState());
+    assertEquals(ExecutionState.FAILED,vertex1.getCurrentExecutionAttempt().getState());
+    assertEquals(ExecutionState.CANCELING,vertex2.getCurrentExecutionAttempt().getState());
+    executor.trigger();
+    vertex2.getCurrentExecutionAttempt().cancelingComplete();
+    assertEquals(JobStatus.CANCELED,graph.getTerminationFuture().get());
+    assertTrue(vertex1.getCurrentExecutionAttempt().getState().isTerminal());
+    assertTrue(vertex2.getCurrentExecutionAttempt().getState().isTerminal());
+    assertEquals(parallelism,slotProvider.getNumberOfAvailableSlots());
+  }
+  /** 
+ * Tests that a terminal global failure concurrent to a local failover leads to a properly failed state.
+ */
+  @Test public void testGlobalFailureConcurrentToLocalFailover() throws Exception {
+    final JobID jid=new JobID();
+    final int parallelism=2;
+    final ManuallyTriggeredDirectExecutor executor=new ManuallyTriggeredDirectExecutor();
+    final SimpleSlotProvider slotProvider=new SimpleSlotProvider(jid,parallelism);
+    final ExecutionGraph graph=createSampleGraph(jid,new FailoverPipelinedRegionWithCustomExecutor(executor),new FixedDelayRestartStrategy(Integer.MAX_VALUE,0),slotProvider,2);
+    final ExecutionJobVertex ejv=graph.getVerticesTopologically().iterator().next();
+    final ExecutionVertex vertex1=ejv.getTaskVertices()[0];
+    final ExecutionVertex vertex2=ejv.getTaskVertices()[1];
+    graph.scheduleForExecution();
+    assertEquals(JobStatus.RUNNING,graph.getState());
+    vertex1.getCurrentExecutionAttempt().fail(new Exception("test failure"));
+    assertEquals(ExecutionState.FAILED,vertex1.getCurrentExecutionAttempt().getState());
+    assertEquals(JobStatus.RUNNING,graph.getState());
+    assertEquals(1,executor.numQueuedRunnables());
+    graph.failGlobal(new SuppressRestartsException(new Exception("test exception")));
+    assertEquals(JobStatus.FAILING,graph.getState());
+    assertEquals(ExecutionState.FAILED,vertex1.getCurrentExecutionAttempt().getState());
+    assertEquals(ExecutionState.CANCELING,vertex2.getCurrentExecutionAttempt().getState());
+    executor.trigger();
+    vertex2.getCurrentExecutionAttempt().cancelingComplete();
+    assertEquals(JobStatus.FAILED,graph.getState());
+    assertTrue(vertex1.getCurrentExecutionAttempt().getState().isTerminal());
+    assertTrue(vertex2.getCurrentExecutionAttempt().getState().isTerminal());
+    assertEquals(parallelism,slotProvider.getNumberOfAvailableSlots());
+  }
+  /** 
+ * Tests that a local failover does not try to trump a global failover.
+ */
+  @Test public void testGlobalRecoveryConcurrentToLocalRecovery() throws Exception {
+    final JobID jid=new JobID();
+    final int parallelism=2;
+    final ManuallyTriggeredDirectExecutor executor=new ManuallyTriggeredDirectExecutor();
+    final SimpleSlotProvider slotProvider=new SimpleSlotProvider(jid,parallelism);
+    final ExecutionGraph graph=createSampleGraph(jid,new FailoverPipelinedRegionWithCustomExecutor(executor),new FixedDelayRestartStrategy(2,0),slotProvider,2);
+    RestartPipelinedRegionStrategy strategy=(RestartPipelinedRegionStrategy)graph.getFailoverStrategy();
+    final ExecutionJobVertex ejv=graph.getVerticesTopologically().iterator().next();
+    final ExecutionVertex vertex1=ejv.getTaskVertices()[0];
+    final ExecutionVertex vertex2=ejv.getTaskVertices()[1];
+    graph.scheduleForExecution();
+    assertEquals(JobStatus.RUNNING,graph.getState());
+    assertEquals(JobStatus.RUNNING,strategy.getFailoverRegion(vertex1).getState());
+    vertex2.getCurrentExecutionAttempt().fail(new Exception("test failure"));
+    assertEquals(ExecutionState.FAILED,vertex2.getCurrentExecutionAttempt().getState());
+    assertEquals(JobStatus.CANCELLING,strategy.getFailoverRegion(vertex2).getState());
+    assertEquals(JobStatus.RUNNING,graph.getState());
+    assertEquals(1,executor.numQueuedRunnables());
+    graph.failGlobal(new Exception("test exception"));
+    assertEquals(JobStatus.FAILING,graph.getState());
+    assertEquals(ExecutionState.FAILED,vertex2.getCurrentExecutionAttempt().getState());
+    assertEquals(ExecutionState.CANCELING,vertex1.getCurrentExecutionAttempt().getState());
+    vertex1.getCurrentExecutionAttempt().cancelingComplete();
+    waitUntilJobStatus(graph,JobStatus.RUNNING,1000);
+    assertEquals(JobStatus.RUNNING,graph.getState());
+    waitUntilExecutionState(vertex1.getCurrentExecutionAttempt(),ExecutionState.DEPLOYING,1000);
+    waitUntilExecutionState(vertex2.getCurrentExecutionAttempt(),ExecutionState.DEPLOYING,1000);
+    vertex1.getCurrentExecutionAttempt().switchToRunning();
+    vertex2.getCurrentExecutionAttempt().switchToRunning();
+    assertEquals(ExecutionState.RUNNING,vertex1.getCurrentExecutionAttempt().getState());
+    assertEquals(ExecutionState.RUNNING,vertex2.getCurrentExecutionAttempt().getState());
+    executor.trigger();
+    assertEquals(JobStatus.RUNNING,graph.getState());
+    assertEquals(JobStatus.RUNNING,strategy.getFailoverRegion(vertex1).getState());
+    assertEquals(JobStatus.RUNNING,strategy.getFailoverRegion(vertex2).getState());
+    assertEquals(ExecutionState.RUNNING,vertex1.getCurrentExecutionAttempt().getState());
+    assertEquals(ExecutionState.RUNNING,vertex2.getCurrentExecutionAttempt().getState());
+    assertEquals(1,vertex1.getCurrentExecutionAttempt().getAttemptNumber());
+    assertEquals(1,vertex2.getCurrentExecutionAttempt().getAttemptNumber());
+    assertEquals(1,vertex1.getCopyOfPriorExecutionsList().size());
+    assertEquals(1,vertex2.getCopyOfPriorExecutionsList().size());
+    assertEquals(0,slotProvider.getNumberOfAvailableSlots());
+    vertex2.getCurrentExecutionAttempt().fail(new Exception("test failure"));
+    assertEquals(1,executor.numQueuedRunnables());
+    executor.trigger();
+    waitUntilExecutionState(vertex2.getCurrentExecutionAttempt(),ExecutionState.DEPLOYING,1000);
+    vertex2.getCurrentExecutionAttempt().switchToRunning();
+    assertEquals(JobStatus.RUNNING,graph.getState());
+    assertEquals(JobStatus.RUNNING,strategy.getFailoverRegion(vertex1).getState());
+    assertEquals(JobStatus.RUNNING,strategy.getFailoverRegion(vertex2).getState());
+    assertEquals(ExecutionState.RUNNING,vertex1.getCurrentExecutionAttempt().getState());
+    assertEquals(ExecutionState.RUNNING,vertex2.getCurrentExecutionAttempt().getState());
+    assertEquals(1,vertex1.getCurrentExecutionAttempt().getAttemptNumber());
+    assertEquals(2,vertex2.getCurrentExecutionAttempt().getAttemptNumber());
+    assertEquals(1,vertex1.getCopyOfPriorExecutionsList().size());
+    assertEquals(2,vertex2.getCopyOfPriorExecutionsList().size());
+    assertEquals(0,slotProvider.getNumberOfAvailableSlots());
+  }
+  private ExecutionGraph createSampleGraph(  JobID jid,  Factory failoverStrategy,  RestartStrategy restartStrategy,  SlotProvider slotProvider,  int parallelism) throws Exception {
+    final JobInformation jobInformation=new DummyJobInformation(jid,"test job");
+    final Time timeout=Time.seconds(10L);
+    final ExecutionGraph graph=new ExecutionGraph(jobInformation,TestingUtils.defaultExecutor(),TestingUtils.defaultExecutor(),timeout,restartStrategy,failoverStrategy,slotProvider,getClass().getClassLoader(),VoidBlobWriter.getInstance(),timeout);
+    JobVertex jv=new JobVertex("test vertex");
+    jv.setInvokableClass(NoOpInvokable.class);
+    jv.setParallelism(parallelism);
+    JobGraph jg=new JobGraph(jid,"testjob",jv);
+    graph.attachJobGraph(jg.getVerticesSortedTopologicallyFromSources());
+    return graph;
+  }
+private static class FailoverPipelinedRegionWithCustomExecutor implements Factory {
+    private final Executor executor;
+    FailoverPipelinedRegionWithCustomExecutor(    Executor executor){
+      this.executor=executor;
+    }
+    @Override public FailoverStrategy create(    ExecutionGraph executionGraph){
+      return new RestartPipelinedRegionStrategy(executionGraph,executor);
+    }
+  }
+}

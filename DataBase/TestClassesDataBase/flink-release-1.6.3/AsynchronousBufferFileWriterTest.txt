@@ -1,0 +1,119 @@
+/** 
+ * Tests for  {@link AsynchronousBufferFileWriter}.
+ */
+public class AsynchronousBufferFileWriterTest {
+  @Rule public ExpectedException exception=ExpectedException.none();
+  private static final IOManager ioManager=new IOManagerAsync();
+  private static final Buffer mockBuffer=mock(Buffer.class);
+  private AsynchronousBufferFileWriter writer;
+  @AfterClass public static void shutdown(){
+    ioManager.shutdown();
+  }
+  @Before public void setUp() throws IOException {
+    writer=new AsynchronousBufferFileWriter(ioManager.createChannel(),new RequestQueue<WriteRequest>());
+  }
+  @Test public void testAddAndHandleRequest() throws Exception {
+    addRequest();
+    assertEquals("Didn't increment number of outstanding requests.",1,writer.getNumberOfOutstandingRequests());
+    handleRequest();
+    assertEquals("Didn't decrement number of outstanding requests.",0,writer.getNumberOfOutstandingRequests());
+  }
+  @Test public void testAddWithFailingWriter() throws Exception {
+    AsynchronousBufferFileWriter writer=new AsynchronousBufferFileWriter(ioManager.createChannel(),new RequestQueue<>());
+    writer.close();
+    exception.expect(IOException.class);
+    Buffer buffer=new NetworkBuffer(MemorySegmentFactory.allocateUnpooledSegment(4096),FreeingBufferRecycler.INSTANCE);
+    try {
+      writer.writeBlock(buffer);
+    }
+  finally {
+      if (!buffer.isRecycled()) {
+        buffer.recycleBuffer();
+        Assert.fail("buffer not recycled");
+      }
+      assertEquals("Shouln't increment number of outstanding requests.",0,writer.getNumberOfOutstandingRequests());
+    }
+  }
+  @Test public void testSubscribe() throws Exception {
+    final TestNotificationListener listener=new TestNotificationListener();
+    assertFalse("Allowed to subscribe w/o any outstanding requests.",writer.registerAllRequestsProcessedListener(listener));
+    addRequest();
+    assertTrue("Didn't allow to subscribe.",writer.registerAllRequestsProcessedListener(listener));
+    handleRequest();
+    assertEquals("Listener was not notified.",1,listener.getNumberOfNotifications());
+  }
+  @Test public void testSubscribeAndClose() throws IOException, InterruptedException {
+    final TestNotificationListener listener=new TestNotificationListener();
+    final AtomicReference<Throwable> error=new AtomicReference<Throwable>();
+    final CountDownLatch sync=new CountDownLatch(1);
+    addRequest();
+    addRequest();
+    writer.registerAllRequestsProcessedListener(listener);
+    final Thread asyncCloseThread=new Thread(new Runnable(){
+      @Override public void run(){
+        try {
+          writer.close();
+        }
+ catch (        Throwable t) {
+          error.set(t);
+        }
+ finally {
+          sync.countDown();
+        }
+      }
+    }
+);
+    asyncCloseThread.start();
+    handleRequest();
+    handleRequest();
+    sync.await();
+    assertEquals("Listener was not notified.",1,listener.getNumberOfNotifications());
+  }
+  @Test public void testConcurrentSubscribeAndHandleRequest() throws Exception {
+    final ExecutorService executor=Executors.newFixedThreadPool(2);
+    final TestNotificationListener listener=new TestNotificationListener();
+    final Callable<Boolean> subscriber=new Callable<Boolean>(){
+      @Override public Boolean call() throws Exception {
+        return writer.registerAllRequestsProcessedListener(listener);
+      }
+    }
+;
+    final Callable<Void> requestHandler=new Callable<Void>(){
+      @Override public Void call() throws Exception {
+        handleRequest();
+        return null;
+      }
+    }
+;
+    try {
+      for (int i=0; i < 50000; i++) {
+        listener.reset();
+        addRequest();
+        Future<Void> handleRequestFuture=executor.submit(requestHandler);
+        Future<Boolean> subscribeFuture=executor.submit(subscriber);
+        handleRequestFuture.get();
+        try {
+          if (subscribeFuture.get()) {
+            assertEquals("Race: Successfully subscribed, but was never notified.",1,listener.getNumberOfNotifications());
+          }
+ else {
+            assertEquals("Race: Never subscribed successfully, but was notified.",0,listener.getNumberOfNotifications());
+          }
+        }
+ catch (        Throwable t) {
+          System.out.println(i);
+          Assert.fail(t.getMessage());
+        }
+      }
+    }
+  finally {
+      executor.shutdownNow();
+    }
+  }
+  private void addRequest() throws IOException {
+    writer.writeBlock(mockBuffer);
+  }
+  private void handleRequest(){
+    writer.handleProcessedBuffer(mockBuffer,null);
+  }
+}

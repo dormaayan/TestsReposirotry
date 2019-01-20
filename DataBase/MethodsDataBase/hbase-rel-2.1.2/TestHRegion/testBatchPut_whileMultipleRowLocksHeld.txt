@@ -1,0 +1,65 @@
+@Test public void testBatchPut_whileMultipleRowLocksHeld() throws Exception {
+  final Put[] puts=new Put[10];
+  MetricsWALSource source=CompatibilitySingletonFactory.getInstance(MetricsWALSource.class);
+  try {
+    long syncs=prepareRegionForBachPut(puts,source,false);
+    puts[5].addColumn(Bytes.toBytes("BAD_CF"),qual,value);
+    LOG.info("batchPut will have to break into four batches to avoid row locks");
+    RowLock rowLock1=region.getRowLock(Bytes.toBytes("row_2"));
+    RowLock rowLock2=region.getRowLock(Bytes.toBytes("row_1"));
+    RowLock rowLock3=region.getRowLock(Bytes.toBytes("row_3"));
+    RowLock rowLock4=region.getRowLock(Bytes.toBytes("row_3"),true);
+    MultithreadedTestUtil.TestContext ctx=new MultithreadedTestUtil.TestContext(CONF);
+    final AtomicReference<OperationStatus[]> retFromThread=new AtomicReference<>();
+    final CountDownLatch startingPuts=new CountDownLatch(1);
+    final CountDownLatch startingClose=new CountDownLatch(1);
+    TestThread putter=new TestThread(ctx){
+      @Override public void doWork() throws IOException {
+        startingPuts.countDown();
+        retFromThread.set(region.batchMutate(puts));
+      }
+    }
+;
+    LOG.info("...starting put thread while holding locks");
+    ctx.addThread(putter);
+    ctx.startThreads();
+    Thread regionCloseThread=new TestThread(ctx){
+      @Override public void doWork(){
+        try {
+          startingPuts.await();
+          Thread.sleep(10);
+          startingClose.countDown();
+          HBaseTestingUtility.closeRegionAndWAL(region);
+        }
+ catch (        IOException e) {
+          throw new RuntimeException(e);
+        }
+catch (        InterruptedException e) {
+          throw new RuntimeException(e);
+        }
+      }
+    }
+;
+    regionCloseThread.start();
+    startingClose.await();
+    startingPuts.await();
+    Thread.sleep(100);
+    LOG.info("...releasing row lock 1, which should let put thread continue");
+    rowLock1.release();
+    rowLock2.release();
+    rowLock3.release();
+    waitForCounter(source,"syncTimeNumOps",syncs + 1);
+    LOG.info("...joining on put thread");
+    ctx.stop();
+    regionCloseThread.join();
+    OperationStatus[] codes=retFromThread.get();
+    for (int i=0; i < codes.length; i++) {
+      assertEquals((i == 5) ? OperationStatusCode.BAD_FAMILY : OperationStatusCode.SUCCESS,codes[i].getOperationStatusCode());
+    }
+    rowLock4.release();
+  }
+  finally {
+    HBaseTestingUtility.closeRegionAndWAL(this.region);
+    this.region=null;
+  }
+}

@@ -1,0 +1,326 @@
+public class OperationsLockTest {
+  private KernelTransactionImplementation transaction=mock(KernelTransactionImplementation.class);
+  private Operations operations;
+  private final Locks.Client locks=mock(Locks.Client.class);
+  private final Write write=mock(Write.class);
+  private InOrder order;
+  private DefaultNodeCursor nodeCursor;
+  private DefaultPropertyCursor propertyCursor;
+  private DefaultRelationshipScanCursor relationshipCursor;
+  private TransactionState txState;
+  private AllStoreHolder allStoreHolder;
+  private final LabelSchemaDescriptor descriptor=SchemaDescriptorFactory.forLabel(123,456);
+  private StorageReader storageReader;
+  private ConstraintIndexCreator constraintIndexCreator;
+  @Before public void setUp() throws InvalidTransactionTypeKernelException {
+    txState=Mockito.spy(new TxState());
+    when(transaction.getReasonIfTerminated()).thenReturn(Optional.empty());
+    when(transaction.statementLocks()).thenReturn(new SimpleStatementLocks(locks));
+    when(transaction.dataWrite()).thenReturn(write);
+    when(transaction.isOpen()).thenReturn(true);
+    when(transaction.lockTracer()).thenReturn(LockTracer.NONE);
+    when(transaction.txState()).thenReturn(txState);
+    when(transaction.securityContext()).thenReturn(SecurityContext.AUTH_DISABLED);
+    DefaultCursors cursors=mock(DefaultCursors.class);
+    nodeCursor=mock(DefaultNodeCursor.class);
+    propertyCursor=mock(DefaultPropertyCursor.class);
+    relationshipCursor=mock(DefaultRelationshipScanCursor.class);
+    when(cursors.allocateNodeCursor()).thenReturn(nodeCursor);
+    when(cursors.allocatePropertyCursor()).thenReturn(propertyCursor);
+    when(cursors.allocateRelationshipScanCursor()).thenReturn(relationshipCursor);
+    AutoIndexing autoindexing=mock(AutoIndexing.class);
+    AutoIndexOperations autoIndexOperations=mock(AutoIndexOperations.class);
+    when(autoindexing.nodes()).thenReturn(autoIndexOperations);
+    when(autoindexing.relationships()).thenReturn(autoIndexOperations);
+    StorageEngine engine=mock(StorageEngine.class);
+    storageReader=mock(StorageReader.class);
+    when(storageReader.nodeExists(anyLong())).thenReturn(true);
+    when(storageReader.constraintsGetForLabel(anyInt())).thenReturn(Collections.emptyIterator());
+    when(storageReader.constraintsGetAll()).thenReturn(Collections.emptyIterator());
+    when(engine.newReader()).thenReturn(storageReader);
+    allStoreHolder=new AllStoreHolder(storageReader,transaction,cursors,mock(ExplicitIndexStore.class),mock(Procedures.class),mock(SchemaState.class),new Dependencies());
+    constraintIndexCreator=mock(ConstraintIndexCreator.class);
+    operations=new Operations(allStoreHolder,mock(IndexTxStateUpdater.class),storageReader,transaction,new KernelToken(storageReader,transaction,mockedTokenHolders()),cursors,autoindexing,constraintIndexCreator,mock(ConstraintSemantics.class),mock(IndexingProvidersService.class),Config.defaults());
+    operations.initialize();
+    this.order=inOrder(locks,txState,storageReader);
+  }
+  @After public void tearDown(){
+    operations.release();
+  }
+  @Test public void shouldAcquireEntityWriteLockCreatingRelationship() throws Exception {
+    long rId=operations.relationshipCreate(1,2,3);
+    order.verify(locks).acquireExclusive(LockTracer.NONE,ResourceTypes.NODE,1);
+    order.verify(locks).acquireExclusive(LockTracer.NONE,ResourceTypes.NODE,3);
+    order.verify(txState).relationshipDoCreate(rId,2,1,3);
+  }
+  @Test public void shouldAcquireNodeLocksWhenCreatingRelationshipInOrderOfAscendingId() throws Exception {
+    long lowId=3;
+    long highId=5;
+    int relationshipLabel=0;
+{
+      operations.relationshipCreate(lowId,relationshipLabel,highId);
+      InOrder lockingOrder=inOrder(locks);
+      lockingOrder.verify(locks).acquireExclusive(LockTracer.NONE,ResourceTypes.NODE,lowId);
+      lockingOrder.verify(locks).acquireExclusive(LockTracer.NONE,ResourceTypes.NODE,highId);
+      lockingOrder.verifyNoMoreInteractions();
+      reset(locks);
+    }
+{
+      operations.relationshipCreate(highId,relationshipLabel,lowId);
+      InOrder lockingOrder=inOrder(locks);
+      lockingOrder.verify(locks).acquireExclusive(LockTracer.NONE,ResourceTypes.NODE,lowId);
+      lockingOrder.verify(locks).acquireExclusive(LockTracer.NONE,ResourceTypes.NODE,highId);
+      lockingOrder.verifyNoMoreInteractions();
+    }
+  }
+  @Test public void shouldAcquireNodeLocksWhenDeletingRelationshipInOrderOfAscendingId() throws Exception {
+    final long relationshipId=10;
+    final long lowId=3;
+    final long highId=5;
+    int relationshipLabel=0;
+{
+      setStoreRelationship(relationshipId,lowId,highId,relationshipLabel);
+      operations.relationshipDelete(relationshipId);
+      InOrder lockingOrder=inOrder(locks);
+      lockingOrder.verify(locks).acquireExclusive(LockTracer.NONE,ResourceTypes.NODE,lowId);
+      lockingOrder.verify(locks).acquireExclusive(LockTracer.NONE,ResourceTypes.NODE,highId);
+      lockingOrder.verify(locks).acquireExclusive(LockTracer.NONE,ResourceTypes.RELATIONSHIP,relationshipId);
+      lockingOrder.verifyNoMoreInteractions();
+      reset(locks);
+    }
+{
+      setStoreRelationship(relationshipId,highId,lowId,relationshipLabel);
+      operations.relationshipDelete(relationshipId);
+      InOrder lockingOrder=inOrder(locks);
+      lockingOrder.verify(locks).acquireExclusive(LockTracer.NONE,ResourceTypes.NODE,lowId);
+      lockingOrder.verify(locks).acquireExclusive(LockTracer.NONE,ResourceTypes.NODE,highId);
+      lockingOrder.verify(locks).acquireExclusive(LockTracer.NONE,ResourceTypes.RELATIONSHIP,relationshipId);
+      lockingOrder.verifyNoMoreInteractions();
+    }
+  }
+  @Test public void shouldAcquireEntityWriteLockBeforeAddingLabelToNode() throws Exception {
+    when(nodeCursor.next()).thenReturn(true);
+    when(nodeCursor.labels()).thenReturn(LabelSet.NONE);
+    operations.nodeAddLabel(123L,456);
+    order.verify(locks).acquireExclusive(LockTracer.NONE,ResourceTypes.NODE,123L);
+    order.verify(txState).nodeDoAddLabel(456,123L);
+  }
+  @Test public void shouldNotAcquireEntityWriteLockBeforeAddingLabelToJustCreatedNode() throws Exception {
+    when(nodeCursor.next()).thenReturn(true);
+    when(nodeCursor.labels()).thenReturn(LabelSet.NONE);
+    when(transaction.hasTxStateWithChanges()).thenReturn(true);
+    txState.nodeDoCreate(123);
+    operations.nodeAddLabel(123,456);
+    verify(locks,never()).acquireExclusive(LockTracer.NONE,ResourceTypes.NODE,123);
+  }
+  @Test public void shouldAcquireSchemaReadLockBeforeAddingLabelToNode() throws Exception {
+    when(nodeCursor.next()).thenReturn(true);
+    when(nodeCursor.labels()).thenReturn(LabelSet.NONE);
+    int labelId=456;
+    operations.nodeAddLabel(123,labelId);
+    order.verify(locks).acquireShared(LockTracer.NONE,ResourceTypes.LABEL,labelId);
+    order.verify(txState).nodeDoAddLabel(labelId,123);
+  }
+  @Test public void shouldAcquireEntityWriteLockBeforeSettingPropertyOnNode() throws Exception {
+    when(nodeCursor.next()).thenReturn(true);
+    when(nodeCursor.labels()).thenReturn(LabelSet.NONE);
+    int propertyKeyId=8;
+    Value value=Values.of(9);
+    when(propertyCursor.next()).thenReturn(true);
+    when(propertyCursor.propertyKey()).thenReturn(propertyKeyId);
+    when(propertyCursor.propertyValue()).thenReturn(NO_VALUE);
+    operations.nodeSetProperty(123,propertyKeyId,value);
+    order.verify(locks).acquireExclusive(LockTracer.NONE,ResourceTypes.NODE,123);
+    order.verify(txState).nodeDoAddProperty(123,propertyKeyId,value);
+  }
+  @Test public void shouldAcquireEntityWriteLockBeforeSettingPropertyOnRelationship() throws Exception {
+    when(relationshipCursor.next()).thenReturn(true);
+    int propertyKeyId=8;
+    Value value=Values.of(9);
+    when(propertyCursor.next()).thenReturn(true);
+    when(propertyCursor.propertyKey()).thenReturn(propertyKeyId);
+    when(propertyCursor.propertyValue()).thenReturn(NO_VALUE);
+    operations.relationshipSetProperty(123,propertyKeyId,value);
+    order.verify(locks).acquireExclusive(LockTracer.NONE,ResourceTypes.RELATIONSHIP,123);
+    order.verify(txState).relationshipDoReplaceProperty(123,propertyKeyId,NO_VALUE,value);
+  }
+  @Test public void shouldNotAcquireEntityWriteLockBeforeSettingPropertyOnJustCreatedNode() throws Exception {
+    when(nodeCursor.next()).thenReturn(true);
+    when(nodeCursor.labels()).thenReturn(LabelSet.NONE);
+    when(transaction.hasTxStateWithChanges()).thenReturn(true);
+    txState.nodeDoCreate(123);
+    int propertyKeyId=8;
+    Value value=Values.of(9);
+    operations.nodeSetProperty(123,propertyKeyId,value);
+    verify(locks,never()).acquireExclusive(LockTracer.NONE,ResourceTypes.NODE,123);
+    verify(txState).nodeDoAddProperty(123,propertyKeyId,value);
+  }
+  @Test public void shouldNotAcquireEntityWriteLockBeforeSettingPropertyOnJustCreatedRelationship() throws Exception {
+    when(relationshipCursor.next()).thenReturn(true);
+    when(transaction.hasTxStateWithChanges()).thenReturn(true);
+    txState.relationshipDoCreate(123,42,43,45);
+    int propertyKeyId=8;
+    Value value=Values.of(9);
+    operations.relationshipSetProperty(123,propertyKeyId,value);
+    verify(locks,never()).acquireExclusive(LockTracer.NONE,ResourceTypes.RELATIONSHIP,123);
+    verify(txState).relationshipDoReplaceProperty(123,propertyKeyId,NO_VALUE,value);
+  }
+  @Test public void shouldAcquireEntityWriteLockBeforeDeletingNode() throws AutoIndexingKernelException {
+    when(nodeCursor.next()).thenReturn(true);
+    when(nodeCursor.labels()).thenReturn(LabelSet.NONE);
+    when(allStoreHolder.nodeExistsInStore(123)).thenReturn(true);
+    operations.nodeDelete(123);
+    order.verify(locks).acquireExclusive(LockTracer.NONE,ResourceTypes.NODE,123);
+    order.verify(txState).nodeDoDelete(123);
+  }
+  @Test public void shouldNotAcquireEntityWriteLockBeforeDeletingJustCreatedNode() throws Exception {
+    txState.nodeDoCreate(123);
+    when(transaction.hasTxStateWithChanges()).thenReturn(true);
+    operations.nodeDelete(123);
+    verify(locks,never()).acquireExclusive(LockTracer.NONE,ResourceTypes.NODE,123);
+    verify(txState).nodeDoDelete(123);
+  }
+  @Test public void shouldAcquireSchemaReadLockBeforeGettingConstraintsByLabelAndProperty(){
+    allStoreHolder.constraintsGetForSchema(descriptor);
+    order.verify(locks).acquireShared(LockTracer.NONE,ResourceTypes.LABEL,descriptor.getLabelId());
+    order.verify(storageReader).constraintsGetForSchema(descriptor);
+  }
+  @Test public void shouldAcquireSchemaReadLockBeforeGettingConstraintsByLabel(){
+    allStoreHolder.constraintsGetForLabel(42);
+    order.verify(locks).acquireShared(LockTracer.NONE,ResourceTypes.LABEL,42);
+    order.verify(storageReader).constraintsGetForLabel(42);
+  }
+  @Test public void shouldAcquireSchemaReadLockBeforeCheckingExistenceConstraints(){
+    allStoreHolder.constraintExists(ConstraintDescriptorFactory.uniqueForSchema(descriptor));
+    order.verify(locks).acquireShared(LockTracer.NONE,ResourceTypes.LABEL,123);
+    order.verify(storageReader).constraintExists(any());
+  }
+  @Test public void shouldAcquireSchemaReadLockLazilyBeforeGettingAllConstraints(){
+    int labelId=1;
+    int relTypeId=2;
+    UniquenessConstraintDescriptor uniquenessConstraint=uniqueForLabel(labelId,2,3,3);
+    RelExistenceConstraintDescriptor existenceConstraint=existsForRelType(relTypeId,3,4,5);
+    when(storageReader.constraintsGetAll()).thenReturn(Iterators.iterator(uniquenessConstraint,existenceConstraint));
+    Iterator<ConstraintDescriptor> result=allStoreHolder.constraintsGetAll();
+    Iterators.count(result);
+    assertThat(asList(result),empty());
+    order.verify(storageReader).constraintsGetAll();
+    order.verify(locks).acquireShared(LockTracer.NONE,ResourceTypes.LABEL,labelId);
+    order.verify(locks).acquireShared(LockTracer.NONE,ResourceTypes.RELATIONSHIP_TYPE,relTypeId);
+  }
+  @Test public void shouldAcquireSchemaWriteLockBeforeRemovingIndexRule() throws Exception {
+    CapableIndexDescriptor index=TestIndexDescriptorFactory.forLabel(0,0).withId(0).withoutCapabilities();
+    when(storageReader.indexGetForSchema(any())).thenReturn(index);
+    operations.indexDrop(index);
+    order.verify(locks).acquireExclusive(LockTracer.NONE,ResourceTypes.LABEL,0);
+    order.verify(txState).indexDoDrop(index);
+  }
+  @Test public void shouldAcquireSchemaWriteLockBeforeCreatingUniquenessConstraint() throws Exception {
+    String defaultProvider=Config.defaults().get(default_schema_provider);
+    when(constraintIndexCreator.createUniquenessConstraintIndex(transaction,descriptor,defaultProvider)).thenReturn(42L);
+    when(storageReader.constraintsGetForSchema(descriptor.schema())).thenReturn(Collections.emptyIterator());
+    operations.uniquePropertyConstraintCreate(descriptor);
+    order.verify(locks).acquireExclusive(LockTracer.NONE,ResourceTypes.LABEL,descriptor.getLabelId());
+    order.verify(txState).constraintDoAdd(ConstraintDescriptorFactory.uniqueForSchema(descriptor),42L);
+  }
+  @Test public void shouldAcquireSchemaWriteLockBeforeDroppingConstraint() throws Exception {
+    UniquenessConstraintDescriptor constraint=uniqueForSchema(descriptor);
+    when(storageReader.constraintExists(constraint)).thenReturn(true);
+    operations.constraintDrop(constraint);
+    order.verify(locks).acquireExclusive(LockTracer.NONE,ResourceTypes.LABEL,descriptor.getLabelId());
+    order.verify(txState).constraintDoDrop(constraint);
+  }
+  @Test public void detachDeleteNodeWithoutRelationshipsExclusivelyLockNode() throws KernelException {
+    long nodeId=1L;
+    returnRelationships(transaction,false,new TestRelationshipChain(nodeId));
+    when(transaction.ambientNodeCursor()).thenReturn(new StubNodeCursor(false));
+    when(nodeCursor.next()).thenReturn(true);
+    LabelSet labels=mock(LabelSet.class);
+    when(labels.all()).thenReturn(EMPTY_LONG_ARRAY);
+    when(nodeCursor.labels()).thenReturn(labels);
+    operations.nodeDetachDelete(nodeId);
+    order.verify(locks).acquireExclusive(LockTracer.NONE,ResourceTypes.NODE,nodeId);
+    order.verify(locks,never()).releaseExclusive(ResourceTypes.NODE,nodeId);
+    order.verify(txState).nodeDoDelete(nodeId);
+  }
+  @Test public void detachDeleteNodeExclusivelyLockNodes() throws KernelException {
+    long nodeId=1L;
+    returnRelationships(transaction,false,new TestRelationshipChain(nodeId).outgoing(1,2L,42));
+    when(transaction.ambientNodeCursor()).thenReturn(new StubNodeCursor(false));
+    LabelSet labels=mock(LabelSet.class);
+    when(labels.all()).thenReturn(EMPTY_LONG_ARRAY);
+    when(nodeCursor.labels()).thenReturn(labels);
+    when(nodeCursor.next()).thenReturn(true);
+    operations.nodeDetachDelete(nodeId);
+    order.verify(locks).acquireExclusive(LockTracer.NONE,ResourceTypes.NODE,nodeId,2L);
+    order.verify(locks,never()).releaseExclusive(ResourceTypes.NODE,nodeId);
+    order.verify(locks,never()).releaseExclusive(ResourceTypes.NODE,2L);
+    order.verify(txState).nodeDoDelete(nodeId);
+  }
+  @Test public void shouldAcquiredSharedLabelLocksWhenDeletingNode() throws AutoIndexingKernelException {
+    long nodeId=1L;
+    long labelId1=1;
+    long labelId2=2;
+    when(nodeCursor.next()).thenReturn(true);
+    LabelSet labels=mock(LabelSet.class);
+    when(labels.all()).thenReturn(new long[]{labelId1,labelId2});
+    when(nodeCursor.labels()).thenReturn(labels);
+    operations.nodeDelete(nodeId);
+    InOrder order=inOrder(locks);
+    order.verify(locks).acquireExclusive(LockTracer.NONE,ResourceTypes.NODE,nodeId);
+    order.verify(locks).acquireShared(LockTracer.NONE,ResourceTypes.LABEL,labelId1,labelId2);
+    order.verifyNoMoreInteractions();
+  }
+  @Test public void shouldAcquiredSharedLabelLocksWhenDetachDeletingNode() throws KernelException {
+    long nodeId=1L;
+    long labelId1=1;
+    long labelId2=2;
+    returnRelationships(transaction,false,new TestRelationshipChain(nodeId));
+    when(transaction.ambientNodeCursor()).thenReturn(new StubNodeCursor(false));
+    when(nodeCursor.next()).thenReturn(true);
+    LabelSet labels=mock(LabelSet.class);
+    when(labels.all()).thenReturn(new long[]{labelId1,labelId2});
+    when(nodeCursor.labels()).thenReturn(labels);
+    operations.nodeDetachDelete(nodeId);
+    InOrder order=inOrder(locks);
+    order.verify(locks).acquireExclusive(LockTracer.NONE,ResourceTypes.NODE,nodeId);
+    order.verify(locks).acquireShared(LockTracer.NONE,ResourceTypes.LABEL,labelId1,labelId2);
+    order.verifyNoMoreInteractions();
+  }
+  @Test public void shouldAcquiredSharedLabelLocksWhenRemovingNodeLabel() throws EntityNotFoundException {
+    long nodeId=1L;
+    int labelId=1;
+    when(nodeCursor.next()).thenReturn(true);
+    when(nodeCursor.hasLabel(labelId)).thenReturn(true);
+    operations.nodeRemoveLabel(nodeId,labelId);
+    InOrder order=inOrder(locks);
+    order.verify(locks).acquireExclusive(LockTracer.NONE,ResourceTypes.NODE,nodeId);
+    order.verify(locks).acquireShared(LockTracer.NONE,ResourceTypes.LABEL,labelId);
+    order.verifyNoMoreInteractions();
+  }
+  @Test public void shouldAcquiredSharedLabelLocksWhenRemovingNodeProperty() throws AutoIndexingKernelException, EntityNotFoundException {
+    long nodeId=1L;
+    long labelId1=1;
+    long labelId2=1;
+    int propertyKeyId=5;
+    when(nodeCursor.next()).thenReturn(true);
+    LabelSet labels=mock(LabelSet.class);
+    when(labels.all()).thenReturn(new long[]{labelId1,labelId2});
+    when(nodeCursor.labels()).thenReturn(labels);
+    when(propertyCursor.next()).thenReturn(true);
+    when(propertyCursor.propertyKey()).thenReturn(propertyKeyId);
+    when(propertyCursor.propertyValue()).thenReturn(Values.of("abc"));
+    operations.nodeRemoveProperty(nodeId,propertyKeyId);
+    InOrder order=inOrder(locks);
+    order.verify(locks).acquireExclusive(LockTracer.NONE,ResourceTypes.NODE,nodeId);
+    order.verify(locks).acquireShared(LockTracer.NONE,ResourceTypes.LABEL,labelId1,labelId2);
+    order.verifyNoMoreInteractions();
+  }
+  private void setStoreRelationship(  long relationshipId,  long sourceNode,  long targetNode,  int relationshipLabel){
+    when(relationshipCursor.next()).thenReturn(true);
+    when(relationshipCursor.relationshipReference()).thenReturn(relationshipId);
+    when(relationshipCursor.sourceNodeReference()).thenReturn(sourceNode);
+    when(relationshipCursor.targetNodeReference()).thenReturn(targetNode);
+    when(relationshipCursor.type()).thenReturn(relationshipLabel);
+  }
+}

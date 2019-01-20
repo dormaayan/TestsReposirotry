@@ -1,0 +1,79 @@
+/** 
+ * Unit test for the HL7MLLP Codec.
+ */
+public class HL7MLLPCodecMessageFloodingTest extends HL7TestSupport {
+  protected JndiRegistry createRegistry() throws Exception {
+    JndiRegistry jndi=super.createRegistry();
+    HL7MLLPCodec codec=new HL7MLLPCodec();
+    codec.setCharset("ISO-8859-1");
+    codec.setConvertLFtoCR(false);
+    jndi.bind("hl7codec",codec);
+    return jndi;
+  }
+  protected RouteBuilder createRouteBuilder() throws Exception {
+    return new RouteBuilder(){
+      public void configure() throws Exception {
+        from("mina2:tcp://127.0.0.1:" + getPort() + "?sync=true&codec=#hl7codec").unmarshal().hl7().process(new Processor(){
+          public void process(          Exchange exchange) throws Exception {
+            Message input=exchange.getIn().getBody(Message.class);
+            Message response=input.generateACK();
+            exchange.getOut().setBody(response);
+            Thread.sleep(50);
+          }
+        }
+).to("mock:result");
+      }
+    }
+;
+  }
+  @Test public void testHL7MessageFlood() throws Exception {
+    Socket socket=new Socket("localhost",getPort());
+    BufferedOutputStream outputStream=new BufferedOutputStream(new DataOutputStream(socket.getOutputStream()));
+    final BufferedInputStream inputStream=new BufferedInputStream(new DataInputStream(socket.getInputStream()));
+    int messageCount=100;
+    CountDownLatch latch=new CountDownLatch(messageCount);
+    Thread t=new Thread(new Runnable(){
+      @Override public void run(){
+        int response;
+        StringBuilder s=new StringBuilder();
+        try {
+          int i=0;
+          boolean cont=true;
+          while (cont && (response=inputStream.read()) >= 0) {
+            if (response == 28) {
+              response=inputStream.read();
+              if (response == 13) {
+                cont=s.toString().contains(String.format("X%dX",i++));
+                s.setLength(0);
+                latch.countDown();
+              }
+            }
+ else {
+              s.append((char)response);
+            }
+          }
+        }
+ catch (        IOException ignored) {
+        }
+      }
+    }
+);
+    t.start();
+    String in="MSH|^~\\&|MYSENDER|MYRECEIVER|MYAPPLICATION||200612211200||QRY^A19|X%dX|P|2.4\r" + "QRD|200612211200|R|I|GetPatient|||1^RD|0101701234|DEM||";
+    for (int i=0; i < messageCount; i++) {
+      String msg=String.format(in,i);
+      outputStream.write(11);
+      outputStream.flush();
+      outputStream.write(msg.getBytes());
+      outputStream.flush();
+      outputStream.write(28);
+      outputStream.write(13);
+      outputStream.flush();
+    }
+    boolean success=latch.await(20,TimeUnit.SECONDS);
+    outputStream.close();
+    inputStream.close();
+    socket.close();
+    assertTrue(success);
+  }
+}

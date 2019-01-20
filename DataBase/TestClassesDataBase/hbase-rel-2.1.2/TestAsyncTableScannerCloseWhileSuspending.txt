@@ -1,0 +1,46 @@
+@Category({MediumTests.class,ClientTests.class}) public class TestAsyncTableScannerCloseWhileSuspending {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestAsyncTableScannerCloseWhileSuspending.class);
+  private static final HBaseTestingUtility TEST_UTIL=new HBaseTestingUtility();
+  private static TableName TABLE_NAME=TableName.valueOf("async");
+  private static byte[] FAMILY=Bytes.toBytes("cf");
+  private static byte[] CQ=Bytes.toBytes("cq");
+  private static AsyncConnection CONN;
+  private static AsyncTable<?> TABLE;
+  @BeforeClass public static void setUp() throws Exception {
+    TEST_UTIL.startMiniCluster(1);
+    TEST_UTIL.createTable(TABLE_NAME,FAMILY);
+    CONN=ConnectionFactory.createAsyncConnection(TEST_UTIL.getConfiguration()).get();
+    TABLE=CONN.getTable(TABLE_NAME,ForkJoinPool.commonPool());
+    TABLE.putAll(IntStream.range(0,100).mapToObj(i -> new Put(Bytes.toBytes(String.format("%02d",i))).addColumn(FAMILY,CQ,Bytes.toBytes(i))).collect(Collectors.toList())).get();
+  }
+  @AfterClass public static void tearDown() throws Exception {
+    CONN.close();
+    TEST_UTIL.shutdownMiniCluster();
+  }
+  private int getScannersCount(){
+    return TEST_UTIL.getHBaseCluster().getRegionServerThreads().stream().map(t -> t.getRegionServer()).mapToInt(rs -> rs.getRSRpcServices().getScannersCount()).sum();
+  }
+  @Test public void testCloseScannerWhileSuspending() throws Exception {
+    try (ResultScanner scanner=TABLE.getScanner(new Scan().setMaxResultSize(1))){
+      TEST_UTIL.waitFor(10000,100,new ExplainingPredicate<Exception>(){
+        @Override public boolean evaluate() throws Exception {
+          return ((AsyncTableResultScanner)scanner).isSuspended();
+        }
+        @Override public String explainFailure() throws Exception {
+          return "The given scanner has been suspended in time";
+        }
+      }
+);
+      assertEquals(1,getScannersCount());
+    }
+     TEST_UTIL.waitFor(10000,100,new ExplainingPredicate<Exception>(){
+      @Override public boolean evaluate() throws Exception {
+        return getScannersCount() == 0;
+      }
+      @Override public String explainFailure() throws Exception {
+        return "Still have " + getScannersCount() + " scanners opened";
+      }
+    }
+);
+  }
+}

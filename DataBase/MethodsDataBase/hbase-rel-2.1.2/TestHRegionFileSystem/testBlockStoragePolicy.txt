@@ -1,0 +1,83 @@
+@Test public void testBlockStoragePolicy() throws Exception {
+  TEST_UTIL=new HBaseTestingUtility();
+  Configuration conf=TEST_UTIL.getConfiguration();
+  TEST_UTIL.startMiniCluster();
+  HTable table=(HTable)TEST_UTIL.createTable(TABLE_NAME,FAMILIES);
+  assertEquals("Should start with empty table",0,TEST_UTIL.countRows(table));
+  HRegionFileSystem regionFs=getHRegionFS(table,conf);
+  String spA=regionFs.getStoragePolicyName(Bytes.toString(FAMILIES[0]));
+  String spB=regionFs.getStoragePolicyName(Bytes.toString(FAMILIES[1]));
+  LOG.debug("Storage policy of cf 0: [" + spA + "].");
+  LOG.debug("Storage policy of cf 1: [" + spB + "].");
+  assertEquals("HOT",spA);
+  assertEquals("HOT",spB);
+  TEST_UTIL.shutdownMiniCluster();
+  TEST_UTIL.getConfiguration().set(HStore.BLOCK_STORAGE_POLICY_KEY,"WARM");
+  TEST_UTIL.startMiniCluster();
+  table=(HTable)TEST_UTIL.createTable(TABLE_NAME,FAMILIES);
+  regionFs=getHRegionFS(table,conf);
+  try (Admin admin=TEST_UTIL.getConnection().getAdmin()){
+    spA=regionFs.getStoragePolicyName(Bytes.toString(FAMILIES[0]));
+    spB=regionFs.getStoragePolicyName(Bytes.toString(FAMILIES[1]));
+    LOG.debug("Storage policy of cf 0: [" + spA + "].");
+    LOG.debug("Storage policy of cf 1: [" + spB + "].");
+    assertEquals("WARM",spA);
+    assertEquals("WARM",spB);
+    HColumnDescriptor hcdA=new HColumnDescriptor(Bytes.toString(FAMILIES[0]));
+    hcdA.setValue(HStore.BLOCK_STORAGE_POLICY_KEY,"ONE_SSD");
+    admin.modifyColumnFamily(TABLE_NAME,hcdA);
+    while (TEST_UTIL.getMiniHBaseCluster().getMaster().getAssignmentManager().getRegionStates().hasRegionsInTransition()) {
+      Thread.sleep(200);
+      LOG.debug("Waiting on table to finish schema altering");
+    }
+    HColumnDescriptor hcdB=new HColumnDescriptor(Bytes.toString(FAMILIES[1]));
+    hcdB.setStoragePolicy("ALL_SSD");
+    admin.modifyColumnFamily(TABLE_NAME,hcdB);
+    while (TEST_UTIL.getMiniHBaseCluster().getMaster().getAssignmentManager().getRegionStates().hasRegionsInTransition()) {
+      Thread.sleep(200);
+      LOG.debug("Waiting on table to finish schema altering");
+    }
+    spA=regionFs.getStoragePolicyName(Bytes.toString(FAMILIES[0]));
+    spB=regionFs.getStoragePolicyName(Bytes.toString(FAMILIES[1]));
+    LOG.debug("Storage policy of cf 0: [" + spA + "].");
+    LOG.debug("Storage policy of cf 1: [" + spB + "].");
+    assertNotNull(spA);
+    assertEquals("ONE_SSD",spA);
+    assertNotNull(spB);
+    assertEquals("ALL_SSD",spB);
+    for (long i=0; i < 3; i++) {
+      Put put=new Put(Bytes.toBytes(i));
+      put.addColumn(FAMILIES[0],Bytes.toBytes(i),Bytes.toBytes(i));
+      table.put(put);
+      admin.flush(TABLE_NAME);
+    }
+    FileSystem fs=TEST_UTIL.getDFSCluster().getFileSystem();
+    Path storePath=regionFs.getStoreDir(Bytes.toString(FAMILIES[0]));
+    FileStatus[] storeFiles=FSUtils.listStatus(fs,storePath);
+    assertNotNull(storeFiles);
+    assertEquals(3,storeFiles.length);
+    Path storeTempDir=new Path(regionFs.getTempDir(),Bytes.toString(FAMILIES[0]));
+    assertTrue(fs.exists(storeTempDir));
+    FileStatus[] tempFiles=FSUtils.listStatus(fs,storeTempDir);
+    assertNull(tempFiles);
+    assertEquals("ONE_SSD",((HFileSystem)regionFs.getFileSystem()).getStoragePolicyName(storeTempDir));
+    for (    FileStatus status : storeFiles) {
+      assertEquals("ONE_SSD",((HFileSystem)regionFs.getFileSystem()).getStoragePolicyName(status.getPath()));
+    }
+    regionFs.setStoragePolicy(Bytes.toString(FAMILIES[0]),"ALL_SSD");
+    regionFs.setStoragePolicy(Bytes.toString(FAMILIES[1]),"ONE_SSD");
+    spA=regionFs.getStoragePolicyName(Bytes.toString(FAMILIES[0]));
+    spB=regionFs.getStoragePolicyName(Bytes.toString(FAMILIES[1]));
+    LOG.debug("Storage policy of cf 0: [" + spA + "].");
+    LOG.debug("Storage policy of cf 1: [" + spB + "].");
+    assertNotNull(spA);
+    assertEquals("ALL_SSD",spA);
+    assertNotNull(spB);
+    assertEquals("ONE_SSD",spB);
+  }
+  finally {
+    table.close();
+    TEST_UTIL.deleteTable(TABLE_NAME);
+    TEST_UTIL.shutdownMiniCluster();
+  }
+}

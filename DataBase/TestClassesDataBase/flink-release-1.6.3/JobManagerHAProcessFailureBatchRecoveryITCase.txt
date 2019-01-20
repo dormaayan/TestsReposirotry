@@ -1,0 +1,195 @@
+/** 
+ * Verify behaviour in case of JobManager process failure during job execution. <p>The test works with multiple job managers processes by spawning JVMs. <p>Initially, it starts two TaskManager (2 slots each) and two JobManager JVMs. <p>It submits a program with parallelism 4 and waits until all tasks are brought up. Coordination between the test and the tasks happens via checking for the existence of temporary files. It then kills the leading JobManager process. The recovery should restart the tasks on the new JobManager. <p>This follows the same structure as  {@link AbstractTaskManagerProcessFailureRecoveryTest}.
+ */
+@SuppressWarnings("serial") @RunWith(Parameterized.class) public class JobManagerHAProcessFailureBatchRecoveryITCase extends TestLogger {
+  private static final ZooKeeperTestEnvironment ZooKeeper=new ZooKeeperTestEnvironment(1);
+  private static final FiniteDuration TestTimeOut=new FiniteDuration(5,TimeUnit.MINUTES);
+  private static final File FileStateBackendBasePath;
+static {
+    try {
+      FileStateBackendBasePath=CommonTestUtils.createTempDirectory();
+    }
+ catch (    IOException e) {
+      throw new RuntimeException("Error in test setup. Could not create directory.",e);
+    }
+  }
+  @AfterClass public static void tearDown() throws Exception {
+    if (ZooKeeper != null) {
+      ZooKeeper.shutdown();
+    }
+    if (FileStateBackendBasePath != null) {
+      FileUtils.deleteDirectory(FileStateBackendBasePath);
+    }
+  }
+  @Before public void cleanUp() throws Exception {
+    ZooKeeper.deleteAll();
+    FileUtils.cleanDirectory(FileStateBackendBasePath);
+  }
+  protected static final String READY_MARKER_FILE_PREFIX="ready_";
+  protected static final String FINISH_MARKER_FILE_PREFIX="finish_";
+  protected static final String PROCEED_MARKER_FILE="proceed";
+  protected static final int PARALLELISM=4;
+  private final ExecutionMode executionMode;
+  public JobManagerHAProcessFailureBatchRecoveryITCase(  ExecutionMode executionMode){
+    this.executionMode=executionMode;
+  }
+  @Parameterized.Parameters public static Collection<Object[]> executionMode(){
+    return Arrays.asList(new Object[][]{{ExecutionMode.PIPELINED},{ExecutionMode.BATCH}});
+  }
+  /** 
+ * Test program with JobManager failure.
+ * @param zkQuorum ZooKeeper quorum to connect to
+ * @param coordinateDir Coordination directory
+ * @throws Exception
+ */
+  public void testJobManagerFailure(  String zkQuorum,  final File coordinateDir) throws Exception {
+    Configuration config=new Configuration();
+    config.setString(CoreOptions.MODE,CoreOptions.LEGACY_MODE);
+    config.setString(HighAvailabilityOptions.HA_MODE,"ZOOKEEPER");
+    config.setString(HighAvailabilityOptions.HA_ZOOKEEPER_QUORUM,zkQuorum);
+    config.setString(HighAvailabilityOptions.HA_STORAGE_PATH,FileStateBackendBasePath.getAbsolutePath());
+    ExecutionEnvironment env=ExecutionEnvironment.createRemoteEnvironment("leader",1,config);
+    env.setParallelism(PARALLELISM);
+    env.setNumberOfExecutionRetries(1);
+    env.getConfig().setExecutionMode(executionMode);
+    env.getConfig().disableSysoutLogging();
+    final long numElements=100000L;
+    final DataSet<Long> result=env.generateSequence(1,numElements).rebalance().map(new RichMapFunction<Long,Long>(){
+      private final File proceedFile=new File(coordinateDir,PROCEED_MARKER_FILE);
+      private boolean markerCreated=false;
+      private boolean checkForProceedFile=true;
+      @Override public Long map(      Long value) throws Exception {
+        if (!markerCreated) {
+          int taskIndex=getRuntimeContext().getIndexOfThisSubtask();
+          AbstractTaskManagerProcessFailureRecoveryTest.touchFile(new File(coordinateDir,READY_MARKER_FILE_PREFIX + taskIndex));
+          markerCreated=true;
+        }
+        if (checkForProceedFile) {
+          if (proceedFile.exists()) {
+            checkForProceedFile=false;
+          }
+ else {
+            Thread.sleep(100);
+          }
+        }
+        return value;
+      }
+    }
+).reduce(new ReduceFunction<Long>(){
+      @Override public Long reduce(      Long value1,      Long value2){
+        return value1 + value2;
+      }
+    }
+).flatMap(new RichFlatMapFunction<Long,Long>(){
+      @Override public void flatMap(      Long value,      Collector<Long> out) throws Exception {
+        assertEquals(numElements * (numElements + 1L) / 2L,(long)value);
+        int taskIndex=getRuntimeContext().getIndexOfThisSubtask();
+        AbstractTaskManagerProcessFailureRecoveryTest.touchFile(new File(coordinateDir,FINISH_MARKER_FILE_PREFIX + taskIndex));
+      }
+    }
+);
+    result.output(new DiscardingOutputFormat<Long>());
+    env.execute();
+  }
+  @Test public void testJobManagerProcessFailure() throws Exception {
+    final int numberOfJobManagers=2;
+    final int numberOfTaskManagers=2;
+    final int numberOfSlotsPerTaskManager=2;
+    assertEquals(PARALLELISM,numberOfTaskManagers * numberOfSlotsPerTaskManager);
+    ActorSystem testActorSystem;
+    final JobManagerProcess[] jmProcess=new JobManagerProcess[numberOfJobManagers];
+    final ActorSystem[] tmActorSystem=new ActorSystem[numberOfTaskManagers];
+    HighAvailabilityServices highAvailabilityServices=null;
+    LeaderRetrievalService leaderRetrievalService=null;
+    File coordinateTempDir=null;
+    try {
+      final Deadline deadline=TestTimeOut.fromNow();
+      coordinateTempDir=createTempDirectory();
+      Configuration config=ZooKeeperTestUtils.createZooKeeperHAConfig(ZooKeeper.getConnectString(),FileStateBackendBasePath.getPath());
+      jmProcess[0]=new JobManagerProcess(0,config);
+      jmProcess[0].startProcess();
+      config.setString(TaskManagerOptions.MANAGED_MEMORY_SIZE,"4m");
+      config.setInteger(TaskManagerOptions.NETWORK_NUM_BUFFERS,100);
+      config.setInteger(TaskManagerOptions.NUM_TASK_SLOTS,2);
+      highAvailabilityServices=HighAvailabilityServicesUtils.createAvailableOrEmbeddedServices(config,TestingUtils.defaultExecutor());
+      for (int i=0; i < numberOfTaskManagers; i++) {
+        tmActorSystem[i]=AkkaUtils.createActorSystem(AkkaUtils.getDefaultAkkaConfig());
+        TaskManager.startTaskManagerComponentsAndActor(config,ResourceID.generate(),tmActorSystem[i],highAvailabilityServices,NoOpMetricRegistry.INSTANCE,"localhost",Option.<String>empty(),false,TaskManager.class);
+      }
+      testActorSystem=AkkaUtils.createActorSystem(AkkaUtils.getDefaultAkkaConfig());
+      jmProcess[0].getActorRef(testActorSystem,deadline.timeLeft());
+      TestingListener leaderListener=new TestingListener();
+      leaderRetrievalService=highAvailabilityServices.getJobManagerLeaderRetriever(HighAvailabilityServices.DEFAULT_JOB_ID);
+      leaderRetrievalService.start(leaderListener);
+      leaderListener.waitForNewLeader(deadline.timeLeft().toMillis());
+      String leaderAddress=leaderListener.getAddress();
+      UUID leaderId=leaderListener.getLeaderSessionID();
+      ActorRef leaderRef=AkkaUtils.getActorRef(leaderAddress,testActorSystem,deadline.timeLeft());
+      ActorGateway leaderGateway=new AkkaActorGateway(leaderRef,leaderId);
+      JobManagerActorTestUtils.waitForTaskManagers(numberOfTaskManagers,leaderGateway,deadline.timeLeft());
+      final File coordinateDirClosure=coordinateTempDir;
+      final Throwable[] errorRef=new Throwable[1];
+      Thread programTrigger=new Thread("Program Trigger"){
+        @Override public void run(){
+          try {
+            testJobManagerFailure(ZooKeeper.getConnectString(),coordinateDirClosure);
+          }
+ catch (          Throwable t) {
+            t.printStackTrace();
+            errorRef[0]=t;
+          }
+        }
+      }
+;
+      programTrigger.start();
+      AbstractTaskManagerProcessFailureRecoveryTest.waitForMarkerFiles(coordinateTempDir,READY_MARKER_FILE_PREFIX,PARALLELISM,deadline.timeLeft().toMillis());
+      jmProcess[0].destroy();
+      jmProcess[1]=new JobManagerProcess(1,config);
+      jmProcess[1].startProcess();
+      jmProcess[1].getActorRef(testActorSystem,deadline.timeLeft());
+      AbstractTaskManagerProcessFailureRecoveryTest.touchFile(new File(coordinateTempDir,PROCEED_MARKER_FILE));
+      programTrigger.join(deadline.timeLeft().toMillis());
+      AbstractTaskManagerProcessFailureRecoveryTest.waitForMarkerFiles(coordinateTempDir,FINISH_MARKER_FILE_PREFIX,1,deadline.timeLeft().toMillis());
+      assertFalse("The program did not finish in time",programTrigger.isAlive());
+      if (errorRef[0] != null) {
+        Throwable error=errorRef[0];
+        error.printStackTrace();
+        fail("The program encountered a " + error.getClass().getSimpleName() + " : "+ error.getMessage());
+      }
+    }
+ catch (    Throwable t) {
+      t.printStackTrace();
+      for (      JobManagerProcess p : jmProcess) {
+        if (p != null) {
+          p.printProcessLog();
+        }
+      }
+      throw t;
+    }
+ finally {
+      for (int i=0; i < numberOfTaskManagers; i++) {
+        if (tmActorSystem[i] != null) {
+          tmActorSystem[i].shutdown();
+        }
+      }
+      if (leaderRetrievalService != null) {
+        leaderRetrievalService.stop();
+      }
+      for (      JobManagerProcess jmProces : jmProcess) {
+        if (jmProces != null) {
+          jmProces.destroy();
+        }
+      }
+      if (highAvailabilityServices != null) {
+        highAvailabilityServices.closeAndCleanupAllData();
+      }
+      if (coordinateTempDir != null) {
+        try {
+          FileUtils.deleteDirectory(coordinateTempDir);
+        }
+ catch (        Throwable ignored) {
+        }
+      }
+    }
+  }
+}

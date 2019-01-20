@@ -1,0 +1,226 @@
+@Category({MediumTests.class,ClientTests.class}) public class TestMetaCache {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestMetaCache.class);
+  private final static HBaseTestingUtility TEST_UTIL=new HBaseTestingUtility();
+  private static final TableName TABLE_NAME=TableName.valueOf("test_table");
+  private static final byte[] FAMILY=Bytes.toBytes("fam1");
+  private static final byte[] QUALIFIER=Bytes.toBytes("qual");
+  private static HRegionServer badRS;
+  /** 
+ * @throws java.lang.Exception
+ */
+  @BeforeClass public static void setUpBeforeClass() throws Exception {
+    Configuration conf=TEST_UTIL.getConfiguration();
+    conf.setStrings(HConstants.REGION_SERVER_IMPL,RegionServerWithFakeRpcServices.class.getName());
+    TEST_UTIL.startMiniCluster(1);
+    TEST_UTIL.getHBaseCluster().waitForActiveAndReadyMaster();
+    TEST_UTIL.waitUntilAllRegionsAssigned(TABLE_NAME.META_TABLE_NAME);
+    badRS=TEST_UTIL.getHBaseCluster().getRegionServer(0);
+    assertTrue(badRS.getRSRpcServices() instanceof FakeRSRpcServices);
+    HTableDescriptor table=new HTableDescriptor(TABLE_NAME);
+    HColumnDescriptor fam=new HColumnDescriptor(FAMILY);
+    fam.setMaxVersions(2);
+    table.addFamily(fam);
+    TEST_UTIL.createTable(table,null);
+  }
+  /** 
+ * @throws java.lang.Exception
+ */
+  @AfterClass public static void tearDownAfterClass() throws Exception {
+    TEST_UTIL.shutdownMiniCluster();
+  }
+  @Test public void testPreserveMetaCacheOnException() throws Exception {
+    ((FakeRSRpcServices)badRS.getRSRpcServices()).setExceptionInjector(new RoundRobinExceptionInjector());
+    Configuration conf=new Configuration(TEST_UTIL.getConfiguration());
+    conf.set("hbase.client.retries.number","1");
+    ConnectionImplementation conn=(ConnectionImplementation)ConnectionFactory.createConnection(conf);
+    try {
+      Table table=conn.getTable(TABLE_NAME);
+      byte[] row=Bytes.toBytes("row1");
+      Put put=new Put(row);
+      put.addColumn(FAMILY,QUALIFIER,Bytes.toBytes(10));
+      Get get=new Get(row);
+      Append append=new Append(row);
+      append.addColumn(FAMILY,QUALIFIER,Bytes.toBytes(11));
+      Increment increment=new Increment(row);
+      increment.addColumn(FAMILY,QUALIFIER,10);
+      Delete delete=new Delete(row);
+      delete.addColumn(FAMILY,QUALIFIER);
+      RowMutations mutations=new RowMutations(row);
+      mutations.add(put);
+      mutations.add(delete);
+      Exception exp;
+      boolean success;
+      for (int i=0; i < 50; i++) {
+        exp=null;
+        success=false;
+        try {
+          table.put(put);
+          success=true;
+          table.get(get);
+          table.append(append);
+          table.increment(increment);
+          table.delete(delete);
+          table.mutateRow(mutations);
+        }
+ catch (        IOException ex) {
+          if (ClientExceptionsUtil.isMetaClearingException(ex) || success) {
+            exp=ex;
+          }
+        }
+        if (exp != null && ClientExceptionsUtil.isMetaClearingException(exp)) {
+          assertNull(conn.getCachedLocation(TABLE_NAME,row));
+        }
+ else         if (success) {
+          assertNotNull(conn.getCachedLocation(TABLE_NAME,row));
+        }
+      }
+    }
+  finally {
+      conn.close();
+    }
+  }
+  @Test public void testCacheClearingOnCallQueueTooBig() throws Exception {
+    ((FakeRSRpcServices)badRS.getRSRpcServices()).setExceptionInjector(new CallQueueTooBigExceptionInjector());
+    Configuration conf=new Configuration(TEST_UTIL.getConfiguration());
+    conf.set("hbase.client.retries.number","2");
+    conf.set(MetricsConnection.CLIENT_SIDE_METRICS_ENABLED_KEY,"true");
+    ConnectionImplementation conn=(ConnectionImplementation)ConnectionFactory.createConnection(conf);
+    try {
+      Table table=conn.getTable(TABLE_NAME);
+      byte[] row=Bytes.toBytes("row1");
+      Put put=new Put(row);
+      put.addColumn(FAMILY,QUALIFIER,Bytes.toBytes(10));
+      table.put(put);
+      MetricsConnection metrics=conn.getConnectionMetrics();
+      long preGetRegionClears=metrics.metaCacheNumClearRegion.getCount();
+      long preGetServerClears=metrics.metaCacheNumClearServer.getCount();
+      Get get=new Get(row);
+      try {
+        table.get(get);
+        fail("Expected CallQueueTooBigException");
+      }
+ catch (      RetriesExhaustedException ree) {
+      }
+      long postGetRegionClears=metrics.metaCacheNumClearRegion.getCount();
+      long postGetServerClears=metrics.metaCacheNumClearServer.getCount();
+      assertEquals(preGetRegionClears,postGetRegionClears);
+      assertEquals(preGetServerClears,postGetServerClears);
+    }
+  finally {
+      conn.close();
+    }
+  }
+  public static List<Throwable> metaCachePreservingExceptions(){
+    return new ArrayList<Throwable>(){
+{
+        add(new RegionOpeningException(" "));
+        add(new RegionTooBusyException("Some old message"));
+        add(new RpcThrottlingException(" "));
+        add(new MultiActionResultTooLarge(" "));
+        add(new RetryImmediatelyException(" "));
+        add(new CallQueueTooBigException());
+      }
+    }
+;
+  }
+public static class RegionServerWithFakeRpcServices extends HRegionServer {
+    private FakeRSRpcServices rsRpcServices;
+    public RegionServerWithFakeRpcServices(    Configuration conf) throws IOException, InterruptedException {
+      super(conf);
+    }
+    @Override protected RSRpcServices createRpcServices() throws IOException {
+      this.rsRpcServices=new FakeRSRpcServices(this);
+      return rsRpcServices;
+    }
+    public void setExceptionInjector(    ExceptionInjector injector){
+      rsRpcServices.setExceptionInjector(injector);
+    }
+  }
+public static class FakeRSRpcServices extends RSRpcServices {
+    private ExceptionInjector exceptions;
+    public FakeRSRpcServices(    HRegionServer rs) throws IOException {
+      super(rs);
+      exceptions=new RoundRobinExceptionInjector();
+    }
+    public void setExceptionInjector(    ExceptionInjector injector){
+      this.exceptions=injector;
+    }
+    @Override public GetResponse get(    final RpcController controller,    final ClientProtos.GetRequest request) throws ServiceException {
+      exceptions.throwOnGet(this,request);
+      return super.get(controller,request);
+    }
+    @Override public ClientProtos.MutateResponse mutate(    final RpcController controller,    final ClientProtos.MutateRequest request) throws ServiceException {
+      exceptions.throwOnMutate(this,request);
+      return super.mutate(controller,request);
+    }
+    @Override public ClientProtos.ScanResponse scan(    final RpcController controller,    final ClientProtos.ScanRequest request) throws ServiceException {
+      exceptions.throwOnScan(this,request);
+      return super.scan(controller,request);
+    }
+  }
+public static abstract class ExceptionInjector {
+    protected boolean isTestTable(    FakeRSRpcServices rpcServices,    HBaseProtos.RegionSpecifier regionSpec) throws ServiceException {
+      try {
+        return TABLE_NAME.equals(rpcServices.getRegion(regionSpec).getTableDescriptor().getTableName());
+      }
+ catch (      IOException ioe) {
+        throw new ServiceException(ioe);
+      }
+    }
+    public abstract void throwOnGet(    FakeRSRpcServices rpcServices,    ClientProtos.GetRequest request) throws ServiceException ;
+    public abstract void throwOnMutate(    FakeRSRpcServices rpcServices,    ClientProtos.MutateRequest request) throws ServiceException ;
+    public abstract void throwOnScan(    FakeRSRpcServices rpcServices,    ClientProtos.ScanRequest request) throws ServiceException ;
+  }
+  /** 
+ * Rotates through the possible cache clearing and non-cache clearing exceptions for requests.
+ */
+public static class RoundRobinExceptionInjector extends ExceptionInjector {
+    private int numReqs=-1;
+    private int expCount=-1;
+    private List<Throwable> metaCachePreservingExceptions=metaCachePreservingExceptions();
+    @Override public void throwOnGet(    FakeRSRpcServices rpcServices,    ClientProtos.GetRequest request) throws ServiceException {
+      throwSomeExceptions(rpcServices,request.getRegion());
+    }
+    @Override public void throwOnMutate(    FakeRSRpcServices rpcServices,    ClientProtos.MutateRequest request) throws ServiceException {
+      throwSomeExceptions(rpcServices,request.getRegion());
+    }
+    @Override public void throwOnScan(    FakeRSRpcServices rpcServices,    ClientProtos.ScanRequest request) throws ServiceException {
+      if (!request.hasScannerId()) {
+        throwSomeExceptions(rpcServices,request.getRegion());
+      }
+    }
+    /** 
+ * Throw some exceptions. Mostly throw exceptions which do not clear meta cache. Periodically throw NotSevingRegionException which clears the meta cache.
+ * @throws ServiceException
+ */
+    private void throwSomeExceptions(    FakeRSRpcServices rpcServices,    HBaseProtos.RegionSpecifier regionSpec) throws ServiceException {
+      if (!isTestTable(rpcServices,regionSpec)) {
+        return;
+      }
+      numReqs++;
+      if (numReqs % 5 == 0) {
+        return;
+      }
+ else       if (numReqs % 5 == 1 || numReqs % 5 == 2) {
+        throw new ServiceException(new NotServingRegionException());
+      }
+      expCount++;
+      Throwable t=metaCachePreservingExceptions.get(expCount % metaCachePreservingExceptions.size());
+      throw new ServiceException(t);
+    }
+  }
+  /** 
+ * Throws CallQueueTooBigException for all gets.
+ */
+public static class CallQueueTooBigExceptionInjector extends ExceptionInjector {
+    @Override public void throwOnGet(    FakeRSRpcServices rpcServices,    ClientProtos.GetRequest request) throws ServiceException {
+      if (isTestTable(rpcServices,request.getRegion())) {
+        throw new ServiceException(new CallQueueTooBigException());
+      }
+    }
+    @Override public void throwOnMutate(    FakeRSRpcServices rpcServices,    ClientProtos.MutateRequest request) throws ServiceException {
+    }
+    @Override public void throwOnScan(    FakeRSRpcServices rpcServices,    ClientProtos.ScanRequest request) throws ServiceException {
+    }
+  }
+}

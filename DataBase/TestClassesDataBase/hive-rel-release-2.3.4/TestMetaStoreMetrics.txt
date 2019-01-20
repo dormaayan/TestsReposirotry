@@ -1,0 +1,88 @@
+/** 
+ * Tests Hive Metastore Metrics.
+ */
+public class TestMetaStoreMetrics {
+  private static HiveConf hiveConf;
+  private static Driver driver;
+  private static CodahaleMetrics metrics;
+  @BeforeClass public static void before() throws Exception {
+    int port=MetaStoreUtils.findFreePort();
+    hiveConf=new HiveConf(TestMetaStoreMetrics.class);
+    hiveConf.setVar(HiveConf.ConfVars.METASTOREURIS,"thrift://localhost:" + port);
+    hiveConf.setIntVar(HiveConf.ConfVars.METASTORETHRIFTCONNECTIONRETRIES,3);
+    hiveConf.setBoolVar(HiveConf.ConfVars.METASTORE_METRICS,true);
+    hiveConf.setBoolVar(HiveConf.ConfVars.HIVE_SUPPORT_CONCURRENCY,false);
+    hiveConf.setVar(HiveConf.ConfVars.HIVE_AUTHORIZATION_MANAGER,"org.apache.hadoop.hive.ql.security.authorization.plugin.sqlstd.SQLStdHiveAuthorizerFactory");
+    MetricsFactory.close();
+    MetricsFactory.init(hiveConf);
+    metrics=(CodahaleMetrics)MetricsFactory.getInstance();
+    MetaStoreUtils.startMetaStore(port,ShimLoader.getHadoopThriftAuthBridge(),hiveConf);
+    SessionState.start(new CliSessionState(hiveConf));
+    driver=new Driver(hiveConf);
+  }
+  @Test public void testMethodCounts() throws Exception {
+    driver.run("show databases");
+    String json=metrics.dumpJson();
+    MetricsTestUtils.verifyMetricsJson(json,MetricsTestUtils.TIMER,"api_get_all_databases",2);
+  }
+  @Test public void testMetaDataCounts() throws Exception {
+    CodahaleMetrics metrics=(CodahaleMetrics)MetricsFactory.getInstance();
+    String json=metrics.dumpJson();
+    int initDbCount=(new Integer((MetricsTestUtils.getJsonNode(json,MetricsTestUtils.GAUGE,MetricsConstant.INIT_TOTAL_DATABASES)).asText())).intValue();
+    int initTblCount=(new Integer((MetricsTestUtils.getJsonNode(json,MetricsTestUtils.GAUGE,MetricsConstant.INIT_TOTAL_TABLES)).asText())).intValue();
+    int initPartCount=(new Integer((MetricsTestUtils.getJsonNode(json,MetricsTestUtils.GAUGE,MetricsConstant.INIT_TOTAL_PARTITIONS)).asText())).intValue();
+    driver.run("create database testdb1");
+    driver.run("create table testtbl1 (key string)");
+    driver.run("create table testtblpart (key string) partitioned by (partkey string)");
+    driver.run("use testdb1");
+    driver.run("create table testtbl2 (key string)");
+    driver.run("create table testtblpart2 (key string) partitioned by (partkey string)");
+    driver.run("alter table default.testtblpart add partition (partkey='a')");
+    driver.run("alter table default.testtblpart add partition (partkey='b')");
+    driver.run("alter table default.testtblpart add partition (partkey='c')");
+    driver.run("alter table testdb1.testtblpart2 add partition (partkey='a')");
+    driver.run("alter table testdb1.testtblpart2 add partition (partkey='b')");
+    driver.run("alter table testdb1.testtblpart2 add partition (partkey='c')");
+    driver.run("create database tempdb");
+    driver.run("use tempdb");
+    driver.run("create table delete_by_table (key string) partitioned by (partkey string)");
+    driver.run("alter table delete_by_table add partition (partkey='temp')");
+    driver.run("drop table delete_by_table");
+    driver.run("create table delete_by_part (key string) partitioned by (partkey string)");
+    driver.run("alter table delete_by_part add partition (partkey='temp')");
+    driver.run("alter table delete_by_part drop partition (partkey='temp')");
+    driver.run("create table delete_by_db (key string) partitioned by (partkey string)");
+    driver.run("alter table delete_by_db add partition (partkey='temp')");
+    driver.run("use default");
+    driver.run("drop database tempdb cascade");
+    json=metrics.dumpJson();
+    MetricsTestUtils.verifyMetricsJson(json,MetricsTestUtils.COUNTER,MetricsConstant.CREATE_TOTAL_DATABASES,2);
+    MetricsTestUtils.verifyMetricsJson(json,MetricsTestUtils.COUNTER,MetricsConstant.CREATE_TOTAL_TABLES,7);
+    MetricsTestUtils.verifyMetricsJson(json,MetricsTestUtils.COUNTER,MetricsConstant.CREATE_TOTAL_PARTITIONS,9);
+    MetricsTestUtils.verifyMetricsJson(json,MetricsTestUtils.COUNTER,MetricsConstant.DELETE_TOTAL_DATABASES,1);
+    MetricsTestUtils.verifyMetricsJson(json,MetricsTestUtils.COUNTER,MetricsConstant.DELETE_TOTAL_TABLES,3);
+    MetricsTestUtils.verifyMetricsJson(json,MetricsTestUtils.COUNTER,MetricsConstant.DELETE_TOTAL_PARTITIONS,3);
+    hiveConf.setVar(HiveConf.ConfVars.METASTORE_RAW_STORE_IMPL,ObjectStore.class.getName());
+    HiveMetaStore.HMSHandler baseHandler=new HiveMetaStore.HMSHandler("test",hiveConf,false);
+    baseHandler.init();
+    baseHandler.updateMetrics();
+    json=metrics.dumpJson();
+    MetricsTestUtils.verifyMetricsJson(json,MetricsTestUtils.GAUGE,MetricsConstant.INIT_TOTAL_DATABASES,initDbCount + 1);
+    MetricsTestUtils.verifyMetricsJson(json,MetricsTestUtils.GAUGE,MetricsConstant.INIT_TOTAL_TABLES,initTblCount + 4);
+    MetricsTestUtils.verifyMetricsJson(json,MetricsTestUtils.GAUGE,MetricsConstant.INIT_TOTAL_PARTITIONS,initPartCount + 6);
+  }
+  @Test public void testConnections() throws Exception {
+    String json=metrics.dumpJson();
+    int initialCount=(new Integer((MetricsTestUtils.getJsonNode(json,MetricsTestUtils.COUNTER,MetricsConstant.OPEN_CONNECTIONS)).asText())).intValue();
+    HiveMetaStoreClient msc=new HiveMetaStoreClient(hiveConf);
+    HiveMetaStoreClient msc2=new HiveMetaStoreClient(hiveConf);
+    json=metrics.dumpJson();
+    MetricsTestUtils.verifyMetricsJson(json,MetricsTestUtils.COUNTER,MetricsConstant.OPEN_CONNECTIONS,initialCount + 2);
+    msc.close();
+    json=metrics.dumpJson();
+    MetricsTestUtils.verifyMetricsJson(json,MetricsTestUtils.COUNTER,MetricsConstant.OPEN_CONNECTIONS,initialCount + 1);
+    msc2.close();
+    json=metrics.dumpJson();
+    MetricsTestUtils.verifyMetricsJson(json,MetricsTestUtils.COUNTER,MetricsConstant.OPEN_CONNECTIONS,initialCount);
+  }
+}

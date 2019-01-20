@@ -1,0 +1,452 @@
+/** 
+ * CLIServiceTest.
+ */
+public abstract class CLIServiceTest {
+  private static final Logger LOG=LoggerFactory.getLogger(CLIServiceTest.class);
+  protected static CLIServiceClient client;
+  /** 
+ * @throws java.lang.Exception
+ */
+  @Before public void setUp() throws Exception {
+  }
+  /** 
+ * @throws java.lang.Exception
+ */
+  @After public void tearDown() throws Exception {
+  }
+  @Test public void testOpenSession() throws Exception {
+    SessionHandle sessionHandle=client.openSession("tom","password",Collections.<String,String>emptyMap());
+    assertNotNull(sessionHandle);
+    client.closeSession(sessionHandle);
+    sessionHandle=client.openSession("tom","password");
+    assertNotNull(sessionHandle);
+    client.closeSession(sessionHandle);
+  }
+  @Test public void testGetFunctions() throws Exception {
+    SessionHandle sessionHandle=client.openSession("tom","password");
+    assertNotNull(sessionHandle);
+    OperationHandle opHandle=client.getFunctions(sessionHandle,null,null,"*");
+    TableSchema schema=client.getResultSetMetadata(opHandle);
+    ColumnDescriptor columnDesc=schema.getColumnDescriptorAt(0);
+    assertEquals("FUNCTION_CAT",columnDesc.getName());
+    assertEquals(Type.STRING_TYPE,columnDesc.getType());
+    columnDesc=schema.getColumnDescriptorAt(1);
+    assertEquals("FUNCTION_SCHEM",columnDesc.getName());
+    assertEquals(Type.STRING_TYPE,columnDesc.getType());
+    columnDesc=schema.getColumnDescriptorAt(2);
+    assertEquals("FUNCTION_NAME",columnDesc.getName());
+    assertEquals(Type.STRING_TYPE,columnDesc.getType());
+    columnDesc=schema.getColumnDescriptorAt(3);
+    assertEquals("REMARKS",columnDesc.getName());
+    assertEquals(Type.STRING_TYPE,columnDesc.getType());
+    columnDesc=schema.getColumnDescriptorAt(4);
+    assertEquals("FUNCTION_TYPE",columnDesc.getName());
+    assertEquals(Type.INT_TYPE,columnDesc.getType());
+    columnDesc=schema.getColumnDescriptorAt(5);
+    assertEquals("SPECIFIC_NAME",columnDesc.getName());
+    assertEquals(Type.STRING_TYPE,columnDesc.getType());
+    client.closeOperation(opHandle);
+    client.closeSession(sessionHandle);
+  }
+  @Test public void testGetInfo() throws Exception {
+    SessionHandle sessionHandle=client.openSession("tom","password",Collections.<String,String>emptyMap());
+    assertNotNull(sessionHandle);
+    GetInfoValue value=client.getInfo(sessionHandle,GetInfoType.CLI_DBMS_NAME);
+    System.out.println(value.getStringValue());
+    value=client.getInfo(sessionHandle,GetInfoType.CLI_SERVER_NAME);
+    System.out.println(value.getStringValue());
+    value=client.getInfo(sessionHandle,GetInfoType.CLI_DBMS_VER);
+    System.out.println(value.getStringValue());
+    client.closeSession(sessionHandle);
+  }
+  /** 
+ * Test the blocking execution of a query
+ * @throws Exception
+ */
+  @Test public void testExecuteStatement() throws Exception {
+    HashMap<String,String> confOverlay=new HashMap<String,String>();
+    SessionHandle sessionHandle=client.openSession("tom","password",new HashMap<String,String>());
+    assertNotNull(sessionHandle);
+    OperationHandle opHandle;
+    String queryString="SET " + HiveConf.ConfVars.HIVE_SUPPORT_CONCURRENCY.varname + " = false";
+    opHandle=client.executeStatement(sessionHandle,queryString,confOverlay);
+    client.closeOperation(opHandle);
+    queryString="DROP TABLE IF EXISTS TEST_EXEC";
+    opHandle=client.executeStatement(sessionHandle,queryString,confOverlay);
+    client.closeOperation(opHandle);
+    queryString="CREATE TABLE TEST_EXEC(ID STRING)";
+    opHandle=client.executeStatement(sessionHandle,queryString,confOverlay);
+    client.closeOperation(opHandle);
+    queryString="SELECT ID+1 FROM TEST_EXEC";
+    opHandle=client.executeStatement(sessionHandle,queryString,confOverlay);
+    OperationStatus opStatus=client.getOperationStatus(opHandle,false);
+    checkOperationTimes(opHandle,opStatus);
+    assertEquals("Query should be finished",OperationState.FINISHED,client.getOperationStatus(opHandle,false).getState());
+    client.closeOperation(opHandle);
+    queryString="DROP TABLE IF EXISTS TEST_EXEC";
+    opHandle=client.executeStatement(sessionHandle,queryString,confOverlay);
+    client.closeOperation(opHandle);
+    client.closeSession(sessionHandle);
+  }
+  /** 
+ * Test async execution of a well-formed and a malformed query with different long polling durations - Test malformed query with default long polling timeout - Test well-formed query with default long polling timeout - Test well-formed query with long polling timeout set to 0 - Test well-formed query with long polling timeout set to 500 millis - Test well-formed query cancellation
+ * @throws Exception
+ */
+  @Test public void testExecuteStatementAsync() throws Exception {
+    Map<String,String> confOverlay=new HashMap<String,String>();
+    String tableName="TEST_EXEC_ASYNC";
+    String columnDefinitions="(ID STRING)";
+    String queryString;
+    SessionHandle sessionHandle=setupTestData(tableName,columnDefinitions,confOverlay);
+    assertNotNull(sessionHandle);
+    OperationState state=null;
+    OperationHandle opHandle;
+    OperationStatus opStatus=null;
+    queryString="SET " + HiveConf.ConfVars.HIVE_SUPPORT_CONCURRENCY.varname + " = false";
+    opHandle=client.executeStatement(sessionHandle,queryString,confOverlay);
+    client.closeOperation(opHandle);
+    long longPollingTimeout;
+    longPollingTimeout=HiveConf.getTimeVar(new HiveConf(),HiveConf.ConfVars.HIVE_SERVER2_LONG_POLLING_TIMEOUT,TimeUnit.MILLISECONDS);
+    queryString="SELECT NON_EXISTING_COLUMN FROM " + tableName;
+    try {
+      runAsyncAndWait(sessionHandle,queryString,confOverlay,OperationState.ERROR,longPollingTimeout);
+    }
+ catch (    HiveSQLException e) {
+    }
+    queryString="CREATE TABLE NON_EXISTING_TAB (ID STRING) location 'invalid://localhost:10000/a/b/c'";
+    opStatus=runAsyncAndWait(sessionHandle,queryString,confOverlay,OperationState.ERROR,longPollingTimeout);
+    assertEquals(opStatus.getOperationException().getSQLState(),"08S01");
+    assertEquals(opStatus.getOperationException().getErrorCode(),1);
+    queryString="SELECT ID+1 FROM " + tableName;
+    runAsyncAndWait(sessionHandle,queryString,confOverlay,OperationState.FINISHED,longPollingTimeout);
+    longPollingTimeout=0;
+    queryString="SELECT ID+1 FROM " + tableName;
+    runAsyncAndWait(sessionHandle,queryString,confOverlay,OperationState.FINISHED,longPollingTimeout);
+    longPollingTimeout=500;
+    queryString="SELECT ID+1 FROM " + tableName;
+    runAsyncAndWait(sessionHandle,queryString,confOverlay,OperationState.FINISHED,longPollingTimeout);
+    queryString="SELECT ID+1 FROM " + tableName;
+    opHandle=client.executeStatementAsync(sessionHandle,queryString,confOverlay);
+    System.out.println("Cancelling " + opHandle);
+    client.cancelOperation(opHandle);
+    OperationStatus operationStatus=client.getOperationStatus(opHandle,false);
+    checkOperationTimes(opHandle,operationStatus);
+    state=client.getOperationStatus(opHandle,false).getState();
+    System.out.println(opHandle + " after cancelling, state= " + state);
+    assertEquals("Query should be cancelled",OperationState.CANCELED,state);
+    queryString="DROP TABLE " + tableName;
+    client.executeStatement(sessionHandle,queryString,confOverlay);
+    client.closeSession(sessionHandle);
+  }
+  private void syncThreadStart(  final CountDownLatch cdlIn,  final CountDownLatch cdlOut){
+    cdlIn.countDown();
+    try {
+      cdlOut.await();
+    }
+ catch (    InterruptedException e) {
+      throw new RuntimeException(e);
+    }
+  }
+  @Test public void testExecuteStatementParallel() throws Exception {
+    Map<String,String> confOverlay=new HashMap<String,String>();
+    String tableName="TEST_EXEC_PARALLEL";
+    String columnDefinitions="(ID STRING)";
+    SessionHandle sessionHandle=setupTestData(tableName,columnDefinitions,confOverlay);
+    assertNotNull(sessionHandle);
+    long longPollingTimeout=HiveConf.getTimeVar(new HiveConf(),HiveConf.ConfVars.HIVE_SERVER2_LONG_POLLING_TIMEOUT,TimeUnit.MILLISECONDS);
+    confOverlay.put(HiveConf.ConfVars.HIVE_SERVER2_LONG_POLLING_TIMEOUT.varname,longPollingTimeout + "ms");
+    int THREAD_COUNT=10, QUERY_COUNT=10;
+    ExecutorService executor=Executors.newFixedThreadPool(THREAD_COUNT);
+    CountDownLatch cdlIn=new CountDownLatch(THREAD_COUNT), cdlOut=new CountDownLatch(1);
+    @SuppressWarnings("unchecked") Callable<Void>[] cs=new Callable[3];
+    String query="SELECT ID + %1$d FROM " + tableName;
+    cs[0]=createQueryCallable(query,confOverlay,longPollingTimeout,QUERY_COUNT,OperationState.FINISHED,true,cdlIn,cdlOut);
+    query="SELECT t1.ID, SUM(t2.ID) + %1$d FROM  " + tableName + " t1 CROSS JOIN "+ tableName+ " t2 GROUP BY t1.ID HAVING t1.ID > 1";
+    cs[1]=createQueryCallable(query,confOverlay,longPollingTimeout,QUERY_COUNT,OperationState.FINISHED,true,cdlIn,cdlOut);
+    query="SELECT b.a FROM (SELECT (t1.ID + %1$d) as a , t2.* FROM  " + tableName + " t1 INNER JOIN "+ tableName+ " t2 ON t1.ID = t2.ID WHERE t2.ID > 2) b";
+    cs[2]=createQueryCallable(query,confOverlay,longPollingTimeout,QUERY_COUNT,OperationState.FINISHED,true,cdlIn,cdlOut);
+    @SuppressWarnings("unchecked") FutureTask<Void>[] tasks=new FutureTask[THREAD_COUNT];
+    for (int i=0; i < THREAD_COUNT; ++i) {
+      tasks[i]=new FutureTask<Void>(cs[i % cs.length]);
+      executor.execute(tasks[i]);
+    }
+    try {
+      cdlIn.await();
+      cdlOut.countDown();
+      for (int i=0; i < THREAD_COUNT; ++i) {
+        tasks[i].get();
+      }
+    }
+ catch (    Throwable t) {
+      throw new RuntimeException(t);
+    }
+    client.executeStatement(sessionHandle,"DROP TABLE " + tableName,confOverlay);
+    client.closeSession(sessionHandle);
+  }
+public static class CompileLockTestSleepHook implements HiveSemanticAnalyzerHook {
+    @Override public ASTNode preAnalyze(    HiveSemanticAnalyzerHookContext context,    ASTNode ast) throws SemanticException {
+      try {
+        Thread.sleep(20 * 1000);
+      }
+ catch (      Throwable t) {
+      }
+      return ast;
+    }
+    @Override public void postAnalyze(    HiveSemanticAnalyzerHookContext context,    List<Task<? extends Serializable>> rootTasks) throws SemanticException {
+    }
+  }
+  @Test public void testGlobalCompileLockTimeout() throws Exception {
+    String tableName="TEST_COMPILE_LOCK_TIMEOUT";
+    String columnDefinitions="(ID STRING)";
+    SessionHandle sessionHandle=setupTestData(tableName,columnDefinitions,new HashMap<String,String>());
+    assertNotNull(sessionHandle);
+    int THREAD_COUNT=3;
+    @SuppressWarnings("unchecked") FutureTask<Void>[] tasks=(FutureTask<Void>[])new FutureTask[THREAD_COUNT];
+    long longPollingTimeoutMs=10 * 60 * 1000;
+    Map<String,String> confOverlay=getConfOverlay(0,longPollingTimeoutMs);
+    confOverlay.put(HiveConf.ConfVars.SEMANTIC_ANALYZER_HOOK.varname,CompileLockTestSleepHook.class.getName());
+    String query="SELECT 0 FROM " + tableName;
+    tasks[0]=new FutureTask<Void>(createQueryCallable(query,confOverlay,longPollingTimeoutMs,1,OperationState.FINISHED,false,null,null));
+    new Thread(tasks[0]).start();
+    Thread.sleep(5 * 1000);
+    confOverlay=getConfOverlay(1,longPollingTimeoutMs);
+    query="SELECT 1 FROM " + tableName;
+    tasks[1]=new FutureTask<Void>(createQueryCallable(query,confOverlay,longPollingTimeoutMs,1,OperationState.ERROR,false,null,null));
+    new Thread(tasks[1]).start();
+    confOverlay=getConfOverlay(100,longPollingTimeoutMs);
+    query="SELECT 2 FROM " + tableName;
+    tasks[2]=new FutureTask<Void>(createQueryCallable(query,confOverlay,longPollingTimeoutMs,1,OperationState.FINISHED,false,null,null));
+    new Thread(tasks[2]).start();
+    boolean foundExpectedException=false;
+    for (int i=0; i < THREAD_COUNT; ++i) {
+      try {
+        tasks[i].get();
+      }
+ catch (      Throwable t) {
+        if (i == 1) {
+          assertTrue(t.getMessage().contains(ErrorMsg.COMPILE_LOCK_TIMED_OUT.getMsg()));
+          foundExpectedException=true;
+        }
+ else {
+          throw new RuntimeException(t);
+        }
+      }
+    }
+    assertTrue(foundExpectedException);
+    client.executeStatement(sessionHandle,"DROP TABLE " + tableName,getConfOverlay(0,longPollingTimeoutMs));
+    client.closeSession(sessionHandle);
+  }
+  private Map<String,String> getConfOverlay(  long compileLockTimeoutSecs,  long longPollingTimeoutMs){
+    Map<String,String> confOverlay=new HashMap<String,String>();
+    confOverlay.put(HiveConf.ConfVars.HIVE_SERVER2_PARALLEL_COMPILATION.varname,"false");
+    confOverlay.put(HiveConf.ConfVars.HIVE_SERVER2_LONG_POLLING_TIMEOUT.varname,longPollingTimeoutMs + "ms");
+    if (compileLockTimeoutSecs > 0) {
+      confOverlay.put(HiveConf.ConfVars.HIVE_SERVER2_COMPILE_LOCK_TIMEOUT.varname,compileLockTimeoutSecs + "s");
+    }
+    return confOverlay;
+  }
+  private Callable<Void> createQueryCallable(  final String queryStringFormat,  final Map<String,String> confOverlay,  final long longPollingTimeout,  final int queryCount,  final OperationState expectedOperationState,  final boolean syncThreadStart,  final CountDownLatch cdlIn,  final CountDownLatch cdlOut){
+    return new Callable<Void>(){
+      @Override public Void call() throws Exception {
+        if (syncThreadStart) {
+          syncThreadStart(cdlIn,cdlOut);
+        }
+        SessionHandle sessionHandle=openSession(confOverlay);
+        OperationHandle[] hs=new OperationHandle[queryCount];
+        for (int i=0; i < hs.length; ++i) {
+          String queryString=String.format(queryStringFormat,i);
+          LOG.info("Submitting " + i);
+          hs[i]=client.executeStatementAsync(sessionHandle,queryString,confOverlay);
+        }
+        for (int i=hs.length - 1; i >= 0; --i) {
+          waitForAsyncQuery(hs[i],expectedOperationState,longPollingTimeout);
+        }
+        return null;
+      }
+    }
+;
+  }
+  /** 
+ * Sets up a test specific table with the given column definitions and config
+ * @param tableName
+ * @param columnDefinitions
+ * @param confOverlay
+ * @throws Exception
+ */
+  private SessionHandle setupTestData(  String tableName,  String columnDefinitions,  Map<String,String> confOverlay) throws Exception {
+    SessionHandle sessionHandle=openSession(confOverlay);
+    createTestTable(tableName,columnDefinitions,confOverlay,sessionHandle);
+    return sessionHandle;
+  }
+  private SessionHandle openSession(  Map<String,String> confOverlay) throws HiveSQLException {
+    SessionHandle sessionHandle=client.openSession("tom","password",confOverlay);
+    assertNotNull(sessionHandle);
+    SessionState.get().setIsHiveServerQuery(true);
+    String queryString="SET " + HiveConf.ConfVars.HIVE_SUPPORT_CONCURRENCY.varname + " = false";
+    client.executeStatement(sessionHandle,queryString,confOverlay);
+    return sessionHandle;
+  }
+  private void createTestTable(  String tableName,  String columnDefinitions,  Map<String,String> confOverlay,  SessionHandle sessionHandle) throws HiveSQLException {
+    String queryString;
+    queryString="DROP TABLE IF EXISTS " + tableName;
+    client.executeStatement(sessionHandle,queryString,confOverlay);
+    queryString="CREATE TABLE " + tableName + columnDefinitions;
+    client.executeStatement(sessionHandle,queryString,confOverlay);
+  }
+  private OperationStatus runAsyncAndWait(  SessionHandle sessionHandle,  String queryString,  Map<String,String> confOverlay,  OperationState expectedState,  long longPollingTimeout) throws HiveSQLException {
+    confOverlay.put(HiveConf.ConfVars.HIVE_SERVER2_LONG_POLLING_TIMEOUT.varname,longPollingTimeout + "ms");
+    OperationHandle h=client.executeStatementAsync(sessionHandle,queryString,confOverlay);
+    return waitForAsyncQuery(h,expectedState,longPollingTimeout);
+  }
+  private OperationStatus waitForAsyncQuery(  OperationHandle opHandle,  OperationState expectedState,  long maxLongPollingTimeout) throws HiveSQLException {
+    long testIterationTimeout=System.currentTimeMillis() + 100000;
+    long longPollingStart;
+    long longPollingEnd;
+    long longPollingTimeDelta;
+    OperationStatus opStatus=null;
+    OperationState state=null;
+    int count=0;
+    long start=System.currentTimeMillis();
+    while (true) {
+      if (System.currentTimeMillis() > testIterationTimeout) {
+        System.out.println("Polling timed out");
+        break;
+      }
+      longPollingStart=System.currentTimeMillis();
+      System.out.println("Long polling starts at: " + longPollingStart);
+      opStatus=client.getOperationStatus(opHandle,false);
+      state=opStatus.getState();
+      longPollingEnd=System.currentTimeMillis();
+      System.out.println("Long polling ends at: " + longPollingEnd);
+      System.out.println("Polling: " + opHandle + " count="+ (++count)+ " state="+ state);
+      if (state == OperationState.CANCELED || state == OperationState.CLOSED || state == OperationState.FINISHED || state == OperationState.ERROR) {
+        break;
+      }
+ else {
+        longPollingTimeDelta=longPollingEnd - longPollingStart;
+        long elapsed=longPollingStart - start;
+        long expectedTimeout=Math.min(maxLongPollingTimeout,(elapsed / TimeUnit.SECONDS.toMillis(10) + 1) * 500);
+        assertTrue(longPollingTimeDelta - 0.9 * expectedTimeout > 0);
+      }
+    }
+    assertEquals(expectedState,client.getOperationStatus(opHandle,false).getState());
+    client.closeOperation(opHandle);
+    return opStatus;
+  }
+  /** 
+ * Test per statement configuration overlay. Create a table using hiveconf: var substitution, with the conf var passed via confOverlay.Verify the confOverlay works for the query and does set the value in the session configuration
+ * @throws Exception
+ */
+  @Test public void testConfOverlay() throws Exception {
+    SessionHandle sessionHandle=client.openSession("tom","password",new HashMap<String,String>());
+    assertNotNull(sessionHandle);
+    String tabName="TEST_CONF_EXEC";
+    String tabNameVar="tabNameVar";
+    String setLockMgr="SET " + HiveConf.ConfVars.HIVE_SUPPORT_CONCURRENCY.varname + " = false";
+    OperationHandle opHandle=client.executeStatement(sessionHandle,setLockMgr,null);
+    client.closeOperation(opHandle);
+    String dropTable="DROP TABLE IF EXISTS " + tabName;
+    opHandle=client.executeStatement(sessionHandle,dropTable,null);
+    client.closeOperation(opHandle);
+    Map<String,String> confOverlay=new HashMap<String,String>();
+    confOverlay.put(tabNameVar,tabName);
+    String createTab="CREATE TABLE ${hiveconf:" + tabNameVar + "} (id int)";
+    opHandle=client.executeStatement(sessionHandle,createTab,confOverlay);
+    assertNotNull(opHandle);
+    assertEquals("Query should be finished",OperationState.FINISHED,client.getOperationStatus(opHandle,false).getState());
+    client.closeOperation(opHandle);
+    String selectTab="SELECT * FROM " + tabName;
+    opHandle=client.executeStatement(sessionHandle,selectTab,null);
+    assertNotNull(opHandle);
+    assertEquals("Query should be finished",OperationState.FINISHED,client.getOperationStatus(opHandle,false).getState());
+    client.closeOperation(opHandle);
+    selectTab="SELECT * FROM ${hiveconf:" + tabNameVar + "}";
+    try {
+      opHandle=client.executeStatement(sessionHandle,selectTab,null);
+      fail("Query should fail");
+    }
+ catch (    HiveSQLException e) {
+    }
+    dropTable="DROP TABLE IF EXISTS " + tabName;
+    opHandle=client.executeStatement(sessionHandle,dropTable,null);
+    client.closeOperation(opHandle);
+    client.closeSession(sessionHandle);
+  }
+  @Test public void testTaskStatus() throws Exception {
+    HashMap<String,String> confOverlay=new HashMap<String,String>();
+    String tableName="TEST_EXEC_ASYNC";
+    String columnDefinitions="(ID STRING)";
+    SessionHandle sessionHandle=setupTestData(tableName,columnDefinitions,confOverlay);
+    assertNotNull(sessionHandle);
+    String select="select a.id, b.id from (SELECT ID + ' ' `ID` FROM TEST_EXEC_ASYNC) a full outer join " + "(SELECT ID + ' ' `ID` FROM TEST_EXEC_ASYNC) b on a.ID=b.ID";
+    OperationHandle ophandle=client.executeStatementAsync(sessionHandle,select,confOverlay);
+    OperationStatus status=null;
+    int count=0;
+    while (true) {
+      status=client.getOperationStatus(ophandle,false);
+      checkOperationTimes(ophandle,status);
+      OperationState state=status.getState();
+      System.out.println("Polling: " + ophandle + " count="+ (++count)+ " state="+ state);
+      String jsonTaskStatus=status.getTaskStatus();
+      assertNotNull(jsonTaskStatus);
+      ObjectMapper mapper=new ObjectMapper();
+      ByteArrayInputStream in=new ByteArrayInputStream(jsonTaskStatus.getBytes("UTF-8"));
+      List<QueryDisplay.TaskDisplay> taskStatuses=mapper.readValue(in,new TypeReference<List<QueryDisplay.TaskDisplay>>(){
+      }
+);
+      System.out.println("task statuses: " + jsonTaskStatus);
+      checkTaskStatuses(taskStatuses);
+      if (OperationState.CANCELED == state || state == OperationState.CLOSED || state == OperationState.FINISHED || state == OperationState.ERROR) {
+        for (        QueryDisplay.TaskDisplay display : taskStatuses) {
+          assertNotNull(display.getReturnValue());
+        }
+        break;
+      }
+      Thread.sleep(1000);
+    }
+  }
+  private void checkTaskStatuses(  List<QueryDisplay.TaskDisplay> taskDisplays){
+    assertNotNull(taskDisplays);
+    for (    QueryDisplay.TaskDisplay taskDisplay : taskDisplays) {
+switch (taskDisplay.taskState) {
+case INITIALIZED:
+case QUEUED:
+        assertNull(taskDisplay.getExternalHandle());
+      assertNull(taskDisplay.getBeginTime());
+    assertNull(taskDisplay.getEndTime());
+  assertNull(taskDisplay.getElapsedTime());
+assertNull(taskDisplay.getErrorMsg());
+assertNull(taskDisplay.getReturnValue());
+break;
+case RUNNING:
+assertNotNull(taskDisplay.getBeginTime());
+assertNull(taskDisplay.getEndTime());
+assertNotNull(taskDisplay.getElapsedTime());
+assertNull(taskDisplay.getErrorMsg());
+assertNull(taskDisplay.getReturnValue());
+break;
+case FINISHED:
+if (taskDisplay.getTaskType() == StageType.MAPRED || taskDisplay.getTaskType() == StageType.MAPREDLOCAL) {
+assertNotNull(taskDisplay.getExternalHandle());
+assertNotNull(taskDisplay.getStatusMessage());
+}
+assertNotNull(taskDisplay.getBeginTime());
+assertNotNull(taskDisplay.getEndTime());
+assertNotNull(taskDisplay.getElapsedTime());
+break;
+case UNKNOWN:
+default :
+fail("unknown task status: " + taskDisplay);
+}
+}
+}
+private void checkOperationTimes(OperationHandle operationHandle,OperationStatus status){
+OperationState state=status.getState();
+assertFalse(status.getOperationStarted() == 0);
+if (OperationState.CANCELED == state || state == OperationState.CLOSED || state == OperationState.FINISHED || state == OperationState.ERROR) {
+System.out.println("##OP " + operationHandle.getHandleIdentifier() + " STATE:"+ status.getState()+ " START:"+ status.getOperationStarted()+ " END:"+ status.getOperationCompleted());
+assertFalse(status.getOperationCompleted() == 0);
+assertTrue(status.getOperationCompleted() - status.getOperationStarted() >= 0);
+}
+}
+}

@@ -1,0 +1,57 @@
+/** 
+ * txns overlap, update same resource, simulate multi-stmt txn case Also tests that we kill txn when it tries to acquire lock if we already know it will not be committed
+ */
+@Test public void testWriteSetTracking4() throws Exception {
+  dropTable(new String[]{"TAB_PART","TAB2"});
+  Assert.assertEquals(0,TxnDbUtil.countQueryAgent("select count(*) from WRITE_SET"));
+  CommandProcessorResponse cpr=driver.run("create table if not exists TAB_PART (a int, b int) " + "partitioned by (p string) clustered by (a) into 2  buckets stored as orc TBLPROPERTIES ('transactional'='true')");
+  checkCmdOnDriver(cpr);
+  cpr=driver.run("create table if not exists TAB2 (a int, b int) partitioned by (p string) " + "clustered by (a) into 2  buckets stored as orc TBLPROPERTIES ('transactional'='true')");
+  checkCmdOnDriver(cpr);
+  txnMgr.openTxn(ctx,"Long Running");
+  checkCmdOnDriver(driver.compileAndRespond("select a from  TAB_PART where p = 'blah'"));
+  txnMgr.acquireLocks(driver.getPlan(),ctx,"Long Running");
+  List<ShowLocksResponseElement> locks=getLocks(txnMgr);
+  Assert.assertEquals("Unexpected lock count",1,locks.size());
+  checkLock(LockType.SHARED_READ,LockState.ACQUIRED,"default","TAB_PART",null,locks);
+  HiveTxnManager txnMgr2=TxnManagerFactory.getTxnManagerFactory().getTxnManager(conf);
+  txnMgr2.openTxn(ctx,"Short Running");
+  checkCmdOnDriver(driver.compileAndRespond("update TAB2 set b = 7 where p = 'blah'"));
+  txnMgr2.acquireLocks(driver.getPlan(),ctx,"Short Running");
+  locks=getLocks(txnMgr);
+  Assert.assertEquals("Unexpected lock count",2,locks.size());
+  checkLock(LockType.SHARED_READ,LockState.ACQUIRED,"default","TAB_PART",null,locks);
+  checkLock(LockType.SHARED_WRITE,LockState.ACQUIRED,"default","TAB2",null,locks);
+  Assert.assertEquals(0,TxnDbUtil.countQueryAgent("select count(*) from WRITE_SET"));
+  AddDynamicPartitions adp=new AddDynamicPartitions(txnMgr2.getCurrentTxnId(),"default","tab2",Collections.EMPTY_LIST);
+  adp.setOperationType(DataOperationType.UPDATE);
+  txnHandler.addDynamicPartitions(adp);
+  txnMgr2.commitTxn();
+  Assert.assertEquals(0,TxnDbUtil.countQueryAgent("select count(*) from WRITE_SET"));
+  txnMgr2.openTxn(ctx,"T3");
+  checkCmdOnDriver(driver.compileAndRespond("update TAB2 set b = 7 where p = 'two'"));
+  txnMgr2.acquireLocks(driver.getPlan(),ctx,"T3");
+  locks=getLocks(txnMgr);
+  Assert.assertEquals("Unexpected lock count",2,locks.size());
+  checkLock(LockType.SHARED_READ,LockState.ACQUIRED,"default","TAB_PART",null,locks);
+  checkLock(LockType.SHARED_WRITE,LockState.ACQUIRED,"default","TAB2",null,locks);
+  Assert.assertEquals(0,TxnDbUtil.countQueryAgent("select count(*) from WRITE_SET"));
+  adp=new AddDynamicPartitions(txnMgr2.getCurrentTxnId(),"default","tab2",Collections.singletonList("p=two"));
+  adp.setOperationType(DataOperationType.UPDATE);
+  txnHandler.addDynamicPartitions(adp);
+  txnMgr2.commitTxn();
+  Assert.assertEquals("WRITE_SET mismatch: " + TxnDbUtil.queryToString("select * from WRITE_SET"),1,TxnDbUtil.countQueryAgent("select count(*) from WRITE_SET"));
+  AcidWriteSetService houseKeeper=new AcidWriteSetService();
+  TestTxnCommands2.runHouseKeeperService(houseKeeper,conf);
+  Assert.assertEquals(1,TxnDbUtil.countQueryAgent("select count(*) from WRITE_SET"));
+  checkCmdOnDriver(driver.compileAndRespond("update TAB2 set b = 17 where a = 1"));
+  txnMgr.acquireLocks(driver.getPlan(),ctx,"Long Running");
+  adp=new AddDynamicPartitions(txnMgr.getCurrentTxnId(),"default","tab2",Collections.EMPTY_LIST);
+  adp.setOperationType(DataOperationType.UPDATE);
+  txnHandler.addDynamicPartitions(adp);
+  txnMgr.commitTxn();
+  locks=getLocks(txnMgr);
+  Assert.assertEquals("Unexpected lock count",0,locks.size());
+  TestTxnCommands2.runHouseKeeperService(houseKeeper,conf);
+  Assert.assertEquals(0,TxnDbUtil.countQueryAgent("select count(*) from WRITE_SET"));
+}

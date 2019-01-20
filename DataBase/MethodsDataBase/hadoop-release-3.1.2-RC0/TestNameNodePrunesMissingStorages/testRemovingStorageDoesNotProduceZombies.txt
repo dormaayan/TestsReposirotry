@@ -1,0 +1,95 @@
+/** 
+ * Regression test for HDFS-7960.<p/> Shutting down a datanode, removing a storage directory, and restarting the DataNode should not produce zombie storages.
+ */
+@Test(timeout=300000) public void testRemovingStorageDoesNotProduceZombies() throws Exception {
+  Configuration conf=new HdfsConfiguration();
+  conf.setInt(DFSConfigKeys.DFS_DATANODE_FAILED_VOLUMES_TOLERATED_KEY,1);
+  conf.setInt(DFSConfigKeys.DFS_NAMENODE_HEARTBEAT_RECHECK_INTERVAL_KEY,1000);
+  final int NUM_STORAGES_PER_DN=2;
+  final MiniDFSCluster cluster=new MiniDFSCluster.Builder(conf).numDataNodes(3).storagesPerDatanode(NUM_STORAGES_PER_DN).build();
+  try {
+    cluster.waitActive();
+    for (    DataNode dn : cluster.getDataNodes()) {
+      assertEquals(NUM_STORAGES_PER_DN,cluster.getNamesystem().getBlockManager().getDatanodeManager().getDatanode(dn.getDatanodeId()).getStorageInfos().length);
+    }
+    final Path TEST_PATH=new Path("/foo1");
+    DistributedFileSystem fs=cluster.getFileSystem();
+    DFSTestUtil.createFile(fs,TEST_PATH,1024,(short)3,0xcafecafe);
+    for (    DataNode dn : cluster.getDataNodes()) {
+      DataNodeTestUtils.triggerBlockReport(dn);
+    }
+    ExtendedBlock block=DFSTestUtil.getFirstBlock(fs,new Path("/foo1"));
+    cluster.getNamesystem().writeLock();
+    final String storageIdToRemove;
+    String datanodeUuid;
+    try {
+      BlockInfo storedBlock=cluster.getNamesystem().getBlockManager().getStoredBlock(block.getLocalBlock());
+      Iterator<DatanodeStorageInfo> storageInfoIter=cluster.getNamesystem().getBlockManager().blocksMap.getStorages(storedBlock).iterator();
+      assertTrue(storageInfoIter.hasNext());
+      DatanodeStorageInfo info=storageInfoIter.next();
+      storageIdToRemove=info.getStorageID();
+      datanodeUuid=info.getDatanodeDescriptor().getDatanodeUuid();
+    }
+  finally {
+      cluster.getNamesystem().writeUnlock();
+    }
+    final DataNode datanodeToRemoveStorageFrom;
+    int datanodeToRemoveStorageFromIdx=0;
+    while (true) {
+      if (datanodeToRemoveStorageFromIdx >= cluster.getDataNodes().size()) {
+        Assert.fail("failed to find datanode with uuid " + datanodeUuid);
+        datanodeToRemoveStorageFrom=null;
+        break;
+      }
+      DataNode dn=cluster.getDataNodes().get(datanodeToRemoveStorageFromIdx);
+      if (dn.getDatanodeUuid().equals(datanodeUuid)) {
+        datanodeToRemoveStorageFrom=dn;
+        break;
+      }
+      datanodeToRemoveStorageFromIdx++;
+    }
+    StorageLocation volumeLocationToRemove=null;
+    try (FsVolumeReferences volumes=datanodeToRemoveStorageFrom.getFSDataset().getFsVolumeReferences()){
+      assertEquals(NUM_STORAGES_PER_DN,volumes.size());
+      for (      FsVolumeSpi volume : volumes) {
+        if (volume.getStorageID().equals(storageIdToRemove)) {
+          volumeLocationToRemove=volume.getStorageLocation();
+        }
+      }
+    }
+     ;
+    assertNotNull(volumeLocationToRemove);
+    datanodeToRemoveStorageFrom.shutdown();
+    FileUtil.fullyDelete(new File(volumeLocationToRemove.getUri()));
+    FileOutputStream fos=new FileOutputStream(new File(volumeLocationToRemove.getUri()));
+    try {
+      fos.write(1);
+    }
+  finally {
+      fos.close();
+    }
+    cluster.restartDataNode(datanodeToRemoveStorageFromIdx);
+    LOG.info("waiting for the datanode to remove " + storageIdToRemove);
+    GenericTestUtils.waitFor(new Supplier<Boolean>(){
+      @Override public Boolean get(){
+        final DatanodeDescriptor dnDescriptor=cluster.getNamesystem().getBlockManager().getDatanodeManager().getDatanode(datanodeToRemoveStorageFrom.getDatanodeUuid());
+        assertNotNull(dnDescriptor);
+        DatanodeStorageInfo[] infos=dnDescriptor.getStorageInfos();
+        for (        DatanodeStorageInfo info : infos) {
+          if (info.getStorageID().equals(storageIdToRemove)) {
+            LOG.info("Still found storage " + storageIdToRemove + " on "+ info+ ".");
+            return false;
+          }
+        }
+        assertEquals(NUM_STORAGES_PER_DN - 1,infos.length);
+        return true;
+      }
+    }
+,1000,30000);
+  }
+  finally {
+    if (cluster != null) {
+      cluster.shutdown();
+    }
+  }
+}

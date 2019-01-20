@@ -1,0 +1,54 @@
+/** 
+ * Test frequent chunk retirement with chunk pool triggered by lots of threads, making sure there's no memory leak (HBASE-16195)
+ * @throws Exception if any error occurred
+ */
+@Test public void testLABChunkQueue() throws Exception {
+  ChunkCreator oldInstance=null;
+  try {
+    MemStoreLABImpl mslab=new MemStoreLABImpl();
+    assertTrue(mslab.getPooledChunks().isEmpty());
+    oldInstance=ChunkCreator.instance;
+    ChunkCreator.instance=null;
+    Configuration conf=HBaseConfiguration.create();
+    conf.setDouble(MemStoreLAB.CHUNK_POOL_MAXSIZE_KEY,0.1);
+    conf.setLong(MemStoreLABImpl.CHUNK_SIZE_KEY,MemStoreLABImpl.MAX_ALLOC_DEFAULT);
+    long globalMemStoreLimit=(long)(ManagementFactory.getMemoryMXBean().getHeapMemoryUsage().getMax() * MemorySizeUtil.getGlobalMemStoreHeapPercent(conf,false));
+    ChunkCreator.initialize(MemStoreLABImpl.MAX_ALLOC_DEFAULT,false,globalMemStoreLimit,0.1f,MemStoreLAB.POOL_INITIAL_SIZE_DEFAULT,null);
+    ChunkCreator.clearDisableFlag();
+    mslab=new MemStoreLABImpl(conf);
+    List<Thread> threads=new ArrayList<>();
+    final KeyValue kv=new KeyValue(Bytes.toBytes("r"),Bytes.toBytes("f"),Bytes.toBytes("q"),new byte[MemStoreLABImpl.MAX_ALLOC_DEFAULT - 32]);
+    for (int i=0; i < 10; i++) {
+      threads.add(getChunkQueueTestThread(mslab,"testLABChunkQueue-" + i,kv));
+    }
+    for (    Thread thread : threads) {
+      thread.start();
+    }
+    Thread.sleep(1000);
+    for (    Thread thread : threads) {
+      thread.interrupt();
+    }
+    boolean threadsRunning=true;
+    boolean alive=false;
+    while (threadsRunning) {
+      alive=false;
+      for (      Thread thread : threads) {
+        if (thread.isAlive()) {
+          alive=true;
+          break;
+        }
+      }
+      if (!alive) {
+        threadsRunning=false;
+      }
+    }
+    assertTrue("All the chunks must have been cleared",ChunkCreator.instance.numberOfMappedChunks() != 0);
+    int pooledChunksNum=mslab.getPooledChunks().size();
+    mslab.close();
+    int queueLength=mslab.getNumOfChunksReturnedToPool();
+    assertTrue("All chunks in chunk queue should be reclaimed or removed" + " after mslab closed but actually: " + (pooledChunksNum - queueLength),pooledChunksNum - queueLength == 0);
+  }
+  finally {
+    ChunkCreator.instance=oldInstance;
+  }
+}

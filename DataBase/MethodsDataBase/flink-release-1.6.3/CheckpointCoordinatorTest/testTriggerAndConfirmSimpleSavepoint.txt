@@ -1,0 +1,87 @@
+@Test public void testTriggerAndConfirmSimpleSavepoint() throws Exception {
+  final JobID jid=new JobID();
+  final long timestamp=System.currentTimeMillis();
+  final ExecutionAttemptID attemptID1=new ExecutionAttemptID();
+  final ExecutionAttemptID attemptID2=new ExecutionAttemptID();
+  ExecutionVertex vertex1=mockExecutionVertex(attemptID1);
+  ExecutionVertex vertex2=mockExecutionVertex(attemptID2);
+  CheckpointCoordinator coord=new CheckpointCoordinator(jid,600000,600000,0,Integer.MAX_VALUE,CheckpointRetentionPolicy.NEVER_RETAIN_AFTER_TERMINATION,new ExecutionVertex[]{vertex1,vertex2},new ExecutionVertex[]{vertex1,vertex2},new ExecutionVertex[]{vertex1,vertex2},new StandaloneCheckpointIDCounter(),new StandaloneCompletedCheckpointStore(1),new MemoryStateBackend(),Executors.directExecutor(),SharedStateRegistry.DEFAULT_FACTORY);
+  assertEquals(0,coord.getNumberOfPendingCheckpoints());
+  assertEquals(0,coord.getNumberOfRetainedSuccessfulCheckpoints());
+  String savepointDir=tmpFolder.newFolder().getAbsolutePath();
+  CompletableFuture<CompletedCheckpoint> savepointFuture=coord.triggerSavepoint(timestamp,savepointDir);
+  assertFalse(savepointFuture.isDone());
+  assertEquals(1,coord.getNumberOfPendingCheckpoints());
+  long checkpointId=coord.getPendingCheckpoints().entrySet().iterator().next().getKey();
+  PendingCheckpoint pending=coord.getPendingCheckpoints().get(checkpointId);
+  assertNotNull(pending);
+  assertEquals(checkpointId,pending.getCheckpointId());
+  assertEquals(timestamp,pending.getCheckpointTimestamp());
+  assertEquals(jid,pending.getJobId());
+  assertEquals(2,pending.getNumberOfNonAcknowledgedTasks());
+  assertEquals(0,pending.getNumberOfAcknowledgedTasks());
+  assertEquals(0,pending.getOperatorStates().size());
+  assertFalse(pending.isDiscarded());
+  assertFalse(pending.isFullyAcknowledged());
+  assertFalse(pending.canBeSubsumed());
+  OperatorID opID1=OperatorID.fromJobVertexID(vertex1.getJobvertexId());
+  OperatorID opID2=OperatorID.fromJobVertexID(vertex2.getJobvertexId());
+  TaskStateSnapshot taskOperatorSubtaskStates1=mock(TaskStateSnapshot.class);
+  TaskStateSnapshot taskOperatorSubtaskStates2=mock(TaskStateSnapshot.class);
+  OperatorSubtaskState subtaskState1=mock(OperatorSubtaskState.class);
+  OperatorSubtaskState subtaskState2=mock(OperatorSubtaskState.class);
+  when(taskOperatorSubtaskStates1.getSubtaskStateByOperatorID(opID1)).thenReturn(subtaskState1);
+  when(taskOperatorSubtaskStates2.getSubtaskStateByOperatorID(opID2)).thenReturn(subtaskState2);
+  AcknowledgeCheckpoint acknowledgeCheckpoint2=new AcknowledgeCheckpoint(jid,attemptID2,checkpointId,new CheckpointMetrics(),taskOperatorSubtaskStates2);
+  coord.receiveAcknowledgeMessage(acknowledgeCheckpoint2);
+  assertEquals(1,pending.getNumberOfAcknowledgedTasks());
+  assertEquals(1,pending.getNumberOfNonAcknowledgedTasks());
+  assertFalse(pending.isDiscarded());
+  assertFalse(pending.isFullyAcknowledged());
+  assertFalse(savepointFuture.isDone());
+  coord.receiveAcknowledgeMessage(acknowledgeCheckpoint2);
+  assertFalse(pending.isDiscarded());
+  assertFalse(pending.isFullyAcknowledged());
+  assertFalse(savepointFuture.isDone());
+  coord.receiveAcknowledgeMessage(new AcknowledgeCheckpoint(jid,attemptID1,checkpointId,new CheckpointMetrics(),taskOperatorSubtaskStates1));
+  assertTrue(pending.isDiscarded());
+  assertTrue(savepointFuture.isDone());
+  assertEquals(1,coord.getNumberOfRetainedSuccessfulCheckpoints());
+  assertEquals(0,coord.getNumberOfPendingCheckpoints());
+{
+    verify(vertex1.getCurrentExecutionAttempt(),times(1)).notifyCheckpointComplete(eq(checkpointId),eq(timestamp));
+    verify(vertex2.getCurrentExecutionAttempt(),times(1)).notifyCheckpointComplete(eq(checkpointId),eq(timestamp));
+  }
+{
+    verify(subtaskState1,times(1)).registerSharedStates(any(SharedStateRegistry.class));
+    verify(subtaskState2,times(1)).registerSharedStates(any(SharedStateRegistry.class));
+  }
+  CompletedCheckpoint success=coord.getSuccessfulCheckpoints().get(0);
+  assertEquals(jid,success.getJobId());
+  assertEquals(timestamp,success.getTimestamp());
+  assertEquals(pending.getCheckpointId(),success.getCheckpointID());
+  assertEquals(2,success.getOperatorStates().size());
+  final long timestampNew=timestamp + 7;
+  savepointFuture=coord.triggerSavepoint(timestampNew,savepointDir);
+  assertFalse(savepointFuture.isDone());
+  long checkpointIdNew=coord.getPendingCheckpoints().entrySet().iterator().next().getKey();
+  coord.receiveAcknowledgeMessage(new AcknowledgeCheckpoint(jid,attemptID1,checkpointIdNew));
+  coord.receiveAcknowledgeMessage(new AcknowledgeCheckpoint(jid,attemptID2,checkpointIdNew));
+  assertEquals(0,coord.getNumberOfPendingCheckpoints());
+  assertEquals(1,coord.getNumberOfRetainedSuccessfulCheckpoints());
+  CompletedCheckpoint successNew=coord.getSuccessfulCheckpoints().get(0);
+  assertEquals(jid,successNew.getJobId());
+  assertEquals(timestampNew,successNew.getTimestamp());
+  assertEquals(checkpointIdNew,successNew.getCheckpointID());
+  assertTrue(successNew.getOperatorStates().isEmpty());
+  assertTrue(savepointFuture.isDone());
+  verify(subtaskState1,never()).discardState();
+  verify(subtaskState2,never()).discardState();
+{
+    verify(vertex1.getCurrentExecutionAttempt(),times(1)).triggerCheckpoint(eq(checkpointIdNew),eq(timestampNew),any(CheckpointOptions.class));
+    verify(vertex2.getCurrentExecutionAttempt(),times(1)).triggerCheckpoint(eq(checkpointIdNew),eq(timestampNew),any(CheckpointOptions.class));
+    verify(vertex1.getCurrentExecutionAttempt(),times(1)).notifyCheckpointComplete(eq(checkpointIdNew),eq(timestampNew));
+    verify(vertex2.getCurrentExecutionAttempt(),times(1)).notifyCheckpointComplete(eq(checkpointIdNew),eq(timestampNew));
+  }
+  coord.shutdown(JobStatus.FINISHED);
+}

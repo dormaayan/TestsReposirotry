@@ -1,0 +1,47 @@
+/** 
+ * Simulates splitting a WAL out from under a regionserver that is still trying to write it. Ensures we do not lose edits.
+ * @throws IOException
+ * @throws InterruptedException
+ */
+@Test public void testLogCannotBeWrittenOnceParsed() throws IOException, InterruptedException {
+  final AtomicLong counter=new AtomicLong(0);
+  AtomicBoolean stop=new AtomicBoolean(false);
+  final String region=REGIONS.get(0);
+  final int numWriters=3;
+  Thread zombie=new ZombieLastLogWriterRegionServer(counter,stop,region,numWriters);
+  try {
+    long startCount=counter.get();
+    zombie.start();
+    while (startCount == counter.get())     Threads.sleep(1);
+    Threads.sleep(1000);
+    final Configuration conf2=HBaseConfiguration.create(conf);
+    final User robber=User.createUserForTesting(conf2,ROBBER,GROUP);
+    int count=robber.runAs(new PrivilegedExceptionAction<Integer>(){
+      @Override public Integer run() throws Exception {
+        StringBuilder ls=new StringBuilder("Contents of WALDIR (").append(WALDIR).append("):\n");
+        for (        FileStatus status : fs.listStatus(WALDIR)) {
+          ls.append("\t").append(status.toString()).append("\n");
+        }
+        LOG.debug(Objects.toString(ls));
+        LOG.info("Splitting WALs out from under zombie. Expecting " + numWriters + " files.");
+        WALSplitter.split(HBASELOGDIR,WALDIR,OLDLOGDIR,fs,conf2,wals);
+        LOG.info("Finished splitting out from under zombie.");
+        Path[] logfiles=getLogForRegion(TABLE_NAME,region);
+        assertEquals("wrong number of split files for region",numWriters,logfiles.length);
+        int count=0;
+        for (        Path logfile : logfiles) {
+          count+=countWAL(logfile);
+        }
+        return count;
+      }
+    }
+);
+    LOG.info("zombie=" + counter.get() + ", robber="+ count);
+    assertTrue("The log file could have at most 1 extra log entry, but can't have less. " + "Zombie could write " + counter.get() + " and logfile had only "+ count,counter.get() == count || counter.get() + 1 == count);
+  }
+  finally {
+    stop.set(true);
+    zombie.interrupt();
+    Threads.threadDumpingIsAlive(zombie);
+  }
+}

@@ -1,0 +1,43 @@
+/** 
+ * See https://github.com/Netflix/Hystrix/issues/212
+ */
+@Test public void testObservableTimeoutNoFallbackThreadContext(){
+  TestSubscriber<Integer> ts=new TestSubscriber<Integer>();
+  final AtomicReference<Thread> onErrorThread=new AtomicReference<Thread>();
+  final AtomicBoolean isRequestContextInitialized=new AtomicBoolean();
+  TestHystrixObservableCommand<Integer> command=getCommand(ExecutionIsolationStrategy.SEMAPHORE,AbstractTestHystrixCommand.ExecutionResult.SUCCESS,200,AbstractTestHystrixCommand.FallbackResult.UNIMPLEMENTED,100);
+  command.toObservable().doOnError(new Action1<Throwable>(){
+    @Override public void call(    Throwable t1){
+      System.out.println("onError: " + t1);
+      System.out.println("onError Thread: " + Thread.currentThread());
+      System.out.println("ThreadContext in onError: " + HystrixRequestContext.isCurrentThreadInitialized());
+      onErrorThread.set(Thread.currentThread());
+      isRequestContextInitialized.set(HystrixRequestContext.isCurrentThreadInitialized());
+    }
+  }
+).subscribe(ts);
+  ts.awaitTerminalEvent();
+  assertTrue(isRequestContextInitialized.get());
+  assertTrue(onErrorThread.get().getName().startsWith("HystrixTimer"));
+  List<Throwable> errors=ts.getOnErrorEvents();
+  assertEquals(1,errors.size());
+  Throwable e=errors.get(0);
+  if (errors.get(0) instanceof HystrixRuntimeException) {
+    HystrixRuntimeException de=(HystrixRuntimeException)e;
+    assertNotNull(de.getFallbackException());
+    assertTrue(de.getFallbackException() instanceof UnsupportedOperationException);
+    assertNotNull(de.getImplementingClass());
+    assertNotNull(de.getCause());
+    assertTrue(de.getCause() instanceof TimeoutException);
+  }
+ else {
+    fail("the exception should be ExecutionException with cause as HystrixRuntimeException");
+  }
+  assertTrue(command.getExecutionTimeInMilliseconds() > -1);
+  assertTrue(command.isResponseTimedOut());
+  assertNotNull(command.getExecutionException());
+  assertCommandExecutionEvents(command,HystrixEventType.TIMEOUT,HystrixEventType.FALLBACK_MISSING);
+  assertEquals(0,command.metrics.getCurrentConcurrentExecutionCount());
+  assertSaneHystrixRequestLog(1);
+  assertFalse(command.isExecutedInThread());
+}

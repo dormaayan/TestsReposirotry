@@ -1,0 +1,141 @@
+@Category({ZKTests.class,MediumTests.class}) public class TestZKLeaderManager {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestZKLeaderManager.class);
+  private static final Logger LOG=LoggerFactory.getLogger(TestZKLeaderManager.class);
+  private static final String LEADER_ZNODE="/test/" + TestZKLeaderManager.class.getSimpleName();
+private static class MockAbortable implements Abortable {
+    private boolean aborted;
+    @Override public void abort(    String why,    Throwable e){
+      aborted=true;
+      LOG.error(HBaseMarkers.FATAL,"Aborting during test: " + why,e);
+      fail("Aborted during test: " + why);
+    }
+    @Override public boolean isAborted(){
+      return aborted;
+    }
+  }
+private static class MockLeader extends Thread implements Stoppable {
+    private volatile boolean stopped;
+    private ZKWatcher watcher;
+    private ZKLeaderManager zkLeader;
+    private AtomicBoolean master=new AtomicBoolean(false);
+    private int index;
+    public MockLeader(    ZKWatcher watcher,    int index){
+      setDaemon(true);
+      setName("TestZKLeaderManager-leader-" + index);
+      this.index=index;
+      this.watcher=watcher;
+      this.zkLeader=new ZKLeaderManager(watcher,LEADER_ZNODE,Bytes.toBytes(index),this);
+    }
+    public boolean isMaster(){
+      return master.get();
+    }
+    public int getIndex(){
+      return index;
+    }
+    public ZKWatcher getWatcher(){
+      return watcher;
+    }
+    @Override public void run(){
+      while (!stopped) {
+        zkLeader.start();
+        zkLeader.waitToBecomeLeader();
+        master.set(true);
+        while (master.get() && !stopped) {
+          try {
+            Thread.sleep(10);
+          }
+ catch (          InterruptedException ignored) {
+          }
+        }
+      }
+    }
+    public void abdicate(){
+      zkLeader.stepDownAsLeader();
+      master.set(false);
+    }
+    @Override public void stop(    String why){
+      stopped=true;
+      abdicate();
+      Threads.sleep(100);
+      watcher.close();
+    }
+    @Override public boolean isStopped(){
+      return stopped;
+    }
+  }
+  private static HBaseZKTestingUtility TEST_UTIL;
+  private static MockLeader[] CANDIDATES;
+  @BeforeClass public static void setupBeforeClass() throws Exception {
+    TEST_UTIL=new HBaseZKTestingUtility();
+    TEST_UTIL.startMiniZKCluster();
+    Configuration conf=TEST_UTIL.getConfiguration();
+    MockAbortable abortable=new MockAbortable();
+    int count=5;
+    CANDIDATES=new MockLeader[count];
+    for (int i=0; i < count; i++) {
+      ZKWatcher watcher=newZK(conf,"server" + i,abortable);
+      CANDIDATES[i]=new MockLeader(watcher,i);
+      CANDIDATES[i].start();
+    }
+  }
+  @AfterClass public static void tearDownAfterClass() throws Exception {
+    TEST_UTIL.shutdownMiniZKCluster();
+  }
+  @Test public void testLeaderSelection() throws Exception {
+    MockLeader currentLeader=getCurrentLeader();
+    assertNotNull("Leader should exist",currentLeader);
+    LOG.debug("Current leader index is " + currentLeader.getIndex());
+    byte[] znodeData=ZKUtil.getData(currentLeader.getWatcher(),LEADER_ZNODE);
+    assertNotNull("Leader znode should contain leader index",znodeData);
+    assertTrue("Leader znode should not be empty",znodeData.length > 0);
+    int storedIndex=Bytes.toInt(znodeData);
+    LOG.debug("Stored leader index in ZK is " + storedIndex);
+    assertEquals("Leader znode should match leader index",currentLeader.getIndex(),storedIndex);
+    currentLeader.abdicate();
+    currentLeader=getCurrentLeader();
+    assertNotNull("New leader should exist after abdication",currentLeader);
+    LOG.debug("New leader index is " + currentLeader.getIndex());
+    znodeData=ZKUtil.getData(currentLeader.getWatcher(),LEADER_ZNODE);
+    assertNotNull("Leader znode should contain leader index",znodeData);
+    assertTrue("Leader znode should not be empty",znodeData.length > 0);
+    storedIndex=Bytes.toInt(znodeData);
+    LOG.debug("Stored leader index in ZK is " + storedIndex);
+    assertEquals("Leader znode should match leader index",currentLeader.getIndex(),storedIndex);
+    currentLeader.stop("Stopping for test");
+    currentLeader=getCurrentLeader();
+    assertNotNull("New leader should exist after stop",currentLeader);
+    LOG.debug("New leader index is " + currentLeader.getIndex());
+    znodeData=ZKUtil.getData(currentLeader.getWatcher(),LEADER_ZNODE);
+    assertNotNull("Leader znode should contain leader index",znodeData);
+    assertTrue("Leader znode should not be empty",znodeData.length > 0);
+    storedIndex=Bytes.toInt(znodeData);
+    LOG.debug("Stored leader index in ZK is " + storedIndex);
+    assertEquals("Leader znode should match leader index",currentLeader.getIndex(),storedIndex);
+    currentLeader.stop("Stopping for test");
+    currentLeader=getCurrentLeader();
+    assertNotNull("New leader should exist",currentLeader);
+  }
+  private MockLeader getCurrentLeader() throws Exception {
+    MockLeader currentLeader=null;
+    outer:     for (int i=0; i < 1000; i++) {
+      for (int j=0; j < CANDIDATES.length; j++) {
+        if (CANDIDATES[j].isMaster()) {
+          if (currentLeader != null) {
+            fail("Both candidate " + currentLeader.getIndex() + " and "+ j+ " claim to be leader!");
+          }
+          currentLeader=CANDIDATES[j];
+        }
+      }
+      if (currentLeader != null) {
+        break outer;
+      }
+      Threads.sleep(100);
+    }
+    return currentLeader;
+  }
+  private static ZKWatcher newZK(  Configuration conf,  String name,  Abortable abort) throws Exception {
+    Configuration copy=HBaseConfiguration.create(conf);
+    ZKWatcher zk=new ZKWatcher(copy,name,abort);
+    return zk;
+  }
+}

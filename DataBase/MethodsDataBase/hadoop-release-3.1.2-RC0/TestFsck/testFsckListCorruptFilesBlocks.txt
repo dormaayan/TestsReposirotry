@@ -1,0 +1,51 @@
+/** 
+ * check if option -list-corruptfiles of fsck command works properly. 
+ */
+@Test public void testFsckListCorruptFilesBlocks() throws Exception {
+  conf.setLong(DFSConfigKeys.DFS_BLOCKREPORT_INTERVAL_MSEC_KEY,1000);
+  conf.setInt(DFSConfigKeys.DFS_DATANODE_DIRECTORYSCAN_INTERVAL_KEY,1);
+  FileSystem fs=null;
+  File builderBaseDir=new File(GenericTestUtils.getRandomizedTempPath());
+  cluster=new MiniDFSCluster.Builder(conf,builderBaseDir).build();
+  cluster.waitActive();
+  fs=cluster.getFileSystem();
+  DFSTestUtil util=new DFSTestUtil.Builder().setName("testGetCorruptFiles").setNumFiles(3).setMaxLevels(1).setMaxSize(1024).build();
+  util.createFiles(fs,"/corruptData",(short)1);
+  util.waitReplication(fs,"/corruptData",(short)1);
+  String outStr=runFsck(conf,0,false,"/corruptData","-list-corruptfileblocks");
+  System.out.println("1. good fsck out: " + outStr);
+  assertTrue(outStr.contains("has 0 CORRUPT files"));
+  final String bpid=cluster.getNamesystem().getBlockPoolId();
+  for (int i=0; i < 4; i++) {
+    for (int j=0; j <= 1; j++) {
+      File storageDir=cluster.getInstanceStorageDir(i,j);
+      File dataDir=MiniDFSCluster.getFinalizedDir(storageDir,bpid);
+      List<File> metadataFiles=MiniDFSCluster.getAllBlockMetadataFiles(dataDir);
+      if (metadataFiles == null) {
+        continue;
+      }
+      for (      File metadataFile : metadataFiles) {
+        File blockFile=Block.metaToBlockFile(metadataFile);
+        assertTrue("Cannot remove file.",blockFile.delete());
+        assertTrue("Cannot remove file.",metadataFile.delete());
+      }
+    }
+  }
+  final NamenodeProtocols namenode=cluster.getNameNodeRpc();
+  CorruptFileBlocks corruptFileBlocks=namenode.listCorruptFileBlocks("/corruptData",null);
+  int numCorrupt=corruptFileBlocks.getFiles().length;
+  while (numCorrupt == 0) {
+    Thread.sleep(1000);
+    corruptFileBlocks=namenode.listCorruptFileBlocks("/corruptData",null);
+    numCorrupt=corruptFileBlocks.getFiles().length;
+  }
+  outStr=runFsck(conf,-1,true,"/corruptData","-list-corruptfileblocks");
+  System.out.println("2. bad fsck out: " + outStr);
+  assertTrue(outStr.contains("has 3 CORRUPT files"));
+  util.createFiles(fs,"/goodData");
+  outStr=runFsck(conf,0,true,"/goodData","-list-corruptfileblocks");
+  System.out.println("3. good fsck out: " + outStr);
+  assertTrue(outStr.contains("has 0 CORRUPT files"));
+  util.cleanup(fs,"/corruptData");
+  util.cleanup(fs,"/goodData");
+}

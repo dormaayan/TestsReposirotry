@@ -1,0 +1,144 @@
+/** 
+ * Tests for the hdfs fix from HBASE-6435. Please don't add new subtest which involves starting / stopping MiniDFSCluster in this class. When stopping MiniDFSCluster, shutdown hooks would be cleared in hadoop's ShutdownHookManager in hadoop 3. This leads to 'Failed suppression of fs shutdown hook' error in region server.
+ */
+@Category({MiscTests.class,LargeTests.class}) public class TestBlockReorderMultiBlocks {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestBlockReorderMultiBlocks.class);
+  private static final Logger LOG=LoggerFactory.getLogger(TestBlockReorderMultiBlocks.class);
+  private Configuration conf;
+  private MiniDFSCluster cluster;
+  private HBaseTestingUtility htu;
+  private DistributedFileSystem dfs;
+  private static final String host1="host1";
+  private static final String host2="host2";
+  private static final String host3="host3";
+  @Rule public TestName name=new TestName();
+  @Before public void setUp() throws Exception {
+    htu=new HBaseTestingUtility();
+    htu.getConfiguration().setInt("dfs.blocksize",1024);
+    htu.getConfiguration().setInt("dfs.replication",3);
+    htu.startMiniDFSCluster(3,new String[]{"/r1","/r2","/r3"},new String[]{host1,host2,host3});
+    conf=htu.getConfiguration();
+    cluster=htu.getDFSCluster();
+    dfs=(DistributedFileSystem)FileSystem.get(conf);
+  }
+  @After public void tearDownAfterClass() throws Exception {
+    htu.shutdownMiniCluster();
+  }
+  /** 
+ * Test that the hook works within HBase, including when there are multiple blocks.
+ */
+  @Test() public void testHBaseCluster() throws Exception {
+    byte[] sb=Bytes.toBytes("sb");
+    htu.startMiniZKCluster();
+    MiniHBaseCluster hbm=htu.startMiniHBaseCluster(1,1);
+    hbm.waitForActiveAndReadyMaster();
+    HRegionServer targetRs=LoadBalancer.isTablesOnMaster(hbm.getConf()) ? hbm.getMaster() : hbm.getRegionServer(0);
+    String host4=targetRs.getServerName().getHostname();
+    LOG.info("Starting a new datanode with the name=" + host4);
+    cluster.startDataNodes(conf,1,true,null,new String[]{"/r4"},new String[]{host4},null);
+    cluster.waitClusterUp();
+    final int repCount=3;
+    conf=targetRs.getConfiguration();
+    HFileSystem rfs=(HFileSystem)targetRs.getFileSystem();
+    Table h=htu.createTable(TableName.valueOf(name.getMethodName()),sb);
+    String rootDir=new Path(FSUtils.getRootDir(conf) + "/" + HConstants.HREGION_LOGDIR_NAME+ "/"+ targetRs.getServerName().toString()).toUri().getPath();
+    DistributedFileSystem mdfs=(DistributedFileSystem)hbm.getMaster().getMasterFileSystem().getFileSystem();
+    int nbTest=0;
+    while (nbTest < 10) {
+      final List<HRegion> regions=targetRs.getRegions(h.getName());
+      final CountDownLatch latch=new CountDownLatch(regions.size());
+      final WALActionsListener listener=new WALActionsListener(){
+        @Override public void postLogRoll(        final Path oldPath,        final Path newPath) throws IOException {
+          latch.countDown();
+        }
+      }
+;
+      for (      HRegion region : regions) {
+        region.getWAL().registerWALActionsListener(listener);
+      }
+      htu.getAdmin().rollWALWriter(targetRs.getServerName());
+      try {
+        latch.await();
+      }
+ catch (      InterruptedException exception) {
+        LOG.warn("Interrupted while waiting for the wal of '" + targetRs + "' to roll. If later "+ "tests fail, it's probably because we should still be waiting.");
+        Thread.currentThread().interrupt();
+      }
+      for (      Region region : regions) {
+        ((HRegion)region).getWAL().unregisterWALActionsListener(listener);
+      }
+      Thread.sleep(100);
+      Put p=new Put(sb);
+      p.addColumn(sb,sb,sb);
+      h.put(p);
+      DirectoryListing dl=dfs.getClient().listPaths(rootDir,HdfsFileStatus.EMPTY_NAME);
+      HdfsFileStatus[] hfs=dl.getPartialListing();
+      Assert.assertTrue(hfs.length >= 1);
+      for (      HdfsFileStatus hf : hfs) {
+        try {
+          LOG.info("Log file found: " + hf.getLocalName() + " in "+ rootDir);
+          String logFile=rootDir + "/" + hf.getLocalName();
+          FileStatus fsLog=rfs.getFileStatus(new Path(logFile));
+          LOG.info("Checking log file: " + logFile);
+          BlockLocation[] bls=rfs.getFileBlockLocations(fsLog,0,1);
+          if (bls.length > 0) {
+            BlockLocation bl=bls[0];
+            LOG.info(bl.getHosts().length + " replicas for block 0 in " + logFile+ " ");
+            for (int i=0; i < bl.getHosts().length - 1; i++) {
+              LOG.info(bl.getHosts()[i] + "    " + logFile);
+              Assert.assertNotSame(bl.getHosts()[i],host4);
+            }
+            String last=bl.getHosts()[bl.getHosts().length - 1];
+            LOG.info(last + "    " + logFile);
+            if (host4.equals(last)) {
+              nbTest++;
+              LOG.info(logFile + " is on the new datanode and is ok");
+              if (bl.getHosts().length == 3) {
+                testFromDFS(dfs,logFile,repCount,host4);
+                testFromDFS(mdfs,logFile,repCount,host4);
+              }
+            }
+          }
+        }
+ catch (        FileNotFoundException exception) {
+          LOG.debug("Failed to find log file '" + hf.getLocalName() + "'; it probably was "+ "archived out from under us so we'll ignore and retry. If this test hangs "+ "indefinitely you should treat this failure as a symptom.",exception);
+        }
+catch (        RemoteException exception) {
+          if (exception.unwrapRemoteException() instanceof FileNotFoundException) {
+            LOG.debug("Failed to find log file '" + hf.getLocalName() + "'; it probably was "+ "archived out from under us so we'll ignore and retry. If this test hangs "+ "indefinitely you should treat this failure as a symptom.",exception);
+          }
+ else {
+            throw exception;
+          }
+        }
+      }
+    }
+  }
+  private void testFromDFS(  DistributedFileSystem dfs,  String src,  int repCount,  String localhost) throws Exception {
+    for (int i=0; i < 10; i++) {
+      LocatedBlocks l;
+      final long max=System.currentTimeMillis() + 10000;
+      boolean done;
+      do {
+        Assert.assertTrue("Can't get enouth replica.",System.currentTimeMillis() < max);
+        l=getNamenode(dfs.getClient()).getBlockLocations(src,0,1);
+        Assert.assertNotNull("Can't get block locations for " + src,l);
+        Assert.assertNotNull(l.getLocatedBlocks());
+        Assert.assertTrue(l.getLocatedBlocks().size() > 0);
+        done=true;
+        for (int y=0; y < l.getLocatedBlocks().size() && done; y++) {
+          done=(l.get(y).getLocations().length == repCount);
+        }
+      }
+ while (!done);
+      for (int y=0; y < l.getLocatedBlocks().size() && done; y++) {
+        Assert.assertEquals(localhost,l.get(y).getLocations()[repCount - 1].getHostName());
+      }
+    }
+  }
+  private static ClientProtocol getNamenode(  DFSClient dfsc) throws Exception {
+    Field nf=DFSClient.class.getDeclaredField("namenode");
+    nf.setAccessible(true);
+    return (ClientProtocol)nf.get(dfsc);
+  }
+}

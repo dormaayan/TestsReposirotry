@@ -1,0 +1,105 @@
+@RunWith(Parameterized.class) public class BatchInsertIndexTest {
+  private final GraphDatabaseSettings.SchemaIndex schemaIndex;
+  private DefaultFileSystemRule fileSystemRule=new DefaultFileSystemRule();
+  private TestDirectory storeDir=TestDirectory.testDirectory();
+  private PageCacheRule pageCacheRule=new PageCacheRule();
+  @Rule public RuleChain ruleChain=RuleChain.outerRule(storeDir).around(fileSystemRule).around(pageCacheRule);
+  @Parameterized.Parameters(name="{0}") public static GraphDatabaseSettings.SchemaIndex[] data(){
+    return GraphDatabaseSettings.SchemaIndex.values();
+  }
+  public BatchInsertIndexTest(  GraphDatabaseSettings.SchemaIndex schemaIndex){
+    this.schemaIndex=schemaIndex;
+  }
+  @Test public void batchInserterShouldUseConfiguredIndexProvider() throws Exception {
+    Config config=Config.defaults(stringMap(default_schema_provider.name(),schemaIndex.providerName()));
+    BatchInserter inserter=newBatchInserter(config);
+    inserter.createDeferredSchemaIndex(TestLabels.LABEL_ONE).on("key").create();
+    inserter.shutdown();
+    GraphDatabaseService db=graphDatabaseService(config);
+    awaitIndexesOnline(db);
+    try (Transaction tx=db.beginTx()){
+      DependencyResolver dependencyResolver=((GraphDatabaseAPI)db).getDependencyResolver();
+      ThreadToStatementContextBridge threadToStatementContextBridge=dependencyResolver.resolveDependency(ThreadToStatementContextBridge.class);
+      KernelTransaction kernelTransaction=threadToStatementContextBridge.getKernelTransactionBoundToThisThread(true);
+      TokenRead tokenRead=kernelTransaction.tokenRead();
+      SchemaRead schemaRead=kernelTransaction.schemaRead();
+      int labelId=tokenRead.nodeLabel(TestLabels.LABEL_ONE.name());
+      int propertyId=tokenRead.propertyKey("key");
+      IndexReference index=schemaRead.index(labelId,propertyId);
+      assertTrue(unexpectedIndexProviderMessage(index),schemaIndex.providerName().contains(index.providerKey()));
+      assertTrue(unexpectedIndexProviderMessage(index),schemaIndex.providerName().contains(index.providerVersion()));
+      tx.success();
+    }
+  finally {
+      db.shutdown();
+    }
+  }
+  @Test public void shouldPopulateIndexWithUniquePointsThatCollideOnSpaceFillingCurve() throws Exception {
+    Config config=Config.defaults(stringMap(default_schema_provider.name(),schemaIndex.providerName()));
+    BatchInserter inserter=newBatchInserter(config);
+    Pair<PointValue,PointValue> collidingPoints=SpatialIndexValueTestUtil.pointsWithSameValueOnSpaceFillingCurve(config);
+    inserter.createNode(MapUtil.map("prop",collidingPoints.first()),TestLabels.LABEL_ONE);
+    inserter.createNode(MapUtil.map("prop",collidingPoints.other()),TestLabels.LABEL_ONE);
+    inserter.createDeferredConstraint(TestLabels.LABEL_ONE).assertPropertyIsUnique("prop").create();
+    inserter.shutdown();
+    GraphDatabaseService db=graphDatabaseService(config);
+    try {
+      awaitIndexesOnline(db);
+      try (Transaction tx=db.beginTx()){
+        assertSingleCorrectHit(db,collidingPoints.first());
+        assertSingleCorrectHit(db,collidingPoints.other());
+        tx.success();
+      }
+     }
+  finally {
+      db.shutdown();
+    }
+  }
+  @Test public void shouldThrowWhenPopulatingWithNonUniquePoints() throws Exception {
+    Config config=Config.defaults(stringMap(default_schema_provider.name(),schemaIndex.providerName()));
+    BatchInserter inserter=newBatchInserter(config);
+    PointValue point=Values.pointValue(CoordinateReferenceSystem.WGS84,0.0,0.0);
+    inserter.createNode(MapUtil.map("prop",point),TestLabels.LABEL_ONE);
+    inserter.createNode(MapUtil.map("prop",point),TestLabels.LABEL_ONE);
+    inserter.createDeferredConstraint(TestLabels.LABEL_ONE).assertPropertyIsUnique("prop").create();
+    inserter.shutdown();
+    GraphDatabaseService db=graphDatabaseService(config);
+    try (Transaction tx=db.beginTx()){
+      Iterator<IndexDefinition> indexes=db.schema().getIndexes().iterator();
+      assertTrue(indexes.hasNext());
+      IndexDefinition index=indexes.next();
+      Schema.IndexState indexState=db.schema().getIndexState(index);
+      assertEquals(Schema.IndexState.FAILED,indexState);
+      assertFalse(indexes.hasNext());
+      tx.success();
+    }
+  finally {
+      db.shutdown();
+    }
+  }
+  private void assertSingleCorrectHit(  GraphDatabaseService db,  PointValue point){
+    ResourceIterator<Node> nodes=db.findNodes(TestLabels.LABEL_ONE,"prop",point);
+    assertTrue(nodes.hasNext());
+    Node node=nodes.next();
+    Object prop=node.getProperty("prop");
+    assertEquals(point,prop);
+    assertFalse(nodes.hasNext());
+  }
+  private BatchInserter newBatchInserter(  Config config) throws Exception {
+    return BatchInserters.inserter(storeDir.databaseDir(),fileSystemRule.get(),config.getRaw());
+  }
+  private GraphDatabaseService graphDatabaseService(  Config config){
+    TestGraphDatabaseFactory factory=new TestGraphDatabaseFactory();
+    factory.setFileSystem(fileSystemRule.get());
+    return factory.newImpermanentDatabaseBuilder(storeDir.databaseDir()).setConfig(config.getRaw()).newGraphDatabase();
+  }
+  private void awaitIndexesOnline(  GraphDatabaseService db){
+    try (Transaction tx=db.beginTx()){
+      db.schema().awaitIndexesOnline(10,TimeUnit.SECONDS);
+      tx.success();
+    }
+   }
+  private static String unexpectedIndexProviderMessage(  IndexReference index){
+    return "Unexpected provider: key=" + index.providerKey() + ", version="+ index.providerVersion();
+  }
+}

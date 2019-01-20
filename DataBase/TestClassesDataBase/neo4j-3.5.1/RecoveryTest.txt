@@ -1,0 +1,253 @@
+public class RecoveryTest {
+  @Rule public final DefaultFileSystemRule fileSystemRule=new DefaultFileSystemRule();
+  @Rule public final TestDirectory directory=TestDirectory.testDirectory();
+  private final LogVersionRepository logVersionRepository=new SimpleLogVersionRepository();
+  private final TransactionIdStore transactionIdStore=new SimpleTransactionIdStore(5L,0,BASE_TX_COMMIT_TIMESTAMP,0,0);
+  private final int logVersion=0;
+  private LogEntry lastCommittedTxStartEntry;
+  private LogEntry lastCommittedTxCommitEntry;
+  private LogEntry expectedStartEntry;
+  private LogEntry expectedCommitEntry;
+  private LogEntry expectedCheckPointEntry;
+  private Monitors monitors=new Monitors();
+  private final SimpleLogVersionRepository versionRepository=new SimpleLogVersionRepository();
+  private LogFiles logFiles;
+  private File storeDir;
+  @Before public void setUp() throws Exception {
+    storeDir=directory.storeDir();
+    logFiles=LogFilesBuilder.builder(directory.databaseLayout(),fileSystemRule.get()).withLogVersionRepository(logVersionRepository).withTransactionIdStore(transactionIdStore).build();
+  }
+  @Test public void shouldRecoverExistingData() throws Exception {
+    File file=logFiles.getLogFileForVersion(logVersion);
+    writeSomeData(file,pair -> {
+      LogEntryWriter writer=pair.first();
+      Consumer<LogPositionMarker> consumer=pair.other();
+      LogPositionMarker marker=new LogPositionMarker();
+      consumer.accept(marker);
+      LogPosition lastCommittedTxPosition=marker.newPosition();
+      writer.writeStartEntry(0,1,2L,3L,new byte[0]);
+      lastCommittedTxStartEntry=new LogEntryStart(0,1,2L,3L,new byte[0],lastCommittedTxPosition);
+      writer.writeCommitEntry(4L,5L);
+      lastCommittedTxCommitEntry=new LogEntryCommit(4L,5L);
+      writer.writeCheckPointEntry(lastCommittedTxPosition);
+      expectedCheckPointEntry=new CheckPoint(lastCommittedTxPosition);
+      consumer.accept(marker);
+      writer.writeStartEntry(0,1,6L,4L,new byte[0]);
+      expectedStartEntry=new LogEntryStart(0,1,6L,4L,new byte[0],marker.newPosition());
+      writer.writeCommitEntry(5L,7L);
+      expectedCommitEntry=new LogEntryCommit(5L,7L);
+      return true;
+    }
+);
+    LifeSupport life=new LifeSupport();
+    RecoveryMonitor monitor=mock(RecoveryMonitor.class);
+    final AtomicBoolean recoveryRequired=new AtomicBoolean();
+    try {
+      StorageEngine storageEngine=mock(StorageEngine.class);
+      final LogEntryReader<ReadableClosablePositionAwareChannel> reader=new VersionAwareLogEntryReader<>();
+      LogTailScanner tailScanner=getTailScanner(logFiles,reader);
+      TransactionMetadataCache metadataCache=new TransactionMetadataCache();
+      LogicalTransactionStore txStore=new PhysicalLogicalTransactionStore(logFiles,metadataCache,reader,monitors,false);
+      CorruptedLogsTruncator logPruner=new CorruptedLogsTruncator(storeDir,logFiles,fileSystemRule.get());
+      life.add(new Recovery(new DefaultRecoveryService(storageEngine,tailScanner,transactionIdStore,txStore,versionRepository,NO_MONITOR){
+        private int nr;
+        @Override public void startRecovery(){
+          recoveryRequired.set(true);
+        }
+        @Override public RecoveryApplier getRecoveryApplier(        TransactionApplicationMode mode) throws Exception {
+          RecoveryApplier actual=super.getRecoveryApplier(mode);
+          if (mode == TransactionApplicationMode.REVERSE_RECOVERY) {
+            return actual;
+          }
+          return new RecoveryApplier(){
+            @Override public void close() throws Exception {
+              actual.close();
+            }
+            @Override public boolean visit(            CommittedTransactionRepresentation tx) throws Exception {
+              actual.visit(tx);
+switch (nr++) {
+case 0:
+                assertEquals(lastCommittedTxStartEntry,tx.getStartEntry());
+              assertEquals(lastCommittedTxCommitEntry,tx.getCommitEntry());
+            break;
+case 1:
+          assertEquals(expectedStartEntry,tx.getStartEntry());
+        assertEquals(expectedCommitEntry,tx.getCommitEntry());
+      break;
+default :
+    fail("Too many recovered transactions");
+}
+return false;
+}
+}
+;
+}
+}
+,logPruner,monitor,SilentProgressReporter.INSTANCE,false));
+life.start();
+InOrder order=inOrder(monitor);
+order.verify(monitor,times(1)).recoveryRequired(any(LogPosition.class));
+order.verify(monitor,times(1)).recoveryCompleted(2);
+assertTrue(recoveryRequired.get());
+}
+  finally {
+life.shutdown();
+}
+}
+@Test public void shouldSeeThatACleanDatabaseShouldNotRequireRecovery() throws Exception {
+File file=logFiles.getLogFileForVersion(logVersion);
+writeSomeData(file,pair -> {
+LogEntryWriter writer=pair.first();
+Consumer<LogPositionMarker> consumer=pair.other();
+LogPositionMarker marker=new LogPositionMarker();
+consumer.accept(marker);
+writer.writeStartEntry(0,1,2L,3L,new byte[0]);
+writer.writeCommitEntry(4L,5L);
+consumer.accept(marker);
+writer.writeCheckPointEntry(marker.newPosition());
+return true;
+}
+);
+LifeSupport life=new LifeSupport();
+RecoveryMonitor monitor=mock(RecoveryMonitor.class);
+try {
+StorageEngine storageEngine=mock(StorageEngine.class);
+final LogEntryReader<ReadableClosablePositionAwareChannel> reader=new VersionAwareLogEntryReader<>();
+LogTailScanner tailScanner=getTailScanner(logFiles,reader);
+TransactionMetadataCache metadataCache=new TransactionMetadataCache();
+LogicalTransactionStore txStore=new PhysicalLogicalTransactionStore(logFiles,metadataCache,reader,monitors,false);
+CorruptedLogsTruncator logPruner=new CorruptedLogsTruncator(storeDir,logFiles,fileSystemRule.get());
+life.add(new Recovery(new DefaultRecoveryService(storageEngine,tailScanner,transactionIdStore,txStore,versionRepository,NO_MONITOR){
+@Override public void startRecovery(){
+fail("Recovery should not be required");
+}
+}
+,logPruner,monitor,SilentProgressReporter.INSTANCE,false));
+life.start();
+verifyZeroInteractions(monitor);
+}
+  finally {
+life.shutdown();
+}
+}
+@Test public void shouldTruncateLogAfterSinglePartialTransaction() throws Exception {
+File file=logFiles.getLogFileForVersion(logVersion);
+final LogPositionMarker marker=new LogPositionMarker();
+writeSomeData(file,pair -> {
+LogEntryWriter writer=pair.first();
+Consumer<LogPositionMarker> consumer=pair.other();
+consumer.accept(marker);
+writer.writeStartEntry(0,1,5L,4L,new byte[0]);
+return true;
+}
+);
+boolean recoveryRequired=recover(storeDir,logFiles);
+assertTrue(recoveryRequired);
+assertEquals(marker.getByteOffset(),file.length());
+}
+@Test public void doNotTruncateCheckpointsAfterLastTransaction() throws IOException {
+File file=logFiles.getLogFileForVersion(logVersion);
+LogPositionMarker marker=new LogPositionMarker();
+writeSomeData(file,pair -> {
+LogEntryWriter writer=pair.first();
+writer.writeStartEntry(1,1,1L,1L,ArrayUtils.EMPTY_BYTE_ARRAY);
+writer.writeCommitEntry(1L,2L);
+writer.writeCheckPointEntry(new LogPosition(logVersion,LogHeader.LOG_HEADER_SIZE));
+writer.writeCheckPointEntry(new LogPosition(logVersion,LogHeader.LOG_HEADER_SIZE));
+writer.writeCheckPointEntry(new LogPosition(logVersion,LogHeader.LOG_HEADER_SIZE));
+writer.writeCheckPointEntry(new LogPosition(logVersion,LogHeader.LOG_HEADER_SIZE));
+Consumer<LogPositionMarker> other=pair.other();
+other.accept(marker);
+return true;
+}
+);
+assertTrue(recover(storeDir,logFiles));
+assertEquals(marker.getByteOffset(),file.length());
+}
+@Test public void shouldTruncateLogAfterLastCompleteTransactionAfterSuccessfulRecovery() throws Exception {
+File file=logFiles.getLogFileForVersion(logVersion);
+final LogPositionMarker marker=new LogPositionMarker();
+writeSomeData(file,pair -> {
+LogEntryWriter writer=pair.first();
+Consumer<LogPositionMarker> consumer=pair.other();
+writer.writeStartEntry(0,1,2L,3L,new byte[0]);
+writer.writeCommitEntry(4L,5L);
+consumer.accept(marker);
+writer.writeStartEntry(0,1,5L,4L,new byte[0]);
+return true;
+}
+);
+boolean recoveryRequired=recover(storeDir,logFiles);
+assertTrue(recoveryRequired);
+assertEquals(marker.getByteOffset(),file.length());
+}
+@Test public void shouldTellTransactionIdStoreAfterSuccessfulRecovery() throws Exception {
+File file=logFiles.getLogFileForVersion(logVersion);
+final LogPositionMarker marker=new LogPositionMarker();
+final byte[] additionalHeaderData=new byte[0];
+final int masterId=0;
+final int authorId=1;
+final long transactionId=4;
+final long commitTimestamp=5;
+writeSomeData(file,pair -> {
+LogEntryWriter writer=pair.first();
+Consumer<LogPositionMarker> consumer=pair.other();
+writer.writeStartEntry(masterId,authorId,2L,3L,additionalHeaderData);
+writer.writeCommitEntry(transactionId,commitTimestamp);
+consumer.accept(marker);
+return true;
+}
+);
+boolean recoveryRequired=recover(storeDir,logFiles);
+assertTrue(recoveryRequired);
+long[] lastClosedTransaction=transactionIdStore.getLastClosedTransaction();
+assertEquals(transactionId,lastClosedTransaction[0]);
+assertEquals(LogEntryStart.checksum(additionalHeaderData,masterId,authorId),transactionIdStore.getLastCommittedTransaction().checksum());
+assertEquals(commitTimestamp,transactionIdStore.getLastCommittedTransaction().commitTimestamp());
+assertEquals(logVersion,lastClosedTransaction[1]);
+assertEquals(marker.getByteOffset(),lastClosedTransaction[2]);
+}
+private boolean recover(File storeDir,LogFiles logFiles){
+LifeSupport life=new LifeSupport();
+RecoveryMonitor monitor=mock(RecoveryMonitor.class);
+final AtomicBoolean recoveryRequired=new AtomicBoolean();
+try {
+StorageEngine storageEngine=mock(StorageEngine.class);
+final LogEntryReader<ReadableClosablePositionAwareChannel> reader=new VersionAwareLogEntryReader<>();
+LogTailScanner tailScanner=getTailScanner(logFiles,reader);
+TransactionMetadataCache metadataCache=new TransactionMetadataCache();
+LogicalTransactionStore txStore=new PhysicalLogicalTransactionStore(logFiles,metadataCache,reader,monitors,false);
+CorruptedLogsTruncator logPruner=new CorruptedLogsTruncator(storeDir,logFiles,fileSystemRule.get());
+life.add(new Recovery(new DefaultRecoveryService(storageEngine,tailScanner,transactionIdStore,txStore,versionRepository,NO_MONITOR){
+@Override public void startRecovery(){
+recoveryRequired.set(true);
+}
+}
+,logPruner,monitor,SilentProgressReporter.INSTANCE,false));
+life.start();
+}
+  finally {
+life.shutdown();
+}
+return recoveryRequired.get();
+}
+private LogTailScanner getTailScanner(LogFiles logFiles,LogEntryReader<ReadableClosablePositionAwareChannel> reader){
+return new LogTailScanner(logFiles,reader,monitors,false);
+}
+private void writeSomeData(File file,Visitor<Pair<LogEntryWriter,Consumer<LogPositionMarker>>,IOException> visitor) throws IOException {
+try (LogVersionedStoreChannel versionedStoreChannel=new PhysicalLogVersionedStoreChannel(fileSystemRule.get().open(file,OpenMode.READ_WRITE),logVersion,CURRENT_LOG_VERSION);PositionAwarePhysicalFlushableChannel writableLogChannel=new PositionAwarePhysicalFlushableChannel(versionedStoreChannel)){
+writeLogHeader(writableLogChannel,logVersion,2L);
+Consumer<LogPositionMarker> consumer=marker -> {
+try {
+writableLogChannel.getCurrentPosition(marker);
+}
+ catch (IOException e) {
+throw new RuntimeException(e);
+}
+}
+;
+LogEntryWriter first=new LogEntryWriter(writableLogChannel);
+visitor.visit(Pair.of(first,consumer));
+}
+ }
+}

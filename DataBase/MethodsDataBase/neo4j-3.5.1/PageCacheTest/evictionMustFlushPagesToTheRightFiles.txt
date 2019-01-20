@@ -1,0 +1,64 @@
+@Test void evictionMustFlushPagesToTheRightFiles(){
+  assertTimeout(ofMillis(SEMI_LONG_TIMEOUT_MILLIS),() -> {
+    configureStandardPageCache();
+    generateFileWithRecords(file("a"),recordCount,recordSize);
+    int filePageSize2=filePageSize - 3;
+    long maxPageIdCursor1=recordCount / recordsPerFilePage;
+    File file2=file("b");
+    long file2sizeBytes=(maxPageIdCursor1 + 17) * filePageSize2;
+    try (OutputStream outputStream=fs.openAsOutputStream(file2,false)){
+      for (int i=0; i < file2sizeBytes; i++) {
+        outputStream.write('a');
+      }
+      outputStream.flush();
+    }
+     try (PagedFile pagedFile1=map(file("a"),filePageSize);PagedFile pagedFile2=map(file2,filePageSize2)){
+      long pageId1=0;
+      long pageId2=0;
+      boolean moreWorkToDo;
+      do {
+        boolean cursorReady1;
+        boolean cursorReady2;
+        try (PageCursor cursor=pagedFile1.io(pageId1,PF_SHARED_WRITE_LOCK)){
+          cursorReady1=cursor.next() && cursor.getCurrentPageId() < maxPageIdCursor1;
+          if (cursorReady1) {
+            writeRecords(cursor);
+            pageId1++;
+          }
+        }
+         try (PageCursor cursor=pagedFile2.io(pageId2,PF_SHARED_WRITE_LOCK | PF_NO_GROW)){
+          cursorReady2=cursor.next();
+          if (cursorReady2) {
+            for (int i=0; i < filePageSize2; i++) {
+              cursor.putByte((byte)'b');
+            }
+            assertFalse(cursor.shouldRetry());
+          }
+          pageId2++;
+        }
+         moreWorkToDo=cursorReady1 || cursorReady2;
+      }
+ while (moreWorkToDo);
+    }
+     assertThat(fs.getFileSize(file2),is(file2sizeBytes));
+    try (InputStream inputStream=fs.openAsInputStream(file2)){
+      for (int i=0; i < file2sizeBytes; i++) {
+        int b=inputStream.read();
+        assertThat(b,is((int)'b'));
+      }
+      assertThat(inputStream.read(),is(-1));
+    }
+     try (StoreChannel channel=fs.open(file("a"),OpenMode.READ)){
+      ByteBuffer bufB=ByteBuffer.allocate(recordSize);
+      for (int i=0; i < recordCount; i++) {
+        bufA.clear();
+        channel.readAll(bufA);
+        bufA.flip();
+        bufB.clear();
+        generateRecordForId(i,bufB);
+        assertThat(bufB.array(),byteArray(bufA.array()));
+      }
+    }
+   }
+);
+}

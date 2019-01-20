@@ -1,0 +1,208 @@
+/** 
+ * Tests the availability of accumulator results during runtime. The test case tests a user-defined accumulator and Flink's internal accumulators for two consecutive tasks. <p>CHAINED[Source -> Map] -> Sink <p>Checks are performed as the elements arrive at the operators. Checks consist of a message sent by the task to the task manager which notifies the job manager and sends the current accumulators. The task blocks until the test has been notified about the current accumulator values. <p>A barrier between the operators ensures that that pipelining is disabled for the streaming test. The batch job reads the records one at a time. The streaming code buffers the records beforehand; that's why exact guarantees about the number of records read are very hard to make. Thus, why we check for an upper bound of the elements read.
+ */
+public class LegacyAccumulatorLiveITCase extends TestLogger {
+  private static final Logger LOG=LoggerFactory.getLogger(LegacyAccumulatorLiveITCase.class);
+  private static ActorSystem system;
+  private static ActorGateway jobManagerGateway;
+  private static ActorRef taskManager;
+  private static JobID jobID;
+  private static JobGraph jobGraph;
+  private static final String ACCUMULATOR_NAME="test";
+  private static final int NUM_ITERATIONS=5;
+  private static List<String> inputData=new ArrayList<>(NUM_ITERATIONS);
+  private static final FiniteDuration TIMEOUT=new FiniteDuration(10,TimeUnit.SECONDS);
+  @Before public void before() throws Exception {
+    system=AkkaUtils.createLocalActorSystem(new Configuration());
+    Configuration config=new Configuration();
+    config.setInteger(ConfigConstants.TASK_MANAGER_NUM_TASK_SLOTS,1);
+    config.setInteger(ConfigConstants.LOCAL_NUMBER_TASK_MANAGER,1);
+    config.setString(AkkaOptions.ASK_TIMEOUT,TestingUtils.DEFAULT_AKKA_ASK_TIMEOUT());
+    TestingCluster testingCluster=new TestingCluster(config,false,true);
+    testingCluster.start();
+    jobManagerGateway=testingCluster.getLeaderGateway(TestingUtils.TESTING_DURATION());
+    taskManager=testingCluster.getTaskManagersAsJava().get(0);
+    for (int i=0; i < NUM_ITERATIONS; i++) {
+      inputData.add(i,String.valueOf(i + 1));
+    }
+    NotifyingMapper.finished=false;
+  }
+  @After public void after() throws Exception {
+    JavaTestKit.shutdownActorSystem(system);
+    inputData.clear();
+  }
+  @Test public void testBatch() throws Exception {
+    ExecutionEnvironment env=new BatchPlanExtractor();
+    env.setParallelism(1);
+    DataSet<String> input=env.fromCollection(inputData);
+    input.flatMap(new NotifyingMapper()).output(new NotifyingOutputFormat());
+    env.execute();
+    jobGraph=getOptimizedPlan(((BatchPlanExtractor)env).plan);
+    jobID=jobGraph.getJobID();
+    verifyResults();
+  }
+  @Test public void testStreaming() throws Exception {
+    StreamExecutionEnvironment env=new DummyStreamExecutionEnvironment();
+    env.setParallelism(1);
+    DataStream<String> input=env.fromCollection(inputData);
+    input.flatMap(new NotifyingMapper()).writeUsingOutputFormat(new NotifyingOutputFormat()).disableChaining();
+    jobGraph=env.getStreamGraph().getJobGraph();
+    jobID=jobGraph.getJobID();
+    verifyResults();
+  }
+  private static void verifyResults(){
+    new JavaTestKit(system){
+{
+        ActorGateway selfGateway=new AkkaActorGateway(getRef(),jobManagerGateway.leaderSessionID());
+        jobManagerGateway.tell(new TestingJobManagerMessages.NotifyWhenAccumulatorChange(jobID),selfGateway);
+        expectMsgEquals(TIMEOUT,true);
+        jobManagerGateway.tell(new JobManagerMessages.SubmitJob(jobGraph,ListeningBehaviour.EXECUTION_RESULT),selfGateway);
+        expectMsgClass(TIMEOUT,JobManagerMessages.JobSubmitSuccess.class);
+        TestingJobManagerMessages.UpdatedAccumulators msg=(TestingJobManagerMessages.UpdatedAccumulators)receiveOne(TIMEOUT);
+        Map<String,OptionalFailure<Accumulator<?,?>>> userAccumulators=msg.userAccumulators();
+        ExecutionAttemptID mapperTaskID=null;
+        ExecutionAttemptID sinkTaskID=null;
+        if (checkUserAccumulators(0,userAccumulators)) {
+          LOG.info("Passed initial check for map task.");
+        }
+ else {
+          fail("Wrong accumulator results when map task begins execution.");
+        }
+        int expectedAccVal=0;
+        for (int i=1; i <= NUM_ITERATIONS; i++) {
+          expectedAccVal+=i;
+          msg=(TestingJobManagerMessages.UpdatedAccumulators)receiveOne(TIMEOUT);
+          userAccumulators=msg.userAccumulators();
+          LOG.info("{}",userAccumulators);
+          if (checkUserAccumulators(expectedAccVal,userAccumulators)) {
+            LOG.info("Passed round #" + i);
+          }
+ else           if (checkUserAccumulators(expectedAccVal,userAccumulators)) {
+            ExecutionAttemptID temp=mapperTaskID;
+            mapperTaskID=sinkTaskID;
+            sinkTaskID=temp;
+            LOG.info("Passed round #" + i);
+          }
+ else {
+            fail("Failed in round #" + i);
+          }
+        }
+        msg=(TestingJobManagerMessages.UpdatedAccumulators)receiveOne(TIMEOUT);
+        userAccumulators=msg.userAccumulators();
+        if (checkUserAccumulators(expectedAccVal,userAccumulators)) {
+          LOG.info("Passed initial check for sink task.");
+        }
+ else {
+          fail("Wrong accumulator results when sink task begins execution.");
+        }
+        for (int i=1; i <= NUM_ITERATIONS; i++) {
+          msg=(TestingJobManagerMessages.UpdatedAccumulators)receiveOne(TIMEOUT);
+          userAccumulators=msg.userAccumulators();
+          LOG.info("{}",userAccumulators);
+          if (checkUserAccumulators(expectedAccVal,userAccumulators)) {
+            LOG.info("Passed round #" + i);
+          }
+ else {
+            fail("Failed in round #" + i);
+          }
+        }
+        expectMsgClass(TIMEOUT,JobManagerMessages.JobResultSuccess.class);
+      }
+    }
+;
+  }
+  private static boolean checkUserAccumulators(  int expected,  Map<String,OptionalFailure<Accumulator<?,?>>> accumulatorMap){
+    LOG.info("checking user accumulators");
+    return accumulatorMap.containsKey(ACCUMULATOR_NAME) && expected == ((IntCounter)accumulatorMap.get(ACCUMULATOR_NAME).getUnchecked()).getLocalValue();
+  }
+  /** 
+ * UDF that notifies when it changes the accumulator values.
+ */
+private static class NotifyingMapper extends RichFlatMapFunction<String,Integer> {
+    private static final long serialVersionUID=1L;
+    private IntCounter counter=new IntCounter();
+    private static boolean finished=false;
+    @Override public void open(    Configuration parameters) throws Exception {
+      getRuntimeContext().addAccumulator(ACCUMULATOR_NAME,counter);
+      notifyTaskManagerOfAccumulatorUpdate();
+    }
+    @Override public void flatMap(    String value,    Collector<Integer> out) throws Exception {
+      int val=Integer.valueOf(value);
+      counter.add(val);
+      out.collect(val);
+      LOG.debug("Emitting value {}.",value);
+      notifyTaskManagerOfAccumulatorUpdate();
+    }
+    @Override public void close() throws Exception {
+      finished=true;
+    }
+  }
+  /** 
+ * Outputs format which notifies of accumulator changes and waits for the previous mapper.
+ */
+private static class NotifyingOutputFormat implements OutputFormat<Integer> {
+    private static final long serialVersionUID=1L;
+    @Override public void configure(    Configuration parameters){
+    }
+    @Override public void open(    int taskNumber,    int numTasks) throws IOException {
+      while (!NotifyingMapper.finished) {
+        try {
+          Thread.sleep(1000);
+        }
+ catch (        InterruptedException e) {
+        }
+      }
+      notifyTaskManagerOfAccumulatorUpdate();
+    }
+    @Override public void writeRecord(    Integer record) throws IOException {
+      notifyTaskManagerOfAccumulatorUpdate();
+    }
+    @Override public void close() throws IOException {
+    }
+  }
+  /** 
+ * Notify task manager of accumulator update and wait until the Heartbeat containing the message has been reported.
+ */
+  public static void notifyTaskManagerOfAccumulatorUpdate(){
+    new JavaTestKit(system){
+{
+        Timeout timeout=new Timeout(TIMEOUT);
+        Future<Object> ask=Patterns.ask(taskManager,new TestingTaskManagerMessages.AccumulatorsChanged(jobID),timeout);
+        try {
+          Await.result(ask,timeout.duration());
+        }
+ catch (        Exception e) {
+          fail("Failed to notify task manager of accumulator update.");
+        }
+      }
+    }
+;
+  }
+  /** 
+ * Helpers to generate the JobGraph.
+ */
+  private static JobGraph getOptimizedPlan(  Plan plan){
+    Optimizer pc=new Optimizer(new DataStatistics(),new Configuration());
+    JobGraphGenerator jgg=new JobGraphGenerator();
+    OptimizedPlan op=pc.compile(plan);
+    return jgg.compileJobGraph(op);
+  }
+private static class BatchPlanExtractor extends LocalEnvironment {
+    private Plan plan=null;
+    @Override public JobExecutionResult execute(    String jobName) throws Exception {
+      plan=createProgramPlan();
+      return new JobExecutionResult(new JobID(),-1,null);
+    }
+  }
+  /** 
+ * This is used to for creating the example topology.  {@link #execute} is never called, weonly use this to call  {@link #getStreamGraph()}.
+ */
+private static class DummyStreamExecutionEnvironment extends StreamExecutionEnvironment {
+    @Override public JobExecutionResult execute() throws Exception {
+      return execute("default");
+    }
+    @Override public JobExecutionResult execute(    String jobName) throws Exception {
+      throw new RuntimeException("This should not be called.");
+    }
+  }
+}

@@ -1,0 +1,126 @@
+@ExtendWith({DefaultFileSystemExtension.class,TestDirectoryExtension.class}) class PartitionedIndexStorageTest {
+  private static final InMemoryDirectoryFactory directoryFactory=new InMemoryDirectoryFactory();
+  @Inject private DefaultFileSystemAbstraction fs;
+  @Inject private TestDirectory testDir;
+  private PartitionedIndexStorage storage;
+  @BeforeEach void createIndexStorage(){
+    storage=new PartitionedIndexStorage(directoryFactory,fs,testDir.databaseDir());
+  }
+  @Test void prepareFolderCreatesFolder() throws IOException {
+    File folder=createRandomFolder(testDir.databaseDir());
+    storage.prepareFolder(folder);
+    assertTrue(fs.fileExists(folder));
+  }
+  @Test void prepareFolderRemovesFromFileSystem() throws IOException {
+    File folder=createRandomFolder(testDir.databaseDir());
+    createRandomFilesAndFolders(folder);
+    storage.prepareFolder(folder);
+    assertTrue(fs.fileExists(folder));
+    assertTrue(ArrayUtil.isEmpty(fs.listFiles(folder)));
+  }
+  @Test void prepareFolderRemovesFromLucene() throws IOException {
+    File folder=createRandomFolder(testDir.databaseDir());
+    Directory dir=createRandomLuceneDir(folder);
+    assertFalse(ArrayUtil.isEmpty(dir.listAll()));
+    storage.prepareFolder(folder);
+    assertTrue(fs.fileExists(folder));
+    assertTrue(ArrayUtil.isEmpty(dir.listAll()));
+  }
+  @Test void openIndexDirectoriesForEmptyIndex() throws IOException {
+    File indexFolder=storage.getIndexFolder();
+    Map<File,Directory> directories=storage.openIndexDirectories();
+    assertTrue(directories.isEmpty());
+  }
+  @Test void openIndexDirectories() throws IOException {
+    File indexFolder=storage.getIndexFolder();
+    createRandomLuceneDir(indexFolder).close();
+    createRandomLuceneDir(indexFolder).close();
+    Map<File,Directory> directories=storage.openIndexDirectories();
+    try {
+      assertEquals(2,directories.size());
+      for (      Directory dir : directories.values()) {
+        assertFalse(ArrayUtil.isEmpty(dir.listAll()));
+      }
+    }
+  finally {
+      IOUtils.closeAll(directories.values());
+    }
+  }
+  @Test void listFoldersForEmptyFolder() throws IOException {
+    File indexFolder=storage.getIndexFolder();
+    fs.mkdirs(indexFolder);
+    List<File> folders=storage.listFolders();
+    assertTrue(folders.isEmpty());
+  }
+  @Test void listFolders() throws IOException {
+    File indexFolder=storage.getIndexFolder();
+    fs.mkdirs(indexFolder);
+    createRandomFile(indexFolder);
+    createRandomFile(indexFolder);
+    File folder1=createRandomFolder(indexFolder);
+    File folder2=createRandomFolder(indexFolder);
+    List<File> folders=storage.listFolders();
+    assertEquals(asSet(folder1,folder2),new HashSet<>(folders));
+  }
+  @Test void shouldListIndexPartitionsSorted() throws Exception {
+    try (FileSystemAbstraction scramblingFs=new DefaultFileSystemAbstraction(){
+      @Override public File[] listFiles(      File directory){
+        List<File> files=asList(super.listFiles(directory));
+        Collections.shuffle(files);
+        return files.toArray(new File[files.size()]);
+      }
+    }
+){
+      PartitionedIndexStorage myStorage=new PartitionedIndexStorage(directoryFactory,scramblingFs,testDir.databaseDir());
+      File parent=myStorage.getIndexFolder();
+      int directoryCount=10;
+      for (int i=0; i < directoryCount; i++) {
+        scramblingFs.mkdirs(new File(parent,String.valueOf(i + 1)));
+      }
+      Map<File,Directory> directories=myStorage.openIndexDirectories();
+      assertEquals(directoryCount,directories.size());
+      int previous=0;
+      for (      Map.Entry<File,Directory> directory : directories.entrySet()) {
+        int current=parseInt(directory.getKey().getName());
+        assertTrue(current > previous,"Wanted directory " + current + " to have higher id than previous "+ previous);
+        previous=current;
+      }
+    }
+   }
+  private void createRandomFilesAndFolders(  File rootFolder) throws IOException {
+    int count=ThreadLocalRandom.current().nextInt(10) + 1;
+    for (int i=0; i < count; i++) {
+      if (ThreadLocalRandom.current().nextBoolean()) {
+        createRandomFile(rootFolder);
+      }
+ else {
+        createRandomFolder(rootFolder);
+      }
+    }
+  }
+  private Directory createRandomLuceneDir(  File rootFolder) throws IOException {
+    File folder=createRandomFolder(rootFolder);
+    Directory directory=directoryFactory.open(folder);
+    try (IndexWriter writer=new IndexWriter(directory,IndexWriterConfigs.standard())){
+      writer.addDocument(randomDocument());
+      writer.commit();
+    }
+     return directory;
+  }
+  private void createRandomFile(  File rootFolder) throws IOException {
+    File file=new File(rootFolder,RandomStringUtils.randomNumeric(5));
+    try (StoreChannel channel=fs.create(file)){
+      channel.writeAll(ByteBuffer.allocate(100));
+    }
+   }
+  private File createRandomFolder(  File rootFolder) throws IOException {
+    File folder=new File(rootFolder,RandomStringUtils.randomNumeric(5));
+    fs.mkdirs(folder);
+    return folder;
+  }
+  private static Document randomDocument(){
+    Document doc=new Document();
+    doc.add(new StringField("field",RandomStringUtils.randomNumeric(5),Field.Store.YES));
+    return doc;
+  }
+}

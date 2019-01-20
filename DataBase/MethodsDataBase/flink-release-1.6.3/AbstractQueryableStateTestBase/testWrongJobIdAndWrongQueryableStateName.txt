@@ -1,0 +1,55 @@
+/** 
+ * Tests that the correct exception is thrown if the query contains a wrong jobId or wrong queryable state name.
+ */
+@Test @Ignore public void testWrongJobIdAndWrongQueryableStateName() throws Exception {
+  final Deadline deadline=Deadline.now().plus(TEST_TIMEOUT);
+  final long numElements=1024L;
+  StreamExecutionEnvironment env=StreamExecutionEnvironment.getExecutionEnvironment();
+  env.setStateBackend(stateBackend);
+  env.setParallelism(maxParallelism);
+  env.setRestartStrategy(RestartStrategies.fixedDelayRestart(Integer.MAX_VALUE,1000L));
+  DataStream<Tuple2<Integer,Long>> source=env.addSource(new TestAscendingValueSource(numElements));
+  ValueStateDescriptor<Tuple2<Integer,Long>> valueState=new ValueStateDescriptor<>("any",source.getType());
+  source.keyBy(new KeySelector<Tuple2<Integer,Long>,Integer>(){
+    private static final long serialVersionUID=7662520075515707428L;
+    @Override public Integer getKey(    Tuple2<Integer,Long> value){
+      return value.f0;
+    }
+  }
+).asQueryableState("hakuna",valueState);
+  try (AutoCancellableJob closableJobGraph=new AutoCancellableJob(deadline,clusterClient,env)){
+    clusterClient.setDetached(true);
+    clusterClient.submitJob(closableJobGraph.getJobGraph(),AbstractQueryableStateTestBase.class.getClassLoader());
+    CompletableFuture<JobStatus> jobStatusFuture=clusterClient.getJobStatus(closableJobGraph.getJobId());
+    while (deadline.hasTimeLeft() && !jobStatusFuture.get(deadline.timeLeft().toMillis(),TimeUnit.MILLISECONDS).equals(JobStatus.RUNNING)) {
+      Thread.sleep(50);
+      jobStatusFuture=clusterClient.getJobStatus(closableJobGraph.getJobId());
+    }
+    assertEquals(JobStatus.RUNNING,jobStatusFuture.get(deadline.timeLeft().toMillis(),TimeUnit.MILLISECONDS));
+    final JobID wrongJobId=new JobID();
+    CompletableFuture<ValueState<Tuple2<Integer,Long>>> unknownJobFuture=client.getKvState(wrongJobId,"hakuna",0,BasicTypeInfo.INT_TYPE_INFO,valueState);
+    try {
+      unknownJobFuture.get(deadline.timeLeft().toMillis(),TimeUnit.MILLISECONDS);
+      fail();
+    }
+ catch (    ExecutionException e) {
+      Assert.assertTrue("GOT: " + e.getCause().getMessage(),e.getCause() instanceof RuntimeException);
+      Assert.assertTrue("GOT: " + e.getCause().getMessage(),e.getCause().getMessage().contains("FlinkJobNotFoundException: Could not find Flink job (" + wrongJobId + ")"));
+    }
+catch (    Exception f) {
+      fail("Unexpected type of exception: " + f.getMessage());
+    }
+    CompletableFuture<ValueState<Tuple2<Integer,Long>>> unknownQSName=client.getKvState(closableJobGraph.getJobId(),"wrong-hakuna",0,BasicTypeInfo.INT_TYPE_INFO,valueState);
+    try {
+      unknownQSName.get(deadline.timeLeft().toMillis(),TimeUnit.MILLISECONDS);
+      fail();
+    }
+ catch (    ExecutionException e) {
+      Assert.assertTrue("GOT: " + e.getCause().getMessage(),e.getCause() instanceof RuntimeException);
+      Assert.assertTrue("GOT: " + e.getCause().getMessage(),e.getCause().getMessage().contains("UnknownKvStateLocation: No KvStateLocation found for KvState instance with name 'wrong-hakuna'."));
+    }
+catch (    Exception f) {
+      fail("Unexpected type of exception: " + f.getMessage());
+    }
+  }
+ }

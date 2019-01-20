@@ -1,0 +1,77 @@
+@Test public void testSecondaryIndexBinarySearch() throws IOException {
+  int numTotalKeys=99;
+  assertTrue(numTotalKeys % 2 == 1);
+  int numSearchedKeys=(numTotalKeys - 1) / 2;
+  ByteArrayOutputStream baos=new ByteArrayOutputStream();
+  DataOutputStream dos=new DataOutputStream(baos);
+  dos.writeInt(numSearchedKeys);
+  int curAllEntriesSize=0;
+  int numEntriesAdded=0;
+  int secondaryIndexEntries[]=new int[numTotalKeys];
+  for (int i=0; i < numTotalKeys; ++i) {
+    byte[] k=RandomKeyValueUtil.randomOrderedKey(rand,i * 2);
+    KeyValue cell=new KeyValue(k,Bytes.toBytes("f"),Bytes.toBytes("q"),Bytes.toBytes("val"));
+    keys.add(cell.getKey());
+    String msgPrefix="Key #" + i + " ("+ Bytes.toStringBinary(k)+ "): ";
+    StringBuilder padding=new StringBuilder();
+    while (msgPrefix.length() + padding.length() < 70)     padding.append(' ');
+    msgPrefix+=padding;
+    if (i % 2 == 1) {
+      dos.writeInt(curAllEntriesSize);
+      secondaryIndexEntries[i]=curAllEntriesSize;
+      LOG.info(msgPrefix + "secondary index entry #" + ((i - 1) / 2)+ ", offset "+ curAllEntriesSize);
+      curAllEntriesSize+=cell.getKey().length + HFileBlockIndex.SECONDARY_INDEX_ENTRY_OVERHEAD;
+      ++numEntriesAdded;
+    }
+ else {
+      secondaryIndexEntries[i]=-1;
+      LOG.info(msgPrefix + "not in the searched array");
+    }
+  }
+  for (int i=0; i < keys.size() - 1; ++i)   assertTrue(CellComparatorImpl.COMPARATOR.compare(new KeyValue.KeyOnlyKeyValue(keys.get(i),0,keys.get(i).length),new KeyValue.KeyOnlyKeyValue(keys.get(i + 1),0,keys.get(i + 1).length)) < 0);
+  dos.writeInt(curAllEntriesSize);
+  assertEquals(numSearchedKeys,numEntriesAdded);
+  int secondaryIndexOffset=dos.size();
+  assertEquals(Bytes.SIZEOF_INT * (numSearchedKeys + 2),secondaryIndexOffset);
+  for (int i=1; i <= numTotalKeys - 1; i+=2) {
+    assertEquals(dos.size(),secondaryIndexOffset + secondaryIndexEntries[i]);
+    long dummyFileOffset=getDummyFileOffset(i);
+    int dummyOnDiskSize=getDummyOnDiskSize(i);
+    LOG.debug("Storing file offset=" + dummyFileOffset + " and onDiskSize="+ dummyOnDiskSize+ " at offset "+ dos.size());
+    dos.writeLong(dummyFileOffset);
+    dos.writeInt(dummyOnDiskSize);
+    LOG.debug("Stored key " + ((i - 1) / 2) + " at offset "+ dos.size());
+    dos.write(keys.get(i));
+  }
+  dos.writeInt(curAllEntriesSize);
+  ByteBuffer nonRootIndex=ByteBuffer.wrap(baos.toByteArray());
+  for (int i=0; i < numTotalKeys; ++i) {
+    byte[] searchKey=keys.get(i);
+    byte[] arrayHoldingKey=new byte[searchKey.length + searchKey.length / 2];
+    System.arraycopy(searchKey,0,arrayHoldingKey,searchKey.length / 2,searchKey.length);
+    KeyValue.KeyOnlyKeyValue cell=new KeyValue.KeyOnlyKeyValue(arrayHoldingKey,searchKey.length / 2,searchKey.length);
+    int searchResult=BlockIndexReader.binarySearchNonRootIndex(cell,new MultiByteBuff(nonRootIndex),CellComparatorImpl.COMPARATOR);
+    String lookupFailureMsg="Failed to look up key #" + i + " ("+ Bytes.toStringBinary(searchKey)+ ")";
+    int expectedResult;
+    int referenceItem;
+    if (i % 2 == 1) {
+      expectedResult=(i - 1) / 2;
+      referenceItem=i;
+    }
+ else {
+      expectedResult=i / 2 - 1;
+      referenceItem=i - 1;
+    }
+    assertEquals(lookupFailureMsg,expectedResult,searchResult);
+    boolean locateBlockResult=(BlockIndexReader.locateNonRootIndexEntry(new MultiByteBuff(nonRootIndex),cell,CellComparatorImpl.COMPARATOR) != -1);
+    if (i == 0) {
+      assertFalse(locateBlockResult);
+    }
+ else {
+      assertTrue(locateBlockResult);
+      String errorMsg="i=" + i + ", position="+ nonRootIndex.position();
+      assertEquals(errorMsg,getDummyFileOffset(referenceItem),nonRootIndex.getLong());
+      assertEquals(errorMsg,getDummyOnDiskSize(referenceItem),nonRootIndex.getInt());
+    }
+  }
+}

@@ -1,0 +1,55 @@
+/** 
+ * Like the previous test but create many files. This covers bugs where the quota adjustment is incorrect but it takes many files to accrue  a big enough accounting error to violate the quota.
+ */
+@Test public void testMultipleFilesSmallerThanOneBlock() throws Exception {
+  final Path parent=new Path(PathUtils.getTestDir(getClass()).getPath(),GenericTestUtils.getMethodName());
+  assertTrue(dfs.mkdirs(parent));
+  Configuration dfsConf=new HdfsConfiguration();
+  final int BLOCK_SIZE=6 * 1024;
+  dfsConf.setInt(DFSConfigKeys.DFS_BLOCK_SIZE_KEY,BLOCK_SIZE);
+  dfsConf.setInt(DFSConfigKeys.DFS_CONTENT_SUMMARY_LIMIT_KEY,2);
+  MiniDFSCluster dfsCluster=new MiniDFSCluster.Builder(dfsConf).numDataNodes(3).build();
+  dfsCluster.waitActive();
+  FileSystem fs=dfsCluster.getFileSystem();
+  DFSAdmin admin=new DFSAdmin(dfsConf);
+  final String nnAddr=dfsConf.get(DFSConfigKeys.DFS_NAMENODE_HTTP_ADDRESS_KEY);
+  final String webhdfsuri=WebHdfsConstants.WEBHDFS_SCHEME + "://" + nnAddr;
+  System.out.println("webhdfsuri=" + webhdfsuri);
+  final FileSystem webHDFS=new Path(webhdfsuri).getFileSystem(dfsConf);
+  try {
+    long nsQuota=FSImageTestUtil.getNSQuota(dfsCluster.getNameNode().getNamesystem());
+    assertTrue("Default namespace quota expected as long max. But the value is :" + nsQuota,nsQuota == Long.MAX_VALUE);
+    Path dir=new Path(parent,"test");
+    boolean exceededQuota=false;
+    ContentSummary c;
+    final int FILE_SIZE=1024;
+    final int QUOTA_SIZE=32 * (int)fs.getDefaultBlockSize(dir);
+    assertEquals(6 * 1024,fs.getDefaultBlockSize(dir));
+    assertEquals(192 * 1024,QUOTA_SIZE);
+    assertTrue(fs.mkdirs(dir));
+    runCommand(admin,false,"-setSpaceQuota",Integer.toString(QUOTA_SIZE),dir.toString());
+    for (int i=0; i < 59; i++) {
+      Path file=new Path(parent,"test/test" + i);
+      DFSTestUtil.createFile(fs,file,FILE_SIZE,(short)3,1L);
+      DFSTestUtil.waitReplication(fs,file,(short)3);
+    }
+    c=fs.getContentSummary(dir);
+    compareQuotaUsage(c,fs,dir);
+    checkContentSummary(c,webHDFS.getContentSummary(dir));
+    assertEquals("Invalid space consumed",59 * FILE_SIZE * 3,c.getSpaceConsumed());
+    assertEquals("Invalid space consumed",QUOTA_SIZE - (59 * FILE_SIZE * 3),3 * (fs.getDefaultBlockSize(dir) - FILE_SIZE));
+    try {
+      Path file=new Path(parent,"test/test59");
+      DFSTestUtil.createFile(fs,file,FILE_SIZE,(short)3,1L);
+      DFSTestUtil.waitReplication(fs,file,(short)3);
+    }
+ catch (    QuotaExceededException e) {
+      exceededQuota=true;
+    }
+    assertTrue("Quota not exceeded",exceededQuota);
+    assertEquals(2,dfsCluster.getNamesystem().getFSDirectory().getYieldCount());
+  }
+  finally {
+    dfsCluster.shutdown();
+  }
+}

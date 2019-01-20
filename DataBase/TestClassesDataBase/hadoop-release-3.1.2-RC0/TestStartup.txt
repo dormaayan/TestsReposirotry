@@ -1,0 +1,482 @@
+/** 
+ * Startup and checkpoint tests
+ */
+public class TestStartup {
+  public static final String NAME_NODE_HOST="localhost:";
+  public static final String WILDCARD_HTTP_HOST="0.0.0.0:";
+  private static final Log LOG=LogFactory.getLog(TestStartup.class.getName());
+  private Configuration config;
+  private File hdfsDir=null;
+  static final long seed=0xAAAAEEFL;
+  static final int blockSize=4096;
+  static final int fileSize=8192;
+  private long editsLength=0, fsimageLength=0;
+  @Before public void setUp() throws Exception {
+    ExitUtil.disableSystemExit();
+    ExitUtil.resetFirstExitException();
+    config=new HdfsConfiguration();
+    hdfsDir=new File(MiniDFSCluster.getBaseDirectory());
+    if (hdfsDir.exists() && !FileUtil.fullyDelete(hdfsDir)) {
+      throw new IOException("Could not delete hdfs directory '" + hdfsDir + "'");
+    }
+    LOG.info("--hdfsdir is " + hdfsDir.getAbsolutePath());
+    config.set(DFSConfigKeys.DFS_NAMENODE_NAME_DIR_KEY,fileAsURI(new File(hdfsDir,"name")).toString());
+    config.set(DFSConfigKeys.DFS_DATANODE_DATA_DIR_KEY,new File(hdfsDir,"data").getPath());
+    config.set(DFSConfigKeys.DFS_DATANODE_ADDRESS_KEY,"0.0.0.0:0");
+    config.set(DFSConfigKeys.DFS_DATANODE_HTTP_ADDRESS_KEY,"0.0.0.0:0");
+    config.set(DFSConfigKeys.DFS_DATANODE_IPC_ADDRESS_KEY,"0.0.0.0:0");
+    config.set(DFSConfigKeys.DFS_NAMENODE_CHECKPOINT_DIR_KEY,fileAsURI(new File(hdfsDir,"secondary")).toString());
+    config.set(DFSConfigKeys.DFS_NAMENODE_SECONDARY_HTTP_ADDRESS_KEY,WILDCARD_HTTP_HOST + "0");
+    FileSystem.setDefaultUri(config,"hdfs://" + NAME_NODE_HOST + "0");
+  }
+  /** 
+ * clean up
+ */
+  @After public void tearDown() throws Exception {
+    if (hdfsDir.exists() && !FileUtil.fullyDelete(hdfsDir)) {
+      throw new IOException("Could not delete hdfs directory in tearDown '" + hdfsDir + "'");
+    }
+  }
+  /** 
+ * Create a number of fsimage checkpoints
+ * @param count number of checkpoints to create
+ * @throws IOException
+ */
+  public void createCheckPoint(  int count) throws IOException {
+    LOG.info("--starting mini cluster");
+    MiniDFSCluster cluster=null;
+    SecondaryNameNode sn=null;
+    try {
+      cluster=new MiniDFSCluster.Builder(config).manageDataDfsDirs(false).manageNameDfsDirs(false).build();
+      cluster.waitActive();
+      LOG.info("--starting Secondary Node");
+      sn=new SecondaryNameNode(config);
+      assertNotNull(sn);
+      for (int i=0; i < count; i++) {
+        FileSystem fileSys=cluster.getFileSystem();
+        Path p=new Path("t" + i);
+        DFSTestUtil.createFile(fileSys,p,fileSize,fileSize,blockSize,(short)1,seed);
+        LOG.info("--file " + p.toString() + " created");
+        LOG.info("--doing checkpoint");
+        sn.doCheckpoint();
+        LOG.info("--done checkpoint");
+      }
+    }
+ catch (    IOException e) {
+      fail(StringUtils.stringifyException(e));
+      System.err.println("checkpoint failed");
+      throw e;
+    }
+ finally {
+      if (sn != null)       sn.shutdown();
+      if (cluster != null)       cluster.shutdown();
+      LOG.info("--cluster shutdown");
+    }
+  }
+  /** 
+ * Corrupts the MD5 sum of the fsimage.
+ * @param corruptAll whether to corrupt one or all of the MD5 sums in the configured namedirs
+ * @throws IOException
+ */
+  private void corruptFSImageMD5(  boolean corruptAll) throws IOException {
+    List<URI> nameDirs=(List<URI>)FSNamesystem.getNamespaceDirs(config);
+    for (    URI uri : nameDirs) {
+      File nameDir=new File(uri.getPath());
+      File dfsDir=nameDir.getParentFile();
+      assertEquals(dfsDir.getName(),"dfs");
+      File imageFile=new File(nameDir,Storage.STORAGE_DIR_CURRENT + "/" + NNStorage.getImageFileName(0));
+      MD5FileUtils.saveMD5File(imageFile,new MD5Hash(new byte[16]));
+      if (!corruptAll) {
+        break;
+      }
+    }
+  }
+  private void corruptNameNodeFiles() throws IOException {
+    List<URI> nameDirs=(List<URI>)FSNamesystem.getNamespaceDirs(config);
+    List<URI> nameEditsDirs=FSNamesystem.getNamespaceEditsDirs(config);
+    File dir=new File(nameDirs.get(0).getPath());
+    this.fsimageLength=new File(new File(dir,Storage.STORAGE_DIR_CURRENT),NameNodeFile.IMAGE.getName()).length();
+    if (dir.exists() && !(FileUtil.fullyDelete(dir)))     throw new IOException("Cannot remove directory: " + dir);
+    LOG.info("--removed dir " + dir + ";len was ="+ this.fsimageLength);
+    if (!dir.mkdirs())     throw new IOException("Cannot create directory " + dir);
+    dir=new File(nameEditsDirs.get(0).getPath());
+    this.editsLength=new File(new File(dir,Storage.STORAGE_DIR_CURRENT),NameNodeFile.EDITS.getName()).length();
+    if (dir.exists() && !(FileUtil.fullyDelete(dir)))     throw new IOException("Cannot remove directory: " + dir);
+    if (!dir.mkdirs())     throw new IOException("Cannot create directory " + dir);
+    LOG.info("--removed dir and recreated " + dir + ";len was ="+ this.editsLength);
+  }
+  /** 
+ * start with -importCheckpoint option and verify that the files are in separate directories and of the right length
+ * @throws IOException
+ */
+  private void checkNameNodeFiles() throws IOException {
+    LOG.info("-- about to start DFS cluster");
+    MiniDFSCluster cluster=null;
+    try {
+      cluster=new MiniDFSCluster.Builder(config).format(false).manageDataDfsDirs(false).manageNameDfsDirs(false).startupOption(IMPORT).build();
+      cluster.waitActive();
+      LOG.info("--NN started with checkpoint option");
+      NameNode nn=cluster.getNameNode();
+      assertNotNull(nn);
+      FSImage image=nn.getFSImage();
+      verifyDifferentDirs(image,this.fsimageLength,this.editsLength);
+    }
+  finally {
+      if (cluster != null)       cluster.shutdown();
+    }
+  }
+  /** 
+ * verify that edits log and fsimage are in different directories and of a correct size
+ */
+  private void verifyDifferentDirs(  FSImage img,  long expectedImgSize,  long expectedEditsSize){
+    StorageDirectory sd=null;
+    for (Iterator<StorageDirectory> it=img.getStorage().dirIterator(); it.hasNext(); ) {
+      sd=it.next();
+      if (sd.getStorageDirType().isOfType(NameNodeDirType.IMAGE)) {
+        img.getStorage();
+        File imf=NNStorage.getStorageFile(sd,NameNodeFile.IMAGE,0);
+        LOG.info("--image file " + imf.getAbsolutePath() + "; len = "+ imf.length()+ "; expected = "+ expectedImgSize);
+        assertEquals(expectedImgSize,imf.length());
+      }
+ else       if (sd.getStorageDirType().isOfType(NameNodeDirType.EDITS)) {
+        img.getStorage();
+        File edf=NNStorage.getStorageFile(sd,NameNodeFile.EDITS,0);
+        LOG.info("-- edits file " + edf.getAbsolutePath() + "; len = "+ edf.length()+ "; expected = "+ expectedEditsSize);
+        assertEquals(expectedEditsSize,edf.length());
+      }
+ else {
+        fail("Image/Edits directories are not different");
+      }
+    }
+  }
+  /** 
+ * secnn-6 checkpoint for edits and image is the same directory
+ * @throws IOException
+ */
+  @Test public void testChkpointStartup2() throws IOException {
+    LOG.info("--starting checkpointStartup2 - same directory for checkpoint");
+    config.set(DFSConfigKeys.DFS_NAMENODE_NAME_DIR_KEY,fileAsURI(new File(hdfsDir,"name")).toString());
+    config.set(DFSConfigKeys.DFS_NAMENODE_EDITS_DIR_KEY,fileAsURI(new File(hdfsDir,"edits")).toString());
+    config.set(DFSConfigKeys.DFS_NAMENODE_CHECKPOINT_EDITS_DIR_KEY,fileAsURI(new File(hdfsDir,"chkpt")).toString());
+    config.set(DFSConfigKeys.DFS_NAMENODE_CHECKPOINT_DIR_KEY,fileAsURI(new File(hdfsDir,"chkpt")).toString());
+    createCheckPoint(1);
+    corruptNameNodeFiles();
+    checkNameNodeFiles();
+  }
+  /** 
+ * seccn-8 checkpoint for edits and image are different directories 
+ * @throws IOException
+ */
+  @Test public void testChkpointStartup1() throws IOException {
+    LOG.info("--starting testStartup Recovery");
+    config.set(DFSConfigKeys.DFS_NAMENODE_NAME_DIR_KEY,fileAsURI(new File(hdfsDir,"name")).toString());
+    config.set(DFSConfigKeys.DFS_NAMENODE_EDITS_DIR_KEY,fileAsURI(new File(hdfsDir,"edits")).toString());
+    config.set(DFSConfigKeys.DFS_NAMENODE_CHECKPOINT_EDITS_DIR_KEY,fileAsURI(new File(hdfsDir,"chkpt_edits")).toString());
+    config.set(DFSConfigKeys.DFS_NAMENODE_CHECKPOINT_DIR_KEY,fileAsURI(new File(hdfsDir,"chkpt")).toString());
+    createCheckPoint(1);
+    corruptNameNodeFiles();
+    checkNameNodeFiles();
+  }
+  /** 
+ * secnn-7 secondary node copies fsimage and edits into correct separate directories.
+ * @throws IOException
+ */
+  @Test public void testSNNStartup() throws IOException {
+    LOG.info("--starting SecondNN startup test");
+    config.set(DFSConfigKeys.DFS_NAMENODE_NAME_DIR_KEY,fileAsURI(new File(hdfsDir,"name")).toString());
+    config.set(DFSConfigKeys.DFS_NAMENODE_EDITS_DIR_KEY,fileAsURI(new File(hdfsDir,"name")).toString());
+    config.set(DFSConfigKeys.DFS_NAMENODE_CHECKPOINT_EDITS_DIR_KEY,fileAsURI(new File(hdfsDir,"chkpt_edits")).toString());
+    config.set(DFSConfigKeys.DFS_NAMENODE_CHECKPOINT_DIR_KEY,fileAsURI(new File(hdfsDir,"chkpt")).toString());
+    LOG.info("--starting NN ");
+    MiniDFSCluster cluster=null;
+    SecondaryNameNode sn=null;
+    NameNode nn=null;
+    try {
+      cluster=new MiniDFSCluster.Builder(config).manageDataDfsDirs(false).manageNameDfsDirs(false).build();
+      cluster.waitActive();
+      nn=cluster.getNameNode();
+      assertNotNull(nn);
+      LOG.info("--starting SecondNN");
+      sn=new SecondaryNameNode(config);
+      assertNotNull(sn);
+      LOG.info("--doing checkpoint");
+      sn.doCheckpoint();
+      LOG.info("--done checkpoint");
+      FSImage image=nn.getFSImage();
+      StorageDirectory sd=image.getStorage().getStorageDir(0);
+      assertEquals(sd.getStorageDirType(),NameNodeDirType.IMAGE_AND_EDITS);
+      image.getStorage();
+      File imf=NNStorage.getStorageFile(sd,NameNodeFile.IMAGE,0);
+      image.getStorage();
+      File edf=NNStorage.getStorageFile(sd,NameNodeFile.EDITS,0);
+      LOG.info("--image file " + imf.getAbsolutePath() + "; len = "+ imf.length());
+      LOG.info("--edits file " + edf.getAbsolutePath() + "; len = "+ edf.length());
+      FSImage chkpImage=sn.getFSImage();
+      verifyDifferentDirs(chkpImage,imf.length(),edf.length());
+    }
+ catch (    IOException e) {
+      fail(StringUtils.stringifyException(e));
+      System.err.println("checkpoint failed");
+      throw e;
+    }
+ finally {
+      if (sn != null)       sn.shutdown();
+      if (cluster != null)       cluster.shutdown();
+    }
+  }
+  @Test(timeout=30000) public void testSNNStartupWithRuntimeException() throws Exception {
+    String[] argv=new String[]{"-checkpoint"};
+    try {
+      SecondaryNameNode.main(argv);
+      fail("Failed to handle runtime exceptions during SNN startup!");
+    }
+ catch (    ExitException ee) {
+      GenericTestUtils.assertExceptionContains(ExitUtil.EXIT_EXCEPTION_MESSAGE,ee);
+      assertTrue("Didn't terminate properly ",ExitUtil.terminateCalled());
+    }
+  }
+  @Test public void testCompression() throws IOException {
+    LOG.info("Test compressing image.");
+    Configuration conf=new Configuration();
+    FileSystem.setDefaultUri(conf,"hdfs://localhost:0");
+    conf.set(DFSConfigKeys.DFS_NAMENODE_HTTP_ADDRESS_KEY,"127.0.0.1:0");
+    File base_dir=new File(PathUtils.getTestDir(getClass()),"dfs/");
+    conf.set(DFSConfigKeys.DFS_NAMENODE_NAME_DIR_KEY,new File(base_dir,"name").getPath());
+    conf.setBoolean(DFSConfigKeys.DFS_PERMISSIONS_ENABLED_KEY,false);
+    DFSTestUtil.formatNameNode(conf);
+    LOG.info("Create an uncompressed fsimage");
+    NameNode namenode=new NameNode(conf);
+    namenode.getNamesystem().mkdirs("/test",new PermissionStatus("hairong",null,FsPermission.getDefault()),true);
+    NamenodeProtocols nnRpc=namenode.getRpcServer();
+    assertTrue(nnRpc.getFileInfo("/test").isDirectory());
+    nnRpc.setSafeMode(SafeModeAction.SAFEMODE_ENTER,false);
+    nnRpc.saveNamespace(0,0);
+    namenode.stop();
+    namenode.join();
+    namenode.joinHttpServer();
+    LOG.info("Read an uncomressed image and store it compressed using default codec.");
+    conf.setBoolean(DFSConfigKeys.DFS_IMAGE_COMPRESS_KEY,true);
+    checkNameSpace(conf);
+    LOG.info("Read a compressed image and store it using a different codec.");
+    conf.set(DFSConfigKeys.DFS_IMAGE_COMPRESSION_CODEC_KEY,"org.apache.hadoop.io.compress.GzipCodec");
+    checkNameSpace(conf);
+    LOG.info("Read a compressed image and store it as uncompressed.");
+    conf.setBoolean(DFSConfigKeys.DFS_IMAGE_COMPRESS_KEY,false);
+    checkNameSpace(conf);
+    LOG.info("Read an uncompressed image and store it as uncompressed.");
+    checkNameSpace(conf);
+  }
+  private void checkNameSpace(  Configuration conf) throws IOException {
+    NameNode namenode=new NameNode(conf);
+    NamenodeProtocols nnRpc=namenode.getRpcServer();
+    assertTrue(nnRpc.getFileInfo("/test").isDirectory());
+    nnRpc.setSafeMode(SafeModeAction.SAFEMODE_ENTER,false);
+    nnRpc.saveNamespace(0,0);
+    namenode.stop();
+    namenode.join();
+    namenode.joinHttpServer();
+  }
+  @Test public void testImageChecksum() throws Exception {
+    LOG.info("Test uncompressed image checksum");
+    testImageChecksum(false);
+    LOG.info("Test compressed image checksum");
+    testImageChecksum(true);
+  }
+  private void testImageChecksum(  boolean compress) throws Exception {
+    MiniDFSCluster cluster=null;
+    if (compress) {
+      config.setBoolean(DFSConfigKeys.DFS_IMAGE_COMPRESSION_CODEC_KEY,true);
+    }
+    try {
+      LOG.info("\n===========================================\n" + "Starting empty cluster");
+      cluster=new MiniDFSCluster.Builder(config).numDataNodes(0).format(true).build();
+      cluster.waitActive();
+      FileSystem fs=cluster.getFileSystem();
+      fs.mkdirs(new Path("/test"));
+      LOG.info("Shutting down cluster #1");
+      cluster.shutdown();
+      cluster=null;
+      corruptFSImageMD5(true);
+      final LogVerificationAppender appender=new LogVerificationAppender();
+      final Logger logger=Logger.getRootLogger();
+      logger.addAppender(appender);
+      LOG.info("\n===========================================\n" + "Starting same cluster after simulated crash");
+      try {
+        cluster=new MiniDFSCluster.Builder(config).numDataNodes(0).format(false).build();
+        fail("Should not have successfully started with corrupt image");
+      }
+ catch (      IOException ioe) {
+        GenericTestUtils.assertExceptionContains("Failed to load FSImage file",ioe);
+        int md5failures=appender.countExceptionsWithMessage(" is corrupt with MD5 checksum of ");
+        assertEquals(2,md5failures);
+      }
+    }
+  finally {
+      if (cluster != null) {
+        cluster.shutdown();
+      }
+    }
+  }
+  @Test(timeout=30000) public void testCorruptImageFallback() throws IOException {
+    createCheckPoint(2);
+    corruptFSImageMD5(false);
+    MiniDFSCluster cluster=new MiniDFSCluster.Builder(config).format(false).manageDataDfsDirs(false).manageNameDfsDirs(false).build();
+    try {
+      cluster.waitActive();
+    }
+  finally {
+      cluster.shutdown();
+    }
+  }
+  @Test(timeout=30000) public void testCorruptImageFallbackLostECPolicy() throws IOException {
+    final ErasureCodingPolicy defaultPolicy=StripedFileTestUtil.getDefaultECPolicy();
+    final String policy=defaultPolicy.getName();
+    final Path f1=new Path("/f1");
+    MiniDFSCluster cluster=new MiniDFSCluster.Builder(config).numDataNodes(0).format(true).build();
+    try {
+      cluster.waitActive();
+      DistributedFileSystem fs=cluster.getFileSystem();
+      fs.enableErasureCodingPolicy(policy);
+      Path srcECDir=new Path("/");
+      fs.setErasureCodingPolicy(srcECDir,defaultPolicy.getName());
+      fs.create(f1);
+      FileStatus fs1=fs.getFileStatus(f1);
+      assertTrue(fs1.isErasureCoded());
+      ErasureCodingPolicy fs1Policy=fs.getErasureCodingPolicy(f1);
+      assertEquals(fs1Policy,defaultPolicy);
+    }
+  finally {
+      cluster.close();
+    }
+    corruptFSImageMD5(false);
+    cluster=new MiniDFSCluster.Builder(config).numDataNodes(0).format(false).build();
+    try {
+      cluster.waitActive();
+      ErasureCodingPolicy[] ecPolicies=cluster.getNameNode().getNamesystem().getErasureCodingPolicyManager().getEnabledPolicies();
+      DistributedFileSystem fs=cluster.getFileSystem();
+      assertEquals(fs.getErasureCodingPolicy(f1),defaultPolicy);
+      assertTrue(ecPolicies.length == 1);
+    }
+  finally {
+      cluster.shutdown();
+    }
+  }
+  /** 
+ * This test tests hosts include list contains host names.  After namenode restarts, the still alive datanodes should not have any trouble in getting registrant again.
+ */
+  @Test public void testNNRestart() throws IOException, InterruptedException {
+    MiniDFSCluster cluster=null;
+    int HEARTBEAT_INTERVAL=1;
+    HostsFileWriter hostsFileWriter=new HostsFileWriter();
+    hostsFileWriter.initialize(config,"work-dir/restartnn");
+    byte b[]={127,0,0,1};
+    InetAddress inetAddress=InetAddress.getByAddress(b);
+    hostsFileWriter.initIncludeHosts(new String[]{inetAddress.getHostName()});
+    int numDatanodes=1;
+    try {
+      cluster=new MiniDFSCluster.Builder(config).numDataNodes(numDatanodes).setupHostsFile(true).build();
+      cluster.waitActive();
+      cluster.restartNameNode();
+      NamenodeProtocols nn=cluster.getNameNodeRpc();
+      assertNotNull(nn);
+      assertTrue(cluster.isDataNodeUp());
+      DatanodeInfo[] info=nn.getDatanodeReport(DatanodeReportType.LIVE);
+      for (int i=0; i < 5 && info.length != numDatanodes; i++) {
+        Thread.sleep(HEARTBEAT_INTERVAL * 1000);
+        info=nn.getDatanodeReport(DatanodeReportType.LIVE);
+      }
+      assertEquals("Number of live nodes should be " + numDatanodes,numDatanodes,info.length);
+    }
+ catch (    IOException e) {
+      fail(StringUtils.stringifyException(e));
+      throw e;
+    }
+ finally {
+      if (cluster != null) {
+        cluster.shutdown();
+      }
+      hostsFileWriter.cleanup();
+    }
+  }
+  @Test(timeout=120000) public void testXattrConfiguration() throws Exception {
+    Configuration conf=new HdfsConfiguration();
+    MiniDFSCluster cluster=null;
+    try {
+      conf.setInt(DFSConfigKeys.DFS_NAMENODE_MAX_XATTR_SIZE_KEY,-1);
+      cluster=new MiniDFSCluster.Builder(conf).numDataNodes(0).format(true).build();
+      fail("Expected exception with negative xattr size");
+    }
+ catch (    IllegalArgumentException e) {
+      GenericTestUtils.assertExceptionContains("The maximum size of an xattr should be > 0",e);
+    }
+ finally {
+      conf.setInt(DFSConfigKeys.DFS_NAMENODE_MAX_XATTR_SIZE_KEY,DFSConfigKeys.DFS_NAMENODE_MAX_XATTR_SIZE_DEFAULT);
+      if (cluster != null) {
+        cluster.shutdown();
+      }
+    }
+    try {
+      conf.setInt(DFSConfigKeys.DFS_NAMENODE_MAX_XATTRS_PER_INODE_KEY,-1);
+      cluster=new MiniDFSCluster.Builder(conf).numDataNodes(0).format(true).build();
+      fail("Expected exception with negative # xattrs per inode");
+    }
+ catch (    IllegalArgumentException e) {
+      GenericTestUtils.assertExceptionContains("Cannot set a negative limit on the number of xattrs per inode",e);
+    }
+ finally {
+      conf.setInt(DFSConfigKeys.DFS_NAMENODE_MAX_XATTRS_PER_INODE_KEY,DFSConfigKeys.DFS_NAMENODE_MAX_XATTRS_PER_INODE_DEFAULT);
+      if (cluster != null) {
+        cluster.shutdown();
+      }
+    }
+  }
+  @Test(timeout=30000) public void testNNFailToStartOnReadOnlyNNDir() throws Exception {
+    final String nnDirStr=Paths.get(hdfsDir.toString(),GenericTestUtils.getMethodName(),"name").toString();
+    config.set(DFSConfigKeys.DFS_NAMENODE_NAME_DIR_KEY,nnDirStr);
+    try (MiniDFSCluster cluster=new MiniDFSCluster.Builder(config).numDataNodes(1).manageNameDfsDirs(false).build()){
+      cluster.waitActive();
+      final Collection<URI> nnDirs=FSNamesystem.getNamespaceDirs(config);
+      assertNotNull(nnDirs);
+      assertTrue(nnDirs.iterator().hasNext());
+      assertEquals("NN dir should be created after NN startup.",new File(nnDirStr),new File(nnDirs.iterator().next().getPath()));
+      final File nnDir=new File(nnDirStr);
+      assertTrue(nnDir.exists());
+      assertTrue(nnDir.isDirectory());
+      try {
+        assertTrue("Setting NN dir read only should succeed.",FileUtil.setWritable(nnDir,false));
+        cluster.restartNameNodes();
+        fail("Restarting NN should fail on read only NN dir.");
+      }
+ catch (      InconsistentFSStateException e) {
+        assertThat(e.toString(),is(allOf(containsString("InconsistentFSStateException"),containsString(nnDirStr),containsString("in an inconsistent state"),containsString("storage directory does not exist or is not accessible."))));
+      }
+ finally {
+        assertTrue("Setting NN dir should succeed.",FileUtil.setWritable(nnDir,true));
+      }
+    }
+   }
+  /** 
+ * Verify the following scenario. 1. NN restarts. 2. Heartbeat RPC will retry and succeed. NN asks DN to reregister. 3. After reregistration completes, DN will send Heartbeat, followed by Blockreport. 4. NN will mark DatanodeStorageInfo#blockContentsStale to false.
+ * @throws Exception
+ */
+  @Test(timeout=60000) public void testStorageBlockContentsStaleAfterNNRestart() throws Exception {
+    MiniDFSCluster dfsCluster=null;
+    try {
+      Configuration config=new Configuration();
+      dfsCluster=new MiniDFSCluster.Builder(config).numDataNodes(1).build();
+      dfsCluster.waitActive();
+      dfsCluster.restartNameNode(true);
+      BlockManagerTestUtil.checkHeartbeat(dfsCluster.getNamesystem().getBlockManager());
+      MBeanServer mbs=ManagementFactory.getPlatformMBeanServer();
+      ObjectName mxbeanNameFsns=new ObjectName("Hadoop:service=NameNode,name=FSNamesystemState");
+      Integer numStaleStorages=(Integer)(mbs.getAttribute(mxbeanNameFsns,"NumStaleStorages"));
+      assertEquals(0,numStaleStorages.intValue());
+    }
+  finally {
+      if (dfsCluster != null) {
+        dfsCluster.shutdown();
+      }
+    }
+    return;
+  }
+}

@@ -1,0 +1,53 @@
+@Test public void testQuota() throws IOException {
+  final TableName tableName=TableName.valueOf(name.getMethodName());
+  HTableDescriptor table=new HTableDescriptor(tableName);
+  HColumnDescriptor fam=new HColumnDescriptor(famName);
+  fam.setScope(HConstants.REPLICATION_SCOPE_GLOBAL);
+  table.addFamily(fam);
+  utility1.getAdmin().createTable(table);
+  utility2.getAdmin().createTable(table);
+  Thread watcher=new Thread(() -> {
+    Replication replication=(Replication)utility1.getMiniHBaseCluster().getRegionServer(0).getReplicationSourceService();
+    AtomicLong bufferUsed=replication.getReplicationManager().getTotalBufferUsed();
+    testQuotaPass=true;
+    while (!Thread.interrupted()) {
+      long size=bufferUsed.get();
+      if (size > 0) {
+        testQuotaNonZero=true;
+      }
+      if (size > REPLICATION_SOURCE_QUOTA * (numOfPeer + 1)) {
+        testQuotaPass=false;
+      }
+      Threads.sleep(50);
+    }
+  }
+);
+  watcher.start();
+  try (Table t1=utility1.getConnection().getTable(tableName);Table t2=utility2.getConnection().getTable(tableName)){
+    for (int i=0; i < 50; i++) {
+      Put put=new Put(ROWS[i]);
+      put.addColumn(famName,VALUE,VALUE);
+      t1.put(put);
+    }
+    long start=EnvironmentEdgeManager.currentTime();
+    while (EnvironmentEdgeManager.currentTime() - start < 180000) {
+      Scan scan=new Scan();
+      scan.setCaching(50);
+      int count=0;
+      try (ResultScanner results=t2.getScanner(scan)){
+        for (        Result result : results) {
+          count++;
+        }
+      }
+       if (count < 50) {
+        LOG.info("Waiting all logs pushed to slave. Expected 50 , actual " + count);
+        Threads.sleep(200);
+        continue;
+      }
+      break;
+    }
+  }
+   watcher.interrupt();
+  Assert.assertTrue(testQuotaPass);
+  Assert.assertTrue(testQuotaNonZero);
+}

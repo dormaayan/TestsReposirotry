@@ -1,0 +1,51 @@
+@Test public void testBypass() throws IOException {
+  Admin admin=TEST_UTIL.getAdmin();
+  List<RegionInfo> regions=admin.getRegions(this.tableName);
+  for (  RegionInfo ri : regions) {
+    admin.unassign(ri.getRegionName(),false);
+  }
+  List<Long> pids=new ArrayList<>(regions.size());
+  for (  RegionInfo ri : regions) {
+    Procedure<MasterProcedureEnv> p=new StallingAssignProcedure(ri);
+    pids.add(TEST_UTIL.getHBaseCluster().getMaster().getMasterProcedureExecutor().submitProcedure(p));
+  }
+  for (  Long pid : pids) {
+    while (!TEST_UTIL.getHBaseCluster().getMaster().getMasterProcedureExecutor().isStarted(pid)) {
+      Thread.currentThread().yield();
+    }
+  }
+  List<Procedure<MasterProcedureEnv>> ps=TEST_UTIL.getHBaseCluster().getMaster().getMasterProcedureExecutor().getProcedures();
+  for (  Procedure<MasterProcedureEnv> p : ps) {
+    if (p instanceof StallingAssignProcedure) {
+      List<Boolean> bs=TEST_UTIL.getHbck().bypassProcedure(Arrays.<Long>asList(p.getProcId()),1,false,false);
+      for (      Boolean b : bs) {
+        LOG.info("BYPASSED {} {}",p.getProcId(),b);
+      }
+    }
+  }
+  for (  Procedure<MasterProcedureEnv> p : ps) {
+    if (p instanceof StallingAssignProcedure) {
+      ((StallingAssignProcedure)p).latch.countDown();
+    }
+  }
+  for (  RegionInfo ri : regions) {
+    try {
+      admin.assign(ri.getRegionName());
+    }
+ catch (    Throwable dnrioe) {
+      LOG.info("Expected {}",dnrioe);
+    }
+  }
+  while (!TEST_UTIL.getHBaseCluster().getMaster().getMasterProcedureExecutor().getActiveProcIds().isEmpty()) {
+    Thread.currentThread().yield();
+  }
+  for (  RegionInfo ri : regions) {
+    TEST_UTIL.getHbck().assigns(Arrays.<String>asList(ri.getEncodedName()),true);
+  }
+  while (!TEST_UTIL.getHBaseCluster().getMaster().getMasterProcedureExecutor().getActiveProcIds().isEmpty()) {
+    Thread.currentThread().yield();
+  }
+  for (  RegionInfo ri : regions) {
+    assertTrue(ri.toString(),TEST_UTIL.getMiniHBaseCluster().getMaster().getAssignmentManager().getRegionStates().isRegionOnline(ri));
+  }
+}

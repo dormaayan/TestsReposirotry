@@ -1,0 +1,50 @@
+/** 
+ * Test for detecting schema-changes for an HCatalog table, across 2 different HCat instances. A table is created with the same schema on 2 HCat instances. The table-schema is modified on the source HCat instance (columns, I/O formats, SerDe definitions, etc.). The table metadata is compared between source and target, the changes are detected and propagated to target.
+ * @throws Exception
+ */
+@Test public void testTableSchemaPropagation() throws Exception {
+  try {
+    startReplicationTargetMetaStoreIfRequired();
+    HCatClient sourceMetaStore=HCatClient.create(new Configuration(hcatConf));
+    final String dbName="myDb";
+    final String tableName="myTable";
+    sourceMetaStore.dropDatabase(dbName,true,HCatClient.DropDBMode.CASCADE);
+    sourceMetaStore.createDatabase(HCatCreateDBDesc.create(dbName).build());
+    List<HCatFieldSchema> columnSchema=Arrays.asList(new HCatFieldSchema("foo",Type.INT,""),new HCatFieldSchema("bar",Type.STRING,""));
+    List<HCatFieldSchema> partitionSchema=Arrays.asList(new HCatFieldSchema("dt",Type.STRING,""),new HCatFieldSchema("grid",Type.STRING,""));
+    HCatTable sourceTable=new HCatTable(dbName,tableName).cols(columnSchema).partCols(partitionSchema);
+    sourceMetaStore.createTable(HCatCreateTableDesc.create(sourceTable).build());
+    sourceTable=sourceMetaStore.getTable(dbName,tableName);
+    assertNotNull("Table couldn't be queried for. ",sourceTable);
+    String tableStringRep=sourceMetaStore.serializeTable(sourceTable);
+    HCatClient targetMetaStore=HCatClient.create(new Configuration(replicationTargetHCatConf));
+    targetMetaStore.dropDatabase(dbName,true,HCatClient.DropDBMode.CASCADE);
+    targetMetaStore.createDatabase(HCatCreateDBDesc.create(dbName).build());
+    HCatTable targetTable=targetMetaStore.deserializeTable(tableStringRep);
+    assertEquals("Table after deserialization should have been identical to sourceTable.",HCatTable.NO_DIFF,sourceTable.diff(targetTable));
+    targetMetaStore.createTable(HCatCreateTableDesc.create(targetTable).build());
+    targetTable=targetMetaStore.getTable(dbName,tableName);
+    assertEquals("Table after deserialization should have been identical to sourceTable.",HCatTable.NO_DIFF,sourceTable.diff(targetTable));
+    List<HCatFieldSchema> newColumnSchema=new ArrayList<HCatFieldSchema>(columnSchema);
+    newColumnSchema.add(new HCatFieldSchema("goo_new",Type.DOUBLE,""));
+    Map<String,String> tableParams=new HashMap<String,String>(1);
+    tableParams.put("orc.compress","ZLIB");
+    sourceTable.cols(newColumnSchema).fileFormat("orcfile").tblProps(tableParams).serdeParam(serdeConstants.FIELD_DELIM,Character.toString('\001'));
+    sourceMetaStore.updateTableSchema(dbName,tableName,sourceTable);
+    sourceTable=sourceMetaStore.getTable(dbName,tableName);
+    EnumSet<HCatTable.TableAttribute> diff=targetTable.diff(sourceTable);
+    assertTrue("Couldn't find change in column-schema.",diff.contains(HCatTable.TableAttribute.COLUMNS));
+    assertTrue("Couldn't find change in InputFormat.",diff.contains(HCatTable.TableAttribute.INPUT_FORMAT));
+    assertTrue("Couldn't find change in OutputFormat.",diff.contains(HCatTable.TableAttribute.OUTPUT_FORMAT));
+    assertTrue("Couldn't find change in SerDe.",diff.contains(HCatTable.TableAttribute.SERDE));
+    assertTrue("Couldn't find change in SerDe parameters.",diff.contains(HCatTable.TableAttribute.SERDE_PROPERTIES));
+    assertTrue("Couldn't find change in Table parameters.",diff.contains(HCatTable.TableAttribute.TABLE_PROPERTIES));
+    targetMetaStore.updateTableSchema(dbName,tableName,targetTable.resolve(sourceTable,diff));
+    targetTable=targetMetaStore.getTable(dbName,tableName);
+    assertEquals("After propagating schema changes, source and target tables should have been equivalent.",HCatTable.NO_DIFF,targetTable.diff(sourceTable));
+  }
+ catch (  Exception unexpected) {
+    LOG.error("Unexpected exception!",unexpected);
+    assertTrue("Unexpected exception! " + unexpected.getMessage(),false);
+  }
+}

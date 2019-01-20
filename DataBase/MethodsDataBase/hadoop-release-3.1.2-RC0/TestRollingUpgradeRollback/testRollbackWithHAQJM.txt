@@ -1,0 +1,47 @@
+/** 
+ * Test rollback scenarios where StandbyNameNode does checkpoints during rolling upgrade.
+ */
+@Test public void testRollbackWithHAQJM() throws Exception {
+  final Configuration conf=new HdfsConfiguration();
+  MiniQJMHACluster cluster=null;
+  final Path foo=new Path("/foo");
+  final Path bar=new Path("/bar");
+  try {
+    cluster=new MiniQJMHACluster.Builder(conf).build();
+    MiniDFSCluster dfsCluster=cluster.getDfsCluster();
+    dfsCluster.waitActive();
+    dfsCluster.getConfiguration(1).setInt(DFSConfigKeys.DFS_HA_TAILEDITS_PERIOD_KEY,1);
+    dfsCluster.restartNameNode(1);
+    dfsCluster.transitionToActive(0);
+    DistributedFileSystem dfs=dfsCluster.getFileSystem(0);
+    dfs.mkdirs(foo);
+    RollingUpgradeInfo info=dfs.rollingUpgrade(RollingUpgradeAction.PREPARE);
+    Assert.assertTrue(info.isStarted());
+    dfs.mkdirs(bar);
+    dfs.close();
+    dfs=dfsCluster.getFileSystem(0);
+    TestRollingUpgrade.queryForPreparation(dfs);
+    Assert.assertTrue(dfsCluster.getNameNode(0).getFSImage().hasRollbackFSImage());
+    Assert.assertTrue(dfsCluster.getNameNode(1).getFSImage().hasRollbackFSImage());
+    dfsCluster.restartNameNode(0,true,"-rollingUpgrade","rollback");
+    dfsCluster.shutdownNameNode(1);
+    dfsCluster.transitionToActive(0);
+    dfs=dfsCluster.getFileSystem(0);
+    Assert.assertTrue(dfs.exists(foo));
+    Assert.assertFalse(dfs.exists(bar));
+    NNStorage storage=dfsCluster.getNamesystem(0).getFSImage().getStorage();
+    checkNNStorage(storage,4,7);
+    for (int i=0; i < NUM_JOURNAL_NODES; i++) {
+      File dir=cluster.getJournalCluster().getCurrentDir(0,MiniQJMHACluster.NAMESERVICE);
+      checkJNStorage(dir,5,7);
+    }
+    dfsCluster.restartNameNode(0);
+    dfsCluster.transitionToActive(0);
+    dfs.rollingUpgrade(RollingUpgradeAction.PREPARE);
+  }
+  finally {
+    if (cluster != null) {
+      cluster.shutdown();
+    }
+  }
+}

@@ -1,0 +1,51 @@
+/** 
+ * Test that  {@link HFileOutputFormat2} RecordWriter uses compression andbloom filter settings from the column family descriptor
+ */
+@Ignore("Goes zombie too frequently; needs work. See HBASE-14563") @Test public void testColumnFamilySettings() throws Exception {
+  Configuration conf=new Configuration(this.util.getConfiguration());
+  RecordWriter<ImmutableBytesWritable,Cell> writer=null;
+  TaskAttemptContext context=null;
+  Path dir=util.getDataTestDir("testColumnFamilySettings");
+  Table table=Mockito.mock(Table.class);
+  RegionLocator regionLocator=Mockito.mock(RegionLocator.class);
+  HTableDescriptor htd=new HTableDescriptor(TABLE_NAMES[0]);
+  Mockito.doReturn(htd).when(table).getTableDescriptor();
+  for (  HColumnDescriptor hcd : HBaseTestingUtility.generateColumnDescriptors()) {
+    htd.addFamily(hcd);
+  }
+  setupMockStartKeys(regionLocator);
+  try {
+    conf.set("io.seqfile.compression.type","NONE");
+    conf.set("hbase.fs.tmp.dir",dir.toString());
+    conf.setBoolean(HFileOutputFormat2.LOCALITY_SENSITIVE_CONF_KEY,false);
+    Job job=new Job(conf,"testLocalMRIncrementalLoad");
+    job.setWorkingDirectory(util.getDataTestDirOnTestFS("testColumnFamilySettings"));
+    setupRandomGeneratorMapper(job,false);
+    HFileOutputFormat2.configureIncrementalLoad(job,table.getTableDescriptor(),regionLocator);
+    FileOutputFormat.setOutputPath(job,dir);
+    context=createTestTaskAttemptContext(job);
+    HFileOutputFormat2 hof=new HFileOutputFormat2();
+    writer=hof.getRecordWriter(context);
+    writeRandomKeyValues(writer,context,htd.getFamiliesKeys(),ROWSPERSPLIT);
+    writer.close(context);
+    FileSystem fs=dir.getFileSystem(conf);
+    hof.getOutputCommitter(context).commitTask(context);
+    hof.getOutputCommitter(context).commitJob(context);
+    FileStatus[] families=FSUtils.listStatus(fs,dir,new FSUtils.FamilyDirFilter(fs));
+    assertEquals(htd.getFamilies().size(),families.length);
+    for (    FileStatus f : families) {
+      String familyStr=f.getPath().getName();
+      HColumnDescriptor hcd=htd.getFamily(Bytes.toBytes(familyStr));
+      Path dataFilePath=fs.listStatus(f.getPath())[0].getPath();
+      Reader reader=HFile.createReader(fs,dataFilePath,new CacheConfig(conf),true,conf);
+      Map<byte[],byte[]> fileInfo=reader.loadFileInfo();
+      byte[] bloomFilter=fileInfo.get(BLOOM_FILTER_TYPE_KEY);
+      if (bloomFilter == null)       bloomFilter=Bytes.toBytes("NONE");
+      assertEquals("Incorrect bloom filter used for column family " + familyStr + "(reader: "+ reader+ ")",hcd.getBloomFilterType(),BloomType.valueOf(Bytes.toString(bloomFilter)));
+      assertEquals("Incorrect compression used for column family " + familyStr + "(reader: "+ reader+ ")",hcd.getCompressionType(),reader.getFileContext().getCompression());
+    }
+  }
+  finally {
+    dir.getFileSystem(conf).delete(dir,true);
+  }
+}

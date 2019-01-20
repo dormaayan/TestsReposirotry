@@ -1,0 +1,42 @@
+/** 
+ * Tests  {@link PartitionRequestQueue#enqueueAvailableReader(NetworkSequenceViewReader)}, verifying the reader would be enqueued in the pipeline iff it has both available credits and buffers.
+ */
+@Test public void testEnqueueReaderByNotifyingBufferAndCredit() throws Exception {
+  final ResultSubpartitionView view=new DefaultBufferResultSubpartitionView(10);
+  ResultPartitionProvider partitionProvider=(partitionId,index,availabilityListener) -> view;
+  final InputChannelID receiverId=new InputChannelID();
+  final PartitionRequestQueue queue=new PartitionRequestQueue();
+  final CreditBasedSequenceNumberingViewReader reader=new CreditBasedSequenceNumberingViewReader(receiverId,0,queue);
+  final EmbeddedChannel channel=new EmbeddedChannel(queue);
+  reader.requestSubpartitionView(partitionProvider,new ResultPartitionID(),0);
+  queue.notifyReaderCreated(reader);
+  ByteBuf channelBlockingBuffer=blockChannel(channel);
+  assertNull(channel.readOutbound());
+  final int notifyNumBuffers=5;
+  for (int i=0; i < notifyNumBuffers; i++) {
+    reader.notifyDataAvailable();
+  }
+  channel.runPendingTasks();
+  assertEquals(0,queue.getAvailableReaders().size());
+  assertTrue(reader.hasBuffersAvailable());
+  assertFalse(reader.isRegisteredAsAvailable());
+  assertEquals(0,reader.getNumCreditsAvailable());
+  final int notifyNumCredits=3;
+  for (int i=1; i <= notifyNumCredits; i++) {
+    queue.addCredit(receiverId,1);
+    assertTrue(reader.isRegisteredAsAvailable());
+    assertThat(queue.getAvailableReaders(),contains(reader));
+    assertEquals(i,reader.getNumCreditsAvailable());
+    assertTrue(reader.hasBuffersAvailable());
+  }
+  channel.flush();
+  assertSame(channelBlockingBuffer,channel.readOutbound());
+  assertEquals(0,queue.getAvailableReaders().size());
+  assertEquals(0,reader.getNumCreditsAvailable());
+  assertTrue(reader.hasBuffersAvailable());
+  assertFalse(reader.isRegisteredAsAvailable());
+  for (int i=1; i <= notifyNumCredits; i++) {
+    assertThat(channel.readOutbound(),instanceOf(NettyMessage.BufferResponse.class));
+  }
+  assertNull(channel.readOutbound());
+}

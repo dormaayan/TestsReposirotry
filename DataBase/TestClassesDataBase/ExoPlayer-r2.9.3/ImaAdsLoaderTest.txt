@@ -1,0 +1,136 @@
+/** 
+ * Test for  {@link ImaAdsLoader}. 
+ */
+@RunWith(RobolectricTestRunner.class) public class ImaAdsLoaderTest {
+  private static final long CONTENT_DURATION_US=10 * C.MICROS_PER_SECOND;
+  private static final Timeline CONTENT_TIMELINE=new SinglePeriodTimeline(CONTENT_DURATION_US,true,false);
+  private static final Uri TEST_URI=Uri.EMPTY;
+  private static final long TEST_AD_DURATION_US=5 * C.MICROS_PER_SECOND;
+  private static final long[][] PREROLL_ADS_DURATIONS_US=new long[][]{{TEST_AD_DURATION_US}};
+  private static final Float[] PREROLL_CUE_POINTS_SECONDS=new Float[]{0f};
+  private static final FakeAd UNSKIPPABLE_AD=new FakeAd(false,0,1,1);
+  private @Mock ImaSdkSettings imaSdkSettings;
+  private @Mock AdsRenderingSettings adsRenderingSettings;
+  private @Mock AdDisplayContainer adDisplayContainer;
+  private @Mock AdsManager adsManager;
+  private SingletonImaFactory testImaFactory;
+  private ViewGroup adUiViewGroup;
+  private TestAdsLoaderListener adsLoaderListener;
+  private FakePlayer fakeExoPlayer;
+  private ImaAdsLoader imaAdsLoader;
+  @Before public void setUp(){
+    MockitoAnnotations.initMocks(this);
+    FakeAdsRequest fakeAdsRequest=new FakeAdsRequest();
+    FakeAdsLoader fakeAdsLoader=new FakeAdsLoader(imaSdkSettings,adsManager);
+    testImaFactory=new SingletonImaFactory(imaSdkSettings,adsRenderingSettings,adDisplayContainer,fakeAdsRequest,fakeAdsLoader);
+    adUiViewGroup=new FrameLayout(RuntimeEnvironment.application);
+  }
+  @After public void teardown(){
+    if (imaAdsLoader != null) {
+      imaAdsLoader.release();
+    }
+  }
+  @Test public void testBuilder_overridesPlayerType(){
+    when(imaSdkSettings.getPlayerType()).thenReturn("test player type");
+    setupPlayback(CONTENT_TIMELINE,PREROLL_ADS_DURATIONS_US,PREROLL_CUE_POINTS_SECONDS);
+    verify(imaSdkSettings).setPlayerType("google/exo.ext.ima");
+  }
+  @Test public void testAttachPlayer_setsAdUiViewGroup(){
+    setupPlayback(CONTENT_TIMELINE,PREROLL_ADS_DURATIONS_US,PREROLL_CUE_POINTS_SECONDS);
+    imaAdsLoader.attachPlayer(fakeExoPlayer,adsLoaderListener,adUiViewGroup);
+    verify(adDisplayContainer,atLeastOnce()).setAdContainer(adUiViewGroup);
+  }
+  @Test public void testAttachPlayer_updatesAdPlaybackState(){
+    setupPlayback(CONTENT_TIMELINE,PREROLL_ADS_DURATIONS_US,PREROLL_CUE_POINTS_SECONDS);
+    imaAdsLoader.attachPlayer(fakeExoPlayer,adsLoaderListener,adUiViewGroup);
+    assertThat(adsLoaderListener.adPlaybackState).isEqualTo(new AdPlaybackState(0).withAdDurationsUs(PREROLL_ADS_DURATIONS_US));
+  }
+  @Test public void testAttachAfterRelease(){
+    setupPlayback(CONTENT_TIMELINE,PREROLL_ADS_DURATIONS_US,PREROLL_CUE_POINTS_SECONDS);
+    imaAdsLoader.release();
+    imaAdsLoader.attachPlayer(fakeExoPlayer,adsLoaderListener,adUiViewGroup);
+  }
+  @Test public void testAttachAndCallbacksAfterRelease(){
+    setupPlayback(CONTENT_TIMELINE,PREROLL_ADS_DURATIONS_US,PREROLL_CUE_POINTS_SECONDS);
+    imaAdsLoader.release();
+    imaAdsLoader.attachPlayer(fakeExoPlayer,adsLoaderListener,adUiViewGroup);
+    fakeExoPlayer.setPlayingContentPosition(0);
+    fakeExoPlayer.setState(Player.STATE_READY,true);
+    imaAdsLoader.requestAds(adUiViewGroup);
+    imaAdsLoader.onAdEvent(getAdEvent(AdEventType.LOADED,UNSKIPPABLE_AD));
+    imaAdsLoader.loadAd(TEST_URI.toString());
+    imaAdsLoader.onAdEvent(getAdEvent(AdEventType.CONTENT_PAUSE_REQUESTED,UNSKIPPABLE_AD));
+    imaAdsLoader.playAd();
+    imaAdsLoader.onAdEvent(getAdEvent(AdEventType.STARTED,UNSKIPPABLE_AD));
+    imaAdsLoader.pauseAd();
+    imaAdsLoader.stopAd();
+    imaAdsLoader.onPlayerError(ExoPlaybackException.createForSource(new IOException()));
+    imaAdsLoader.onPositionDiscontinuity(Player.DISCONTINUITY_REASON_SEEK);
+    imaAdsLoader.onAdEvent(getAdEvent(AdEventType.CONTENT_RESUME_REQUESTED,null));
+    imaAdsLoader.handlePrepareError(0,0,new IOException());
+  }
+  @Test public void testPlayback_withPrerollAd_marksAdAsPlayed(){
+    setupPlayback(CONTENT_TIMELINE,PREROLL_ADS_DURATIONS_US,PREROLL_CUE_POINTS_SECONDS);
+    imaAdsLoader.attachPlayer(fakeExoPlayer,adsLoaderListener,adUiViewGroup);
+    imaAdsLoader.onAdEvent(getAdEvent(AdEventType.LOADED,UNSKIPPABLE_AD));
+    imaAdsLoader.loadAd(TEST_URI.toString());
+    imaAdsLoader.onAdEvent(getAdEvent(AdEventType.CONTENT_PAUSE_REQUESTED,UNSKIPPABLE_AD));
+    imaAdsLoader.playAd();
+    fakeExoPlayer.setPlayingAdPosition(0,0,0,0);
+    fakeExoPlayer.setState(Player.STATE_READY,true);
+    imaAdsLoader.onAdEvent(getAdEvent(AdEventType.STARTED,UNSKIPPABLE_AD));
+    imaAdsLoader.onAdEvent(getAdEvent(AdEventType.FIRST_QUARTILE,UNSKIPPABLE_AD));
+    imaAdsLoader.onAdEvent(getAdEvent(AdEventType.MIDPOINT,UNSKIPPABLE_AD));
+    imaAdsLoader.onAdEvent(getAdEvent(AdEventType.THIRD_QUARTILE,UNSKIPPABLE_AD));
+    fakeExoPlayer.setPlayingContentPosition(0);
+    imaAdsLoader.stopAd();
+    imaAdsLoader.onAdEvent(getAdEvent(AdEventType.CONTENT_RESUME_REQUESTED,null));
+    assertThat(adsLoaderListener.adPlaybackState).isEqualTo(new AdPlaybackState(0).withContentDurationUs(CONTENT_DURATION_US).withAdCount(0,1).withAdUri(0,0,TEST_URI).withAdDurationsUs(PREROLL_ADS_DURATIONS_US).withPlayedAd(0,0).withAdResumePositionUs(0));
+  }
+  private void setupPlayback(  Timeline contentTimeline,  long[][] adDurationsUs,  Float[] cuePoints){
+    fakeExoPlayer=new FakePlayer();
+    adsLoaderListener=new TestAdsLoaderListener(fakeExoPlayer,contentTimeline,adDurationsUs);
+    when(adsManager.getAdCuePoints()).thenReturn(Arrays.asList(cuePoints));
+    imaAdsLoader=new ImaAdsLoader.Builder(RuntimeEnvironment.application).setImaFactory(testImaFactory).setImaSdkSettings(imaSdkSettings).buildForAdTag(TEST_URI);
+  }
+  private static AdEvent getAdEvent(  AdEventType adEventType,  @Nullable Ad ad){
+    return new AdEvent(){
+      @Override public AdEventType getType(){
+        return adEventType;
+      }
+      @Override public @Nullable Ad getAd(){
+        return ad;
+      }
+      @Override public Map<String,String> getAdData(){
+        return Collections.emptyMap();
+      }
+    }
+;
+  }
+  /** 
+ * Ad loader event listener that forwards ad playback state to a fake player. 
+ */
+private static final class TestAdsLoaderListener implements AdsLoader.EventListener {
+    private final FakePlayer fakeExoPlayer;
+    private final Timeline contentTimeline;
+    private final long[][] adDurationsUs;
+    public AdPlaybackState adPlaybackState;
+    public TestAdsLoaderListener(    FakePlayer fakeExoPlayer,    Timeline contentTimeline,    long[][] adDurationsUs){
+      this.fakeExoPlayer=fakeExoPlayer;
+      this.contentTimeline=contentTimeline;
+      this.adDurationsUs=adDurationsUs;
+    }
+    @Override public void onAdPlaybackState(    AdPlaybackState adPlaybackState){
+      adPlaybackState=adPlaybackState.withAdDurationsUs(adDurationsUs);
+      this.adPlaybackState=adPlaybackState;
+      fakeExoPlayer.updateTimeline(new SinglePeriodAdTimeline(contentTimeline,adPlaybackState));
+    }
+    @Override public void onAdLoadError(    AdLoadException error,    DataSpec dataSpec){
+      assertThat(error.type).isNotEqualTo(AdLoadException.TYPE_UNEXPECTED);
+    }
+    @Override public void onAdClicked(){
+    }
+    @Override public void onAdTapped(){
+    }
+  }
+}

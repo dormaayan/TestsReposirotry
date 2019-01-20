@@ -1,0 +1,62 @@
+/** 
+ * Test from client side for scan while the region is reopened on the same region server.
+ * @throws Exception
+ */
+@Test public void testScanOnReopenedRegion() throws Exception {
+  final TableName tableName=TableName.valueOf(name.getMethodName());
+  byte[][] QUALIFIERS=HTestConst.makeNAscii(QUALIFIER,2);
+  Table ht=TEST_UTIL.createTable(tableName,FAMILY);
+  Put put;
+  Scan scan;
+  Result result;
+  ResultScanner scanner;
+  boolean toLog=false;
+  List<Cell> kvListExp;
+  put=new Put(ROW);
+  for (int i=0; i < QUALIFIERS.length; i++) {
+    KeyValue kv=new KeyValue(ROW,FAMILY,QUALIFIERS[i],i,VALUE);
+    put.add(kv);
+  }
+  ht.put(put);
+  scan=new Scan().withStartRow(ROW);
+  scanner=ht.getScanner(scan);
+  HRegionLocation loc;
+  try (RegionLocator locator=TEST_UTIL.getConnection().getRegionLocator(tableName)){
+    loc=locator.getRegionLocation(ROW);
+  }
+   HRegionInfo hri=loc.getRegionInfo();
+  MiniHBaseCluster cluster=TEST_UTIL.getMiniHBaseCluster();
+  byte[] regionName=hri.getRegionName();
+  int i=cluster.getServerWith(regionName);
+  HRegionServer rs=cluster.getRegionServer(i);
+  LOG.info("Unassigning " + hri);
+  TEST_UTIL.getAdmin().unassign(hri.getRegionName(),true);
+  long startTime=EnvironmentEdgeManager.currentTime();
+  long timeOut=10000;
+  boolean offline=false;
+  while (true) {
+    if (rs.getOnlineRegion(regionName) == null) {
+      offline=true;
+      break;
+    }
+    assertTrue("Timed out in closing the testing region",EnvironmentEdgeManager.currentTime() < startTime + timeOut);
+  }
+  assertTrue(offline);
+  LOG.info("Assigning " + hri);
+  TEST_UTIL.getAdmin().assign(hri.getRegionName());
+  startTime=EnvironmentEdgeManager.currentTime();
+  while (true) {
+    rs=cluster.getRegionServer(cluster.getServerWith(regionName));
+    if (rs != null && rs.getOnlineRegion(regionName) != null) {
+      offline=false;
+      break;
+    }
+    assertTrue("Timed out in open the testing region",EnvironmentEdgeManager.currentTime() < startTime + timeOut);
+  }
+  assertFalse(offline);
+  kvListExp=new ArrayList<>();
+  kvListExp.add(new KeyValue(ROW,FAMILY,QUALIFIERS[0],0,VALUE));
+  kvListExp.add(new KeyValue(ROW,FAMILY,QUALIFIERS[1],1,VALUE));
+  result=scanner.next();
+  verifyResult(result,kvListExp,toLog,"Testing scan on re-opened region");
+}

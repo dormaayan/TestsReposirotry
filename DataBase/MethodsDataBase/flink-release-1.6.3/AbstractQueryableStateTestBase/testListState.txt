@@ -1,0 +1,64 @@
+/** 
+ * Tests simple list state queryable state instance. Each source emits (subtaskIndex, 0)..(subtaskIndex, numElements) tuples, which are then queried. The list state instance add the values to the list. The test succeeds after each subtask index is queried and the list contains the correct number of distinct elements.
+ */
+@Test public void testListState() throws Exception {
+  final Deadline deadline=Deadline.now().plus(TEST_TIMEOUT);
+  final long numElements=1024L;
+  StreamExecutionEnvironment env=StreamExecutionEnvironment.getExecutionEnvironment();
+  env.setStateBackend(stateBackend);
+  env.setParallelism(maxParallelism);
+  env.setRestartStrategy(RestartStrategies.fixedDelayRestart(Integer.MAX_VALUE,1000L));
+  DataStream<Tuple2<Integer,Long>> source=env.addSource(new TestAscendingValueSource(numElements));
+  final ListStateDescriptor<Long> listStateDescriptor=new ListStateDescriptor<Long>("list",BasicTypeInfo.LONG_TYPE_INFO);
+  listStateDescriptor.setQueryable("list-queryable");
+  source.keyBy(new KeySelector<Tuple2<Integer,Long>,Integer>(){
+    private static final long serialVersionUID=8470749712274833552L;
+    @Override public Integer getKey(    Tuple2<Integer,Long> value){
+      return value.f0;
+    }
+  }
+).process(new ProcessFunction<Tuple2<Integer,Long>,Object>(){
+    private static final long serialVersionUID=-805125545438296619L;
+    private transient ListState<Long> listState;
+    @Override public void open(    Configuration parameters) throws Exception {
+      super.open(parameters);
+      listState=getRuntimeContext().getListState(listStateDescriptor);
+    }
+    @Override public void processElement(    Tuple2<Integer,Long> value,    Context ctx,    Collector<Object> out) throws Exception {
+      listState.add(value.f1);
+    }
+  }
+);
+  try (AutoCancellableJob autoCancellableJob=new AutoCancellableJob(deadline,clusterClient,env)){
+    final JobID jobId=autoCancellableJob.getJobId();
+    final JobGraph jobGraph=autoCancellableJob.getJobGraph();
+    clusterClient.setDetached(true);
+    clusterClient.submitJob(jobGraph,AbstractQueryableStateTestBase.class.getClassLoader());
+    final Map<Integer,Set<Long>> results=new HashMap<>();
+    for (int key=0; key < maxParallelism; key++) {
+      boolean success=false;
+      while (deadline.hasTimeLeft() && !success) {
+        final CompletableFuture<ListState<Long>> future=getKvState(deadline,client,jobId,"list-queryable",key,BasicTypeInfo.INT_TYPE_INFO,listStateDescriptor,false,executor);
+        Iterable<Long> value=future.get(deadline.timeLeft().toMillis(),TimeUnit.MILLISECONDS).get();
+        Set<Long> res=new HashSet<>();
+        for (        Long v : value) {
+          res.add(v);
+        }
+        if (res.size() == numElements + 1L) {
+          success=true;
+          results.put(key,res);
+        }
+ else {
+          Thread.sleep(RETRY_TIMEOUT);
+        }
+      }
+      assertTrue("Did not succeed query",success);
+    }
+    for (int key=0; key < maxParallelism; key++) {
+      Set<Long> values=results.get(key);
+      for (long i=0L; i <= numElements; i++) {
+        assertTrue(values.contains(i));
+      }
+    }
+  }
+ }

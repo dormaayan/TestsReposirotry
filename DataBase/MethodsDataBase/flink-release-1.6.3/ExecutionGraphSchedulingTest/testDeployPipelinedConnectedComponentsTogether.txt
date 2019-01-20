@@ -1,0 +1,55 @@
+/** 
+ * This test verifies that before deploying a pipelined connected component, the full set of slots is available, and that not some tasks are deployed, and later the system realizes that not enough resources are available.
+ */
+@Test public void testDeployPipelinedConnectedComponentsTogether() throws Exception {
+  final int parallelism=8;
+  final JobVertex sourceVertex=new JobVertex("source");
+  sourceVertex.setParallelism(parallelism);
+  sourceVertex.setInvokableClass(NoOpInvokable.class);
+  final JobVertex targetVertex=new JobVertex("target");
+  targetVertex.setParallelism(parallelism);
+  targetVertex.setInvokableClass(NoOpInvokable.class);
+  targetVertex.connectNewDataSetAsInput(sourceVertex,DistributionPattern.ALL_TO_ALL,ResultPartitionType.PIPELINED);
+  final JobID jobId=new JobID();
+  final JobGraph jobGraph=new JobGraph(jobId,"test",sourceVertex,targetVertex);
+  @SuppressWarnings({"unchecked","rawtypes"}) final CompletableFuture<LogicalSlot>[] sourceFutures=new CompletableFuture[parallelism];
+  @SuppressWarnings({"unchecked","rawtypes"}) final CompletableFuture<LogicalSlot>[] targetFutures=new CompletableFuture[parallelism];
+  final TaskManagerGateway[] sourceTaskManagers=new TaskManagerGateway[parallelism];
+  final TaskManagerGateway[] targetTaskManagers=new TaskManagerGateway[parallelism];
+  final SimpleSlot[] sourceSlots=new SimpleSlot[parallelism];
+  final SimpleSlot[] targetSlots=new SimpleSlot[parallelism];
+  for (int i=0; i < parallelism; i++) {
+    sourceTaskManagers[i]=createTaskManager();
+    targetTaskManagers[i]=createTaskManager();
+    sourceSlots[i]=createSlot(sourceTaskManagers[i],jobId);
+    targetSlots[i]=createSlot(targetTaskManagers[i],jobId);
+    sourceFutures[i]=new CompletableFuture<>();
+    targetFutures[i]=new CompletableFuture<>();
+  }
+  ProgrammedSlotProvider slotProvider=new ProgrammedSlotProvider(parallelism);
+  slotProvider.addSlots(sourceVertex.getID(),sourceFutures);
+  slotProvider.addSlots(targetVertex.getID(),targetFutures);
+  final ExecutionGraph eg=createExecutionGraph(jobGraph,slotProvider);
+  for (int i=0; i < parallelism; i+=2) {
+    sourceFutures[i].complete(sourceSlots[i]);
+  }
+  eg.setScheduleMode(ScheduleMode.EAGER);
+  eg.setQueuedSchedulingAllowed(true);
+  eg.scheduleForExecution();
+  verifyNothingDeployed(eg,sourceTaskManagers);
+  for (int i=1; i < parallelism; i+=2) {
+    sourceFutures[i].complete(sourceSlots[i]);
+  }
+  verifyNothingDeployed(eg,sourceTaskManagers);
+  for (int i=1; i < parallelism; i++) {
+    targetFutures[i].complete(targetSlots[i]);
+  }
+  verifyNothingDeployed(eg,targetTaskManagers);
+  targetFutures[0].complete(targetSlots[0]);
+  for (  TaskManagerGateway gateway : sourceTaskManagers) {
+    verify(gateway,timeout(500L)).submitTask(any(TaskDeploymentDescriptor.class),any(Time.class));
+  }
+  for (  TaskManagerGateway gateway : targetTaskManagers) {
+    verify(gateway,timeout(500L)).submitTask(any(TaskDeploymentDescriptor.class),any(Time.class));
+  }
+}

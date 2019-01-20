@@ -1,0 +1,120 @@
+/** 
+ * This test does some random modifications to a state table and a reference (hash map). Then draws snapshots, performs more modifications and checks snapshot integrity.
+ */
+@Test public void testRandomModificationsAndCopyOnWriteIsolation() throws Exception {
+  final RegisteredKeyValueStateBackendMetaInfo<Integer,ArrayList<Integer>> metaInfo=new RegisteredKeyValueStateBackendMetaInfo<>(StateDescriptor.Type.UNKNOWN,"test",IntSerializer.INSTANCE,new ArrayListSerializer<>(IntSerializer.INSTANCE));
+  final MockInternalKeyContext<Integer> keyContext=new MockInternalKeyContext<>(IntSerializer.INSTANCE);
+  final CopyOnWriteStateTable<Integer,Integer,ArrayList<Integer>> stateTable=new CopyOnWriteStateTable<>(keyContext,metaInfo);
+  final HashMap<Tuple2<Integer,Integer>,ArrayList<Integer>> referenceMap=new HashMap<>();
+  final Random random=new Random(42);
+  CopyOnWriteStateTable.StateTableEntry<Integer,Integer,ArrayList<Integer>>[] snapshot=null;
+  int snapshotSize=0;
+  Tuple3<Integer,Integer,ArrayList<Integer>>[] reference=null;
+  int val=0;
+  int snapshotCounter=0;
+  int referencedSnapshotId=0;
+  final StateTransformationFunction<ArrayList<Integer>,Integer> transformationFunction=new StateTransformationFunction<ArrayList<Integer>,Integer>(){
+    @Override public ArrayList<Integer> apply(    ArrayList<Integer> previousState,    Integer value) throws Exception {
+      if (previousState == null) {
+        previousState=new ArrayList<>();
+      }
+      previousState.add(value);
+      return previousState;
+    }
+  }
+;
+  for (int i=0; i < 10_000_000; ++i) {
+    int key=random.nextInt(20);
+    int namespace=random.nextInt(4);
+    Tuple2<Integer,Integer> compositeKey=new Tuple2<>(key,namespace);
+    int op=random.nextInt(7);
+    ArrayList<Integer> state=null;
+    ArrayList<Integer> referenceState=null;
+switch (op) {
+case 0:
+case 1:
+{
+        state=stateTable.get(key,namespace);
+        referenceState=referenceMap.get(compositeKey);
+        if (null == state) {
+          state=new ArrayList<>();
+          stateTable.put(key,namespace,state);
+          referenceState=new ArrayList<>();
+          referenceMap.put(compositeKey,referenceState);
+        }
+        break;
+      }
+case 2:
+{
+      stateTable.put(key,namespace,new ArrayList<Integer>());
+      referenceMap.put(compositeKey,new ArrayList<Integer>());
+      break;
+    }
+case 3:
+{
+    state=stateTable.putAndGetOld(key,namespace,new ArrayList<Integer>());
+    referenceState=referenceMap.put(compositeKey,new ArrayList<Integer>());
+    break;
+  }
+case 4:
+{
+  stateTable.remove(key,namespace);
+  referenceMap.remove(compositeKey);
+  break;
+}
+case 5:
+{
+state=stateTable.removeAndGetOld(key,namespace);
+referenceState=referenceMap.remove(compositeKey);
+break;
+}
+case 6:
+{
+final int updateValue=random.nextInt(1000);
+stateTable.transform(key,namespace,updateValue,transformationFunction);
+referenceMap.put(compositeKey,transformationFunction.apply(referenceMap.remove(compositeKey),updateValue));
+break;
+}
+default :
+{
+Assert.fail("Unknown op-code " + op);
+}
+}
+Assert.assertEquals(referenceMap.size(),stateTable.size());
+if (state != null) {
+if (random.nextBoolean() && !state.isEmpty()) {
+state.remove(state.size() - 1);
+referenceState.remove(referenceState.size() - 1);
+}
+ else {
+state.add(val);
+referenceState.add(val);
+++val;
+}
+}
+Assert.assertEquals(referenceState,state);
+if (i > 0 && i % 500 == 0) {
+if (snapshot != null) {
+deepCheck(reference,convert(snapshot,snapshotSize));
+if (i % 1_000 == 0) {
+++snapshotCounter;
+stateTable.snapshotTableArrays();
+stateTable.releaseSnapshot(snapshotCounter);
+}
+if (i % 5_000 == 0) {
+snapshot=null;
+reference=null;
+snapshotSize=0;
+stateTable.releaseSnapshot(referencedSnapshotId);
+}
+}
+ else {
+++snapshotCounter;
+referencedSnapshotId=snapshotCounter;
+snapshot=stateTable.snapshotTableArrays();
+snapshotSize=stateTable.size();
+reference=manualDeepDump(referenceMap);
+}
+}
+}
+}

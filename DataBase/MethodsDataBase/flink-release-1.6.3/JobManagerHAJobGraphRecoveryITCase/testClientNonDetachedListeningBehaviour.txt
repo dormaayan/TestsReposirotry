@@ -1,0 +1,94 @@
+/** 
+ * Tests that clients receive updates after recovery by a new leader.
+ */
+@Test public void testClientNonDetachedListeningBehaviour() throws Exception {
+  Configuration config=ZooKeeperTestUtils.createZooKeeperHAConfig(ZooKeeper.getConnectString(),tempFolder.getRoot().getPath());
+  ActorSystem testSystem=null;
+  JobManagerProcess[] jobManagerProcess=new JobManagerProcess[2];
+  LeaderRetrievalService leaderRetrievalService=null;
+  ActorSystem taskManagerSystem=null;
+  final HighAvailabilityServices highAvailabilityServices=HighAvailabilityServicesUtils.createHighAvailabilityServices(config,TestingUtils.defaultExecutor(),HighAvailabilityServicesUtils.AddressResolution.NO_ADDRESS_RESOLUTION);
+  try {
+    final Deadline deadline=TestTimeOut.fromNow();
+    testSystem=AkkaUtils.createActorSystem(new Configuration(),new Some<>(new Tuple2<String,Object>("localhost",0)));
+    jobManagerProcess[0]=new JobManagerProcess(0,config);
+    jobManagerProcess[1]=new JobManagerProcess(1,config);
+    jobManagerProcess[0].startProcess();
+    jobManagerProcess[1].startProcess();
+    TestingListener leaderListener=new TestingListener();
+    leaderRetrievalService=highAvailabilityServices.getJobManagerLeaderRetriever(HighAvailabilityServices.DEFAULT_JOB_ID);
+    leaderRetrievalService.start(leaderListener);
+    taskManagerSystem=AkkaUtils.createActorSystem(AkkaUtils.getDefaultAkkaConfig());
+    TaskManager.startTaskManagerComponentsAndActor(config,ResourceID.generate(),taskManagerSystem,highAvailabilityServices,NoOpMetricRegistry.INSTANCE,"localhost",Option.<String>empty(),false,TaskManager.class);
+    TestActorRef<RecordingTestClient> clientRef=TestActorRef.create(testSystem,Props.create(RecordingTestClient.class));
+    JobGraph jobGraph=createBlockingJobGraph();
+{
+      leaderListener.waitForNewLeader(deadline.timeLeft().toMillis());
+      String leaderAddress=leaderListener.getAddress();
+      UUID leaderId=leaderListener.getLeaderSessionID();
+      AkkaActorGateway client=new AkkaActorGateway(clientRef,leaderId);
+      ActorRef leaderRef=AkkaUtils.getActorRef(leaderAddress,testSystem,deadline.timeLeft());
+      ActorGateway leader=new AkkaActorGateway(leaderRef,leaderId);
+      int numSlots=0;
+      while (numSlots == 0) {
+        Future<?> slotsFuture=leader.ask(JobManagerMessages.getRequestTotalNumberOfSlots(),deadline.timeLeft());
+        numSlots=(Integer)Await.result(slotsFuture,deadline.timeLeft());
+      }
+      leader.tell(new SubmitJob(jobGraph,ListeningBehaviour.EXECUTION_RESULT_AND_STATE_CHANGES),client);
+      JobManagerActorTestUtils.waitForJobStatus(jobGraph.getJobID(),JobStatus.RUNNING,leader,deadline.timeLeft());
+    }
+    JobManagerProcess leadingJobManagerProcess;
+    if (jobManagerProcess[0].getJobManagerAkkaURL(deadline.timeLeft()).equals(leaderListener.getAddress())) {
+      leadingJobManagerProcess=jobManagerProcess[0];
+    }
+ else {
+      leadingJobManagerProcess=jobManagerProcess[1];
+    }
+    leadingJobManagerProcess.destroy();
+{
+      leaderListener.waitForNewLeader(deadline.timeLeft().toMillis());
+      String leaderAddress=leaderListener.getAddress();
+      UUID leaderId=leaderListener.getLeaderSessionID();
+      ActorRef leaderRef=AkkaUtils.getActorRef(leaderAddress,testSystem,deadline.timeLeft());
+      ActorGateway leader=new AkkaActorGateway(leaderRef,leaderId);
+      JobManagerActorTestUtils.waitForJobStatus(jobGraph.getJobID(),JobStatus.RUNNING,leader,deadline.timeLeft());
+      leader.tell(new JobManagerMessages.CancelJob(jobGraph.getJobID()));
+    }
+    clientRef.underlyingActor().awaitJobResult(deadline.timeLeft().toMillis());
+    int jobSubmitSuccessMessages=0;
+    for (    Object msg : clientRef.underlyingActor().getMessages()) {
+      if (msg instanceof JobManagerMessages.JobSubmitSuccess) {
+        jobSubmitSuccessMessages++;
+      }
+    }
+    assertEquals(2,jobSubmitSuccessMessages);
+  }
+ catch (  Throwable t) {
+    t.printStackTrace();
+    if (jobManagerProcess[0] != null) {
+      jobManagerProcess[0].printProcessLog();
+    }
+    if (jobManagerProcess[1] != null) {
+      jobManagerProcess[1].printProcessLog();
+    }
+    throw t;
+  }
+ finally {
+    if (jobManagerProcess[0] != null) {
+      jobManagerProcess[0].destroy();
+    }
+    if (jobManagerProcess[1] != null) {
+      jobManagerProcess[1].destroy();
+    }
+    if (leaderRetrievalService != null) {
+      leaderRetrievalService.stop();
+    }
+    if (taskManagerSystem != null) {
+      taskManagerSystem.shutdown();
+    }
+    if (testSystem != null) {
+      testSystem.shutdown();
+    }
+    highAvailabilityServices.closeAndCleanupAllData();
+  }
+}

@@ -1,0 +1,71 @@
+/** 
+ * Testcase for HBASE-21490.
+ */
+@Category({MasterTests.class,MediumTests.class}) public class TestLoadProcedureError {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestLoadProcedureError.class);
+  private static final HBaseTestingUtility UTIL=new HBaseTestingUtility();
+  private static TableName NAME=TableName.valueOf("Load");
+  private static volatile CountDownLatch ARRIVE;
+  private static volatile boolean FINISH_PROC;
+  private static volatile boolean FAIL_LOAD;
+public static final class TestProcedure extends NoopProcedure<MasterProcedureEnv> implements TableProcedureInterface {
+    @Override protected Procedure<MasterProcedureEnv>[] execute(    MasterProcedureEnv env) throws ProcedureYieldException, ProcedureSuspendedException, InterruptedException {
+      if (ARRIVE != null) {
+        ARRIVE.countDown();
+        ARRIVE=null;
+      }
+      if (FINISH_PROC) {
+        return null;
+      }
+      setTimeout(1000);
+      setState(ProcedureState.WAITING_TIMEOUT);
+      throw new ProcedureSuspendedException();
+    }
+    @Override protected synchronized boolean setTimeoutFailure(    MasterProcedureEnv env){
+      setState(ProcedureState.RUNNABLE);
+      env.getProcedureScheduler().addBack(this);
+      return false;
+    }
+    @Override protected void afterReplay(    MasterProcedureEnv env){
+      if (FAIL_LOAD) {
+        throw new RuntimeException("Inject error");
+      }
+    }
+    @Override public TableName getTableName(){
+      return NAME;
+    }
+    @Override public TableOperationType getTableOperationType(){
+      return TableOperationType.READ;
+    }
+  }
+  @BeforeClass public static void setUp() throws Exception {
+    UTIL.startMiniCluster(1);
+  }
+  @AfterClass public static void tearDown() throws Exception {
+    UTIL.shutdownMiniCluster();
+  }
+  private void waitNoMaster(){
+    UTIL.waitFor(30000,() -> UTIL.getMiniHBaseCluster().getLiveMasterThreads().isEmpty());
+  }
+  @Test public void testLoadError() throws Exception {
+    ProcedureExecutor<MasterProcedureEnv> procExec=UTIL.getMiniHBaseCluster().getMaster().getMasterProcedureExecutor();
+    ARRIVE=new CountDownLatch(1);
+    long procId=procExec.submitProcedure(new TestProcedure());
+    ARRIVE.await();
+    FAIL_LOAD=true;
+    UTIL.getMiniHBaseCluster().getMaster().getWalProcedureStore().stop(true);
+    UTIL.getMiniHBaseCluster().getMaster().abort("for testing");
+    waitNoMaster();
+    UTIL.getMiniHBaseCluster().startMaster();
+    waitNoMaster();
+    UTIL.getMiniHBaseCluster().startMaster();
+    waitNoMaster();
+    FAIL_LOAD=false;
+    HMaster master=UTIL.getMiniHBaseCluster().startMaster().getMaster();
+    UTIL.waitFor(30000,() -> master.isActiveMaster() && master.isInitialized());
+    TestProcedure proc=(TestProcedure)master.getMasterProcedureExecutor().getProcedure(procId);
+    assertFalse(proc.isFinished());
+    FINISH_PROC=true;
+    UTIL.waitFor(30000,() -> proc.isFinished());
+  }
+}

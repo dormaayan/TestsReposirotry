@@ -1,0 +1,38 @@
+/** 
+ * Test decommission process on standby NN. Verify admins can run "dfsadmin -refreshNodes" on SBN and decomm process can finish as long as admins run "dfsadmin -refreshNodes" on active NN. SBN used to mark excess replica upon recommission. The SBN's pick for excess replica could be different from the one picked by ANN. That creates inconsistent state and prevent SBN from finishing decommission.
+ */
+@Test(timeout=360000) public void testDecommissionOnStandby() throws Exception {
+  getConf().setInt(DFSConfigKeys.DFS_HA_TAILEDITS_PERIOD_KEY,1);
+  getConf().setInt(DFSConfigKeys.DFS_NAMENODE_HEARTBEAT_RECHECK_INTERVAL_KEY,30000);
+  getConf().setInt(DFSConfigKeys.DFS_NAMENODE_TOLERATE_HEARTBEAT_MULTIPLIER_KEY,2);
+  long slowHeartbeatDNwaitTime=getConf().getLong(DFSConfigKeys.DFS_HEARTBEAT_INTERVAL_KEY,DFSConfigKeys.DFS_HEARTBEAT_INTERVAL_DEFAULT) * 1000 * (getConf().getInt(DFSConfigKeys.DFS_NAMENODE_TOLERATE_HEARTBEAT_MULTIPLIER_KEY,DFSConfigKeys.DFS_NAMENODE_TOLERATE_HEARTBEAT_MULTIPLIER_DEFAULT) + 1);
+  startSimpleHACluster(3);
+  Path file1=new Path("testDecommissionHA.dat");
+  int replicas=3;
+  FileSystem activeFileSys=getCluster().getFileSystem(0);
+  writeFile(activeFileSys,file1,replicas);
+  HATestUtil.waitForStandbyToCatchUp(getCluster().getNameNode(0),getCluster().getNameNode(1));
+  getConf().setLong(DFSConfigKeys.DFS_HEARTBEAT_INTERVAL_KEY,30);
+  getCluster().startDataNodes(getConf(),1,true,null,null,null);
+  DataNode lastDN=getCluster().getDataNodes().get(3);
+  lastDN.getDatanodeUuid();
+  DataNode firstDN=getCluster().getDataNodes().get(0);
+  DatanodeInfo decommissionedNodeFromANN=takeNodeOutofService(0,firstDN.getDatanodeUuid(),0,null,AdminStates.DECOMMISSIONED);
+  DatanodeInfo decomNodeFromSBN=takeNodeOutofService(1,firstDN.getDatanodeUuid(),0,null,AdminStates.DECOMMISSIONED);
+  Thread.sleep(slowHeartbeatDNwaitTime);
+  putNodeInService(1,decomNodeFromSBN);
+  MiniDFSCluster.DataNodeProperties lastDNprop=getCluster().stopDataNode(3);
+  lastDNprop.conf.setLong(DFSConfigKeys.DFS_HEARTBEAT_INTERVAL_KEY,HEARTBEAT_INTERVAL);
+  getCluster().restartDataNode(lastDNprop);
+  MiniDFSCluster.DataNodeProperties nextToLastDNprop=getCluster().stopDataNode(2);
+  nextToLastDNprop.conf.setLong(DFSConfigKeys.DFS_HEARTBEAT_INTERVAL_KEY,30);
+  getCluster().restartDataNode(nextToLastDNprop);
+  getCluster().waitActive();
+  Thread.sleep(slowHeartbeatDNwaitTime);
+  putNodeInService(0,decommissionedNodeFromANN);
+  getCluster().triggerHeartbeats();
+  HATestUtil.waitForDNDeletions(getCluster());
+  getCluster().triggerDeletionReports();
+  takeNodeOutofService(0,firstDN.getDatanodeUuid(),0,null,AdminStates.DECOMMISSIONED);
+  takeNodeOutofService(1,firstDN.getDatanodeUuid(),0,null,AdminStates.DECOMMISSIONED);
+}

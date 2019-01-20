@@ -1,0 +1,122 @@
+@RunWith(Parameterized.class) public class DatabaseCompositeIndexAccessorTest {
+  private static final int PROP_ID1=1;
+  private static final int PROP_ID2=2;
+  private static final IndexDescriptor DESCRIPTOR=TestIndexDescriptorFactory.forLabel(0,PROP_ID1,PROP_ID2);
+  private static final Config config=Config.defaults();
+  @Rule public final ThreadingRule threading=new ThreadingRule();
+  @ClassRule public static final EphemeralFileSystemRule fileSystemRule=new EphemeralFileSystemRule();
+  @Parameterized.Parameter public IOFunction<DirectoryFactory,LuceneIndexAccessor> accessorFactory;
+  private LuceneIndexAccessor accessor;
+  private final long nodeId=1;
+  private final long nodeId2=2;
+  private final Object[] values={"value1","values2"};
+  private final Object[] values2={40,42};
+  private DirectoryFactory.InMemoryDirectoryFactory dirFactory;
+  private static final IndexDescriptor SCHEMA_INDEX_DESCRIPTOR=TestIndexDescriptorFactory.forLabel(0,PROP_ID1,PROP_ID2);
+  private static final IndexDescriptor UNIQUE_SCHEMA_INDEX_DESCRIPTOR=TestIndexDescriptorFactory.uniqueForLabel(1,PROP_ID1,PROP_ID2);
+  @Parameterized.Parameters(name="{0}") public static Collection<IOFunction<DirectoryFactory,LuceneIndexAccessor>[]> implementations(){
+    final File dir=new File("dir");
+    return Arrays.asList(arg(dirFactory1 -> {
+      SchemaIndex index=LuceneSchemaIndexBuilder.create(SCHEMA_INDEX_DESCRIPTOR,config).withFileSystem(fileSystemRule.get()).withDirectoryFactory(dirFactory1).withIndexRootFolder(new File(dir,"1")).build();
+      index.create();
+      index.open();
+      return new LuceneIndexAccessor(index,DESCRIPTOR);
+    }
+),arg(dirFactory1 -> {
+      SchemaIndex index=LuceneSchemaIndexBuilder.create(UNIQUE_SCHEMA_INDEX_DESCRIPTOR,config).withFileSystem(fileSystemRule.get()).withDirectoryFactory(dirFactory1).withIndexRootFolder(new File(dir,"testIndex")).build();
+      index.create();
+      index.open();
+      return new LuceneIndexAccessor(index,DESCRIPTOR);
+    }
+));
+  }
+  @SuppressWarnings("unchecked") private static IOFunction<DirectoryFactory,LuceneIndexAccessor>[] arg(  IOFunction<DirectoryFactory,LuceneIndexAccessor> foo){
+    return new IOFunction[]{foo};
+  }
+  @Before public void before() throws IOException {
+    dirFactory=new DirectoryFactory.InMemoryDirectoryFactory();
+    accessor=accessorFactory.apply(dirFactory);
+  }
+  @After public void after() throws IOException {
+    accessor.close();
+    dirFactory.close();
+  }
+  @Test public void indexReaderShouldSupportScan() throws Exception {
+    updateAndCommit(asList(add(nodeId,values),add(nodeId2,values2)));
+    IndexReader reader=accessor.newReader();
+    LongIterator results=reader.query(IndexQuery.exists(PROP_ID1),IndexQuery.exists(PROP_ID2));
+    assertEquals(asSet(nodeId,nodeId2),PrimitiveLongCollections.toSet(results));
+    assertEquals(asSet(nodeId),PrimitiveLongCollections.toSet(reader.query(exact(PROP_ID1,values[0]),exact(PROP_ID2,values[1]))));
+    reader.close();
+  }
+  @Test public void multipleIndexReadersFromDifferentPointsInTimeCanSeeDifferentResults() throws Exception {
+    updateAndCommit(asList(add(nodeId,values)));
+    IndexReader firstReader=accessor.newReader();
+    updateAndCommit(asList(add(nodeId2,values2)));
+    IndexReader secondReader=accessor.newReader();
+    assertEquals(asSet(nodeId),PrimitiveLongCollections.toSet(firstReader.query(exact(PROP_ID1,values[0]),exact(PROP_ID2,values[1]))));
+    assertEquals(asSet(),PrimitiveLongCollections.toSet(firstReader.query(exact(PROP_ID1,values2[0]),exact(PROP_ID2,values2[1]))));
+    assertEquals(asSet(nodeId),PrimitiveLongCollections.toSet(secondReader.query(exact(PROP_ID1,values[0]),exact(PROP_ID2,values[1]))));
+    assertEquals(asSet(nodeId2),PrimitiveLongCollections.toSet(secondReader.query(exact(PROP_ID1,values2[0]),exact(PROP_ID2,values2[1]))));
+    firstReader.close();
+    secondReader.close();
+  }
+  @Test public void canAddNewData() throws Exception {
+    updateAndCommit(asList(add(nodeId,values),add(nodeId2,values2)));
+    IndexReader reader=accessor.newReader();
+    assertEquals(asSet(nodeId),PrimitiveLongCollections.toSet(reader.query(exact(PROP_ID1,values[0]),exact(PROP_ID2,values[1]))));
+    reader.close();
+  }
+  @Test public void canChangeExistingData() throws Exception {
+    updateAndCommit(asList(add(nodeId,values)));
+    updateAndCommit(asList(change(nodeId,values,values2)));
+    IndexReader reader=accessor.newReader();
+    assertEquals(asSet(nodeId),PrimitiveLongCollections.toSet(reader.query(exact(PROP_ID1,values2[0]),exact(PROP_ID2,values2[1]))));
+    assertEquals(emptySet(),PrimitiveLongCollections.toSet(reader.query(exact(PROP_ID1,values[0]),exact(PROP_ID2,values[1]))));
+    reader.close();
+  }
+  @Test public void canRemoveExistingData() throws Exception {
+    updateAndCommit(asList(add(nodeId,values),add(nodeId2,values2)));
+    updateAndCommit(asList(remove(nodeId,values)));
+    IndexReader reader=accessor.newReader();
+    assertEquals(asSet(nodeId2),PrimitiveLongCollections.toSet(reader.query(exact(PROP_ID1,values2[0]),exact(PROP_ID2,values2[1]))));
+    assertEquals(asSet(),PrimitiveLongCollections.toSet(reader.query(exact(PROP_ID1,values[0]),exact(PROP_ID2,values[1]))));
+    reader.close();
+  }
+  @Test public void shouldStopSamplingWhenIndexIsDropped() throws Exception {
+    updateAndCommit(asList(add(nodeId,values),add(nodeId2,values2)));
+    IndexReader indexReader=accessor.newReader();
+    IndexSampler indexSampler=indexReader.createSampler();
+    Future<Void> drop=threading.executeAndAwait((IOFunction<Void,Void>)nothing -> {
+      accessor.drop();
+      return nothing;
+    }
+,null,waitingWhileIn(TaskCoordinator.class,"awaitCompletion"),3,SECONDS);
+    try (IndexReader reader=indexReader){
+      indexSampler.sampleIndex();
+      fail("expected exception");
+    }
+ catch (    IndexNotFoundKernelException e) {
+      assertEquals("Index dropped while sampling.",e.getMessage());
+    }
+ finally {
+      drop.get();
+    }
+  }
+  private IndexEntryUpdate<?> add(  long nodeId,  Object... values){
+    return IndexQueryHelper.add(nodeId,SCHEMA_INDEX_DESCRIPTOR.schema(),values);
+  }
+  private IndexEntryUpdate<?> remove(  long nodeId,  Object... values){
+    return IndexQueryHelper.remove(nodeId,SCHEMA_INDEX_DESCRIPTOR.schema(),values);
+  }
+  private IndexEntryUpdate<?> change(  long nodeId,  Object[] valuesBefore,  Object[] valuesAfter){
+    return IndexQueryHelper.change(nodeId,SCHEMA_INDEX_DESCRIPTOR.schema(),valuesBefore,valuesAfter);
+  }
+  private void updateAndCommit(  List<IndexEntryUpdate<?>> nodePropertyUpdates) throws IOException, IndexEntryConflictException {
+    try (IndexUpdater updater=accessor.newUpdater(IndexUpdateMode.ONLINE)){
+      for (      IndexEntryUpdate<?> update : nodePropertyUpdates) {
+        updater.process(update);
+      }
+    }
+   }
+}

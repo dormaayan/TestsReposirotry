@@ -1,0 +1,53 @@
+/** 
+ * Tests that the checkpointed partitioned and non-partitioned state is assigned properly to the  {@link Execution} upon recovery.
+ * @throws Exception
+ */
+@Test public void testRestoreLatestCheckpointedState() throws Exception {
+  final JobID jid=new JobID();
+  final long timestamp=System.currentTimeMillis();
+  final JobVertexID jobVertexID1=new JobVertexID();
+  final JobVertexID jobVertexID2=new JobVertexID();
+  int parallelism1=3;
+  int parallelism2=2;
+  int maxParallelism1=42;
+  int maxParallelism2=13;
+  final ExecutionJobVertex jobVertex1=mockExecutionJobVertex(jobVertexID1,parallelism1,maxParallelism1);
+  final ExecutionJobVertex jobVertex2=mockExecutionJobVertex(jobVertexID2,parallelism2,maxParallelism2);
+  List<ExecutionVertex> allExecutionVertices=new ArrayList<>(parallelism1 + parallelism2);
+  allExecutionVertices.addAll(Arrays.asList(jobVertex1.getTaskVertices()));
+  allExecutionVertices.addAll(Arrays.asList(jobVertex2.getTaskVertices()));
+  ExecutionVertex[] arrayExecutionVertices=allExecutionVertices.toArray(new ExecutionVertex[allExecutionVertices.size()]);
+  CompletedCheckpointStore store=new RecoverableCompletedCheckpointStore();
+  CheckpointCoordinator coord=new CheckpointCoordinator(jid,600000,600000,0,Integer.MAX_VALUE,CheckpointRetentionPolicy.NEVER_RETAIN_AFTER_TERMINATION,arrayExecutionVertices,arrayExecutionVertices,arrayExecutionVertices,new StandaloneCheckpointIDCounter(),store,new MemoryStateBackend(),Executors.directExecutor(),SharedStateRegistry.DEFAULT_FACTORY);
+  coord.triggerCheckpoint(timestamp,false);
+  assertTrue(coord.getPendingCheckpoints().keySet().size() == 1);
+  long checkpointId=Iterables.getOnlyElement(coord.getPendingCheckpoints().keySet());
+  List<KeyGroupRange> keyGroupPartitions1=StateAssignmentOperation.createKeyGroupPartitions(maxParallelism1,parallelism1);
+  List<KeyGroupRange> keyGroupPartitions2=StateAssignmentOperation.createKeyGroupPartitions(maxParallelism2,parallelism2);
+  for (int index=0; index < jobVertex1.getParallelism(); index++) {
+    TaskStateSnapshot subtaskState=mockSubtaskState(jobVertexID1,index,keyGroupPartitions1.get(index));
+    AcknowledgeCheckpoint acknowledgeCheckpoint=new AcknowledgeCheckpoint(jid,jobVertex1.getTaskVertices()[index].getCurrentExecutionAttempt().getAttemptId(),checkpointId,new CheckpointMetrics(),subtaskState);
+    coord.receiveAcknowledgeMessage(acknowledgeCheckpoint);
+  }
+  for (int index=0; index < jobVertex2.getParallelism(); index++) {
+    TaskStateSnapshot subtaskState=mockSubtaskState(jobVertexID2,index,keyGroupPartitions2.get(index));
+    AcknowledgeCheckpoint acknowledgeCheckpoint=new AcknowledgeCheckpoint(jid,jobVertex2.getTaskVertices()[index].getCurrentExecutionAttempt().getAttemptId(),checkpointId,new CheckpointMetrics(),subtaskState);
+    coord.receiveAcknowledgeMessage(acknowledgeCheckpoint);
+  }
+  List<CompletedCheckpoint> completedCheckpoints=coord.getSuccessfulCheckpoints();
+  assertEquals(1,completedCheckpoints.size());
+  store.shutdown(JobStatus.SUSPENDED);
+  Map<JobVertexID,ExecutionJobVertex> tasks=new HashMap<>();
+  tasks.put(jobVertexID1,jobVertex1);
+  tasks.put(jobVertexID2,jobVertex2);
+  coord.restoreLatestCheckpointedState(tasks,true,false);
+  for (  CompletedCheckpoint completedCheckpoint : completedCheckpoints) {
+    for (    OperatorState taskState : completedCheckpoint.getOperatorStates().values()) {
+      for (      OperatorSubtaskState subtaskState : taskState.getStates()) {
+        verify(subtaskState,times(2)).registerSharedStates(any(SharedStateRegistry.class));
+      }
+    }
+  }
+  verifyStateRestore(jobVertexID1,jobVertex1,keyGroupPartitions1);
+  verifyStateRestore(jobVertexID2,jobVertex2,keyGroupPartitions2);
+}

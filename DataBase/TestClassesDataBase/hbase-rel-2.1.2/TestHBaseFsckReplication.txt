@@ -1,0 +1,45 @@
+@Category({ReplicationTests.class,MediumTests.class}) public class TestHBaseFsckReplication {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestHBaseFsckReplication.class);
+  private static final HBaseTestingUtility UTIL=new HBaseTestingUtility();
+  @BeforeClass public static void setUp() throws Exception {
+    UTIL.getConfiguration().setBoolean("hbase.write.hbck1.lock.file",false);
+    UTIL.startMiniCluster(1);
+  }
+  @AfterClass public static void tearDown() throws Exception {
+    UTIL.shutdownMiniCluster();
+  }
+  @Test public void test() throws Exception {
+    ReplicationPeerStorage peerStorage=ReplicationStorageFactory.getReplicationPeerStorage(UTIL.getZooKeeperWatcher(),UTIL.getConfiguration());
+    ReplicationQueueStorage queueStorage=ReplicationStorageFactory.getReplicationQueueStorage(UTIL.getZooKeeperWatcher(),UTIL.getConfiguration());
+    String peerId1="1";
+    String peerId2="2";
+    peerStorage.addPeer(peerId1,ReplicationPeerConfig.newBuilder().setClusterKey("key").build(),true);
+    peerStorage.addPeer(peerId2,ReplicationPeerConfig.newBuilder().setClusterKey("key").build(),true);
+    for (int i=0; i < 10; i++) {
+      queueStorage.addWAL(ServerName.valueOf("localhost",10000 + i,100000 + i),peerId1,"file-" + i);
+    }
+    queueStorage.addWAL(ServerName.valueOf("localhost",10000,100000),peerId2,"file");
+    HBaseFsck fsck=HbckTestingUtil.doFsck(UTIL.getConfiguration(),true);
+    HbckTestingUtil.assertNoErrors(fsck);
+    assertEquals(10,queueStorage.getListOfReplicators().size());
+    peerStorage.removePeer(peerId1);
+    assertEquals(10,queueStorage.getListOfReplicators().size());
+    fsck=HbckTestingUtil.doFsck(UTIL.getConfiguration(),false);
+    HbckTestingUtil.assertErrors(fsck,Stream.generate(() -> {
+      return ERROR_CODE.UNDELETED_REPLICATION_QUEUE;
+    }
+).limit(10).toArray(ERROR_CODE[]::new));
+    assertEquals(10,queueStorage.getListOfReplicators().size());
+    fsck=HbckTestingUtil.doFsck(UTIL.getConfiguration(),true);
+    HbckTestingUtil.assertErrors(fsck,Stream.generate(() -> {
+      return ERROR_CODE.UNDELETED_REPLICATION_QUEUE;
+    }
+).limit(10).toArray(ERROR_CODE[]::new));
+    List<ServerName> replicators=queueStorage.getListOfReplicators();
+    assertEquals(1,replicators.size());
+    assertEquals(ServerName.valueOf("localhost",10000,100000),replicators.get(0));
+    for (    String queueId : queueStorage.getAllQueues(replicators.get(0))) {
+      assertEquals(peerId2,queueId);
+    }
+  }
+}

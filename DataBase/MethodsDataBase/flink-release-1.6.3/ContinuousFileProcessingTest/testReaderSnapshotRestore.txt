@@ -1,0 +1,45 @@
+@Test public void testReaderSnapshotRestore() throws Exception {
+  String testBasePath=hdfsURI + "/" + UUID.randomUUID()+ "/";
+  TimestampedFileInputSplit split1=new TimestampedFileInputSplit(0,3,new Path("test/test1"),0,100,null);
+  TimestampedFileInputSplit split2=new TimestampedFileInputSplit(10,2,new Path("test/test2"),101,200,null);
+  TimestampedFileInputSplit split3=new TimestampedFileInputSplit(10,1,new Path("test/test2"),0,100,null);
+  TimestampedFileInputSplit split4=new TimestampedFileInputSplit(11,0,new Path("test/test3"),0,100,null);
+  final OneShotLatch latch=new OneShotLatch();
+  BlockingFileInputFormat format=new BlockingFileInputFormat(latch,new Path(testBasePath));
+  TypeInformation<FileInputSplit> typeInfo=TypeExtractor.getInputFormatTypes(format);
+  ContinuousFileReaderOperator<FileInputSplit> initReader=new ContinuousFileReaderOperator<>(format);
+  initReader.setOutputType(typeInfo,new ExecutionConfig());
+  OneInputStreamOperatorTestHarness<TimestampedFileInputSplit,FileInputSplit> initTestInstance=new OneInputStreamOperatorTestHarness<>(initReader);
+  initTestInstance.setTimeCharacteristic(TimeCharacteristic.EventTime);
+  initTestInstance.open();
+  initTestInstance.processElement(new StreamRecord<>(split1));
+  initTestInstance.processElement(new StreamRecord<>(split2));
+  initTestInstance.processElement(new StreamRecord<>(split3));
+  initTestInstance.processElement(new StreamRecord<>(split4));
+  final OperatorSubtaskState snapshot;
+synchronized (initTestInstance.getCheckpointLock()) {
+    snapshot=initTestInstance.snapshot(0L,0L);
+  }
+  ContinuousFileReaderOperator<FileInputSplit> restoredReader=new ContinuousFileReaderOperator<>(new BlockingFileInputFormat(latch,new Path(testBasePath)));
+  restoredReader.setOutputType(typeInfo,new ExecutionConfig());
+  OneInputStreamOperatorTestHarness<TimestampedFileInputSplit,FileInputSplit> restoredTestInstance=new OneInputStreamOperatorTestHarness<>(restoredReader);
+  restoredTestInstance.setTimeCharacteristic(TimeCharacteristic.EventTime);
+  restoredTestInstance.initializeState(snapshot);
+  restoredTestInstance.open();
+  latch.trigger();
+synchronized (initTestInstance.getCheckpointLock()) {
+    initTestInstance.close();
+  }
+synchronized (restoredTestInstance.getCheckpointLock()) {
+    restoredTestInstance.close();
+  }
+  FileInputSplit fsSplit1=createSplitFromTimestampedSplit(split1);
+  FileInputSplit fsSplit2=createSplitFromTimestampedSplit(split2);
+  FileInputSplit fsSplit3=createSplitFromTimestampedSplit(split3);
+  FileInputSplit fsSplit4=createSplitFromTimestampedSplit(split4);
+  Assert.assertTrue(initTestInstance.getOutput().contains(new StreamRecord<>(fsSplit1)));
+  Assert.assertTrue(initTestInstance.getOutput().contains(new StreamRecord<>(fsSplit2)));
+  Assert.assertTrue(initTestInstance.getOutput().contains(new StreamRecord<>(fsSplit3)));
+  Assert.assertTrue(initTestInstance.getOutput().contains(new StreamRecord<>(fsSplit4)));
+  Assert.assertArrayEquals(initTestInstance.getOutput().toArray(),restoredTestInstance.getOutput().toArray());
+}

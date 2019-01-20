@@ -1,0 +1,73 @@
+@Test(timeout=30000) public void testRollingUpgradeWithQJM() throws Exception {
+  String nnDirPrefix=MiniDFSCluster.getBaseDirectory() + "/nn/";
+  final File nn1Dir=new File(nnDirPrefix + "image1");
+  final File nn2Dir=new File(nnDirPrefix + "image2");
+  LOG.info("nn1Dir=" + nn1Dir);
+  LOG.info("nn2Dir=" + nn2Dir);
+  final Configuration conf=new HdfsConfiguration();
+  final MiniJournalCluster mjc=new MiniJournalCluster.Builder(conf).build();
+  mjc.waitActive();
+  setConf(conf,nn1Dir,mjc);
+{
+    final MiniDFSCluster cluster=new MiniDFSCluster.Builder(conf).numDataNodes(0).manageNameDfsDirs(false).checkExitOnShutdown(false).build();
+    cluster.shutdown();
+  }
+  MiniDFSCluster cluster2=null;
+  try {
+    FileUtil.fullyDelete(nn2Dir);
+    FileUtil.copy(nn1Dir,FileSystem.getLocal(conf).getRaw(),new Path(nn2Dir.getAbsolutePath()),false,conf);
+    final MiniDFSCluster cluster=new MiniDFSCluster.Builder(conf).numDataNodes(0).format(false).manageNameDfsDirs(false).checkExitOnShutdown(false).build();
+    final Path foo=new Path("/foo");
+    final Path bar=new Path("/bar");
+    final Path baz=new Path("/baz");
+    final RollingUpgradeInfo info1;
+{
+      final DistributedFileSystem dfs=cluster.getFileSystem();
+      dfs.mkdirs(foo);
+      dfs.setSafeMode(SafeModeAction.SAFEMODE_ENTER);
+      info1=dfs.rollingUpgrade(RollingUpgradeAction.PREPARE);
+      dfs.setSafeMode(SafeModeAction.SAFEMODE_LEAVE);
+      LOG.info("START\n" + info1);
+      assertEquals(info1,dfs.rollingUpgrade(RollingUpgradeAction.QUERY));
+      dfs.mkdirs(bar);
+      cluster.shutdown();
+    }
+    final Configuration conf2=setConf(new Configuration(),nn2Dir,mjc);
+    cluster2=new MiniDFSCluster.Builder(conf2).numDataNodes(0).format(false).manageNameDfsDirs(false).build();
+    final DistributedFileSystem dfs2=cluster2.getFileSystem();
+    Assert.assertTrue(dfs2.exists(foo));
+    Assert.assertTrue(dfs2.exists(bar));
+    Assert.assertFalse(dfs2.exists(baz));
+    assertEquals(info1,dfs2.rollingUpgrade(RollingUpgradeAction.QUERY));
+    dfs2.mkdirs(baz);
+    LOG.info("RESTART cluster 2");
+    cluster2.restartNameNode();
+    assertEquals(info1,dfs2.rollingUpgrade(RollingUpgradeAction.QUERY));
+    Assert.assertTrue(dfs2.exists(foo));
+    Assert.assertTrue(dfs2.exists(bar));
+    Assert.assertTrue(dfs2.exists(baz));
+    try {
+      cluster2.restartNameNode("-upgrade");
+    }
+ catch (    IOException e) {
+      LOG.info("The exception is expected.",e);
+    }
+    LOG.info("RESTART cluster 2 again");
+    cluster2.restartNameNode();
+    assertEquals(info1,dfs2.rollingUpgrade(RollingUpgradeAction.QUERY));
+    Assert.assertTrue(dfs2.exists(foo));
+    Assert.assertTrue(dfs2.exists(bar));
+    Assert.assertTrue(dfs2.exists(baz));
+    final RollingUpgradeInfo finalize=dfs2.rollingUpgrade(RollingUpgradeAction.FINALIZE);
+    Assert.assertTrue(finalize.isFinalized());
+    LOG.info("RESTART cluster 2 with regular startup option");
+    cluster2.getNameNodeInfos()[0].setStartOpt(StartupOption.REGULAR);
+    cluster2.restartNameNode();
+    Assert.assertTrue(dfs2.exists(foo));
+    Assert.assertTrue(dfs2.exists(bar));
+    Assert.assertTrue(dfs2.exists(baz));
+  }
+  finally {
+    if (cluster2 != null)     cluster2.shutdown();
+  }
+}

@@ -1,0 +1,57 @@
+@Test(timeout=20000) public void testReplaceExpiringDelegationToken() throws Exception {
+  conf.setBoolean(YarnConfiguration.RM_PROXY_USER_PRIVILEGES_ENABLED,true);
+  conf.set(CommonConfigurationKeysPublic.HADOOP_SECURITY_AUTHENTICATION,"kerberos");
+  UserGroupInformation.setConfiguration(conf);
+  Text userText1=new Text("user1");
+  DelegationTokenIdentifier dtId1=new DelegationTokenIdentifier(userText1,new Text("renewer1"),userText1);
+  dtId1.setMaxDate(0);
+  final Token<DelegationTokenIdentifier> token1=new Token<DelegationTokenIdentifier>(dtId1.getBytes(),"password1".getBytes(),dtId1.getKind(),new Text("service1"));
+  Text userText2=new Text("user2");
+  DelegationTokenIdentifier dtId2=new DelegationTokenIdentifier(userText1,new Text("renewer2"),userText2);
+  final Token<DelegationTokenIdentifier> expectedToken=new Token<DelegationTokenIdentifier>(dtId2.getBytes(),"password2".getBytes(),dtId2.getKind(),new Text("service2"));
+  final MockRM rm=new TestSecurityMockRM(conf,null){
+    @Override protected DelegationTokenRenewer createDelegationTokenRenewer(){
+      return new DelegationTokenRenewer(){
+        @Override protected Token<?>[] obtainSystemTokensForUser(        String user,        final Credentials credentials) throws IOException {
+          credentials.addToken(expectedToken.getService(),expectedToken);
+          return new Token<?>[]{expectedToken};
+        }
+      }
+;
+    }
+  }
+;
+  rm.start();
+  Credentials credentials=new Credentials();
+  credentials.addToken(userText1,token1);
+  RMApp app=rm.submitApp(200,"name","user",new HashMap<ApplicationAccessType,String>(),false,"default",1,credentials);
+  GenericTestUtils.waitFor(new Supplier<Boolean>(){
+    public Boolean get(){
+      return rm.getRMContext().getDelegationTokenRenewer().getAllTokens().get(token1) == null;
+    }
+  }
+,1000,20000);
+  GenericTestUtils.waitFor(new Supplier<Boolean>(){
+    public Boolean get(){
+      return !rm.getRMContext().getDelegationTokenRenewer().getDelegationTokens().contains(token1);
+    }
+  }
+,1000,20000);
+  GenericTestUtils.waitFor(new Supplier<Boolean>(){
+    public Boolean get(){
+      return rm.getRMContext().getDelegationTokenRenewer().getDelegationTokens().contains(expectedToken);
+    }
+  }
+,1000,20000);
+  final MockNM nm1=new MockNM("127.0.0.1:1234",15120,rm.getResourceTrackerService());
+  nm1.registerNode();
+  NodeHeartbeatResponse response=nm1.nodeHeartbeat(true);
+  ByteBuffer tokenBuffer=response.getSystemCredentialsForApps().get(app.getApplicationId());
+  Assert.assertNotNull(tokenBuffer);
+  Credentials appCredentials=new Credentials();
+  DataInputByteBuffer buf=new DataInputByteBuffer();
+  tokenBuffer.rewind();
+  buf.reset(tokenBuffer);
+  appCredentials.readTokenStorageStream(buf);
+  Assert.assertTrue(appCredentials.getAllTokens().contains(expectedToken));
+}

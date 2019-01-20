@@ -1,0 +1,350 @@
+@Category(LargeTests.class) public class TestEndToEndSplitTransaction {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestEndToEndSplitTransaction.class);
+  private static final Logger LOG=LoggerFactory.getLogger(TestEndToEndSplitTransaction.class);
+  private static final HBaseTestingUtility TEST_UTIL=new HBaseTestingUtility();
+  private static final Configuration CONF=TEST_UTIL.getConfiguration();
+  @Rule public TestName name=new TestName();
+  @BeforeClass public static void beforeAllTests() throws Exception {
+    TEST_UTIL.getConfiguration().setInt(HConstants.HBASE_CLIENT_RETRIES_NUMBER,5);
+    TEST_UTIL.startMiniCluster();
+  }
+  @AfterClass public static void afterAllTests() throws Exception {
+    TEST_UTIL.shutdownMiniCluster();
+  }
+  @Test public void testCanSplitJustAfterASplit() throws Exception {
+    LOG.info("Starting testCanSplitJustAfterASplit");
+    byte[] fam=Bytes.toBytes("cf_split");
+    TableName tableName=TableName.valueOf("CanSplitTable");
+    Table source=TEST_UTIL.getConnection().getTable(tableName);
+    Admin admin=TEST_UTIL.getAdmin();
+    Map<String,StoreFileReader> scanner=Maps.newHashMap();
+    try {
+      TableDescriptor htd=TableDescriptorBuilder.newBuilder(tableName).setColumnFamily(ColumnFamilyDescriptorBuilder.of(fam)).build();
+      admin.createTable(htd);
+      TEST_UTIL.loadTable(source,fam);
+      List<HRegion> regions=TEST_UTIL.getHBaseCluster().getRegions(tableName);
+      regions.get(0).forceSplit(null);
+      admin.split(tableName);
+      while (regions.size() <= 1) {
+        regions=TEST_UTIL.getHBaseCluster().getRegions(tableName);
+        regions.stream().forEach(r -> r.getStores().get(0).getStorefiles().stream().filter(s -> s.isReference() && !scanner.containsKey(r.getRegionInfo().getEncodedName())).forEach(sf -> {
+          StoreFileReader reader=((HStoreFile)sf).getReader();
+          reader.getStoreFileScanner(true,false,false,0,0,false);
+          scanner.put(r.getRegionInfo().getEncodedName(),reader);
+          LOG.info("Got reference to file = " + sf.getPath() + ",for region = "+ r.getRegionInfo().getEncodedName());
+        }
+));
+      }
+      Assert.assertTrue("Regions did not split properly",regions.size() > 1);
+      Assert.assertTrue("Could not get reference any of the store file",scanner.size() > 1);
+      RetryCounter retrier=new RetryCounter(30,1,TimeUnit.SECONDS);
+      while (CompactionState.NONE != admin.getCompactionState(tableName) && retrier.shouldRetry()) {
+        retrier.sleepUntilNextRetry();
+      }
+      Assert.assertEquals("Compaction did not complete in 30 secs",CompactionState.NONE,admin.getCompactionState(tableName));
+      regions.stream().filter(region -> scanner.containsKey(region.getRegionInfo().getEncodedName())).forEach(r -> Assert.assertTrue("Contains an open file reference which can be split",!r.getStores().get(0).canSplit()));
+    }
+  finally {
+      scanner.values().stream().forEach(s -> {
+        try {
+          s.close(true);
+        }
+ catch (        IOException ioe) {
+          LOG.error("Failed while closing store file",ioe);
+        }
+      }
+);
+      scanner.clear();
+      if (source != null) {
+        source.close();
+      }
+      TEST_UTIL.deleteTableIfAny(tableName);
+    }
+  }
+  /** 
+ * Tests that the client sees meta table changes as atomic during splits
+ */
+  @Test public void testFromClientSideWhileSplitting() throws Throwable {
+    LOG.info("Starting testFromClientSideWhileSplitting");
+    final TableName tableName=TableName.valueOf(name.getMethodName());
+    final byte[] FAMILY=Bytes.toBytes("family");
+    Table table=TEST_UTIL.createTable(tableName,FAMILY);
+    Stoppable stopper=new StoppableImplementation();
+    RegionSplitter regionSplitter=new RegionSplitter(table);
+    RegionChecker regionChecker=new RegionChecker(CONF,stopper,tableName);
+    final ChoreService choreService=new ChoreService("TEST_SERVER");
+    choreService.scheduleChore(regionChecker);
+    regionSplitter.start();
+    regionSplitter.join();
+    stopper.stop(null);
+    if (regionChecker.ex != null) {
+      throw new AssertionError("regionChecker",regionChecker.ex);
+    }
+    if (regionSplitter.ex != null) {
+      throw new AssertionError("regionSplitter",regionSplitter.ex);
+    }
+    regionChecker.verify();
+  }
+static class RegionSplitter extends Thread {
+    final Connection connection;
+    Throwable ex;
+    Table table;
+    TableName tableName;
+    byte[] family;
+    Admin admin;
+    HRegionServer rs;
+    RegionSplitter(    Table table) throws IOException {
+      this.table=table;
+      this.tableName=table.getName();
+      this.family=table.getTableDescriptor().getFamiliesKeys().iterator().next();
+      admin=TEST_UTIL.getAdmin();
+      rs=TEST_UTIL.getMiniHBaseCluster().getRegionServer(0);
+      connection=TEST_UTIL.getConnection();
+    }
+    @Override public void run(){
+      try {
+        Random random=new Random();
+        for (int i=0; i < 5; i++) {
+          List<RegionInfo> regions=MetaTableAccessor.getTableRegions(connection,tableName,true);
+          if (regions.isEmpty()) {
+            continue;
+          }
+          int regionIndex=random.nextInt(regions.size());
+          RegionInfo region=Iterators.get(regions.iterator(),regionIndex);
+          int start=0, end=Integer.MAX_VALUE;
+          if (region.getStartKey().length > 0) {
+            start=Bytes.toInt(region.getStartKey());
+          }
+          if (region.getEndKey().length > 0) {
+            end=Bytes.toInt(region.getEndKey());
+          }
+          int mid=start + ((end - start) / 2);
+          byte[] splitPoint=Bytes.toBytes(mid);
+          addData(start);
+          addData(mid);
+          flushAndBlockUntilDone(admin,rs,region.getRegionName());
+          compactAndBlockUntilDone(admin,rs,region.getRegionName());
+          log("Initiating region split for:" + region.getRegionNameAsString());
+          try {
+            admin.splitRegion(region.getRegionName(),splitPoint);
+            blockUntilRegionSplit(CONF,50000,region.getRegionName(),true);
+          }
+ catch (          NotServingRegionException ex) {
+          }
+        }
+      }
+ catch (      Throwable ex) {
+        this.ex=ex;
+      }
+    }
+    void addData(    int start) throws IOException {
+      List<Put> puts=new ArrayList<>();
+      for (int i=start; i < start + 100; i++) {
+        Put put=new Put(Bytes.toBytes(i));
+        put.addColumn(family,family,Bytes.toBytes(i));
+        puts.add(put);
+      }
+      table.put(puts);
+    }
+  }
+  /** 
+ * Checks regions using MetaTableAccessor and HTable methods
+ */
+static class RegionChecker extends ScheduledChore {
+    Connection connection;
+    Configuration conf;
+    TableName tableName;
+    Throwable ex;
+    RegionChecker(    Configuration conf,    Stoppable stopper,    TableName tableName) throws IOException {
+      super("RegionChecker",stopper,100);
+      this.conf=conf;
+      this.tableName=tableName;
+      this.connection=ConnectionFactory.createConnection(conf);
+    }
+    /** 
+ * verify region boundaries obtained from MetaScanner 
+ */
+    void verifyRegionsUsingMetaTableAccessor() throws Exception {
+      List<RegionInfo> regionList=MetaTableAccessor.getTableRegions(connection,tableName,true);
+      verifyTableRegions(regionList.stream().collect(Collectors.toCollection(() -> new TreeSet<>(RegionInfo.COMPARATOR))));
+      regionList=MetaTableAccessor.getAllRegions(connection,true);
+      verifyTableRegions(regionList.stream().collect(Collectors.toCollection(() -> new TreeSet<>(RegionInfo.COMPARATOR))));
+    }
+    /** 
+ * verify region boundaries obtained from HTable.getStartEndKeys() 
+ */
+    void verifyRegionsUsingHTable() throws IOException {
+      Table table=null;
+      try {
+        table=connection.getTable(tableName);
+        try (RegionLocator rl=connection.getRegionLocator(tableName)){
+          Pair<byte[][],byte[][]> keys=rl.getStartEndKeys();
+          verifyStartEndKeys(keys);
+          Set<RegionInfo> regions=new TreeSet<>(RegionInfo.COMPARATOR);
+          for (          HRegionLocation loc : rl.getAllRegionLocations()) {
+            regions.add(loc.getRegionInfo());
+          }
+          verifyTableRegions(regions);
+        }
+       }
+  finally {
+        IOUtils.closeQuietly(table);
+      }
+    }
+    void verify() throws Exception {
+      verifyRegionsUsingMetaTableAccessor();
+      verifyRegionsUsingHTable();
+    }
+    void verifyTableRegions(    Set<RegionInfo> regions){
+      log("Verifying " + regions.size() + " regions: "+ regions);
+      byte[][] startKeys=new byte[regions.size()][];
+      byte[][] endKeys=new byte[regions.size()][];
+      int i=0;
+      for (      RegionInfo region : regions) {
+        startKeys[i]=region.getStartKey();
+        endKeys[i]=region.getEndKey();
+        i++;
+      }
+      Pair<byte[][],byte[][]> keys=new Pair<>(startKeys,endKeys);
+      verifyStartEndKeys(keys);
+    }
+    void verifyStartEndKeys(    Pair<byte[][],byte[][]> keys){
+      byte[][] startKeys=keys.getFirst();
+      byte[][] endKeys=keys.getSecond();
+      assertEquals(startKeys.length,endKeys.length);
+      assertTrue("Found 0 regions for the table",startKeys.length > 0);
+      assertArrayEquals("Start key for the first region is not byte[0]",HConstants.EMPTY_START_ROW,startKeys[0]);
+      byte[] prevEndKey=HConstants.EMPTY_START_ROW;
+      for (int i=0; i < startKeys.length; i++) {
+        assertArrayEquals("Hole in hbase:meta is detected. prevEndKey=" + Bytes.toStringBinary(prevEndKey) + " ,regionStartKey="+ Bytes.toStringBinary(startKeys[i]),prevEndKey,startKeys[i]);
+        prevEndKey=endKeys[i];
+      }
+      assertArrayEquals("End key for the last region is not byte[0]",HConstants.EMPTY_END_ROW,endKeys[endKeys.length - 1]);
+    }
+    @Override protected void chore(){
+      try {
+        verify();
+      }
+ catch (      Throwable ex) {
+        this.ex=ex;
+        getStopper().stop("caught exception");
+      }
+    }
+  }
+  public static void log(  String msg){
+    LOG.info(msg);
+  }
+  public static void flushAndBlockUntilDone(  Admin admin,  HRegionServer rs,  byte[] regionName) throws IOException, InterruptedException {
+    log("flushing region: " + Bytes.toStringBinary(regionName));
+    admin.flushRegion(regionName);
+    log("blocking until flush is complete: " + Bytes.toStringBinary(regionName));
+    Threads.sleepWithoutInterrupt(500);
+    while (rs.getOnlineRegion(regionName).getMemStoreDataSize() > 0) {
+      Threads.sleep(50);
+    }
+  }
+  public static void compactAndBlockUntilDone(  Admin admin,  HRegionServer rs,  byte[] regionName) throws IOException, InterruptedException {
+    log("Compacting region: " + Bytes.toStringBinary(regionName));
+    admin.majorCompactRegion(regionName);
+    log("blocking until compaction is complete: " + Bytes.toStringBinary(regionName));
+    Threads.sleepWithoutInterrupt(500);
+    outer:     for (; ; ) {
+      for (      Store store : rs.getOnlineRegion(regionName).getStores()) {
+        if (store.getStorefilesCount() > 1) {
+          Threads.sleep(50);
+          continue outer;
+        }
+      }
+      break;
+    }
+  }
+  /** 
+ * Blocks until the region split is complete in hbase:meta and region server opens the daughters
+ */
+  public static void blockUntilRegionSplit(  Configuration conf,  long timeout,  final byte[] regionName,  boolean waitForDaughters) throws IOException, InterruptedException {
+    long start=System.currentTimeMillis();
+    log("blocking until region is split:" + Bytes.toStringBinary(regionName));
+    RegionInfo daughterA=null, daughterB=null;
+    try (Connection conn=ConnectionFactory.createConnection(conf);Table metaTable=conn.getTable(TableName.META_TABLE_NAME)){
+      Result result=null;
+      RegionInfo region=null;
+      while ((System.currentTimeMillis() - start) < timeout) {
+        result=metaTable.get(new Get(regionName));
+        if (result == null) {
+          break;
+        }
+        region=MetaTableAccessor.getRegionInfo(result);
+        if (region.isSplitParent()) {
+          log("found parent region: " + region.toString());
+          PairOfSameType<RegionInfo> pair=MetaTableAccessor.getDaughterRegions(result);
+          daughterA=pair.getFirst();
+          daughterB=pair.getSecond();
+          break;
+        }
+        Threads.sleep(100);
+      }
+      if (daughterA == null || daughterB == null) {
+        throw new IOException("Failed to get daughters, daughterA=" + daughterA + ", daughterB="+ daughterB+ ", timeout="+ timeout+ ", result="+ result+ ", regionName="+ Bytes.toString(regionName)+ ", region="+ region);
+      }
+      if (waitForDaughters) {
+        long rem=timeout - (System.currentTimeMillis() - start);
+        blockUntilRegionIsInMeta(conn,rem,daughterA);
+        rem=timeout - (System.currentTimeMillis() - start);
+        blockUntilRegionIsInMeta(conn,rem,daughterB);
+        rem=timeout - (System.currentTimeMillis() - start);
+        blockUntilRegionIsOpened(conf,rem,daughterA);
+        rem=timeout - (System.currentTimeMillis() - start);
+        blockUntilRegionIsOpened(conf,rem,daughterB);
+        compactAndBlockUntilDone(TEST_UTIL.getAdmin(),TEST_UTIL.getMiniHBaseCluster().getRegionServer(0),daughterA.getRegionName());
+        compactAndBlockUntilDone(TEST_UTIL.getAdmin(),TEST_UTIL.getMiniHBaseCluster().getRegionServer(0),daughterB.getRegionName());
+        removeCompactedFiles(conn,timeout,daughterA);
+        removeCompactedFiles(conn,timeout,daughterB);
+      }
+    }
+   }
+  public static void removeCompactedFiles(  Connection conn,  long timeout,  RegionInfo hri) throws IOException, InterruptedException {
+    log("remove compacted files for : " + hri.getRegionNameAsString());
+    List<HRegion> regions=TEST_UTIL.getHBaseCluster().getRegions(hri.getTable());
+    regions.stream().forEach(r -> {
+      try {
+        r.getStores().get(0).closeAndArchiveCompactedFiles();
+      }
+ catch (      IOException ioe) {
+        LOG.error("failed in removing compacted file",ioe);
+      }
+    }
+);
+  }
+  public static void blockUntilRegionIsInMeta(  Connection conn,  long timeout,  RegionInfo hri) throws IOException, InterruptedException {
+    log("blocking until region is in META: " + hri.getRegionNameAsString());
+    long start=System.currentTimeMillis();
+    while (System.currentTimeMillis() - start < timeout) {
+      HRegionLocation loc=MetaTableAccessor.getRegionLocation(conn,hri);
+      if (loc != null && !loc.getRegionInfo().isOffline()) {
+        log("found region in META: " + hri.getRegionNameAsString());
+        break;
+      }
+      Threads.sleep(100);
+    }
+  }
+  public static void blockUntilRegionIsOpened(  Configuration conf,  long timeout,  RegionInfo hri) throws IOException, InterruptedException {
+    log("blocking until region is opened for reading:" + hri.getRegionNameAsString());
+    long start=System.currentTimeMillis();
+    try (Connection conn=ConnectionFactory.createConnection(conf);Table table=conn.getTable(hri.getTable())){
+      byte[] row=hri.getStartKey();
+      if (row == null || row.length <= 0) {
+        row=new byte[]{'0'};
+      }
+      Get get=new Get(row);
+      while (System.currentTimeMillis() - start < timeout) {
+        try {
+          table.get(get);
+          break;
+        }
+ catch (        IOException ex) {
+        }
+        Threads.sleep(100);
+      }
+    }
+   }
+}

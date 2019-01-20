@@ -1,0 +1,37 @@
+@Test public void testReencryptionUpdaterFaultRecover() throws Exception {
+class MyInjector extends EncryptionFaultInjector {
+    private volatile int exceptionCount=0;
+    MyInjector(    int oneTask){
+      exceptionCount=oneTask;
+    }
+    @Override public synchronized void reencryptUpdaterProcessOneTask() throws IOException {
+      if (exceptionCount > 0) {
+        --exceptionCount;
+        throw new RetriableException("Injected process task failure");
+      }
+    }
+  }
+  final MyInjector injector=new MyInjector(10);
+  EncryptionFaultInjector.instance=injector;
+  final int len=8196;
+  final Path zoneParent=new Path("/zones");
+  final Path zone=new Path(zoneParent,"zone");
+  fsWrapper.mkdir(zone,FsPermission.getDirDefault(),true);
+  dfsAdmin.createEncryptionZone(zone,TEST_KEY,NO_TRASH);
+  for (int i=0; i < 10; ++i) {
+    DFSTestUtil.createFile(fs,new Path(zone,Integer.toString(i)),len,(short)1,0xFEED);
+  }
+  rollKey(TEST_KEY);
+  Whitebox.setInternalState(getUpdater(),"faultRetryInterval",50);
+  dfsAdmin.reencryptEncryptionZone(zone,ReencryptAction.START);
+  waitForReencryptedZones(1);
+  assertEquals(0,injector.exceptionCount);
+  RemoteIterator<ZoneReencryptionStatus> it=dfsAdmin.listReencryptionStatus();
+  assertTrue(it.hasNext());
+  ZoneReencryptionStatus zs=it.next();
+  assertEquals(zone.toString(),zs.getZoneName());
+  assertEquals(ZoneReencryptionStatus.State.Completed,zs.getState());
+  verifyZoneCompletionTime(zs);
+  assertEquals(10,zs.getFilesReencrypted());
+  assertEquals(0,zs.getNumReencryptionFailures());
+}

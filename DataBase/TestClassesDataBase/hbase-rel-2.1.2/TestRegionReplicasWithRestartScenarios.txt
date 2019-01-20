@@ -1,0 +1,80 @@
+@Category({RegionServerTests.class,MediumTests.class}) public class TestRegionReplicasWithRestartScenarios {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestRegionReplicasWithRestartScenarios.class);
+  private static final Logger LOG=LoggerFactory.getLogger(TestRegionReplicasWithRestartScenarios.class);
+  @Rule public TestName name=new TestName();
+  private static final int NB_SERVERS=3;
+  private Table table;
+  private static final HBaseTestingUtility HTU=new HBaseTestingUtility();
+  private static final byte[] f=HConstants.CATALOG_FAMILY;
+  @BeforeClass public static void beforeClass() throws Exception {
+    HTU.getConfiguration().setInt(DFSConfigKeys.DFS_BLOCK_SIZE_KEY,8192);
+    HTU.getConfiguration().setInt(DFSConfigKeys.DFS_CLIENT_READ_PREFETCH_SIZE_KEY,1);
+    HTU.getConfiguration().setInt(HConstants.HREGION_MEMSTORE_FLUSH_SIZE,128 * 1024 * 1024);
+    HTU.getConfiguration().setInt(">hbase.master.wait.on.regionservers.mintostart",3);
+    HTU.startMiniCluster(NB_SERVERS);
+  }
+  @Before public void before() throws IOException {
+    TableName tableName=TableName.valueOf(this.name.getMethodName());
+    this.table=createTableDirectlyFromHTD(tableName);
+  }
+  @After public void after() throws IOException {
+    this.table.close();
+  }
+  private static Table createTableDirectlyFromHTD(  final TableName tableName) throws IOException {
+    TableDescriptorBuilder builder=TableDescriptorBuilder.newBuilder(tableName);
+    builder.setRegionReplication(3);
+    return HTU.createTable(builder.build(),new byte[][]{f},getSplits(20),new Configuration(HTU.getConfiguration()));
+  }
+  private static byte[][] getSplits(  int numRegions){
+    RegionSplitter.UniformSplit split=new RegionSplitter.UniformSplit();
+    split.setFirstRow(Bytes.toBytes(0L));
+    split.setLastRow(Bytes.toBytes(Long.MAX_VALUE));
+    return split.split(numRegions);
+  }
+  @AfterClass public static void afterClass() throws Exception {
+    HRegionServer.TEST_SKIP_REPORTING_TRANSITION=false;
+    HTU.shutdownMiniCluster();
+  }
+  private HRegionServer getRS(){
+    return HTU.getMiniHBaseCluster().getRegionServer(0);
+  }
+  private HRegionServer getSecondaryRS(){
+    return HTU.getMiniHBaseCluster().getRegionServer(1);
+  }
+  private HRegionServer getTertiaryRS(){
+    return HTU.getMiniHBaseCluster().getRegionServer(2);
+  }
+  @Test public void testRegionReplicasCreated() throws Exception {
+    Collection<HRegion> onlineRegions=getRS().getOnlineRegionsLocalContext();
+    boolean res=checkDuplicates(onlineRegions);
+    assertFalse(res);
+    Collection<HRegion> onlineRegions2=getSecondaryRS().getOnlineRegionsLocalContext();
+    res=checkDuplicates(onlineRegions2);
+    assertFalse(res);
+    Collection<HRegion> onlineRegions3=getTertiaryRS().getOnlineRegionsLocalContext();
+    checkDuplicates(onlineRegions3);
+    assertFalse(res);
+    int totalRegions=onlineRegions.size() + onlineRegions2.size() + onlineRegions3.size();
+    assertEquals(62,totalRegions);
+  }
+  private boolean checkDuplicates(  Collection<HRegion> onlineRegions3) throws Exception {
+    ArrayList<Region> copyOfRegion=new ArrayList<Region>(onlineRegions3);
+    for (    Region region : copyOfRegion) {
+      RegionInfo regionInfo=region.getRegionInfo();
+      RegionInfo regionInfoForReplica=RegionReplicaUtil.getRegionInfoForDefaultReplica(regionInfo);
+      int i=0;
+      for (      Region actualRegion : onlineRegions3) {
+        if (regionInfoForReplica.equals(RegionReplicaUtil.getRegionInfoForDefaultReplica(actualRegion.getRegionInfo()))) {
+          i++;
+          if (i > 1) {
+            LOG.info("Duplicate found " + actualRegion.getRegionInfo() + " "+ region.getRegionInfo());
+            assertTrue(Bytes.equals(region.getRegionInfo().getStartKey(),actualRegion.getRegionInfo().getStartKey()));
+            assertTrue(Bytes.equals(region.getRegionInfo().getEndKey(),actualRegion.getRegionInfo().getEndKey()));
+            return true;
+          }
+        }
+      }
+    }
+    return false;
+  }
+}

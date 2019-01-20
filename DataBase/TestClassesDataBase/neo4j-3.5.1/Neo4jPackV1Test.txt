@@ -1,0 +1,175 @@
+public class Neo4jPackV1Test {
+  private final Neo4jPackV1 neo4jPack=new Neo4jPackV1();
+  private byte[] packed(  AnyValue object) throws IOException {
+    PackedOutputArray output=new PackedOutputArray();
+    Neo4jPack.Packer packer=neo4jPack.newPacker(output);
+    packer.pack(object);
+    return output.bytes();
+  }
+  private AnyValue unpacked(  byte[] bytes) throws IOException {
+    PackedInputArray input=new PackedInputArray(bytes);
+    Neo4jPack.Unpacker unpacker=neo4jPack.newUnpacker(input);
+    return unpacker.unpack();
+  }
+  @Test public void shouldBeAbleToPackAndUnpackList() throws IOException {
+    PackedOutputArray output=new PackedOutputArray();
+    Neo4jPack.Packer packer=neo4jPack.newPacker(output);
+    packer.packListHeader(ALICE.labels().length());
+    List<String> expected=new ArrayList<>();
+    TextArray labels=ALICE.labels();
+    for (int i=0; i < labels.length(); i++) {
+      String labelName=labels.stringValue(i);
+      packer.pack(labelName);
+      expected.add(labelName);
+    }
+    AnyValue unpacked=unpacked(output.bytes());
+    assertThat(unpacked,instanceOf(ListValue.class));
+    ListValue unpackedList=(ListValue)unpacked;
+    assertThat(unpackedList,equalTo(ValueUtils.asListValue(expected)));
+  }
+  @Test public void shouldBeAbleToPackAndUnpackMap() throws IOException {
+    PackedOutputArray output=new PackedOutputArray();
+    Neo4jPack.Packer packer=neo4jPack.newPacker(output);
+    packer.packMapHeader(ALICE.properties().size());
+    ALICE.properties().foreach((s,value) -> {
+      try {
+        packer.pack(s);
+        packer.pack(value);
+      }
+ catch (      IOException e) {
+        throw new UncheckedIOException(e);
+      }
+    }
+);
+    AnyValue unpacked=unpacked(output.bytes());
+    assertThat(unpacked,instanceOf(MapValue.class));
+    MapValue unpackedMap=(MapValue)unpacked;
+    assertThat(unpackedMap,equalTo(ALICE.properties()));
+  }
+  @Test public void shouldFailWhenTryingToPackAndUnpackMapContainingNullKeys() throws IOException {
+    PackedOutputArray output=new PackedOutputArray();
+    Neo4jPack.Packer packer=neo4jPack.newPacker(output);
+    Map<String,AnyValue> map=new HashMap<>();
+    map.put(null,longValue(42L));
+    map.put("foo",longValue(1337L));
+    packer.packMapHeader(map.size());
+    for (    Map.Entry<String,AnyValue> entry : map.entrySet()) {
+      packer.pack(entry.getKey());
+      packer.pack(entry.getValue());
+    }
+    try {
+      PackedInputArray input=new PackedInputArray(output.bytes());
+      Neo4jPack.Unpacker unpacker=neo4jPack.newUnpacker(input);
+      unpacker.unpack();
+      fail("exception expected");
+    }
+ catch (    BoltIOException ex) {
+      assertEquals(Neo4jError.from(Status.Request.Invalid,"Value `null` is not supported as key in maps, must be a non-nullable string."),Neo4jError.from(ex));
+    }
+  }
+  @Test public void shouldThrowOnUnpackingMapWithDuplicateKeys() throws IOException {
+    PackedOutputArray output=new PackedOutputArray();
+    Neo4jPack.Packer packer=neo4jPack.newPacker(output);
+    packer.packMapHeader(2);
+    packer.pack("key");
+    packer.pack(intValue(1));
+    packer.pack("key");
+    packer.pack(intValue(2));
+    try {
+      PackedInputArray input=new PackedInputArray(output.bytes());
+      Neo4jPack.Unpacker unpacker=neo4jPack.newUnpacker(input);
+      unpacker.unpack();
+      fail("exception expected");
+    }
+ catch (    BoltIOException ex) {
+      assertEquals(Neo4jError.from(Status.Request.Invalid,"Duplicate map key `key`."),Neo4jError.from(ex));
+    }
+  }
+  @Test public void shouldThrowOnUnpackingMapWithUnsupportedKeyType() throws IOException {
+    PackedOutputArray output=new PackedOutputArray();
+    Neo4jPack.Packer packer=neo4jPack.newPacker(output);
+    packer.packMapHeader(2);
+    packer.pack(ValueUtils.of(1L));
+    packer.pack(intValue(1));
+    try {
+      PackedInputArray input=new PackedInputArray(output.bytes());
+      Neo4jPack.Unpacker unpacker=neo4jPack.newUnpacker(input);
+      unpacker.unpack();
+      fail("exception expected");
+    }
+ catch (    BoltIOException ex) {
+      assertEquals(Neo4jError.from(Status.Request.InvalidFormat,"Bad key type: INTEGER"),Neo4jError.from(ex));
+    }
+  }
+  @Test public void shouldNotBeAbleToUnpackNode() throws IOException {
+    try {
+      unpacked(packed(ALICE));
+      fail("exception expected.");
+    }
+ catch (    BoltIOException ex) {
+      assertEquals(Neo4jError.from(Status.Statement.TypeError,"Node values cannot be unpacked with this version of bolt."),Neo4jError.from(ex));
+    }
+  }
+  @Test public void shouldNotBeAbleToUnpackRelationship() throws IOException {
+    try {
+      unpacked(packed(ALICE_KNOWS_BOB));
+      fail("exception expected.");
+    }
+ catch (    BoltIOException ex) {
+      assertEquals(Neo4jError.from(Status.Statement.TypeError,"Relationship values cannot be unpacked with this version of bolt."),Neo4jError.from(ex));
+    }
+  }
+  @Test public void shouldNotBeAbleToUnpackUnboundRelationship() throws IOException {
+    PackedOutputArray out=new PackedOutputArray();
+    Neo4jPackV1.Packer packer=neo4jPack.newPacker(out);
+    packer.packStructHeader(3,UNBOUND_RELATIONSHIP);
+    packer.pack(ValueUtils.of(1L));
+    packer.pack(ValueUtils.of("RELATES_TO"));
+    packer.pack(ValueUtils.asMapValue(MapUtil.map("a",1L,"b","x")));
+    try {
+      unpacked(out.bytes());
+      fail("exception expected.");
+    }
+ catch (    BoltIOException ex) {
+      assertEquals(Neo4jError.from(Status.Statement.TypeError,"Relationship values cannot be unpacked with this version of bolt."),Neo4jError.from(ex));
+    }
+  }
+  @Test public void shouldNotBeAbleToUnpackPaths() throws IOException {
+    for (    PathValue path : ALL_PATHS) {
+      try {
+        unpacked(packed(path));
+        fail("exception expected.");
+      }
+ catch (      BoltIOException ex) {
+        assertEquals(Neo4jError.from(Status.Statement.TypeError,"Path values cannot be unpacked with this version of bolt."),Neo4jError.from(ex));
+      }
+    }
+  }
+  @Test public void shouldTreatSingleCharAsSingleCharacterString() throws IOException {
+    PackedOutputArray output=new PackedOutputArray();
+    Neo4jPack.Packer packer=neo4jPack.newPacker(output);
+    packer.pack(charValue('C'));
+    AnyValue unpacked=unpacked(output.bytes());
+    assertThat(unpacked,instanceOf(TextValue.class));
+    assertThat(unpacked,equalTo(stringValue("C")));
+  }
+  @Test public void shouldTreatCharArrayAsListOfStrings() throws IOException {
+    PackedOutputArray output=new PackedOutputArray();
+    Neo4jPack.Packer packer=neo4jPack.newPacker(output);
+    packer.pack(charArray(new char[]{'W','H','Y'}));
+    Object unpacked=unpacked(output.bytes());
+    assertThat(unpacked,instanceOf(ListValue.class));
+    assertThat(unpacked,equalTo(VirtualValues.list(stringValue("W"),stringValue("H"),stringValue("Y"))));
+  }
+  @Test public void shouldPackUtf8() throws IOException {
+    String value="\uD83D\uDE31";
+    byte[] bytes=value.getBytes(StandardCharsets.UTF_8);
+    TextValue textValue=utf8Value(bytes,0,bytes.length);
+    PackedOutputArray output=new PackedOutputArray();
+    Neo4jPack.Packer packer=neo4jPack.newPacker(output);
+    packer.pack(textValue);
+    AnyValue unpacked=unpacked(output.bytes());
+    assertThat(unpacked,is(instanceOf(UTF8StringValue.class)));
+    assertThat(unpacked,equalTo(textValue));
+  }
+}

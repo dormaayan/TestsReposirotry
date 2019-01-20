@@ -1,0 +1,601 @@
+/** 
+ * TestHive.
+ */
+public class TestHive extends TestCase {
+  protected Hive hm;
+  protected HiveConf hiveConf;
+  @Override protected void setUp() throws Exception {
+    super.setUp();
+    hiveConf=new HiveConf(this.getClass());
+    hiveConf.setVar(HiveConf.ConfVars.HIVE_AUTHORIZATION_MANAGER,"org.apache.hadoop.hive.ql.security.authorization.plugin.sqlstd.SQLStdHiveAuthorizerFactory");
+    hiveConf.setFloat("fs.trash.checkpoint.interval",30);
+    hiveConf.setFloat("fs.trash.interval",30);
+    SessionState.start(hiveConf);
+    try {
+      hm=Hive.get(hiveConf);
+    }
+ catch (    Exception e) {
+      System.err.println(StringUtils.stringifyException(e));
+      System.err.println("Unable to initialize Hive Metastore using configuration: \n " + hiveConf);
+      throw e;
+    }
+  }
+  @Override protected void tearDown() throws Exception {
+    try {
+      super.tearDown();
+      hiveConf.setFloat("fs.trash.checkpoint.interval",30);
+      hiveConf.setFloat("fs.trash.interval",30);
+      Hive.closeCurrent();
+    }
+ catch (    Exception e) {
+      System.err.println(StringUtils.stringifyException(e));
+      System.err.println("Unable to close Hive Metastore using configruation: \n " + hiveConf);
+      throw e;
+    }
+  }
+  public void testTable() throws Throwable {
+    try {
+      String tableName="table_for_testtable";
+      try {
+        hm.dropTable(MetaStoreUtils.DEFAULT_DATABASE_NAME,tableName);
+      }
+ catch (      HiveException e1) {
+        e1.printStackTrace();
+        assertTrue("Unable to drop table",false);
+      }
+      Table tbl=new Table(MetaStoreUtils.DEFAULT_DATABASE_NAME,tableName);
+      List<FieldSchema> fields=tbl.getCols();
+      fields.add(new FieldSchema("col1",serdeConstants.INT_TYPE_NAME,"int -- first column"));
+      fields.add(new FieldSchema("col2",serdeConstants.STRING_TYPE_NAME,"string -- second column"));
+      fields.add(new FieldSchema("col3",serdeConstants.DOUBLE_TYPE_NAME,"double -- thrift column"));
+      tbl.setFields(fields);
+      tbl.setOutputFormatClass(HiveIgnoreKeyTextOutputFormat.class);
+      tbl.setInputFormatClass(SequenceFileInputFormat.class);
+      tbl.setProperty("comment","this is a test table created as part junit tests");
+      List<String> bucketCols=tbl.getBucketCols();
+      bucketCols.add("col1");
+      try {
+        tbl.setBucketCols(bucketCols);
+      }
+ catch (      HiveException e) {
+        e.printStackTrace();
+        assertTrue("Unable to set bucket column for table: " + tableName,false);
+      }
+      List<FieldSchema> partCols=new ArrayList<FieldSchema>();
+      partCols.add(new FieldSchema("ds",serdeConstants.STRING_TYPE_NAME,"partition column, date but in string format as date type is not yet supported in QL"));
+      tbl.setPartCols(partCols);
+      tbl.setNumBuckets((short)512);
+      tbl.setOwner("pchakka");
+      tbl.setRetention(10);
+      tbl.setSerdeParam(serdeConstants.FIELD_DELIM,"1");
+      tbl.setSerdeParam(serdeConstants.LINE_DELIM,"\n");
+      tbl.setSerdeParam(serdeConstants.MAPKEY_DELIM,"3");
+      tbl.setSerdeParam(serdeConstants.COLLECTION_DELIM,"2");
+      tbl.setSerdeParam(serdeConstants.FIELD_DELIM,"1");
+      tbl.setSerializationLib(LazySimpleSerDe.class.getName());
+      tbl.setStoredAsSubDirectories(false);
+      tbl.setRewriteEnabled(false);
+      setNullCreateTableGrants();
+      try {
+        hm.createTable(tbl);
+      }
+ catch (      HiveException e) {
+        e.printStackTrace();
+        assertTrue("Unable to create table: " + tableName,false);
+      }
+      validateTable(tbl,tableName);
+      try {
+        hm.dropTable(MetaStoreUtils.DEFAULT_DATABASE_NAME,tableName,true,false);
+        Table ft2=hm.getTable(MetaStoreUtils.DEFAULT_DATABASE_NAME,tableName,false);
+        assertNull("Unable to drop table ",ft2);
+      }
+ catch (      HiveException e) {
+        assertTrue("Unable to drop table: " + tableName,false);
+      }
+    }
+ catch (    Throwable e) {
+      System.err.println(StringUtils.stringifyException(e));
+      System.err.println("testTable failed");
+      throw e;
+    }
+  }
+  private void setNullCreateTableGrants(){
+    SessionState.get().setCreateTableGrants(null);
+  }
+  /** 
+ * Tests create and fetch of a thrift based table.
+ * @throws Throwable
+ */
+  public void testThriftTable() throws Throwable {
+    String tableName="table_for_test_thrifttable";
+    try {
+      try {
+        hm.dropTable(MetaStoreUtils.DEFAULT_DATABASE_NAME,tableName);
+      }
+ catch (      HiveException e1) {
+        System.err.println(StringUtils.stringifyException(e1));
+        assertTrue("Unable to drop table",false);
+      }
+      Table tbl=new Table(MetaStoreUtils.DEFAULT_DATABASE_NAME,tableName);
+      tbl.setInputFormatClass(SequenceFileInputFormat.class.getName());
+      tbl.setOutputFormatClass(SequenceFileOutputFormat.class.getName());
+      tbl.setSerializationLib(ThriftDeserializer.class.getName());
+      tbl.setSerdeParam(serdeConstants.SERIALIZATION_CLASS,Complex.class.getName());
+      tbl.setSerdeParam(serdeConstants.SERIALIZATION_FORMAT,TBinaryProtocol.class.getName());
+      tbl.setStoredAsSubDirectories(false);
+      tbl.setRewriteEnabled(false);
+      setNullCreateTableGrants();
+      try {
+        hm.createTable(tbl);
+      }
+ catch (      HiveException e) {
+        System.err.println(StringUtils.stringifyException(e));
+        assertTrue("Unable to create table: " + tableName,false);
+      }
+      validateTable(tbl,tableName);
+      hm.dropTable(DEFAULT_DATABASE_NAME,tableName);
+    }
+ catch (    Throwable e) {
+      System.err.println(StringUtils.stringifyException(e));
+      System.err.println("testThriftTable() failed");
+      throw e;
+    }
+  }
+  /** 
+ * Test logging of timing for metastore api calls
+ * @throws Throwable
+ */
+  public void testMetaStoreApiTiming() throws Throwable {
+    Logger logger=LogManager.getLogger("hive.ql.metadata.Hive");
+    Level oldLevel=logger.getLevel();
+    LoggerContext ctx=(LoggerContext)LogManager.getContext(false);
+    Configuration config=ctx.getConfiguration();
+    LoggerConfig loggerConfig=config.getLoggerConfig(logger.getName());
+    loggerConfig.setLevel(Level.DEBUG);
+    ctx.updateLoggers();
+    StringAppender appender=StringAppender.createStringAppender("%m");
+    appender.addToLogger(logger.getName(),Level.DEBUG);
+    appender.start();
+    try {
+      hm.clearMetaCallTiming();
+      hm.getAllDatabases();
+      hm.dumpAndClearMetaCallTiming("test");
+      String logStr=appender.getOutput();
+      String expectedString="getAllDatabases_()=";
+      Assert.assertTrue(logStr + " should contain <" + expectedString,logStr.contains(expectedString));
+      appender.reset();
+      hm.dumpAndClearMetaCallTiming("test");
+      logStr=appender.getOutput();
+      Assert.assertFalse(logStr + " should not contain <" + expectedString,logStr.contains(expectedString));
+    }
+  finally {
+      loggerConfig.setLevel(oldLevel);
+      ctx.updateLoggers();
+      appender.removeFromLogger(logger.getName());
+    }
+  }
+  /** 
+ * Gets a table from the metastore and compares it to the original Table
+ * @param tbl
+ * @param tableName
+ * @throws MetaException
+ */
+  private void validateTable(  Table tbl,  String tableName) throws MetaException {
+    Warehouse wh=new Warehouse(hiveConf);
+    Table ft=null;
+    try {
+      tbl.getTTable().setPrivilegesIsSet(false);
+      ft=hm.getTable(MetaStoreUtils.DEFAULT_DATABASE_NAME,tableName);
+      assertNotNull("Unable to fetch table",ft);
+      ft.checkValidity(hiveConf);
+      assertEquals("Table names didn't match for table: " + tableName,tbl.getTableName(),ft.getTableName());
+      assertEquals("Table owners didn't match for table: " + tableName,tbl.getOwner(),ft.getOwner());
+      assertEquals("Table retention didn't match for table: " + tableName,tbl.getRetention(),ft.getRetention());
+      assertEquals("Data location is not set correctly",wh.getDefaultTablePath(hm.getDatabase(DEFAULT_DATABASE_NAME),tableName).toString(),ft.getDataLocation().toString());
+      tbl.setDataLocation(ft.getDataLocation());
+      tbl.setCreateTime(ft.getTTable().getCreateTime());
+      tbl.getParameters().put(hive_metastoreConstants.DDL_TIME,ft.getParameters().get(hive_metastoreConstants.DDL_TIME));
+      assertTrue("Tables  doesn't match: " + tableName,ft.getTTable().equals(tbl.getTTable()));
+      assertEquals("SerializationLib is not set correctly",tbl.getSerializationLib(),ft.getSerializationLib());
+      assertEquals("Serde is not set correctly",tbl.getDeserializer().getClass().getName(),ft.getDeserializer().getClass().getName());
+    }
+ catch (    HiveException e) {
+      System.err.println(StringUtils.stringifyException(e));
+      assertTrue("Unable to fetch table correctly: " + tableName,false);
+    }
+  }
+  private static Table createTestTable(  String dbName,  String tableName) throws HiveException {
+    Table tbl=new Table(dbName,tableName);
+    tbl.setInputFormatClass(SequenceFileInputFormat.class.getName());
+    tbl.setOutputFormatClass(SequenceFileOutputFormat.class.getName());
+    tbl.setSerializationLib(ThriftDeserializer.class.getName());
+    tbl.setSerdeParam(serdeConstants.SERIALIZATION_CLASS,Complex.class.getName());
+    tbl.setSerdeParam(serdeConstants.SERIALIZATION_FORMAT,TBinaryProtocol.class.getName());
+    return tbl;
+  }
+  /** 
+ * Test basic Hive class interaction, that: - We can have different Hive objects throughout the lifetime of this thread.
+ */
+  public void testHiveCloseCurrent() throws Throwable {
+    Hive hive1=Hive.get();
+    Hive.closeCurrent();
+    Hive hive2=Hive.get();
+    Hive.closeCurrent();
+    assertTrue(hive1 != hive2);
+  }
+  public void testGetAndDropTables() throws Throwable {
+    try {
+      String dbName="db_for_testgettables";
+      String table1Name="table1";
+      hm.dropDatabase(dbName,true,true,true);
+      Database db=new Database();
+      db.setName(dbName);
+      hm.createDatabase(db);
+      List<String> ts=new ArrayList<String>(2);
+      ts.add(table1Name);
+      ts.add("table2");
+      Table tbl1=createTestTable(dbName,ts.get(0));
+      hm.createTable(tbl1);
+      Table tbl2=createTestTable(dbName,ts.get(1));
+      hm.createTable(tbl2);
+      List<String> fts=hm.getTablesForDb(dbName,".*");
+      assertEquals(ts,fts);
+      assertEquals(2,fts.size());
+      fts=hm.getTablesForDb(dbName,".*1");
+      assertEquals(1,fts.size());
+      assertEquals(ts.get(0),fts.get(0));
+      Table table1=hm.getTable(dbName,table1Name);
+      assertNotNull(table1);
+      assertEquals(table1Name,table1.getTableName());
+      FileSystem fs=table1.getPath().getFileSystem(hiveConf);
+      assertTrue(fs.exists(table1.getPath()));
+      hm.dropTable(dbName,table1Name);
+      assertFalse(fs.exists(table1.getPath()));
+      for (      String tableName : hm.getAllTables(dbName)) {
+        Table table=hm.getTable(dbName,tableName);
+        hm.dropTable(dbName,tableName);
+        assertFalse(fs.exists(table.getPath()));
+      }
+      hm.dropDatabase(dbName);
+    }
+ catch (    Throwable e) {
+      System.err.println(StringUtils.stringifyException(e));
+      System.err.println("testGetAndDropTables() failed");
+      throw e;
+    }
+  }
+  public void testDropTableTrash() throws Throwable {
+    if (!ShimLoader.getHadoopShims().supportTrashFeature()) {
+      return;
+    }
+    try {
+      String dbName="db_for_testdroptable";
+      hm.dropDatabase(dbName,true,true,true);
+      Database db=new Database();
+      db.setName(dbName);
+      hm.createDatabase(db);
+      List<String> ts=new ArrayList<String>(2);
+      String tableBaseName="droptable";
+      ts.add(tableBaseName + "1");
+      ts.add(tableBaseName + "2");
+      Table tbl1=createTestTable(dbName,ts.get(0));
+      hm.createTable(tbl1);
+      Table tbl2=createTestTable(dbName,ts.get(1));
+      hm.createTable(tbl2);
+      Table table1=hm.getTable(dbName,ts.get(0));
+      assertNotNull(table1);
+      assertEquals(ts.get(0),table1.getTableName());
+      Path path1=table1.getPath();
+      FileSystem fs=path1.getFileSystem(hiveConf);
+      assertTrue(fs.exists(path1));
+      Path trashDir=ShimLoader.getHadoopShims().getCurrentTrashPath(hiveConf,fs);
+      assertNotNull("trash directory should not be null",trashDir);
+      Path trash1=mergePaths(trashDir,path1);
+      Path pathglob=trash1.suffix("*");
+      ;
+      FileStatus before[]=fs.globStatus(pathglob);
+      hm.dropTable(dbName,ts.get(0));
+      assertFalse(fs.exists(path1));
+      FileStatus after[]=fs.globStatus(pathglob);
+      assertTrue("trash dir before and after DROP TABLE noPURGE are not different",before.length != after.length);
+      Table table2=hm.getTable(dbName,ts.get(1));
+      assertNotNull(table2);
+      assertEquals(ts.get(1),table2.getTableName());
+      Path path2=table2.getPath();
+      assertTrue(fs.exists(path2));
+      Path trash2=mergePaths(trashDir,path2);
+      System.out.println("trashDir2 is " + trash2);
+      pathglob=trash2.suffix("*");
+      before=fs.globStatus(pathglob);
+      hm.dropTable(dbName,ts.get(1),true,true,true);
+      assertFalse(fs.exists(path2));
+      after=fs.globStatus(pathglob);
+      Arrays.sort(before);
+      Arrays.sort(after);
+      assertEquals("trash dir before and after DROP TABLE PURGE are different",before.length,after.length);
+      assertTrue("trash dir before and after DROP TABLE PURGE are different",Arrays.equals(before,after));
+      for (      String tableName : hm.getAllTables(dbName)) {
+        Table table=hm.getTable(dbName,tableName);
+        hm.dropTable(dbName,tableName);
+        assertFalse(fs.exists(table.getPath()));
+      }
+      hm.dropDatabase(dbName);
+    }
+ catch (    Throwable e) {
+      System.err.println(StringUtils.stringifyException(e));
+      System.err.println("testDropTableTrash() failed");
+      throw e;
+    }
+  }
+  private FileStatus[] getTrashContents() throws Exception {
+    FileSystem fs=FileSystem.get(hiveConf);
+    Path trashDir=ShimLoader.getHadoopShims().getCurrentTrashPath(hiveConf,fs);
+    return fs.globStatus(trashDir.suffix("/*"));
+  }
+  private Table createPartitionedTable(  String dbName,  String tableName) throws Exception {
+    try {
+      hm.dropTable(dbName,tableName);
+      hm.createTable(tableName,Arrays.asList("key","value"),Arrays.asList("ds","hr"),TextInputFormat.class,HiveIgnoreKeyTextOutputFormat.class);
+      return hm.getTable(dbName,tableName);
+    }
+ catch (    Exception exception) {
+      fail("Unable to drop and create table " + dbName + "."+ tableName+ " because "+ StringUtils.stringifyException(exception));
+      throw exception;
+    }
+  }
+  private void cleanUpTableQuietly(  String dbName,  String tableName){
+    try {
+      hm.dropTable(dbName,tableName,true,true,true);
+    }
+ catch (    Exception exception) {
+      fail("Unexpected exception: " + StringUtils.stringifyException(exception));
+    }
+  }
+  /** 
+ * Test for PURGE support for dropping partitions. 1. Drop partitions without PURGE, and check that the data isn't moved to Trash. 2. Drop partitions with PURGE, and check that the data is moved to Trash.
+ * @throws Exception on failure.
+ */
+  public void testDropPartitionsWithPurge() throws Exception {
+    String dbName=MetaStoreUtils.DEFAULT_DATABASE_NAME;
+    String tableName="table_for_testDropPartitionsWithPurge";
+    try {
+      Map<String,String> partitionSpec=new ImmutableMap.Builder<String,String>().put("ds","20141216").put("hr","12").build();
+      int trashSizeBeforeDrop=getTrashContents().length;
+      Table table=createPartitionedTable(dbName,tableName);
+      hm.createPartition(table,partitionSpec);
+      Partition partition=hm.getPartition(table,partitionSpec,false);
+      assertNotNull("Newly created partition shouldn't be null!",partition);
+      hm.dropPartition(dbName,tableName,partition.getValues(),PartitionDropOptions.instance().deleteData(true).purgeData(true));
+      int trashSizeAfterDropPurge=getTrashContents().length;
+      assertEquals("After dropPartitions(purge), trash should've remained unchanged!",trashSizeBeforeDrop,trashSizeAfterDropPurge);
+      hm.createPartition(table,partitionSpec);
+      partition=hm.getPartition(table,partitionSpec,false);
+      assertNotNull("Newly created partition shouldn't be null!",partition);
+      hm.dropPartition(dbName,tableName,partition.getValues(),PartitionDropOptions.instance().deleteData(true).purgeData(false));
+      int trashSizeWithoutPurge=getTrashContents().length;
+      assertEquals("After dropPartitions(noPurge), data should've gone to trash!",trashSizeBeforeDrop,trashSizeWithoutPurge);
+    }
+ catch (    Exception e) {
+      fail("Unexpected exception: " + StringUtils.stringifyException(e));
+    }
+ finally {
+      cleanUpTableQuietly(dbName,tableName);
+    }
+  }
+  /** 
+ * Test that tables set up with auto-purge skip trash-directory when tables/partitions are dropped.
+ * @throws Throwable
+ */
+  public void testAutoPurgeTablesAndPartitions() throws Throwable {
+    String dbName=MetaStoreUtils.DEFAULT_DATABASE_NAME;
+    String tableName="table_for_testAutoPurgeTablesAndPartitions";
+    try {
+      Table table=createPartitionedTable(dbName,tableName);
+      table.getParameters().put("auto.purge","true");
+      hm.alterTable(tableName,table,null);
+      Map<String,String> partitionSpec=new ImmutableMap.Builder<String,String>().put("ds","20141216").put("hr","12").build();
+      int trashSizeBeforeDrop=getTrashContents().length;
+      hm.createPartition(table,partitionSpec);
+      Partition partition=hm.getPartition(table,partitionSpec,false);
+      assertNotNull("Newly created partition shouldn't be null!",partition);
+      hm.dropPartition(dbName,tableName,partition.getValues(),PartitionDropOptions.instance().deleteData(true).purgeData(false));
+      int trashSizeAfterDrop=getTrashContents().length;
+      assertEquals("After dropPartition(noPurge), data should still have skipped trash.",trashSizeBeforeDrop,trashSizeAfterDrop);
+      trashSizeBeforeDrop=trashSizeAfterDrop;
+      hm.dropTable(dbName,tableName);
+      trashSizeAfterDrop=getTrashContents().length;
+      assertEquals("After dropTable(noPurge), data should still have skipped trash.",trashSizeBeforeDrop,trashSizeAfterDrop);
+    }
+ catch (    Exception e) {
+      fail("Unexpected failure: " + StringUtils.stringifyException(e));
+    }
+ finally {
+      cleanUpTableQuietly(dbName,tableName);
+    }
+  }
+  public void testPartition() throws Throwable {
+    try {
+      String tableName="table_for_testpartition";
+      try {
+        hm.dropTable(MetaStoreUtils.DEFAULT_DATABASE_NAME,tableName);
+      }
+ catch (      HiveException e) {
+        System.err.println(StringUtils.stringifyException(e));
+        assertTrue("Unable to drop table: " + tableName,false);
+      }
+      LinkedList<String> cols=new LinkedList<String>();
+      cols.add("key");
+      cols.add("value");
+      LinkedList<String> part_cols=new LinkedList<String>();
+      part_cols.add("ds");
+      part_cols.add("hr");
+      try {
+        hm.createTable(tableName,cols,part_cols,TextInputFormat.class,HiveIgnoreKeyTextOutputFormat.class);
+      }
+ catch (      HiveException e) {
+        System.err.println(StringUtils.stringifyException(e));
+        assertTrue("Unable to create table: " + tableName,false);
+      }
+      Table tbl=null;
+      try {
+        tbl=hm.getTable(MetaStoreUtils.DEFAULT_DATABASE_NAME,tableName);
+      }
+ catch (      HiveException e) {
+        System.err.println(StringUtils.stringifyException(e));
+        assertTrue("Unable to fetch table: " + tableName,false);
+      }
+      HashMap<String,String> part_spec=new HashMap<String,String>();
+      part_spec.clear();
+      part_spec.put("ds","2008-04-08");
+      part_spec.put("hr","12");
+      try {
+        hm.createPartition(tbl,part_spec);
+      }
+ catch (      HiveException e) {
+        System.err.println(StringUtils.stringifyException(e));
+        assertTrue("Unable to create parition for table: " + tableName,false);
+      }
+      hm.dropTable(MetaStoreUtils.DEFAULT_DATABASE_NAME,tableName);
+    }
+ catch (    Throwable e) {
+      System.err.println(StringUtils.stringifyException(e));
+      System.err.println("testPartition() failed");
+      throw e;
+    }
+  }
+  /** 
+ * Tests creating a simple index on a simple table.
+ * @throws Throwable
+ */
+  public void testIndex() throws Throwable {
+    try {
+      String tableName="table_for_testindex";
+      String qTableName=MetaStoreUtils.DEFAULT_DATABASE_NAME + "." + tableName;
+      try {
+        hm.dropTable(MetaStoreUtils.DEFAULT_DATABASE_NAME,tableName);
+      }
+ catch (      HiveException e) {
+        e.printStackTrace();
+        assertTrue("Unable to drop table",false);
+      }
+      Table tbl=new Table(MetaStoreUtils.DEFAULT_DATABASE_NAME,tableName);
+      List<FieldSchema> fields=tbl.getCols();
+      fields.add(new FieldSchema("col1",serdeConstants.INT_TYPE_NAME,"int -- first column"));
+      fields.add(new FieldSchema("col2",serdeConstants.STRING_TYPE_NAME,"string -- second column"));
+      fields.add(new FieldSchema("col3",serdeConstants.DOUBLE_TYPE_NAME,"double -- thrift column"));
+      tbl.setFields(fields);
+      tbl.setOutputFormatClass(HiveIgnoreKeyTextOutputFormat.class);
+      tbl.setInputFormatClass(SequenceFileInputFormat.class);
+      try {
+        hm.createTable(tbl);
+      }
+ catch (      HiveException e) {
+        e.printStackTrace();
+        assertTrue("Unable to create table: " + tableName,false);
+      }
+      String indexName="index_on_table_for_testindex";
+      String indexHandlerClass=HiveIndex.IndexType.COMPACT_SUMMARY_TABLE.getHandlerClsName();
+      List<String> indexedCols=new ArrayList<String>();
+      indexedCols.add("col1");
+      String indexTableName="index_on_table_for_testindex_table";
+      String qIndexTableName=MetaStoreUtils.DEFAULT_DATABASE_NAME + "." + indexTableName;
+      boolean deferredRebuild=true;
+      String inputFormat=SequenceFileInputFormat.class.getName();
+      String outputFormat=SequenceFileOutputFormat.class.getName();
+      String serde=null;
+      String storageHandler=null;
+      String location=null;
+      String collItemDelim=null;
+      String fieldDelim=null;
+      String fieldEscape=null;
+      String lineDelim=null;
+      String mapKeyDelim=null;
+      String indexComment=null;
+      Map<String,String> indexProps=null;
+      Map<String,String> tableProps=null;
+      Map<String,String> serdeProps=new HashMap<String,String>();
+      hm.createIndex(qTableName,indexName,indexHandlerClass,indexedCols,qIndexTableName,deferredRebuild,inputFormat,outputFormat,serde,storageHandler,location,indexProps,tableProps,serdeProps,collItemDelim,fieldDelim,fieldEscape,lineDelim,mapKeyDelim,indexComment);
+      Index index=null;
+      try {
+        index=hm.getIndex(tableName,indexName);
+        assertNotNull("Unable to fetch index",index);
+        index.validate();
+        assertEquals("Index names don't match for index: " + indexName,indexName,index.getIndexName());
+        assertEquals("Table names don't match for index: " + indexName,tableName,index.getOrigTableName());
+        assertEquals("Index table names didn't match for index: " + indexName,indexTableName,index.getIndexTableName());
+        assertEquals("Index handler classes didn't match for index: " + indexName,indexHandlerClass,index.getIndexHandlerClass());
+        assertEquals("Deferred rebuild didn't match for index: " + indexName,deferredRebuild,index.isDeferredRebuild());
+      }
+ catch (      HiveException e) {
+        System.err.println(StringUtils.stringifyException(e));
+        assertTrue("Unable to fetch index correctly: " + indexName,false);
+      }
+      try {
+        hm.dropIndex(MetaStoreUtils.DEFAULT_DATABASE_NAME,tableName,indexName,false,true);
+      }
+ catch (      HiveException e) {
+        System.err.println(StringUtils.stringifyException(e));
+        assertTrue("Unable to drop index: " + indexName,false);
+      }
+      boolean dropIndexException=false;
+      try {
+        hm.getIndex(tableName,indexName);
+      }
+ catch (      HiveException e) {
+        dropIndexException=true;
+      }
+      assertTrue("Unable to drop index: " + indexName,dropIndexException);
+      try {
+        hm.dropTable(tableName);
+        Table droppedTable=hm.getTable(tableName,false);
+        assertNull("Unable to drop table " + tableName,droppedTable);
+      }
+ catch (      HiveException e) {
+        System.err.println(StringUtils.stringifyException(e));
+        assertTrue("Unable to drop table: " + tableName,false);
+      }
+    }
+ catch (    Throwable e) {
+      System.err.println(StringUtils.stringifyException(e));
+      System.err.println("testIndex failed");
+      throw e;
+    }
+  }
+  public void testHiveRefreshOnConfChange() throws Throwable {
+    Hive prevHiveObj=Hive.get();
+    prevHiveObj.getDatabaseCurrent();
+    Hive newHiveObj;
+    HiveConf newHconf=new HiveConf(hiveConf);
+    newHiveObj=Hive.get(newHconf);
+    assertTrue(prevHiveObj == newHiveObj);
+    newHiveObj=Hive.get(newHconf,true);
+    assertTrue(prevHiveObj != newHiveObj);
+    prevHiveObj=Hive.get();
+    prevHiveObj.getDatabaseCurrent();
+    newHconf=new HiveConf(hiveConf);
+    newHconf.setIntVar(ConfVars.METASTORETHRIFTCONNECTIONRETRIES,newHconf.getIntVar(ConfVars.METASTORETHRIFTCONNECTIONRETRIES) + 1);
+    newHiveObj=Hive.get(newHconf);
+    assertTrue(prevHiveObj != newHiveObj);
+  }
+  private static final String SEPARATOR="/";
+  private static final char SEPARATOR_CHAR='/';
+  private static final String CUR_DIR=".";
+  private static final boolean WINDOWS=System.getProperty("os.name").startsWith("Windows");
+  private static final Pattern hasDriveLetterSpecifier=Pattern.compile("^/?[a-zA-Z]:");
+  private static Path mergePaths(  Path path1,  Path path2){
+    String path2Str=path2.toUri().getPath();
+    path2Str=path2Str.substring(startPositionWithoutWindowsDrive(path2Str));
+    return new Path(path1.toUri().getScheme(),path1.toUri().getAuthority(),path1.toUri().getPath() + path2Str);
+  }
+  private static int startPositionWithoutWindowsDrive(  String path){
+    if (hasWindowsDrive(path)) {
+      return path.charAt(0) == SEPARATOR_CHAR ? 3 : 2;
+    }
+ else {
+      return 0;
+    }
+  }
+  private static boolean hasWindowsDrive(  String path){
+    return (WINDOWS && hasDriveLetterSpecifier.matcher(path).find());
+  }
+}

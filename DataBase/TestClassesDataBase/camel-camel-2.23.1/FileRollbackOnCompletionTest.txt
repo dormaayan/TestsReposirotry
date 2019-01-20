@@ -1,0 +1,58 @@
+/** 
+ * @version 
+ */
+public class FileRollbackOnCompletionTest extends ContextTestSupport {
+  private static final CountDownLatch LATCH=new CountDownLatch(1);
+public static final class FileRollback implements Synchronization {
+    public void onComplete(    Exchange exchange){
+    }
+    public void onFailure(    Exchange exchange){
+      String name=exchange.getIn().getHeader(Exchange.FILE_NAME_PRODUCED,String.class);
+      FileUtil.deleteFile(new File(name));
+      LATCH.countDown();
+    }
+  }
+public static final class OrderService {
+    public String createMail(    String order) throws Exception {
+      return "Order confirmed: " + order;
+    }
+    public void sendMail(    String body,    @Header("to") String to){
+      if (to.equals("FATAL")) {
+        throw new IllegalArgumentException("Simulated fatal error");
+      }
+    }
+  }
+  @Override @Before public void setUp() throws Exception {
+    deleteDirectory("target/mail/backup");
+    super.setUp();
+  }
+  @Test public void testOk() throws Exception {
+    template.sendBodyAndHeader("direct:confirm","bumper","to","someone@somewhere.org");
+    File file=new File("target/mail/backup/");
+    String[] files=file.list();
+    assertEquals("There should be one file",1,files.length);
+  }
+  @Test public void testRollback() throws Exception {
+    try {
+      template.sendBodyAndHeader("direct:confirm","bumper","to","FATAL");
+      fail("Should have thrown an exception");
+    }
+ catch (    CamelExecutionException e) {
+      assertIsInstanceOf(IllegalArgumentException.class,e.getCause());
+      assertEquals("Simulated fatal error",e.getCause().getMessage());
+    }
+    oneExchangeDone.matchesMockWaitTime();
+    assertTrue("Should countdown the latch",LATCH.await(5,TimeUnit.SECONDS));
+    File file=new File("target/mail/backup/");
+    String[] files=file.list();
+    assertEquals("There should be no files",0,files.length);
+  }
+  @Override protected RouteBuilder createRouteBuilder() throws Exception {
+    return new RouteBuilder(){
+      @Override public void configure() throws Exception {
+        from("direct:confirm").onCompletion().onFailureOnly().bean(FileRollback.class,"onFailure").end().bean(OrderService.class,"createMail").log("Saving mail backup file").to("file:target/mail/backup").log("Trying to send mail to ${header.to}").bean(OrderService.class,"sendMail").log("Mail send to ${header.to}");
+      }
+    }
+;
+  }
+}

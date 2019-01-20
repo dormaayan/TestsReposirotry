@@ -1,0 +1,59 @@
+/** 
+ * Tests that the TaskManager does not send an excessive amount of registration messages to the job manager if its registration was rejected.
+ */
+@Test public void testTaskManagerNoExcessiveRegistrationMessages() throws Exception {
+  new JavaTestKit(actorSystem){
+{
+      ActorGateway jm=null;
+      ActorGateway taskManager=null;
+      try {
+        FiniteDuration timeout=new FiniteDuration(5,TimeUnit.SECONDS);
+        jm=TestingUtils.createForwardingActor(actorSystem,getTestActor(),HighAvailabilityServices.DEFAULT_LEADER_ID,Option.<String>empty());
+        highAvailabilityServices.setJobMasterLeaderRetriever(HighAvailabilityServices.DEFAULT_JOB_ID,new SettableLeaderRetrievalService(jm.path(),HighAvailabilityServices.DEFAULT_LEADER_ID));
+        final ActorGateway jmGateway=jm;
+        long refusedRegistrationPause=500;
+        long initialRegistrationPause=100;
+        long maxDelay=30000;
+        Configuration tmConfig=new Configuration(config);
+        tmConfig.setString(TaskManagerOptions.REFUSED_REGISTRATION_BACKOFF,refusedRegistrationPause + " ms");
+        tmConfig.setString(TaskManagerOptions.INITIAL_REGISTRATION_BACKOFF,initialRegistrationPause + " ms");
+        taskManager=createTaskManager(actorSystem,highAvailabilityServices,tmConfig,true,false);
+        final ActorGateway taskManagerGateway=taskManager;
+        final Deadline deadline=timeout.fromNow();
+        try {
+          while (deadline.hasTimeLeft()) {
+            expectMsgClass(deadline.timeLeft(),RegisterTaskManager.class);
+            taskManagerGateway.tell(new RefuseRegistration(new Exception("test reason")),jmGateway);
+          }
+        }
+ catch (        AssertionError error) {
+        }
+        RegisterTaskManager[] registerTaskManagerMessages=new ReceiveWhile<RegisterTaskManager>(RegisterTaskManager.class,timeout){
+          @Override protected RegisterTaskManager match(          Object msg) throws Exception {
+            if (msg instanceof RegisterTaskManager) {
+              return (RegisterTaskManager)msg;
+            }
+ else {
+              throw noMatch();
+            }
+          }
+        }
+.get();
+        int maxExponent=(int)Math.floor(Math.log(((double)maxDelay / initialRegistrationPause + 1)) / Math.log(2));
+        int exponent=(int)Math.ceil(Math.log(((double)timeout.toMillis() / initialRegistrationPause + 1)) / Math.log(2));
+        int exp=Math.min(maxExponent,exponent);
+        long difference=timeout.toMillis() - (initialRegistrationPause * (1 << exp));
+        int numberRegisterTaskManagerMessages=exp;
+        if (difference > 0) {
+          numberRegisterTaskManagerMessages+=Math.ceil((double)difference / maxDelay);
+        }
+        int maxExpectedNumberOfRegisterTaskManagerMessages=numberRegisterTaskManagerMessages * 2;
+        assertTrue("The number of RegisterTaskManager messages #" + registerTaskManagerMessages.length + " should be less than #"+ maxExpectedNumberOfRegisterTaskManagerMessages,registerTaskManagerMessages.length <= maxExpectedNumberOfRegisterTaskManagerMessages);
+      }
+  finally {
+        stopActorGatewaysGracefully(Arrays.asList(taskManager,jm));
+      }
+    }
+  }
+;
+}

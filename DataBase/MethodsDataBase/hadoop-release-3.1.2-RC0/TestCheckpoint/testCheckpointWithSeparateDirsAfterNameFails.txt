@@ -1,0 +1,48 @@
+/** 
+ * Test case where the NN is configured with a name-only and an edits-only dir, with storage-restore turned on. In this case, if the name-only dir disappears and comes back, a new checkpoint after it has been restored should function correctly.
+ * @throws Exception
+ */
+@Test public void testCheckpointWithSeparateDirsAfterNameFails() throws Exception {
+  MiniDFSCluster cluster=null;
+  SecondaryNameNode secondary=null;
+  File currentDir=null;
+  Configuration conf=new HdfsConfiguration();
+  File base_dir=new File(MiniDFSCluster.getBaseDirectory());
+  conf.setBoolean(DFSConfigKeys.DFS_NAMENODE_NAME_DIR_RESTORE_KEY,true);
+  conf.set(DFSConfigKeys.DFS_NAMENODE_NAME_DIR_KEY,MiniDFSCluster.getBaseDirectory() + "/name-only");
+  conf.set(DFSConfigKeys.DFS_NAMENODE_EDITS_DIR_KEY,MiniDFSCluster.getBaseDirectory() + "/edits-only");
+  conf.set(DFSConfigKeys.DFS_NAMENODE_CHECKPOINT_DIR_KEY,fileAsURI(new File(base_dir,"namesecondary1")).toString());
+  try {
+    cluster=new MiniDFSCluster.Builder(conf).numDataNodes(0).format(true).manageNameDfsDirs(false).build();
+    secondary=startSecondaryNameNode(conf);
+    secondary.doCheckpoint();
+    NamenodeProtocols nn=cluster.getNameNodeRpc();
+    NNStorage storage=cluster.getNameNode().getFSImage().getStorage();
+    StorageDirectory sd0=storage.getStorageDir(0);
+    assertEquals(NameNodeDirType.IMAGE,sd0.getStorageDirType());
+    currentDir=sd0.getCurrentDir();
+    assertEquals(0,FileUtil.chmod(currentDir.getAbsolutePath(),"000"));
+    try {
+      secondary.doCheckpoint();
+      fail("Did not fail to checkpoint when there are no valid storage dirs");
+    }
+ catch (    IOException ioe) {
+      GenericTestUtils.assertExceptionContains("No targets in destination storage",ioe);
+    }
+    assertEquals(0,FileUtil.chmod(currentDir.getAbsolutePath(),"755"));
+    nn.restoreFailedStorage("true");
+    nn.rollEditLog();
+    secondary.doCheckpoint();
+    assertNNHasCheckpoints(cluster,ImmutableList.of(8));
+    assertParallelFilesInvariant(cluster,ImmutableList.of(secondary));
+  }
+  finally {
+    if (currentDir != null) {
+      FileUtil.chmod(currentDir.getAbsolutePath(),"755");
+    }
+    cleanup(secondary);
+    secondary=null;
+    cleanup(cluster);
+    cluster=null;
+  }
+}

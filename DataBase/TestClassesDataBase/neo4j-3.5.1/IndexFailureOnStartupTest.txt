@@ -1,0 +1,92 @@
+public class IndexFailureOnStartupTest {
+  private static final Label PERSON=Label.label("Person");
+  @Rule public final RandomRule random=new RandomRule();
+  @Rule public final DatabaseRule db=new EmbeddedDatabaseRule().startLazily();
+  @Test public void failedIndexShouldRepairAutomatically() throws Exception {
+    try (Transaction tx=db.beginTx()){
+      db.schema().indexFor(PERSON).on("name").create();
+      tx.success();
+    }
+     awaitIndexesOnline(5,SECONDS);
+    createNamed(PERSON,"Johan");
+    db.restartDatabase(new SabotageNativeIndex(random.random()));
+    createNamed(PERSON,"Lars");
+    awaitIndexesOnline(5,SECONDS);
+    indexStateShouldBe(equalTo(ONLINE));
+    assertFindsNamed(PERSON,"Lars");
+  }
+  @Test public void shouldNotBeAbleToViolateConstraintWhenBackingIndexFailsToOpen() throws Exception {
+    try (Transaction tx=db.beginTx()){
+      db.schema().constraintFor(PERSON).assertPropertyIsUnique("name").create();
+      tx.success();
+    }
+     createNamed(PERSON,"Lars");
+    db.restartDatabase(new SabotageNativeIndex(random.random()));
+    createNamed(PERSON,"Johan");
+    Throwable failure=null;
+    try {
+      createNamed(PERSON,"Lars");
+    }
+ catch (    Throwable e) {
+      failure=e;
+    }
+    assertNotNull(failure);
+    indexStateShouldBe(equalTo(ONLINE));
+  }
+  @Test public void shouldArchiveFailedIndex() throws Exception {
+    db.withSetting(GraphDatabaseSettings.archive_failed_index,"true");
+    try (Transaction tx=db.beginTx()){
+      Node node=db.createNode(PERSON);
+      node.setProperty("name","Fry");
+      tx.success();
+    }
+     try (Transaction tx=db.beginTx()){
+      Node node=db.createNode(PERSON);
+      node.setProperty("name",Values.pointValue(CoordinateReferenceSystem.WGS84,1,2));
+      tx.success();
+    }
+     try (Transaction tx=db.beginTx()){
+      db.schema().constraintFor(PERSON).assertPropertyIsUnique("name").create();
+      tx.success();
+    }
+     assertThat(archiveFile(),nullValue());
+    db.restartDatabase(new SabotageNativeIndex(random.random()));
+    indexStateShouldBe(equalTo(ONLINE));
+    assertThat(archiveFile(),notNullValue());
+  }
+  private File archiveFile(){
+    File indexDir=nativeIndexDirectoryStructure(db.databaseLayout()).rootDirectory();
+    File[] files=indexDir.listFiles(pathname -> pathname.isFile() && pathname.getName().startsWith("archive-"));
+    if (files == null || files.length == 0) {
+      return null;
+    }
+    assertEquals(1,files.length);
+    return files[0];
+  }
+  private void awaitIndexesOnline(  int timeout,  TimeUnit unit){
+    try (Transaction tx=db.beginTx()){
+      db.schema().awaitIndexesOnline(timeout,unit);
+      tx.success();
+    }
+   }
+  private void assertFindsNamed(  Label label,  String name){
+    try (Transaction tx=db.beginTx()){
+      assertNotNull("Must be able to find node created while index was offline",db.findNode(label,"name",name));
+      tx.success();
+    }
+   }
+  private void indexStateShouldBe(  Matcher<Schema.IndexState> matchesExpectation){
+    try (Transaction tx=db.beginTx()){
+      for (      IndexDefinition index : db.schema().getIndexes()) {
+        assertThat(db.schema().getIndexState(index),matchesExpectation);
+      }
+      tx.success();
+    }
+   }
+  private void createNamed(  Label label,  String name){
+    try (Transaction tx=db.beginTx()){
+      db.createNode(label).setProperty("name",name);
+      tx.success();
+    }
+   }
+}

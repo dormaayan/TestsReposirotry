@@ -1,0 +1,66 @@
+/** 
+ * Test for blockIdCK with datanode decommission.
+ */
+@Test public void testBlockIdCKDecommission() throws Exception {
+  final short replFactor=1;
+  short numDn=2;
+  final long blockSize=512;
+  boolean checkDecommissionInProgress=false;
+  String[] racks={"/rack1","/rack2"};
+  String[] hosts={"host1","host2"};
+  conf.setLong(DFSConfigKeys.DFS_BLOCK_SIZE_KEY,blockSize);
+  conf.setInt(DFSConfigKeys.DFS_REPLICATION_KEY,2);
+  DistributedFileSystem dfs;
+  File builderBaseDir=new File(GenericTestUtils.getRandomizedTempPath());
+  cluster=new MiniDFSCluster.Builder(conf,builderBaseDir).numDataNodes(numDn).hosts(hosts).racks(racks).build();
+  assertNotNull("Failed Cluster Creation",cluster);
+  cluster.waitClusterUp();
+  dfs=cluster.getFileSystem();
+  assertNotNull("Failed to get FileSystem",dfs);
+  DFSTestUtil util=new DFSTestUtil.Builder().setName(getClass().getSimpleName()).setNumFiles(1).build();
+  final String pathString=new String("/testfile");
+  final Path path=new Path(pathString);
+  util.createFile(dfs,path,1024,replFactor,1000L);
+  util.waitReplication(dfs,path,replFactor);
+  StringBuilder sb=new StringBuilder();
+  for (  LocatedBlock lb : util.getAllBlocks(dfs,path)) {
+    sb.append(lb.getBlock().getLocalBlock().getBlockName() + " ");
+  }
+  String[] bIds=sb.toString().split(" ");
+  String outStr=runFsck(conf,0,true,"/","-blockId",bIds[0]);
+  System.out.println(outStr);
+  assertTrue(outStr.contains(NamenodeFsck.HEALTHY_STATUS));
+  FSNamesystem fsn=cluster.getNameNode().getNamesystem();
+  BlockManager bm=fsn.getBlockManager();
+  ExtendedBlock eb=util.getFirstBlock(dfs,path);
+  BlockCollection bc=null;
+  try {
+    fsn.writeLock();
+    BlockInfo bi=bm.getStoredBlock(eb.getLocalBlock());
+    bc=fsn.getBlockCollection(bi);
+  }
+  finally {
+    fsn.writeUnlock();
+  }
+  DatanodeDescriptor dn=bc.getBlocks()[0].getDatanode(0);
+  bm.getDatanodeManager().getDatanodeAdminManager().startDecommission(dn);
+  String dnName=dn.getXferAddr();
+  DatanodeInfo datanodeInfo=null;
+  int count=0;
+  do {
+    Thread.sleep(2000);
+    for (    DatanodeInfo info : dfs.getDataNodeStats()) {
+      if (dnName.equals(info.getXferAddr())) {
+        datanodeInfo=info;
+      }
+    }
+    if (!checkDecommissionInProgress && datanodeInfo != null && datanodeInfo.isDecommissionInProgress()) {
+      String fsckOut=runFsck(conf,3,true,"/","-blockId",bIds[0]);
+      assertTrue(fsckOut.contains(NamenodeFsck.DECOMMISSIONING_STATUS));
+      checkDecommissionInProgress=true;
+    }
+  }
+ while (datanodeInfo != null && !datanodeInfo.isDecommissioned());
+  String fsckOut=runFsck(conf,2,true,"/","-blockId",bIds[0]);
+  assertTrue(fsckOut.contains(NamenodeFsck.DECOMMISSIONED_STATUS));
+}

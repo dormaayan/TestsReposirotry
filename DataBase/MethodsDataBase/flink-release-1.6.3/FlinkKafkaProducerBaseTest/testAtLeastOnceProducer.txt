@@ -1,0 +1,34 @@
+/** 
+ * Test ensuring that the producer is not dropping buffered records; we set a timeout because the test will not finish if the logic is broken.
+ */
+@SuppressWarnings("unchecked") @Test(timeout=10000) public void testAtLeastOnceProducer() throws Throwable {
+  final DummyFlinkKafkaProducer<String> producer=new DummyFlinkKafkaProducer<>(FakeStandardProducerConfig.get(),new KeyedSerializationSchemaWrapper<>(new SimpleStringSchema()),null);
+  producer.setFlushOnCheckpoint(true);
+  final KafkaProducer<?,?> mockProducer=producer.getMockKafkaProducer();
+  final OneInputStreamOperatorTestHarness<String,Object> testHarness=new OneInputStreamOperatorTestHarness<>(new StreamSink<>(producer));
+  testHarness.open();
+  testHarness.processElement(new StreamRecord<>("msg-1"));
+  testHarness.processElement(new StreamRecord<>("msg-2"));
+  testHarness.processElement(new StreamRecord<>("msg-3"));
+  verify(mockProducer,times(3)).send(any(ProducerRecord.class),any(Callback.class));
+  Assert.assertEquals(3,producer.getPendingSize());
+  CheckedThread snapshotThread=new CheckedThread(){
+    @Override public void go() throws Exception {
+      testHarness.snapshot(123L,123L);
+    }
+  }
+;
+  snapshotThread.start();
+  producer.waitUntilFlushStarted();
+  Assert.assertTrue("Snapshot returned before all records were flushed",snapshotThread.isAlive());
+  producer.getPendingCallbacks().get(0).onCompletion(null,null);
+  Assert.assertTrue("Snapshot returned before all records were flushed",snapshotThread.isAlive());
+  Assert.assertEquals(2,producer.getPendingSize());
+  producer.getPendingCallbacks().get(1).onCompletion(null,null);
+  Assert.assertTrue("Snapshot returned before all records were flushed",snapshotThread.isAlive());
+  Assert.assertEquals(1,producer.getPendingSize());
+  producer.getPendingCallbacks().get(2).onCompletion(null,null);
+  Assert.assertEquals(0,producer.getPendingSize());
+  snapshotThread.sync();
+  testHarness.close();
+}

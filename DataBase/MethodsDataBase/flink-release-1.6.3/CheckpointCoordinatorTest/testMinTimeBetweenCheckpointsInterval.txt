@@ -1,0 +1,36 @@
+/** 
+ * This test verified that after a completed checkpoint a certain time has passed before another is triggered.
+ */
+@Test public void testMinTimeBetweenCheckpointsInterval() throws Exception {
+  final JobID jid=new JobID();
+  final ExecutionAttemptID attemptID=new ExecutionAttemptID();
+  final ExecutionVertex vertex=mockExecutionVertex(attemptID);
+  final Execution executionAttempt=vertex.getCurrentExecutionAttempt();
+  final BlockingQueue<Long> triggerCalls=new LinkedBlockingQueue<>();
+  doAnswer(invocation -> {
+    triggerCalls.add((Long)invocation.getArguments()[0]);
+    return null;
+  }
+).when(executionAttempt).triggerCheckpoint(anyLong(),anyLong(),any(CheckpointOptions.class));
+  final long delay=50;
+  final CheckpointCoordinator coord=new CheckpointCoordinator(jid,2,200_000,delay,1,CheckpointRetentionPolicy.NEVER_RETAIN_AFTER_TERMINATION,new ExecutionVertex[]{vertex},new ExecutionVertex[]{vertex},new ExecutionVertex[]{vertex},new StandaloneCheckpointIDCounter(),new StandaloneCompletedCheckpointStore(2),new MemoryStateBackend(),Executors.directExecutor(),SharedStateRegistry.DEFAULT_FACTORY);
+  try {
+    coord.startCheckpointScheduler();
+    Long firstCallId=triggerCalls.take();
+    assertEquals(1L,firstCallId.longValue());
+    AcknowledgeCheckpoint ackMsg=new AcknowledgeCheckpoint(jid,attemptID,1L);
+    final long ackTime=System.nanoTime();
+    coord.receiveAcknowledgeMessage(ackMsg);
+    Long nextCallId=triggerCalls.take();
+    final long nextCheckpointTime=System.nanoTime();
+    assertEquals(2L,nextCallId.longValue());
+    final long delayMillis=(nextCheckpointTime - ackTime) / 1_000_000;
+    if (delayMillis + 1 < delay) {
+      fail("checkpoint came too early: delay was " + delayMillis + " but should have been at least "+ delay);
+    }
+  }
+  finally {
+    coord.stopCheckpointScheduler();
+    coord.shutdown(JobStatus.FINISHED);
+  }
+}

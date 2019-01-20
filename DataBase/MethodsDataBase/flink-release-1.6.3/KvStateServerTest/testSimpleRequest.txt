@@ -1,0 +1,60 @@
+/** 
+ * Tests a simple successful query via a SocketChannel.
+ */
+@Test public void testSimpleRequest() throws Throwable {
+  KvStateServerImpl server=null;
+  Bootstrap bootstrap=null;
+  try {
+    KvStateRegistry registry=new KvStateRegistry();
+    KvStateRequestStats stats=new AtomicKvStateRequestStats();
+    server=new KvStateServerImpl(InetAddress.getLocalHost(),Collections.singletonList(0).iterator(),1,1,registry,stats);
+    server.start();
+    InetSocketAddress serverAddress=server.getServerAddress();
+    int numKeyGroups=1;
+    AbstractStateBackend abstractBackend=new MemoryStateBackend();
+    DummyEnvironment dummyEnv=new DummyEnvironment("test",1,0);
+    dummyEnv.setKvStateRegistry(registry);
+    final JobID jobId=new JobID();
+    AbstractKeyedStateBackend<Integer> backend=abstractBackend.createKeyedStateBackend(dummyEnv,jobId,"test_op",IntSerializer.INSTANCE,numKeyGroups,new KeyGroupRange(0,0),registry.createTaskRegistry(jobId,new JobVertexID()));
+    final KvStateServerHandlerTest.TestRegistryListener registryListener=new KvStateServerHandlerTest.TestRegistryListener();
+    registry.registerListener(jobId,registryListener);
+    ValueStateDescriptor<Integer> desc=new ValueStateDescriptor<>("any",IntSerializer.INSTANCE);
+    desc.setQueryable("vanilla");
+    ValueState<Integer> state=backend.getPartitionedState(VoidNamespace.INSTANCE,VoidNamespaceSerializer.INSTANCE,desc);
+    int expectedValue=712828289;
+    int key=99812822;
+    backend.setCurrentKey(key);
+    state.update(expectedValue);
+    byte[] serializedKeyAndNamespace=KvStateSerializer.serializeKeyAndNamespace(key,IntSerializer.INSTANCE,VoidNamespace.INSTANCE,VoidNamespaceSerializer.INSTANCE);
+    final BlockingQueue<ByteBuf> responses=new LinkedBlockingQueue<>();
+    bootstrap=createBootstrap(new LengthFieldBasedFrameDecoder(Integer.MAX_VALUE,0,4,0,4),new ChannelInboundHandlerAdapter(){
+      @Override public void channelRead(      ChannelHandlerContext ctx,      Object msg) throws Exception {
+        responses.add((ByteBuf)msg);
+      }
+    }
+);
+    Channel channel=bootstrap.connect(serverAddress.getAddress(),serverAddress.getPort()).sync().channel();
+    long requestId=Integer.MAX_VALUE + 182828L;
+    assertTrue(registryListener.registrationName.equals("vanilla"));
+    final KvStateInternalRequest request=new KvStateInternalRequest(registryListener.kvStateId,serializedKeyAndNamespace);
+    ByteBuf serializeRequest=MessageSerializer.serializeRequest(channel.alloc(),requestId,request);
+    channel.writeAndFlush(serializeRequest);
+    ByteBuf buf=responses.poll(TIMEOUT_MILLIS,TimeUnit.MILLISECONDS);
+    assertEquals(MessageType.REQUEST_RESULT,MessageSerializer.deserializeHeader(buf));
+    assertEquals(requestId,MessageSerializer.getRequestId(buf));
+    KvStateResponse response=server.getSerializer().deserializeResponse(buf);
+    int actualValue=KvStateSerializer.deserializeValue(response.getContent(),IntSerializer.INSTANCE);
+    assertEquals(expectedValue,actualValue);
+  }
+  finally {
+    if (server != null) {
+      server.shutdown();
+    }
+    if (bootstrap != null) {
+      EventLoopGroup group=bootstrap.group();
+      if (group != null) {
+        group.shutdownGracefully(0,10,TimeUnit.SECONDS);
+      }
+    }
+  }
+}

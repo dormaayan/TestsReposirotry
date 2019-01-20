@@ -1,0 +1,326 @@
+/** 
+ * Nested class that handles the established TCP connections
+ */
+class ClientSocketThread extends Thread {
+  Logger log=LoggerFactory.getLogger(this.getClass());
+  Socket clientSocket;
+  int messageCounter;
+  ClientSocketThread(  Socket clientSocket){
+    this.clientSocket=clientSocket;
+  }
+  void checkConnection(){
+    if (clientSocket == null) {
+      throw new MllpJUnitResourceException("checkConnection failed - clientSocket is null");
+    }
+    if (clientSocket.isClosed()) {
+      throw new MllpJUnitResourceException("checkConnection failed - clientSocket is closed");
+    }
+    if (!clientSocket.isConnected()) {
+      throw new MllpJUnitResourceException("checkConnection failed - clientSocket is not connected");
+    }
+    try {
+      if (MllpProtocolConstants.END_OF_STREAM == clientSocket.getInputStream().read()) {
+        throw new MllpJUnitResourceException("checkConnection failed - read() returned END_OF_STREAM");
+      }
+    }
+ catch (    IOException ioEx) {
+      throw new MllpJUnitResourceException("checkConnection failed - read() failure",ioEx);
+    }
+  }
+  void closeConnection(){
+    if (clientSocket != null && !clientSocket.isClosed()) {
+      try {
+        clientSocket.close();
+      }
+ catch (      IOException ioEx) {
+        log.warn("Ignoring IOException encountered when closing client Socket",ioEx);
+      }
+ finally {
+        clientSocket=null;
+      }
+    }
+  }
+  void resetConnection(){
+    if (clientSocket != null && !clientSocket.isClosed()) {
+      try {
+        clientSocket.setSoLinger(true,0);
+      }
+ catch (      SocketException socketEx) {
+        log.warn("Ignoring SocketException encountered when setting SO_LINGER in preparation of resetting client Socket",socketEx);
+      }
+      try {
+        clientSocket.close();
+      }
+ catch (      IOException ioEx) {
+        log.warn("Ignoring IOException encountered when resetting client Socket",ioEx);
+      }
+ finally {
+        clientSocket=null;
+      }
+    }
+  }
+  /** 
+ * Read a MLLP-Framed message
+ * @param anInputStream source input stream
+ * @return the MLLP payload
+ * @throws IOException when the underlying Java Socket calls raise these exceptions
+ */
+  public String getMessage(  InputStream anInputStream) throws IOException {
+    try {
+      boolean waitingForStartOfBlock=true;
+      while (waitingForStartOfBlock) {
+        int potentialStartCharacter=anInputStream.read();
+switch (potentialStartCharacter) {
+case MllpProtocolConstants.END_OF_STREAM:
+          return null;
+case MllpProtocolConstants.START_OF_BLOCK:
+        waitingForStartOfBlock=false;
+      break;
+default :
+    log.warn("START_OF_BLOCK character has not been received.  Out-of-band character received: {}",potentialStartCharacter);
+}
+}
+}
+ catch (SocketException socketEx) {
+if (clientSocket != null) {
+if (clientSocket.isClosed()) {
+  log.info("Client socket closed while waiting for START_OF_BLOCK");
+}
+ else if (clientSocket.isConnected()) {
+  log.info("SocketException encountered while waiting for START_OF_BLOCK");
+  resetConnection();
+}
+ else {
+  log.error("Unable to read from socket stream when expected START_OF_BLOCK - resetting connection ",socketEx);
+  resetConnection();
+}
+}
+return null;
+}
+boolean endOfMessage=false;
+StringBuilder parsedMessage=new StringBuilder(anInputStream.available() + 10);
+while (!endOfMessage) {
+int characterReceived=anInputStream.read();
+switch (characterReceived) {
+case MllpProtocolConstants.START_OF_BLOCK:
+log.error("Received START_OF_BLOCK before END_OF_DATA.  Discarding data: {}",parsedMessage);
+return null;
+case MllpProtocolConstants.END_OF_STREAM:
+log.error("Received END_OF_STREAM without END_OF_DATA.  Discarding data: {}",parsedMessage);
+return null;
+case MllpProtocolConstants.END_OF_BLOCK:
+characterReceived=anInputStream.read();
+if (characterReceived != MllpProtocolConstants.END_OF_DATA) {
+log.error("Received {} when expecting END_OF_DATA after END_OF_BLOCK.  Discarding Hl7TestMessageGenerator: {}",characterReceived,parsedMessage.toString());
+return null;
+}
+endOfMessage=true;
+break;
+default :
+parsedMessage.append((char)characterReceived);
+}
+}
+return parsedMessage.toString();
+}
+/** 
+ * Generates a HL7 Application Accept Acknowledgement
+ * @param hl7Message HL7 message that is being acknowledged
+ * @return a HL7 Application Accept Acknowlegdement
+ */
+private String generateAcknowledgementMessage(String hl7Message){
+return generateAcknowledgementMessage(hl7Message,"AA");
+}
+/** 
+ * Generates a HL7 Application Acknowledgement
+ * @param hl7Message          HL7 message that is being acknowledged
+ * @param acknowledgementCode AA, AE or AR
+ * @return a HL7 Application Acknowledgement
+ */
+private String generateAcknowledgementMessage(String hl7Message,String acknowledgementCode){
+return generateAcknowledgement(hl7Message,acknowledgementCode);
+}
+private void uncheckedSleep(long milliseconds){
+try {
+Thread.sleep(milliseconds);
+}
+ catch (InterruptedException e) {
+log.warn("Sleep interrupted",e);
+}
+}
+/** 
+ * Receives HL7 messages and replies with HL7 Acknowledgements. The exact behaviour of this method is very configurable, allowing simulation of varies error conditions.
+ */
+public void run(){
+String localAddress=clientSocket.getLocalAddress().toString();
+String remoteAddress=clientSocket.getRemoteSocketAddress().toString();
+log.info("Handling Connection: {} -> {}",localAddress,remoteAddress);
+try {
+while (!isInterrupted() && null != clientSocket && clientSocket.isConnected() && !clientSocket.isClosed()) {
+InputStream instream;
+try {
+instream=clientSocket.getInputStream();
+}
+ catch (IOException ioEx) {
+if (clientSocket.isClosed()) {
+log.debug("Client socket was closed - ignoring exception",clientSocket);
+break;
+}
+ else {
+throw new MllpJUnitResourceException("Unexpected IOException encounted getting input stream",ioEx);
+}
+}
+catch (Exception unexpectedEx) {
+throw new MllpJUnitResourceException("Unexpected exception encounted getting input stream",unexpectedEx);
+}
+String parsedHL7Message;
+try {
+parsedHL7Message=getMessage(instream);
+}
+ catch (SocketTimeoutException timeoutEx) {
+log.info("Waiting for message from client");
+continue;
+}
+if (null != parsedHL7Message && parsedHL7Message.length() > 0) {
+++messageCounter;
+if (closeSocketBeforeAcknowledgement(messageCounter)) {
+log.warn("Closing socket before sending acknowledgement");
+clientSocket.shutdownInput();
+clientSocket.shutdownOutput();
+clientSocket.close();
+break;
+}
+if (resetSocketBeforeAcknowledgement(messageCounter)) {
+log.warn("Resetting socket before sending acknowledgement");
+try {
+clientSocket.setSoLinger(true,0);
+}
+ catch (IOException ioEx) {
+log.warn("Ignoring IOException encountered setting SO_LINGER when prepareing to reset socket",ioEx);
+}
+clientSocket.shutdownInput();
+clientSocket.shutdownOutput();
+clientSocket.close();
+break;
+}
+String acknowledgmentMessage;
+if (acknowledgementString == null) {
+if (sendApplicationErrorAcknowledgement(messageCounter) || sendApplicationErrorAcknowledgement(parsedHL7Message)) {
+acknowledgmentMessage=generateAcknowledgementMessage(parsedHL7Message,"AE");
+}
+ else if (sendApplicationRejectAcknowledgement(messageCounter) || sendApplicationRejectAcknowledgement(parsedHL7Message)) {
+acknowledgmentMessage=generateAcknowledgementMessage(parsedHL7Message,"AR");
+}
+ else {
+acknowledgmentMessage=generateAcknowledgementMessage(parsedHL7Message);
+}
+}
+ else {
+acknowledgmentMessage=acknowledgementString;
+}
+BufferedOutputStream outstream=new BufferedOutputStream(clientSocket.getOutputStream());
+if (sendOutOfBandData(messageCounter)) {
+byte[] outOfBandDataBytes="Out Of Band Hl7TestMessageGenerator".getBytes();
+outstream.write(outOfBandDataBytes,0,outOfBandDataBytes.length);
+}
+if (excludeStartOfBlock(messageCounter)) {
+log.warn("NOT sending START_OF_BLOCK");
+}
+ else {
+outstream.write(MllpProtocolConstants.START_OF_BLOCK);
+if (delayBeforeStartOfBlock > 0) {
+uncheckedSleep(delayBeforeStartOfBlock);
+uncheckedFlush(outstream);
+}
+}
+if (excludeAcknowledgement(messageCounter)) {
+log.info("NOT sending Acknowledgement body");
+}
+ else {
+if (delayBeforeAcknowledgement > 0) {
+uncheckedSleep(delayBeforeAcknowledgement);
+}
+log.debug("Buffering Acknowledgement\n\t{}",acknowledgmentMessage.replace('\r','\n'));
+byte[] ackBytes=acknowledgmentMessage.getBytes();
+if (delayDuringAcknowledgement > 0) {
+int firstHalf=ackBytes.length / 2;
+outstream.write(ackBytes,0,firstHalf);
+uncheckedFlush(outstream);
+uncheckedSleep(delayDuringAcknowledgement);
+outstream.write(ackBytes,firstHalf,ackBytes.length - firstHalf);
+uncheckedFlush(outstream);
+}
+ else {
+outstream.write(ackBytes,0,ackBytes.length);
+}
+if (delayAfterAcknowledgement > 0) {
+uncheckedFlush(outstream);
+uncheckedSleep(delayAfterAcknowledgement);
+}
+}
+if (excludeEndOfBlock(messageCounter)) {
+log.warn("NOT sending END_OF_BLOCK");
+}
+ else {
+outstream.write(MllpProtocolConstants.END_OF_BLOCK);
+if (delayAfterEndOfBlock > 0) {
+uncheckedFlush(outstream);
+uncheckedSleep(delayAfterEndOfBlock);
+}
+}
+if (excludeEndOfData(messageCounter)) {
+log.warn("NOT sending END_OF_DATA");
+}
+ else {
+outstream.write(MllpProtocolConstants.END_OF_DATA);
+}
+log.debug("Writing Acknowledgement\n\t{}",acknowledgmentMessage.replace('\r','\n'));
+uncheckedFlush(outstream);
+if (closeSocketAfterAcknowledgement(messageCounter)) {
+log.info("Closing Client");
+clientSocket.shutdownInput();
+clientSocket.shutdownOutput();
+clientSocket.close();
+break;
+}
+}
+}
+}
+ catch (IOException e) {
+String errorMessage="Error while reading and writing from clientSocket";
+log.error(errorMessage,e);
+throw new MllpJUnitResourceException(errorMessage,e);
+}
+ finally {
+if (clientSocket != null) {
+try {
+clientSocket.close();
+}
+ catch (IOException e) {
+String errorMessage="Error while attempting to close to client Socket";
+log.error(errorMessage,e);
+throw new MllpJUnitResourceException(errorMessage,e);
+}
+}
+}
+log.debug("Client Connection Finished: {} -> {}",localAddress,remoteAddress);
+}
+private void uncheckedFlush(OutputStream outputStream){
+try {
+outputStream.flush();
+}
+ catch (IOException e) {
+log.warn("Ignoring exception caught while flushing output stream",e);
+}
+}
+@Override public void interrupt(){
+if (clientSocket != null && clientSocket.isConnected() && !clientSocket.isClosed()) {
+try {
+clientSocket.close();
+}
+ catch (Exception ex) {
+log.warn("Exception encountered closing client socket on interrput",ex);
+}
+}
+super.interrupt();
+}
+}

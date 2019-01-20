@@ -1,0 +1,104 @@
+public class LegacySlotCountExceedingParallelismTest extends TestLogger {
+  private static final int NUMBER_OF_TMS=2;
+  private static final int NUMBER_OF_SLOTS_PER_TM=2;
+  private static final int PARALLELISM=NUMBER_OF_TMS * NUMBER_OF_SLOTS_PER_TM;
+  public static final String JOB_NAME="SlotCountExceedingParallelismTest (no slot sharing, blocking results)";
+  private static TestingCluster flink;
+  @BeforeClass public static void setUp() throws Exception {
+    flink=TestingUtils.startTestingCluster(NUMBER_OF_SLOTS_PER_TM,NUMBER_OF_TMS,TestingUtils.DEFAULT_AKKA_ASK_TIMEOUT());
+  }
+  @AfterClass public static void tearDown() throws Exception {
+    if (flink != null) {
+      flink.stop();
+    }
+  }
+  @Test public void testNoSlotSharingAndBlockingResultSender() throws Exception {
+    JobGraph jobGraph=createTestJobGraph(JOB_NAME,PARALLELISM * 2,PARALLELISM);
+    submitJobGraphAndWait(jobGraph);
+  }
+  @Test public void testNoSlotSharingAndBlockingResultReceiver() throws Exception {
+    JobGraph jobGraph=createTestJobGraph(JOB_NAME,PARALLELISM,PARALLELISM * 2);
+    submitJobGraphAndWait(jobGraph);
+  }
+  @Test public void testNoSlotSharingAndBlockingResultBoth() throws Exception {
+    JobGraph jobGraph=createTestJobGraph(JOB_NAME,PARALLELISM * 2,PARALLELISM * 2);
+    submitJobGraphAndWait(jobGraph);
+  }
+  private void submitJobGraphAndWait(  final JobGraph jobGraph) throws JobExecutionException {
+    flink.submitJobAndWait(jobGraph,false,TestingUtils.TESTING_DURATION());
+  }
+  private JobGraph createTestJobGraph(  String jobName,  int senderParallelism,  int receiverParallelism){
+    final JobVertex sender=new JobVertex("Sender");
+    sender.setInvokableClass(RoundRobinSubtaskIndexSender.class);
+    sender.getConfiguration().setInteger(RoundRobinSubtaskIndexSender.CONFIG_KEY,receiverParallelism);
+    sender.setParallelism(senderParallelism);
+    final JobVertex receiver=new JobVertex("Receiver");
+    receiver.setInvokableClass(SubtaskIndexReceiver.class);
+    receiver.getConfiguration().setInteger(SubtaskIndexReceiver.CONFIG_KEY,senderParallelism);
+    receiver.setParallelism(receiverParallelism);
+    receiver.connectNewDataSetAsInput(sender,DistributionPattern.ALL_TO_ALL,ResultPartitionType.BLOCKING);
+    final JobGraph jobGraph=new JobGraph(jobName,sender,receiver);
+    jobGraph.setAllowQueuedScheduling(true);
+    return jobGraph;
+  }
+  /** 
+ * Sends the subtask index a configurable number of times in a round-robin fashion.
+ */
+public static class RoundRobinSubtaskIndexSender extends AbstractInvokable {
+    public static final String CONFIG_KEY="number-of-times-to-send";
+    public RoundRobinSubtaskIndexSender(    Environment environment){
+      super(environment);
+    }
+    @Override public void invoke() throws Exception {
+      RecordWriter<IntValue> writer=new RecordWriter<>(getEnvironment().getWriter(0));
+      final int numberOfTimesToSend=getTaskConfiguration().getInteger(CONFIG_KEY,0);
+      final IntValue subtaskIndex=new IntValue(getEnvironment().getTaskInfo().getIndexOfThisSubtask());
+      try {
+        for (int i=0; i < numberOfTimesToSend; i++) {
+          writer.emit(subtaskIndex);
+        }
+        writer.flushAll();
+      }
+  finally {
+        writer.clearBuffers();
+      }
+    }
+  }
+  /** 
+ * Expects to receive the subtask index from a configurable number of sender tasks.
+ */
+public static class SubtaskIndexReceiver extends AbstractInvokable {
+    public static final String CONFIG_KEY="number-of-indexes-to-receive";
+    public SubtaskIndexReceiver(    Environment environment){
+      super(environment);
+    }
+    @Override public void invoke() throws Exception {
+      RecordReader<IntValue> reader=new RecordReader<>(getEnvironment().getInputGate(0),IntValue.class,getEnvironment().getTaskManagerInfo().getTmpDirectories());
+      try {
+        final int numberOfSubtaskIndexesToReceive=getTaskConfiguration().getInteger(CONFIG_KEY,0);
+        final BitSet receivedSubtaskIndexes=new BitSet(numberOfSubtaskIndexesToReceive);
+        IntValue record;
+        int numberOfReceivedSubtaskIndexes=0;
+        while ((record=reader.next()) != null) {
+          numberOfReceivedSubtaskIndexes++;
+          if (numberOfReceivedSubtaskIndexes > numberOfSubtaskIndexesToReceive) {
+            throw new IllegalStateException("Received more records than expected.");
+          }
+          int subtaskIndex=record.getValue();
+          if (receivedSubtaskIndexes.get(subtaskIndex)) {
+            throw new IllegalStateException("Received expected subtask index twice.");
+          }
+ else {
+            receivedSubtaskIndexes.set(subtaskIndex,true);
+          }
+        }
+        if (receivedSubtaskIndexes.cardinality() != numberOfSubtaskIndexesToReceive) {
+          throw new IllegalStateException("Finished receive, but did not receive " + "all expected subtask indexes.");
+        }
+      }
+  finally {
+        reader.clearBuffers();
+      }
+    }
+  }
+}

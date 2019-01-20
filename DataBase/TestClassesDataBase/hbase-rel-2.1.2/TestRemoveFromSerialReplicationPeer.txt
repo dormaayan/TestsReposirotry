@@ -1,0 +1,51 @@
+/** 
+ * Testcase for HBASE-20296.
+ */
+@Category({ReplicationTests.class,MediumTests.class}) public class TestRemoveFromSerialReplicationPeer extends SerialReplicationTestBase {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestRemoveFromSerialReplicationPeer.class);
+  @Before public void setUp() throws IOException, StreamLacksCapabilityException {
+    setupWALWriter();
+  }
+  private void waitUntilHasLastPushedSequenceId(  RegionInfo region) throws Exception {
+    ReplicationQueueStorage queueStorage=UTIL.getMiniHBaseCluster().getMaster().getReplicationPeerManager().getQueueStorage();
+    UTIL.waitFor(30000,new ExplainingPredicate<Exception>(){
+      @Override public boolean evaluate() throws Exception {
+        return queueStorage.getLastSequenceId(region.getEncodedName(),PEER_ID) > 0;
+      }
+      @Override public String explainFailure() throws Exception {
+        return "Still no last pushed sequence id for " + region;
+      }
+    }
+);
+  }
+  @Test public void testRemoveTable() throws Exception {
+    TableName tableName=createTable();
+    ReplicationPeerConfig peerConfig=ReplicationPeerConfig.newBuilder().setClusterKey("127.0.0.1:2181:/hbase").setReplicationEndpointImpl(LocalReplicationEndpoint.class.getName()).setReplicateAllUserTables(false).setTableCFsMap(ImmutableMap.of(tableName,Collections.emptyList())).setSerial(true).build();
+    UTIL.getAdmin().addReplicationPeer(PEER_ID,peerConfig,true);
+    try (Table table=UTIL.getConnection().getTable(tableName)){
+      for (int i=0; i < 100; i++) {
+        table.put(new Put(Bytes.toBytes(i)).addColumn(CF,CQ,Bytes.toBytes(i)));
+      }
+    }
+     RegionInfo region=UTIL.getMiniHBaseCluster().getRegions(tableName).get(0).getRegionInfo();
+    waitUntilHasLastPushedSequenceId(region);
+    UTIL.getAdmin().updateReplicationPeerConfig(PEER_ID,ReplicationPeerConfig.newBuilder(peerConfig).setTableCFsMap(Collections.emptyMap()).build());
+    ReplicationQueueStorage queueStorage=UTIL.getMiniHBaseCluster().getMaster().getReplicationPeerManager().getQueueStorage();
+    assertEquals(HConstants.NO_SEQNUM,queueStorage.getLastSequenceId(region.getEncodedName(),PEER_ID));
+  }
+  @Test public void testRemoveSerialFlag() throws Exception {
+    TableName tableName=createTable();
+    addPeer(true);
+    try (Table table=UTIL.getConnection().getTable(tableName)){
+      for (int i=0; i < 100; i++) {
+        table.put(new Put(Bytes.toBytes(i)).addColumn(CF,CQ,Bytes.toBytes(i)));
+      }
+    }
+     RegionInfo region=UTIL.getMiniHBaseCluster().getRegions(tableName).get(0).getRegionInfo();
+    waitUntilHasLastPushedSequenceId(region);
+    UTIL.getAdmin().updateReplicationPeerConfig(PEER_ID,ReplicationPeerConfig.newBuilder(UTIL.getAdmin().getReplicationPeerConfig(PEER_ID)).setSerial(false).build());
+    waitUntilReplicationDone(100);
+    ReplicationQueueStorage queueStorage=UTIL.getMiniHBaseCluster().getMaster().getReplicationPeerManager().getQueueStorage();
+    assertEquals(HConstants.NO_SEQNUM,queueStorage.getLastSequenceId(region.getEncodedName(),PEER_ID));
+  }
+}

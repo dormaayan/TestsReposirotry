@@ -1,0 +1,66 @@
+/** 
+ * Integration test to validate the builder builds a client with the correct configuration
+ */
+public class RestClientBuilderIntegTests extends RestClientTestCase {
+  private static HttpsServer httpsServer;
+  @BeforeClass public static void startHttpServer() throws Exception {
+    httpsServer=MockHttpServer.createHttps(new InetSocketAddress(InetAddress.getLoopbackAddress(),0),0);
+    httpsServer.setHttpsConfigurator(new HttpsConfigurator(getSslContext()));
+    httpsServer.createContext("/",new ResponseHandler());
+    httpsServer.start();
+  }
+private static class ResponseHandler implements HttpHandler {
+    @Override public void handle(    HttpExchange httpExchange) throws IOException {
+      httpExchange.sendResponseHeaders(200,-1);
+      httpExchange.close();
+    }
+  }
+  @AfterClass public static void stopHttpServers() throws IOException {
+    httpsServer.stop(0);
+    httpsServer=null;
+  }
+  public void testBuilderUsesDefaultSSLContext() throws Exception {
+    assumeFalse("Due to bug inside jdk, this test can't momentarily run with java 11. " + "See: https://github.com/elastic/elasticsearch/issues/31940",System.getProperty("java.version").contains("11"));
+    final SSLContext defaultSSLContext=SSLContext.getDefault();
+    try {
+      try (RestClient client=buildRestClient()){
+        try {
+          client.performRequest(new Request("GET","/"));
+          fail("connection should have been rejected due to SSL handshake");
+        }
+ catch (        Exception e) {
+          assertThat(e.getMessage(),containsString("General SSLEngine problem"));
+        }
+      }
+       SSLContext.setDefault(getSslContext());
+      try (RestClient client=buildRestClient()){
+        Response response=client.performRequest(new Request("GET","/"));
+        assertEquals(200,response.getStatusLine().getStatusCode());
+      }
+     }
+  finally {
+      SSLContext.setDefault(defaultSSLContext);
+    }
+  }
+  private RestClient buildRestClient(){
+    InetSocketAddress address=httpsServer.getAddress();
+    return RestClient.builder(new HttpHost(address.getHostString(),address.getPort(),"https")).build();
+  }
+  private static SSLContext getSslContext() throws Exception {
+    SSLContext sslContext=SSLContext.getInstance("TLS");
+    try (InputStream certFile=RestClientBuilderIntegTests.class.getResourceAsStream("/test.crt")){
+      KeyStore keyStore=KeyStore.getInstance(KeyStore.getDefaultType());
+      keyStore.load(null,"password".toCharArray());
+      CertificateFactory certFactory=CertificateFactory.getInstance("X.509");
+      PKCS8EncodedKeySpec privateKeySpec=new PKCS8EncodedKeySpec(Files.readAllBytes(Paths.get(RestClientBuilderIntegTests.class.getResource("/test.der").toURI())));
+      KeyFactory keyFactory=KeyFactory.getInstance("RSA");
+      keyStore.setKeyEntry("mykey",keyFactory.generatePrivate(privateKeySpec),"password".toCharArray(),new Certificate[]{certFactory.generateCertificate(certFile)});
+      KeyManagerFactory kmf=KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm());
+      kmf.init(keyStore,"password".toCharArray());
+      TrustManagerFactory tmf=TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm());
+      tmf.init(keyStore);
+      sslContext.init(kmf.getKeyManagers(),tmf.getTrustManagers(),null);
+    }
+     return sslContext;
+  }
+}

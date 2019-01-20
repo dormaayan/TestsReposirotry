@@ -1,0 +1,80 @@
+/** 
+ * testcase for https://issues.apache.org/jira/browse/HBASE-15252
+ */
+@Test public void testDatalossWhenInputError() throws Exception {
+  final TableName tableName=TableName.valueOf("testDatalossWhenInputError");
+  final HRegionInfo hri=createBasic3FamilyHRegionInfo(tableName);
+  final Path basedir=FSUtils.getWALTableDir(conf,tableName);
+  deleteDir(basedir);
+  final byte[] rowName=tableName.getName();
+  final int countPerFamily=10;
+  final HTableDescriptor htd=createBasic1FamilyHTD(tableName);
+  HRegion region1=HBaseTestingUtility.createRegionAndWAL(hri,hbaseRootDir,this.conf,htd);
+  Path regionDir=region1.getWALRegionDir();
+  HBaseTestingUtility.closeRegionAndWAL(region1);
+  WAL wal=createWAL(this.conf,hbaseRootDir,logName);
+  HRegion region=HRegion.openHRegion(this.conf,this.fs,hbaseRootDir,hri,htd,wal);
+  for (  HColumnDescriptor hcd : htd.getFamilies()) {
+    addRegionEdits(rowName,hcd.getName(),countPerFamily,this.ee,region,"x");
+  }
+  final Get g=new Get(rowName);
+  Result result=region.get(g);
+  assertEquals(countPerFamily * htd.getFamilies().size(),result.size());
+  region.close(true);
+  wal.shutdown();
+  runWALSplit(this.conf);
+  Path editFile=WALSplitter.getSplitEditFilesSorted(this.fs,regionDir).first();
+  FSDataInputStream stream=fs.open(editFile);
+  stream.seek(ProtobufLogReader.PB_WAL_MAGIC.length);
+  Class<? extends AbstractFSWALProvider.Reader> logReaderClass=conf.getClass("hbase.regionserver.hlog.reader.impl",ProtobufLogReader.class,AbstractFSWALProvider.Reader.class);
+  AbstractFSWALProvider.Reader reader=logReaderClass.getDeclaredConstructor().newInstance();
+  reader.init(this.fs,editFile,conf,stream);
+  final long headerLength=stream.getPos();
+  reader.close();
+  FileSystem spyFs=spy(this.fs);
+  doAnswer(new Answer<FSDataInputStream>(){
+    @Override public FSDataInputStream answer(    InvocationOnMock invocation) throws Throwable {
+      FSDataInputStream stream=(FSDataInputStream)invocation.callRealMethod();
+      Field field=FilterInputStream.class.getDeclaredField("in");
+      field.setAccessible(true);
+      final DFSInputStream in=(DFSInputStream)field.get(stream);
+      DFSInputStream spyIn=spy(in);
+      doAnswer(new Answer<Integer>(){
+        private long pos;
+        @Override public Integer answer(        InvocationOnMock invocation) throws Throwable {
+          if (pos >= headerLength) {
+            throw new IOException("read over limit");
+          }
+          int b=(Integer)invocation.callRealMethod();
+          if (b > 0) {
+            pos+=b;
+          }
+          return b;
+        }
+      }
+).when(spyIn).read(any(byte[].class),anyInt(),anyInt());
+      doAnswer(new Answer<Void>(){
+        @Override public Void answer(        InvocationOnMock invocation) throws Throwable {
+          invocation.callRealMethod();
+          in.close();
+          return null;
+        }
+      }
+).when(spyIn).close();
+      field.set(stream,spyIn);
+      return stream;
+    }
+  }
+).when(spyFs).open(eq(editFile));
+  WAL wal2=createWAL(this.conf,hbaseRootDir,logName);
+  HRegion region2;
+  try {
+    region2=HRegion.openHRegion(conf,spyFs,hbaseRootDir,hri,htd,wal2);
+    assertEquals(result.size(),region2.get(g).size());
+  }
+ catch (  IOException e) {
+    assertEquals("read over limit",e.getMessage());
+  }
+  region2=HRegion.openHRegion(conf,fs,hbaseRootDir,hri,htd,wal2);
+  assertEquals(result.size(),region2.get(g).size());
+}

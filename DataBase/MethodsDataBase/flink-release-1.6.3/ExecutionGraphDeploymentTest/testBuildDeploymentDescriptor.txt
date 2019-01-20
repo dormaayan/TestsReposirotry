@@ -1,0 +1,62 @@
+@Test public void testBuildDeploymentDescriptor(){
+  try {
+    final JobID jobId=new JobID();
+    final JobVertexID jid1=new JobVertexID();
+    final JobVertexID jid2=new JobVertexID();
+    final JobVertexID jid3=new JobVertexID();
+    final JobVertexID jid4=new JobVertexID();
+    JobVertex v1=new JobVertex("v1",jid1);
+    JobVertex v2=new JobVertex("v2",jid2);
+    JobVertex v3=new JobVertex("v3",jid3);
+    JobVertex v4=new JobVertex("v4",jid4);
+    v1.setParallelism(10);
+    v2.setParallelism(10);
+    v3.setParallelism(10);
+    v4.setParallelism(10);
+    v1.setInvokableClass(BatchTask.class);
+    v2.setInvokableClass(BatchTask.class);
+    v3.setInvokableClass(BatchTask.class);
+    v4.setInvokableClass(BatchTask.class);
+    v2.connectNewDataSetAsInput(v1,DistributionPattern.ALL_TO_ALL,ResultPartitionType.PIPELINED);
+    v3.connectNewDataSetAsInput(v2,DistributionPattern.ALL_TO_ALL,ResultPartitionType.PIPELINED);
+    v4.connectNewDataSetAsInput(v2,DistributionPattern.ALL_TO_ALL,ResultPartitionType.PIPELINED);
+    final JobInformation expectedJobInformation=new DummyJobInformation(jobId,"some job");
+    ExecutionGraph eg=new ExecutionGraph(expectedJobInformation,TestingUtils.defaultExecutor(),TestingUtils.defaultExecutor(),AkkaUtils.getDefaultTimeout(),new NoRestartStrategy(),new RestartAllStrategy.Factory(),new Scheduler(TestingUtils.defaultExecutionContext()),ExecutionGraph.class.getClassLoader(),blobWriter,AkkaUtils.getDefaultTimeout());
+    checkJobOffloaded(eg);
+    List<JobVertex> ordered=Arrays.asList(v1,v2,v3,v4);
+    eg.attachJobGraph(ordered);
+    ExecutionJobVertex ejv=eg.getAllVertices().get(jid2);
+    ExecutionVertex vertex=ejv.getTaskVertices()[3];
+    ExecutionGraphTestUtils.SimpleActorGatewayWithTDD instanceGateway=new ExecutionGraphTestUtils.SimpleActorGatewayWithTDD(TestingUtils.directExecutionContext(),blobCache);
+    final Instance instance=getInstance(new ActorTaskManagerGateway(instanceGateway));
+    final SimpleSlot slot=instance.allocateSimpleSlot();
+    assertEquals(ExecutionState.CREATED,vertex.getExecutionState());
+    vertex.deployToSlot(slot);
+    assertEquals(ExecutionState.DEPLOYING,vertex.getExecutionState());
+    checkTaskOffloaded(eg,vertex.getJobvertexId());
+    TaskDeploymentDescriptor descr=instanceGateway.lastTDD;
+    assertNotNull(descr);
+    JobInformation jobInformation=descr.getSerializedJobInformation().deserializeValue(getClass().getClassLoader());
+    TaskInformation taskInformation=descr.getSerializedTaskInformation().deserializeValue(getClass().getClassLoader());
+    assertEquals(jobId,descr.getJobId());
+    assertEquals(jobId,jobInformation.getJobId());
+    assertEquals(jid2,taskInformation.getJobVertexId());
+    assertEquals(3,descr.getSubtaskIndex());
+    assertEquals(10,taskInformation.getNumberOfSubtasks());
+    assertEquals(BatchTask.class.getName(),taskInformation.getInvokableClassName());
+    assertEquals("v2",taskInformation.getTaskName());
+    Collection<ResultPartitionDeploymentDescriptor> producedPartitions=descr.getProducedPartitions();
+    Collection<InputGateDeploymentDescriptor> consumedPartitions=descr.getInputGates();
+    assertEquals(2,producedPartitions.size());
+    assertEquals(1,consumedPartitions.size());
+    Iterator<ResultPartitionDeploymentDescriptor> iteratorProducedPartitions=producedPartitions.iterator();
+    Iterator<InputGateDeploymentDescriptor> iteratorConsumedPartitions=consumedPartitions.iterator();
+    assertEquals(10,iteratorProducedPartitions.next().getNumberOfSubpartitions());
+    assertEquals(10,iteratorProducedPartitions.next().getNumberOfSubpartitions());
+    assertEquals(10,iteratorConsumedPartitions.next().getInputChannelDeploymentDescriptors().length);
+  }
+ catch (  Exception e) {
+    e.printStackTrace();
+    fail(e.getMessage());
+  }
+}

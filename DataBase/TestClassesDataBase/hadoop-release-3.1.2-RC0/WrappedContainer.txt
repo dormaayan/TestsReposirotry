@@ -1,0 +1,254 @@
+@SuppressWarnings("unchecked") private class WrappedContainer {
+  final DrainDispatcher dispatcher;
+  final EventHandler<LocalizationEvent> localizerBus;
+  final EventHandler<ContainersLauncherEvent> launcherBus;
+  final EventHandler<ContainersMonitorEvent> monitorBus;
+  final EventHandler<AuxServicesEvent> auxBus;
+  final EventHandler<ApplicationEvent> appBus;
+  final EventHandler<LogHandlerEvent> LogBus;
+  final EventHandler<ContainerSchedulerEvent> schedBus;
+  final ContainersLauncher launcher;
+  final ContainerLaunchContext ctxt;
+  final ContainerId cId;
+  final Container c;
+  final Map<String,LocalResource> localResources;
+  final Map<String,ByteBuffer> serviceData;
+  final Context context=mock(Context.class);
+  private final DeletionService delService;
+  private final Map<ContainerState,ContainerEventType> initStateToEvent=new HashMap<>();
+  private final Map<ContainerEventType,ContainerState> eventToFinalState=new HashMap<>();
+  WrappedContainer(  int appId,  long timestamp,  int id,  String user) throws IOException {
+    this(appId,timestamp,id,user,null);
+  }
+  WrappedContainer(  int appId,  long timestamp,  int id,  String user,  ContainerRetryContext containerRetryContext) throws IOException {
+    this(appId,timestamp,id,user,true,false,containerRetryContext);
+  }
+  WrappedContainer(  int appId,  long timestamp,  int id,  String user,  boolean withLocalRes,  boolean withServiceData) throws IOException {
+    this(appId,timestamp,id,user,withLocalRes,withServiceData,null);
+  }
+  @SuppressWarnings("rawtypes") WrappedContainer(  int appId,  long timestamp,  int id,  String user,  boolean withLocalRes,  boolean withServiceData,  ContainerRetryContext containerRetryContext) throws IOException {
+    dispatcher=new DrainDispatcher();
+    dispatcher.init(new Configuration());
+    localizerBus=mock(EventHandler.class);
+    launcherBus=mock(EventHandler.class);
+    monitorBus=mock(EventHandler.class);
+    auxBus=mock(EventHandler.class);
+    appBus=mock(EventHandler.class);
+    LogBus=mock(EventHandler.class);
+    delService=mock(DeletionService.class);
+    schedBus=new ContainerScheduler(context,dispatcher,metrics,0){
+      @Override protected void scheduleContainer(      Container container){
+        container.sendLaunchEvent();
+      }
+    }
+;
+    dispatcher.register(LocalizationEventType.class,localizerBus);
+    dispatcher.register(ContainersLauncherEventType.class,launcherBus);
+    dispatcher.register(ContainersMonitorEventType.class,monitorBus);
+    dispatcher.register(ContainerSchedulerEventType.class,schedBus);
+    dispatcher.register(AuxServicesEventType.class,auxBus);
+    dispatcher.register(ApplicationEventType.class,appBus);
+    dispatcher.register(LogHandlerEventType.class,LogBus);
+    when(context.getApplications()).thenReturn(new ConcurrentHashMap<ApplicationId,Application>());
+    NMNullStateStoreService stateStore=new NMNullStateStoreService();
+    when(context.getNMStateStore()).thenReturn(stateStore);
+    NodeStatusUpdater nodeStatusUpdater=mock(NodeStatusUpdater.class);
+    when(context.getNodeStatusUpdater()).thenReturn(nodeStatusUpdater);
+    ContainerExecutor executor=mock(ContainerExecutor.class);
+    Mockito.doNothing().when(executor).pauseContainer(any(Container.class));
+    Mockito.doNothing().when(executor).resumeContainer(any(Container.class));
+    launcher=new ContainersLauncher(context,dispatcher,executor,null,null);
+    launcher.containerLauncher=mock(ExecutorService.class);
+    Future future=mock(Future.class);
+    when(launcher.containerLauncher.submit(any(Callable.class))).thenReturn(future);
+    when(future.isDone()).thenReturn(false);
+    when(future.cancel(false)).thenReturn(true);
+    launcher.init(new Configuration());
+    launcher.start();
+    dispatcher.register(ContainersLauncherEventType.class,launcher);
+    ctxt=mock(ContainerLaunchContext.class);
+    org.apache.hadoop.yarn.api.records.Container mockContainer=mock(org.apache.hadoop.yarn.api.records.Container.class);
+    cId=BuilderUtils.newContainerId(appId,1,timestamp,id);
+    when(mockContainer.getId()).thenReturn(cId);
+    Resource resource=BuilderUtils.newResource(1024,1);
+    when(mockContainer.getResource()).thenReturn(resource);
+    String host="127.0.0.1";
+    int port=1234;
+    long currentTime=System.currentTimeMillis();
+    ContainerTokenIdentifier identifier=new ContainerTokenIdentifier(cId,"127.0.0.1",user,resource,currentTime + 10000L,123,currentTime,Priority.newInstance(0),0);
+    Token token=BuilderUtils.newContainerToken(BuilderUtils.newNodeId(host,port),"password".getBytes(),identifier);
+    when(mockContainer.getContainerToken()).thenReturn(token);
+    if (withLocalRes) {
+      Random r=new Random();
+      long seed=r.nextLong();
+      r.setSeed(seed);
+      System.out.println("WrappedContainerLocalResource seed: " + seed);
+      localResources=createLocalResources(r);
+    }
+ else {
+      localResources=Collections.<String,LocalResource>emptyMap();
+    }
+    when(ctxt.getLocalResources()).thenReturn(localResources);
+    if (withServiceData) {
+      Random r=new Random();
+      long seed=r.nextLong();
+      r.setSeed(seed);
+      System.out.println("ServiceData seed: " + seed);
+      serviceData=createServiceData(r);
+    }
+ else {
+      serviceData=Collections.<String,ByteBuffer>emptyMap();
+    }
+    when(ctxt.getServiceData()).thenReturn(serviceData);
+    when(ctxt.getContainerRetryContext()).thenReturn(containerRetryContext);
+    when(context.getDeletionService()).thenReturn(delService);
+    ContainerStateTransitionListener listener=new ContainerStateTransitionListener(){
+      @Override public void init(      Context cntxt){
+      }
+      @Override public void preTransition(      ContainerImpl op,      ContainerState beforeState,      ContainerEvent eventToBeProcessed){
+        initStateToEvent.put(beforeState,eventToBeProcessed.getType());
+      }
+      @Override public void postTransition(      ContainerImpl op,      ContainerState beforeState,      ContainerState afterState,      ContainerEvent processedEvent){
+        eventToFinalState.put(processedEvent.getType(),afterState);
+      }
+    }
+;
+    NodeManager.DefaultContainerStateListener multi=new NodeManager.DefaultContainerStateListener();
+    multi.addListener(listener);
+    when(context.getContainerStateTransitionListener()).thenReturn(multi);
+    c=new ContainerImpl(conf,dispatcher,ctxt,null,metrics,identifier,context);
+    dispatcher.register(ContainerEventType.class,new EventHandler<ContainerEvent>(){
+      @Override public void handle(      ContainerEvent event){
+        c.handle(event);
+      }
+    }
+);
+    dispatcher.start();
+  }
+  private void drainDispatcherEvents(){
+    dispatcher.await();
+  }
+  public void finished(){
+    dispatcher.stop();
+  }
+  public void initContainer(){
+    c.handle(new ContainerEvent(cId,ContainerEventType.INIT_CONTAINER));
+    drainDispatcherEvents();
+  }
+  public void resourceFailedContainer(){
+    c.handle(new ContainerEvent(cId,ContainerEventType.RESOURCE_FAILED));
+    drainDispatcherEvents();
+  }
+  public void handleContainerResourceFailedEvent(){
+    c.handle(new ContainerResourceFailedEvent(cId,null,null));
+    drainDispatcherEvents();
+  }
+  public Map<Path,List<String>> doLocalizeResources(  boolean checkLocalizingState,  int skipRsrcCount) throws URISyntaxException {
+    Path cache=new Path("file:///cache");
+    Map<Path,List<String>> localPaths=new HashMap<Path,List<String>>();
+    int counter=0;
+    for (    Entry<String,LocalResource> rsrc : localResources.entrySet()) {
+      if (counter++ < skipRsrcCount) {
+        continue;
+      }
+      if (checkLocalizingState) {
+        assertEquals(ContainerState.LOCALIZING,c.getContainerState());
+      }
+      LocalResourceRequest req=new LocalResourceRequest(rsrc.getValue());
+      Path p=new Path(cache,rsrc.getKey());
+      localPaths.put(p,Arrays.asList(rsrc.getKey()));
+      c.handle(new ContainerResourceLocalizedEvent(c.getContainerId(),req,p));
+    }
+    drainDispatcherEvents();
+    return localPaths;
+  }
+  public Map<Path,List<String>> localizeResources() throws URISyntaxException {
+    return doLocalizeResources(true,0);
+  }
+  public void localizeResourcesFromInvalidState(  int skipRsrcCount) throws URISyntaxException {
+    doLocalizeResources(false,skipRsrcCount);
+  }
+  public void failLocalizeSpecificResource(  String rsrcKey) throws URISyntaxException {
+    LocalResource rsrc=localResources.get(rsrcKey);
+    LocalResourceRequest req=new LocalResourceRequest(rsrc);
+    Exception e=new Exception(FAKE_LOCALIZATION_ERROR);
+    c.handle(new ContainerResourceFailedEvent(c.getContainerId(),req,e.getMessage()));
+    drainDispatcherEvents();
+  }
+  public void failLocalizeResources(  int failRsrcCount) throws URISyntaxException {
+    int counter=0;
+    for (    Entry<String,LocalResource> rsrc : localResources.entrySet()) {
+      if (counter >= failRsrcCount) {
+        break;
+      }
+      ++counter;
+      LocalResourceRequest req=new LocalResourceRequest(rsrc.getValue());
+      Exception e=new Exception(FAKE_LOCALIZATION_ERROR);
+      c.handle(new ContainerResourceFailedEvent(c.getContainerId(),req,e.getMessage()));
+    }
+    drainDispatcherEvents();
+  }
+  public void launchContainer(){
+    c.handle(new ContainerEvent(cId,ContainerEventType.CONTAINER_LAUNCHED));
+    drainDispatcherEvents();
+  }
+  public void containerSuccessful(){
+    c.handle(new ContainerEvent(cId,ContainerEventType.CONTAINER_EXITED_WITH_SUCCESS));
+    drainDispatcherEvents();
+  }
+  public void containerResourcesCleanup(){
+    c.handle(new ContainerEvent(cId,ContainerEventType.CONTAINER_RESOURCES_CLEANEDUP));
+    drainDispatcherEvents();
+  }
+  public void dockerContainerResourcesCleanup(){
+    c.handle(new ContainerEvent(cId,ContainerEventType.CONTAINER_RESOURCES_CLEANEDUP));
+    verify(delService,times(1)).delete(argThat(new DockerContainerDeletionMatcher(delService,cId.toString())));
+    drainDispatcherEvents();
+  }
+  public void setupDockerContainerEnv(){
+    Map<String,String> env=new HashMap<>();
+    env.put(ContainerRuntimeConstants.ENV_CONTAINER_TYPE,"docker");
+    when(this.ctxt.getEnvironment()).thenReturn(env);
+  }
+  public void containerFailed(  int exitCode){
+    String diagnosticMsg="Container completed with exit code " + exitCode;
+    c.handle(new ContainerExitEvent(cId,ContainerEventType.CONTAINER_EXITED_WITH_FAILURE,exitCode,diagnosticMsg));
+    ContainerStatus containerStatus=c.cloneAndGetContainerStatus();
+    assert containerStatus.getDiagnostics().contains(diagnosticMsg);
+    assert containerStatus.getExitStatus() == exitCode;
+    drainDispatcherEvents();
+    if (c.getContainerState() == ContainerState.RELAUNCHING) {
+      launchContainer();
+    }
+  }
+  public void killContainer(){
+    c.handle(new ContainerKillEvent(cId,ContainerExitStatus.KILLED_BY_RESOURCEMANAGER,"KillRequest"));
+    drainDispatcherEvents();
+  }
+  public void pauseContainer(){
+    c.handle(new ContainerPauseEvent(cId,"PauseRequest"));
+    drainDispatcherEvents();
+  }
+  public void resumeContainer(){
+    c.handle(new ContainerResumeEvent(cId,"ResumeRequest"));
+    drainDispatcherEvents();
+  }
+  public void containerKilledOnRequest(){
+    int exitCode=ContainerExitStatus.KILLED_BY_RESOURCEMANAGER;
+    String diagnosticMsg="Container completed with exit code " + exitCode;
+    c.handle(new ContainerExitEvent(cId,ContainerEventType.CONTAINER_KILLED_ON_REQUEST,exitCode,diagnosticMsg));
+    ContainerStatus containerStatus=c.cloneAndGetContainerStatus();
+    assert containerStatus.getDiagnostics().contains(diagnosticMsg);
+    assert containerStatus.getExitStatus() == exitCode;
+    drainDispatcherEvents();
+  }
+  public int getLocalResourceCount(){
+    return localResources.size();
+  }
+  public String getDiagnostics(){
+    return c.cloneAndGetContainerStatus().getDiagnostics();
+  }
+  public SlidingWindowRetryPolicy getRetryPolicy(){
+    return ((ContainerImpl)c).getRetryPolicy();
+  }
+}

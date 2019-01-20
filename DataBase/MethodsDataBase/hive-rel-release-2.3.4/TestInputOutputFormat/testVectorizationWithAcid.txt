@@ -1,0 +1,53 @@
+@Test public void testVectorizationWithAcid() throws Exception {
+  StructObjectInspector inspector=new BigRowInspector();
+  JobConf conf=createMockExecutionEnvironment(workDir,new Path("mock:///"),"vectorizationAcid",inspector,true,1);
+  Path partDir=new Path(conf.get("mapred.input.dir"));
+  OrcRecordUpdater writer=new OrcRecordUpdater(partDir,new AcidOutputFormat.Options(conf).maximumTransactionId(10).writingBase(true).bucket(0).inspector(inspector).finalDestination(partDir));
+  for (int i=0; i < 100; ++i) {
+    BigRow row=new BigRow(i);
+    writer.insert(10,row);
+  }
+  writer.close(false);
+  Path path=new Path("mock:/vectorizationAcid/p=0/base_0000010/bucket_00000");
+  setBlocks(path,conf,new MockBlock("host0","host1"));
+  HiveInputFormat<?,?> inputFormat=new HiveInputFormat<WritableComparable,Writable>();
+  InputSplit[] splits=inputFormat.getSplits(conf,10);
+  assertEquals(1,splits.length);
+  conf.set(IOConstants.SCHEMA_EVOLUTION_COLUMNS,BigRow.getColumnNamesProperty());
+  conf.set(IOConstants.SCHEMA_EVOLUTION_COLUMNS_TYPES,BigRow.getColumnTypesProperty());
+  HiveConf.setBoolVar(conf,HiveConf.ConfVars.HIVE_TRANSACTIONAL_TABLE_SCAN,true);
+  org.apache.hadoop.mapred.RecordReader<NullWritable,VectorizedRowBatch> reader=inputFormat.getRecordReader(splits[0],conf,Reporter.NULL);
+  NullWritable key=reader.createKey();
+  VectorizedRowBatch value=reader.createValue();
+  assertEquals(true,reader.next(key,value));
+  assertEquals(100,value.count());
+  LongColumnVector booleanColumn=(LongColumnVector)value.cols[0];
+  LongColumnVector byteColumn=(LongColumnVector)value.cols[1];
+  LongColumnVector shortColumn=(LongColumnVector)value.cols[2];
+  LongColumnVector intColumn=(LongColumnVector)value.cols[3];
+  LongColumnVector longColumn=(LongColumnVector)value.cols[4];
+  DoubleColumnVector floatColumn=(DoubleColumnVector)value.cols[5];
+  DoubleColumnVector doubleCoulmn=(DoubleColumnVector)value.cols[6];
+  BytesColumnVector stringColumn=(BytesColumnVector)value.cols[7];
+  DecimalColumnVector decimalColumn=(DecimalColumnVector)value.cols[8];
+  LongColumnVector dateColumn=(LongColumnVector)value.cols[9];
+  TimestampColumnVector timestampColumn=(TimestampColumnVector)value.cols[10];
+  for (int i=0; i < 100; i++) {
+    assertEquals("checking boolean " + i,i % 2 == 0 ? 1 : 0,booleanColumn.vector[i]);
+    assertEquals("checking byte " + i,(byte)i,byteColumn.vector[i]);
+    assertEquals("checking short " + i,(short)i,shortColumn.vector[i]);
+    assertEquals("checking int " + i,i,intColumn.vector[i]);
+    assertEquals("checking long " + i,i,longColumn.vector[i]);
+    assertEquals("checking float " + i,i,floatColumn.vector[i],0.0001);
+    assertEquals("checking double " + i,i,doubleCoulmn.vector[i],0.0001);
+    Text strValue=new Text();
+    strValue.set(stringColumn.vector[i],stringColumn.start[i],stringColumn.length[i]);
+    assertEquals("checking string " + i,new Text(Long.toHexString(i)),strValue);
+    assertEquals("checking decimal " + i,HiveDecimal.create(i),decimalColumn.vector[i].getHiveDecimal());
+    assertEquals("checking date " + i,i,dateColumn.vector[i]);
+    long millis=(long)i * MILLIS_IN_DAY;
+    millis-=LOCAL_TIMEZONE.getOffset(millis);
+    assertEquals("checking timestamp " + i,millis,timestampColumn.getTime(i));
+  }
+  assertEquals(false,reader.next(key,value));
+}

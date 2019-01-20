@@ -1,0 +1,45 @@
+/** 
+ * Test HFileArchiver.resolveAndArchive() race condition HBASE-7643
+ */
+@Test public void testCleaningRace() throws Exception {
+  final long TEST_TIME=20 * 1000;
+  final ChoreService choreService=new ChoreService("TEST_SERVER_NAME");
+  Configuration conf=UTIL.getMiniHBaseCluster().getMaster().getConfiguration();
+  Path rootDir=UTIL.getDataTestDirOnTestFS("testCleaningRace");
+  FileSystem fs=UTIL.getTestFileSystem();
+  Path archiveDir=new Path(rootDir,HConstants.HFILE_ARCHIVE_DIRECTORY);
+  Path regionDir=new Path(FSUtils.getTableDir(new Path("./"),TableName.valueOf(name.getMethodName())),"abcdef");
+  Path familyDir=new Path(regionDir,"cf");
+  Path sourceRegionDir=new Path(rootDir,regionDir);
+  fs.mkdirs(sourceRegionDir);
+  Stoppable stoppable=new StoppableImplementation();
+  HFileCleaner cleaner=new HFileCleaner(1,stoppable,conf,fs,archiveDir);
+  try {
+    choreService.scheduleChore(cleaner);
+    long startTime=System.currentTimeMillis();
+    for (long fid=0; (System.currentTimeMillis() - startTime) < TEST_TIME; ++fid) {
+      Path file=new Path(familyDir,String.valueOf(fid));
+      Path sourceFile=new Path(rootDir,file);
+      Path archiveFile=new Path(archiveDir,file);
+      fs.createNewFile(sourceFile);
+      try {
+        HFileArchiver.archiveRegion(fs,rootDir,sourceRegionDir.getParent(),sourceRegionDir);
+        LOG.debug("hfile=" + fid + " should be in the archive");
+        assertTrue(fs.exists(archiveFile));
+        assertFalse(fs.exists(sourceFile));
+      }
+ catch (      IOException e) {
+        LOG.debug("hfile=" + fid + " should be in the source location");
+        assertFalse(fs.exists(archiveFile));
+        assertTrue(fs.exists(sourceFile));
+        fs.delete(sourceFile,false);
+      }
+    }
+  }
+  finally {
+    stoppable.stop("test end");
+    cleaner.cancel(true);
+    choreService.shutdown();
+    fs.delete(rootDir,true);
+  }
+}

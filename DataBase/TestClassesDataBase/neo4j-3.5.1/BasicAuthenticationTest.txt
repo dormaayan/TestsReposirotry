@@ -1,0 +1,125 @@
+public class BasicAuthenticationTest {
+  @Rule public ExpectedException exception=ExpectedException.none();
+  private Authentication authentication;
+  @Test public void shouldNotDoAnythingOnSuccess() throws Exception {
+    AuthenticationResult result=authentication.authenticate(map("scheme","basic","principal","mike","credentials",UTF8.encode("secret2")));
+    assertThat(result.getLoginContext().subject().username(),equalTo("mike"));
+  }
+  @Test public void shouldThrowAndLogOnFailure() throws Exception {
+    exception.expect(AuthenticationException.class);
+    exception.expect(hasStatus(Status.Security.Unauthorized));
+    exception.expectMessage("The client is unauthorized due to authentication failure.");
+    authentication.authenticate(map("scheme","basic","principal","bob","credentials",UTF8.encode("banana")));
+  }
+  @Test public void shouldIndicateThatCredentialsExpired() throws Exception {
+    AuthenticationResult result=authentication.authenticate(map("scheme","basic","principal","bob","credentials",UTF8.encode("secret")));
+    assertTrue(result.credentialsExpired());
+  }
+  @Test public void shouldFailWhenTooManyAttempts() throws Exception {
+    int maxFailedAttempts=ThreadLocalRandom.current().nextInt(1,10);
+    Authentication auth=createAuthentication(maxFailedAttempts);
+    for (int i=0; i < maxFailedAttempts; ++i) {
+      try {
+        auth.authenticate(map("scheme","basic","principal","bob","credentials",UTF8.encode("gelato")));
+      }
+ catch (      AuthenticationException e) {
+        assertThat(e.status(),equalTo(Status.Security.Unauthorized));
+      }
+    }
+    exception.expect(AuthenticationException.class);
+    exception.expect(hasStatus(Status.Security.AuthenticationRateLimit));
+    exception.expectMessage("The client has provided incorrect authentication details too many times in a row.");
+    auth.authenticate(map("scheme","basic","principal","bob","credentials",UTF8.encode("gelato")));
+  }
+  @Test public void shouldBeAbleToUpdateCredentials() throws Exception {
+    authentication.authenticate(map("scheme","basic","principal","mike","credentials",UTF8.encode("secret2"),"new_credentials",UTF8.encode("secret")));
+    authentication.authenticate(map("scheme","basic","principal","mike","credentials",UTF8.encode("secret")));
+  }
+  @Test public void shouldClearCredentialsAfterUse() throws Exception {
+    byte[] oldPassword=UTF8.encode("secret2");
+    byte[] newPassword1=UTF8.encode("secret");
+    byte[] newPassword2=UTF8.encode("secret");
+    authentication.authenticate(map("scheme","basic","principal","mike","credentials",oldPassword,"new_credentials",newPassword1));
+    authentication.authenticate(map("scheme","basic","principal","mike","credentials",newPassword2));
+    assertThat(oldPassword,isCleared());
+    assertThat(newPassword1,isCleared());
+    assertThat(newPassword2,isCleared());
+  }
+  @Test public void shouldBeAbleToUpdateExpiredCredentials() throws Exception {
+    AuthenticationResult result=authentication.authenticate(map("scheme","basic","principal","bob","credentials",UTF8.encode("secret"),"new_credentials",UTF8.encode("secret2")));
+    assertThat(result.credentialsExpired(),equalTo(false));
+  }
+  @Test public void shouldNotBeAbleToUpdateCredentialsIfOldCredentialsAreInvalid() throws Exception {
+    exception.expect(AuthenticationException.class);
+    exception.expect(hasStatus(Status.Security.Unauthorized));
+    exception.expectMessage("The client is unauthorized due to authentication failure.");
+    authentication.authenticate(map("scheme","basic","principal","bob","credentials",UTF8.encode("gelato"),"new_credentials",UTF8.encode("secret2")));
+  }
+  @Test public void shouldThrowWithNoScheme() throws Exception {
+    exception.expect(AuthenticationException.class);
+    exception.expect(hasStatus(Status.Security.Unauthorized));
+    authentication.authenticate(map("principal","bob","credentials",UTF8.encode("secret")));
+  }
+  @Test public void shouldFailOnInvalidAuthToken() throws Exception {
+    exception.expect(AuthenticationException.class);
+    exception.expect(hasStatus(Status.Security.Unauthorized));
+    authentication.authenticate(map("this","does","not","matter","for","test"));
+  }
+  @Test public void shouldFailOnMalformedToken() throws Exception {
+    exception.expect(AuthenticationException.class);
+    exception.expect(hasStatus(Status.Security.Unauthorized));
+    exception.expectMessage("Unsupported authentication token, the value associated with the key `principal` " + "must be a String but was: SingletonList");
+    authentication.authenticate(map("scheme","basic","principal",singletonList("bob"),"credentials",UTF8.encode("secret")));
+  }
+  @Before public void setup() throws Throwable {
+    authentication=createAuthentication(3);
+  }
+  private static Authentication createAuthentication(  int maxFailedAttempts) throws Exception {
+    UserRepository users=new InMemoryUserRepository();
+    PasswordPolicy policy=mock(PasswordPolicy.class);
+    Config config=Config.defaults(GraphDatabaseSettings.auth_max_failed_attempts,String.valueOf(maxFailedAttempts));
+    BasicAuthManager manager=new BasicAuthManager(users,policy,Clocks.systemClock(),users,config);
+    Authentication authentication=new BasicAuthentication(manager,manager);
+    manager.newUser("bob",UTF8.encode("secret"),true);
+    manager.newUser("mike",UTF8.encode("secret2"),false);
+    return authentication;
+  }
+  private HasStatus hasStatus(  Status status){
+    return new HasStatus(status);
+  }
+static class HasStatus extends TypeSafeMatcher<Status.HasStatus> {
+    private Status status;
+    HasStatus(    Status status){
+      this.status=status;
+    }
+    @Override protected boolean matchesSafely(    Status.HasStatus item){
+      return item.status() == status;
+    }
+    @Override public void describeTo(    Description description){
+      description.appendText("expects status ").appendValue(status);
+    }
+    @Override protected void describeMismatchSafely(    Status.HasStatus item,    Description mismatchDescription){
+      mismatchDescription.appendText("was ").appendValue(item.status());
+    }
+  }
+  static CredentialsClearedMatcher isCleared(){
+    return new CredentialsClearedMatcher();
+  }
+static class CredentialsClearedMatcher extends BaseMatcher<byte[]> {
+    @Override public boolean matches(    Object o){
+      if (o instanceof byte[]) {
+        byte[] bytes=(byte[])o;
+        for (int i=0; i < bytes.length; i++) {
+          if (bytes[i] != (byte)0) {
+            return false;
+          }
+        }
+        return true;
+      }
+      return false;
+    }
+    @Override public void describeTo(    Description description){
+      description.appendText("Byte array should contain only zeroes");
+    }
+  }
+}

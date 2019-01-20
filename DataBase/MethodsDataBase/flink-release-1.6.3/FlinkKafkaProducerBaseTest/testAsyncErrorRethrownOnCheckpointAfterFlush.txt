@@ -1,0 +1,32 @@
+/** 
+ * Test ensuring that if an async exception is caught for one of the flushed requests on checkpoint, it should be rethrown; we set a timeout because the test will not finish if the logic is broken. <p>Note that this test does not test the snapshot method is blocked correctly when there are pending records. The test for that is covered in testAtLeastOnceProducer.
+ */
+@SuppressWarnings("unchecked") @Test(timeout=5000) public void testAsyncErrorRethrownOnCheckpointAfterFlush() throws Throwable {
+  final DummyFlinkKafkaProducer<String> producer=new DummyFlinkKafkaProducer<>(FakeStandardProducerConfig.get(),new KeyedSerializationSchemaWrapper<>(new SimpleStringSchema()),null);
+  producer.setFlushOnCheckpoint(true);
+  final KafkaProducer<?,?> mockProducer=producer.getMockKafkaProducer();
+  final OneInputStreamOperatorTestHarness<String,Object> testHarness=new OneInputStreamOperatorTestHarness<>(new StreamSink<>(producer));
+  testHarness.open();
+  testHarness.processElement(new StreamRecord<>("msg-1"));
+  testHarness.processElement(new StreamRecord<>("msg-2"));
+  testHarness.processElement(new StreamRecord<>("msg-3"));
+  verify(mockProducer,times(3)).send(any(ProducerRecord.class),any(Callback.class));
+  producer.getPendingCallbacks().get(0).onCompletion(null,null);
+  CheckedThread snapshotThread=new CheckedThread(){
+    @Override public void go() throws Exception {
+      testHarness.snapshot(123L,123L);
+    }
+  }
+;
+  snapshotThread.start();
+  producer.getPendingCallbacks().get(1).onCompletion(null,new Exception("artificial async failure for 2nd message"));
+  producer.getPendingCallbacks().get(2).onCompletion(null,null);
+  try {
+    snapshotThread.sync();
+  }
+ catch (  Exception e) {
+    Assert.assertTrue(e.getCause().getMessage().contains("artificial async failure for 2nd message"));
+    return;
+  }
+  Assert.fail();
+}

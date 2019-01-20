@@ -1,0 +1,51 @@
+@Test public void testMemoryPressureFlush() throws HiveException {
+  List<String> mapColumnNames=new ArrayList<String>();
+  mapColumnNames.add("Key");
+  mapColumnNames.add("Value");
+  VectorizationContext ctx=new VectorizationContext("name",mapColumnNames);
+  GroupByDesc desc=buildKeyGroupByDesc(ctx,"max","Value",TypeInfoFactory.longTypeInfo,"Key",TypeInfoFactory.longTypeInfo);
+  MemoryMXBean memoryMXBean=ManagementFactory.getMemoryMXBean();
+  long maxMemory=memoryMXBean.getHeapMemoryUsage().getMax();
+  float treshold=100.0f * 1024.0f / maxMemory;
+  desc.setMemoryThreshold(treshold);
+  CompilationOpContext cCtx=new CompilationOpContext();
+  Operator<? extends OperatorDesc> groupByOp=OperatorFactory.get(cCtx,desc);
+  VectorGroupByOperator vgo=(VectorGroupByOperator)Vectorizer.vectorizeGroupByOperator(groupByOp,ctx);
+  FakeCaptureOutputOperator out=FakeCaptureOutputOperator.addCaptureOutputChild(cCtx,vgo);
+  vgo.initialize(hconf,null);
+  this.outputRowCount=0;
+  out.setOutputInspector(new FakeCaptureOutputOperator.OutputInspector(){
+    @Override public void inspectRow(    Object row,    int tag) throws HiveException {
+      ++outputRowCount;
+    }
+  }
+);
+  Iterable<Object> it=new Iterable<Object>(){
+    @Override public Iterator<Object> iterator(){
+      return new Iterator<Object>(){
+        long value=0;
+        @Override public boolean hasNext(){
+          return true;
+        }
+        @Override public Object next(){
+          return ++value;
+        }
+        @Override public void remove(){
+        }
+      }
+;
+    }
+  }
+;
+  FakeVectorRowBatchFromObjectIterables data=new FakeVectorRowBatchFromObjectIterables(100,new String[]{"long","long"},it,it);
+  long countRowsProduced=0;
+  for (  VectorizedRowBatch unit : data) {
+    countRowsProduced+=100;
+    vgo.process(unit,0);
+    if (0 < outputRowCount) {
+      break;
+    }
+    assertTrue(countRowsProduced < 100 * 1024 / 16);
+  }
+  assertTrue(0 < outputRowCount);
+}

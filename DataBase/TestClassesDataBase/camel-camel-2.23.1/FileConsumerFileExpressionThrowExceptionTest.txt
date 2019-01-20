@@ -1,0 +1,56 @@
+/** 
+ * Unit test for expression option for file consumer.
+ */
+public class FileConsumerFileExpressionThrowExceptionTest extends ContextTestSupport {
+  private static volatile String event="";
+  private static volatile Exception rollbackCause;
+  private static final CountDownLatch LATCH=new CountDownLatch(1);
+  @Override @Before public void setUp() throws Exception {
+    deleteDirectory("target/filelanguage");
+    super.setUp();
+  }
+  @Override public boolean isUseRouteBuilder(){
+    return false;
+  }
+  @Override protected JndiRegistry createRegistry() throws Exception {
+    JndiRegistry jndi=super.createRegistry();
+    jndi.bind("counter",new MyGuidGenerator());
+    jndi.bind("myPoll",new MyPollStrategy());
+    return jndi;
+  }
+  @Test public void testConsumeExpressionThrowException() throws Exception {
+    template.sendBodyAndHeader("file://target/filelanguage/bean","Bye World",Exchange.FILE_NAME,"123.txt");
+    context.addRoutes(new RouteBuilder(){
+      @Override public void configure() throws Exception {
+        from("file://target/filelanguage/bean/" + "?pollStrategy=#myPoll&initialDelay=0&delay=10&fileName=${bean:counter?method=doNotExistMethod}.txt&delete=true").to("mock:result");
+      }
+    }
+);
+    context.start();
+    await().atMost(2,TimeUnit.SECONDS).until(() -> LATCH.getCount() == 0);
+    assertTrue(event.startsWith("rollback"));
+    assertNotNull(rollbackCause);
+    MethodNotFoundException e=assertIsInstanceOf(MethodNotFoundException.class,rollbackCause.getCause());
+    assertNotNull(e);
+    assertEquals("doNotExistMethod",e.getMethodName());
+  }
+public class MyGuidGenerator {
+    public String next(){
+      return "123";
+    }
+  }
+private static class MyPollStrategy implements PollingConsumerPollStrategy {
+    public boolean begin(    Consumer consumer,    Endpoint endpoint){
+      return true;
+    }
+    public void commit(    Consumer consumer,    Endpoint endpoint,    int polledMessages){
+      event+="commit";
+    }
+    public boolean rollback(    Consumer consumer,    Endpoint endpoint,    int retryCounter,    Exception cause) throws Exception {
+      event+="rollback";
+      rollbackCause=cause;
+      LATCH.countDown();
+      return false;
+    }
+  }
+}

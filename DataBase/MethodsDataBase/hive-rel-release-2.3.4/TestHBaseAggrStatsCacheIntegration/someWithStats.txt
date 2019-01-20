@@ -1,0 +1,74 @@
+@Test public void someWithStats() throws Exception {
+  String dbName="default";
+  String tableName="psws";
+  List<String> partVals1=Arrays.asList("today");
+  List<String> partVals2=Arrays.asList("yesterday");
+  long now=System.currentTimeMillis();
+  List<FieldSchema> cols=new ArrayList<>();
+  cols.add(new FieldSchema("col1","long","nocomment"));
+  SerDeInfo serde=new SerDeInfo("serde","seriallib",null);
+  StorageDescriptor sd=new StorageDescriptor(cols,"file:/tmp","input","output",false,0,serde,null,null,Collections.<String,String>emptyMap());
+  List<FieldSchema> partCols=new ArrayList<>();
+  partCols.add(new FieldSchema("ds","string",""));
+  Table table=new Table(tableName,dbName,"me",(int)now,(int)now,0,sd,partCols,Collections.<String,String>emptyMap(),null,null,null);
+  store.createTable(table);
+  boolean first=true;
+  for (  List<String> partVals : Arrays.asList(partVals1,partVals2)) {
+    StorageDescriptor psd=new StorageDescriptor(sd);
+    psd.setLocation("file:/tmp/default/psws/ds=" + partVals.get(0));
+    Partition part=new Partition(partVals,dbName,tableName,(int)now,(int)now,psd,Collections.<String,String>emptyMap());
+    store.addPartition(part);
+    if (first) {
+      ColumnStatistics cs=new ColumnStatistics();
+      ColumnStatisticsDesc desc=new ColumnStatisticsDesc(false,dbName,tableName);
+      desc.setLastAnalyzed(now);
+      desc.setPartName("ds=" + partVals.get(0));
+      cs.setStatsDesc(desc);
+      ColumnStatisticsObj obj=new ColumnStatisticsObj();
+      obj.setColName("col1");
+      obj.setColType("long");
+      ColumnStatisticsData data=new ColumnStatisticsData();
+      LongColumnStatsData lcsd=new LongColumnStatsData();
+      lcsd.setHighValue(192L);
+      lcsd.setLowValue(-20L);
+      lcsd.setNumNulls(30);
+      lcsd.setNumDVs(32);
+      data.setLongStats(lcsd);
+      obj.setStatsData(data);
+      cs.addToStatsObj(obj);
+      store.updatePartitionColumnStatistics(cs,partVals);
+      first=false;
+    }
+  }
+  Checker statChecker=new Checker(){
+    @Override public void checkStats(    AggrStats aggrStats) throws Exception {
+      Assert.assertEquals(1,aggrStats.getPartsFound());
+      Assert.assertEquals(1,aggrStats.getColStatsSize());
+      ColumnStatisticsObj cso=aggrStats.getColStats().get(0);
+      Assert.assertEquals("col1",cso.getColName());
+      Assert.assertEquals("long",cso.getColType());
+      LongColumnStatsData lcsd=cso.getStatsData().getLongStats();
+      Assert.assertEquals(192L,lcsd.getHighValue());
+      Assert.assertEquals(-20L,lcsd.getLowValue());
+      Assert.assertEquals(30,lcsd.getNumNulls());
+      Assert.assertEquals(32,lcsd.getNumDVs());
+    }
+  }
+;
+  AggrStats aggrStats=store.get_aggr_stats_for(dbName,tableName,Arrays.asList("ds=today","ds=yesterday"),Arrays.asList("col1"));
+  statChecker.checkStats(aggrStats);
+  Assert.assertEquals(0,store.backdoor().getStatsCache().hbaseHits.getCnt());
+  Assert.assertEquals(1,store.backdoor().getStatsCache().totalGets.getCnt());
+  Assert.assertEquals(1,store.backdoor().getStatsCache().misses.getCnt());
+  aggrStats=store.get_aggr_stats_for(dbName,tableName,Arrays.asList("ds=yesterday","ds=today"),Arrays.asList("col1"));
+  statChecker.checkStats(aggrStats);
+  Assert.assertEquals(0,store.backdoor().getStatsCache().hbaseHits.getCnt());
+  Assert.assertEquals(2,store.backdoor().getStatsCache().totalGets.getCnt());
+  Assert.assertEquals(1,store.backdoor().getStatsCache().misses.getCnt());
+  store.backdoor().getStatsCache().flushMemory();
+  aggrStats=store.get_aggr_stats_for(dbName,tableName,Arrays.asList("ds=today","ds=yesterday"),Arrays.asList("col1"));
+  statChecker.checkStats(aggrStats);
+  Assert.assertEquals(1,store.backdoor().getStatsCache().hbaseHits.getCnt());
+  Assert.assertEquals(3,store.backdoor().getStatsCache().totalGets.getCnt());
+  Assert.assertEquals(1,store.backdoor().getStatsCache().misses.getCnt());
+}

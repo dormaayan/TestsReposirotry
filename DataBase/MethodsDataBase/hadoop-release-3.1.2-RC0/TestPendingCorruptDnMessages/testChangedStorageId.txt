@@ -1,0 +1,41 @@
+@Test(timeout=60000) public void testChangedStorageId() throws IOException, URISyntaxException, InterruptedException, TimeoutException {
+  HdfsConfiguration conf=new HdfsConfiguration();
+  conf.setInt(DFSConfigKeys.DFS_HA_TAILEDITS_PERIOD_KEY,1);
+  final MiniDFSCluster cluster=new MiniDFSCluster.Builder(conf).numDataNodes(1).nnTopology(MiniDFSNNTopology.simpleHATopology()).build();
+  try {
+    cluster.transitionToActive(0);
+    FileSystem fs=HATestUtil.configureFailoverFs(cluster,conf);
+    OutputStream out=fs.create(filePath);
+    out.write("foo bar baz".getBytes());
+    out.close();
+    HATestUtil.waitForStandbyToCatchUp(cluster.getNameNode(0),cluster.getNameNode(1));
+    ExtendedBlock block=DFSTestUtil.getFirstBlock(fs,filePath);
+    cluster.changeGenStampOfBlock(0,block,900);
+    DataNodeTestUtils.runDirectoryScanner(cluster.getDataNodes().get(0));
+    DataNodeProperties dnProps=cluster.stopDataNode(0);
+    cluster.restartNameNode(1,false);
+    assertTrue(cluster.restartDataNode(dnProps,true));
+    GenericTestUtils.waitFor(new Supplier<Boolean>(){
+      @Override public Boolean get(){
+        return cluster.getNamesystem(1).getBlockManager().getPendingDataNodeMessageCount() == 1;
+      }
+    }
+,1000,30000);
+    final String oldStorageId=getRegisteredDatanodeUid(cluster,1);
+    assertNotNull(oldStorageId);
+    assertTrue(wipeAndRestartDn(cluster,0));
+    GenericTestUtils.waitFor(new Supplier<Boolean>(){
+      @Override public Boolean get(){
+        final String newStorageId=getRegisteredDatanodeUid(cluster,1);
+        return newStorageId != null && !newStorageId.equals(oldStorageId);
+      }
+    }
+,1000,30000);
+    assertEquals(0,cluster.getNamesystem(1).getBlockManager().getPendingDataNodeMessageCount());
+    cluster.transitionToStandby(0);
+    cluster.transitionToActive(1);
+  }
+  finally {
+    cluster.shutdown();
+  }
+}

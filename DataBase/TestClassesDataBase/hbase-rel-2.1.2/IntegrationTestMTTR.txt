@@ -1,0 +1,362 @@
+/** 
+ * Integration test that should benchmark how fast HBase can recover from failures. This test starts different threads: <ol> <li> Load Test Tool.<br/> This runs so that all RegionServers will have some load and WALs will be full. </li> <li> Scan thread.<br/> This thread runs a very short scan over and over again recording how log it takes to respond. The longest response is assumed to be the time it took to recover. </li> <li> Put thread.<br/> This thread just like the scan thread except it does a very small put. </li> <li> Admin thread. <br/> This thread will continually go to the master to try and get the cluster status.  Just like the put and scan threads, the time to respond is recorded. </li> <li> Chaos Monkey thread.<br/> This thread runs a ChaosMonkey.Action. </li> </ol> <p/> The ChaosMonkey actions currently run are: <ul> <li>Restart the RegionServer holding meta.</li> <li>Move the Regions of meta.</li> <li>Restart the RegionServer holding the table the scan and put threads are targeting.</li> <li>Move the Regions of the table used by the scan and put threads.</li> <li>Restart the master.</li> </ul> <p/> At the end of the test a log line is output on the INFO level containing the timing data that was collected.
+ */
+@Category(IntegrationTests.class) public class IntegrationTestMTTR {
+  /** 
+ * Constants.
+ */
+  private static final byte[] FAMILY=Bytes.toBytes("d");
+  private static final Logger LOG=LoggerFactory.getLogger(IntegrationTestMTTR.class);
+  private static long sleepTime;
+  private static final String SLEEP_TIME_KEY="hbase.IntegrationTestMTTR.sleeptime";
+  private static final long SLEEP_TIME_DEFAULT=60 * 1000l;
+  /** 
+ * Configurable table names.
+ */
+  private static TableName tableName;
+  private static TableName loadTableName;
+  /** 
+ * Util to get at the cluster.
+ */
+  private static IntegrationTestingUtility util;
+  /** 
+ * Executor for test threads.
+ */
+  private static ExecutorService executorService;
+  /** 
+ * All of the chaos monkey actions used.
+ */
+  private static Action restartRSAction;
+  private static Action restartMetaAction;
+  private static Action moveMetaRegionsAction;
+  private static Action moveRegionAction;
+  private static Action restartMasterAction;
+  /** 
+ * The load test tool used to create load and make sure that WALs aren't empty.
+ */
+  private static LoadTestTool loadTool;
+  @BeforeClass public static void setUp() throws Exception {
+    if (util == null) {
+      util=new IntegrationTestingUtility();
+    }
+    util.initializeCluster(3);
+    loadTool=new LoadTestTool();
+    loadTool.setConf(util.getConfiguration());
+    executorService=Executors.newFixedThreadPool(8);
+    setupTables();
+    sleepTime=util.getConfiguration().getLong(SLEEP_TIME_KEY,SLEEP_TIME_DEFAULT);
+    setupActions();
+  }
+  private static void setupActions() throws IOException {
+    util.getConfiguration().setLong(Action.START_RS_TIMEOUT_KEY,3 * 60 * 1000);
+    restartRSAction=new RestartRsHoldingTableAction(sleepTime,util.getConnection().getRegionLocator(tableName));
+    restartMetaAction=new RestartRsHoldingMetaAction(sleepTime);
+    moveMetaRegionsAction=new MoveRegionsOfTableAction(sleepTime,MonkeyConstants.DEFAULT_MOVE_REGIONS_MAX_TIME,TableName.META_TABLE_NAME);
+    moveRegionAction=new MoveRegionsOfTableAction(sleepTime,MonkeyConstants.DEFAULT_MOVE_REGIONS_MAX_TIME,tableName);
+    restartMasterAction=new RestartActiveMasterAction(1000);
+    Action.ActionContext actionContext=new Action.ActionContext(util);
+    restartRSAction.init(actionContext);
+    restartMetaAction.init(actionContext);
+    moveMetaRegionsAction.init(actionContext);
+    moveRegionAction.init(actionContext);
+    restartMasterAction.init(actionContext);
+  }
+  private static void setupTables() throws IOException {
+    tableName=TableName.valueOf(util.getConfiguration().get("hbase.IntegrationTestMTTR.tableName","IntegrationTestMTTR"));
+    loadTableName=TableName.valueOf(util.getConfiguration().get("hbase.IntegrationTestMTTR.loadTableName","IntegrationTestMTTRLoadTestTool"));
+    if (util.getAdmin().tableExists(tableName)) {
+      util.deleteTable(tableName);
+    }
+    if (util.getAdmin().tableExists(loadTableName)) {
+      util.deleteTable(loadTableName);
+    }
+    TableDescriptor tableDescriptor=util.getAdmin().getDescriptor(tableName);
+    TableDescriptorBuilder builder=TableDescriptorBuilder.newBuilder(tableDescriptor);
+    builder.setMaxFileSize(Long.MAX_VALUE);
+    ColumnFamilyDescriptorBuilder colDescriptorBldr=ColumnFamilyDescriptorBuilder.newBuilder(FAMILY);
+    colDescriptorBldr.setMaxVersions(1);
+    builder.setColumnFamily(colDescriptorBldr.build());
+    util.getAdmin().createTable(builder.build());
+    int ret=loadTool.run(new String[]{"-tn",loadTableName.getNameAsString(),"-init_only"});
+    assertEquals("Failed to initialize LoadTestTool",0,ret);
+  }
+  @AfterClass public static void after() throws IOException {
+    util.restoreCluster();
+    util=null;
+    executorService.shutdown();
+    executorService=null;
+    moveRegionAction=null;
+    restartMetaAction=null;
+    moveMetaRegionsAction=null;
+    restartRSAction=null;
+    restartMasterAction=null;
+    loadTool=null;
+  }
+  private static boolean tablesOnMaster(){
+    boolean ret=true;
+    String value=util.getConfiguration().get("hbase.balancer.tablesOnMaster");
+    if (value != null && value.equalsIgnoreCase("none")) {
+      ret=false;
+    }
+    return ret;
+  }
+  @Test public void testRestartRsHoldingTable() throws Exception {
+    run(new ActionCallable(restartRSAction),"RestartRsHoldingTableAction");
+  }
+  @Test public void testKillRsHoldingMeta() throws Exception {
+    assumeFalse(tablesOnMaster());
+    run(new ActionCallable(restartMetaAction),"KillRsHoldingMeta");
+  }
+  @Test public void testMoveMeta() throws Exception {
+    run(new ActionCallable(moveMetaRegionsAction),"MoveMeta");
+  }
+  @Test public void testMoveRegion() throws Exception {
+    run(new ActionCallable(moveRegionAction),"MoveRegion");
+  }
+  @Test public void testRestartMaster() throws Exception {
+    run(new ActionCallable(restartMasterAction),"RestartMaster");
+  }
+  public void run(  Callable<Boolean> monkeyCallable,  String testName) throws Exception {
+    int maxIters=util.getHBaseClusterInterface().isDistributedCluster() ? 10 : 3;
+    LOG.info("Starting " + testName + " with "+ maxIters+ " iterations.");
+    ArrayList<TimingResult> resultPuts=new ArrayList<>(maxIters);
+    ArrayList<TimingResult> resultScan=new ArrayList<>(maxIters);
+    ArrayList<TimingResult> resultAdmin=new ArrayList<>(maxIters);
+    long start=System.nanoTime();
+    try {
+      for (int fullIterations=0; fullIterations < maxIters; fullIterations++) {
+        Future<Boolean> monkeyFuture=executorService.submit(monkeyCallable);
+        Future<TimingResult> putFuture=executorService.submit(new PutCallable(monkeyFuture));
+        Future<TimingResult> scanFuture=executorService.submit(new ScanCallable(monkeyFuture));
+        Future<TimingResult> adminFuture=executorService.submit(new AdminCallable(monkeyFuture));
+        Future<Boolean> loadFuture=executorService.submit(new LoadCallable(monkeyFuture));
+        monkeyFuture.get();
+        loadFuture.get();
+        TimingResult putTime=putFuture.get();
+        TimingResult scanTime=scanFuture.get();
+        TimingResult adminTime=adminFuture.get();
+        resultPuts.add(putTime);
+        resultScan.add(scanTime);
+        resultAdmin.add(adminTime);
+        Thread.sleep(5000l);
+      }
+    }
+ catch (    Exception e) {
+      long runtimeMs=TimeUnit.MILLISECONDS.convert(System.nanoTime() - start,TimeUnit.NANOSECONDS);
+      LOG.info(testName + " failed after " + runtimeMs+ "ms.",e);
+      throw e;
+    }
+    long runtimeMs=TimeUnit.MILLISECONDS.convert(System.nanoTime() - start,TimeUnit.NANOSECONDS);
+    MoreObjects.ToStringHelper helper=MoreObjects.toStringHelper("MTTRResults").add("putResults",resultPuts).add("scanResults",resultScan).add("adminResults",resultAdmin).add("totalRuntimeMs",runtimeMs).add("name",testName);
+    LOG.info(helper.toString());
+  }
+  /** 
+ * Class to store results of TimingCallable. Stores times and trace id.
+ */
+private static class TimingResult {
+    DescriptiveStatistics stats=new DescriptiveStatistics();
+    ArrayList<String> traces=new ArrayList<>(10);
+    /** 
+ * Add a result to this aggregate result.
+ * @param time Time in nanoseconds
+ * @param span Span.  To be kept if the time taken was over 1 second
+ */
+    public void addResult(    long time,    Span span){
+      if (span == null) {
+        return;
+      }
+      stats.addValue(TimeUnit.MILLISECONDS.convert(time,TimeUnit.NANOSECONDS));
+      if (TimeUnit.SECONDS.convert(time,TimeUnit.NANOSECONDS) >= 1) {
+        traces.add(span.getTracerId());
+      }
+    }
+    @Override public String toString(){
+      MoreObjects.ToStringHelper helper=MoreObjects.toStringHelper(this).add("numResults",stats.getN()).add("minTime",stats.getMin()).add("meanTime",stats.getMean()).add("maxTime",stats.getMax()).add("25th",stats.getPercentile(25)).add("50th",stats.getPercentile(50)).add("75th",stats.getPercentile(75)).add("90th",stats.getPercentile(90)).add("95th",stats.getPercentile(95)).add("99th",stats.getPercentile(99)).add("99.9th",stats.getPercentile(99.9)).add("99.99th",stats.getPercentile(99.99)).add("traces",traces);
+      return helper.toString();
+    }
+  }
+  /** 
+ * Base class for actions that need to record the time needed to recover from a failure.
+ */
+static abstract class TimingCallable implements Callable<TimingResult> {
+    protected final Future<?> future;
+    public TimingCallable(    Future<?> f){
+      future=f;
+    }
+    @Override public TimingResult call() throws Exception {
+      TimingResult result=new TimingResult();
+      final int maxIterations=10;
+      int numAfterDone=0;
+      int resetCount=0;
+      TraceUtil.addSampler(AlwaysSampler.INSTANCE);
+      while (numAfterDone < maxIterations) {
+        long start=System.nanoTime();
+        Span span=null;
+        try (TraceScope scope=TraceUtil.createTrace(getSpanName())){
+          if (scope != null) {
+            span=scope.getSpan();
+          }
+          boolean actionResult=doAction();
+          if (actionResult && future.isDone()) {
+            numAfterDone++;
+          }
+        }
+ catch (        AccessDeniedException e) {
+          throw e;
+        }
+catch (        CoprocessorException e) {
+          throw e;
+        }
+catch (        FatalConnectionException e) {
+          throw e;
+        }
+catch (        InvalidFamilyOperationException e) {
+          throw e;
+        }
+catch (        NamespaceExistException e) {
+          throw e;
+        }
+catch (        NamespaceNotFoundException e) {
+          throw e;
+        }
+catch (        NoSuchColumnFamilyException e) {
+          throw e;
+        }
+catch (        TableExistsException e) {
+          throw e;
+        }
+catch (        TableNotFoundException e) {
+          throw e;
+        }
+catch (        RetriesExhaustedException e) {
+          throw e;
+        }
+catch (        Exception e) {
+          resetCount++;
+          if (resetCount < maxIterations) {
+            LOG.info("Non-fatal exception while running " + this.toString() + ". Resetting loop counter",e);
+            numAfterDone=0;
+          }
+ else {
+            LOG.info("Too many unexpected Exceptions. Aborting.",e);
+            throw e;
+          }
+        }
+        result.addResult(System.nanoTime() - start,span);
+      }
+      return result;
+    }
+    protected abstract boolean doAction() throws Exception ;
+    protected String getSpanName(){
+      return this.getClass().getSimpleName();
+    }
+    @Override public String toString(){
+      return this.getSpanName();
+    }
+  }
+  /** 
+ * Callable that will keep putting small amounts of data into a table until  the future supplied returns.  It keeps track of the max time.
+ */
+static class PutCallable extends TimingCallable {
+    private final Table table;
+    public PutCallable(    Future<?> f) throws IOException {
+      super(f);
+      this.table=util.getConnection().getTable(tableName);
+    }
+    @Override protected boolean doAction() throws Exception {
+      Put p=new Put(Bytes.toBytes(RandomStringUtils.randomAlphanumeric(5)));
+      p.addColumn(FAMILY,Bytes.toBytes("\0"),Bytes.toBytes(RandomStringUtils.randomAscii(5)));
+      table.put(p);
+      return true;
+    }
+    @Override protected String getSpanName(){
+      return "MTTR Put Test";
+    }
+  }
+  /** 
+ * Callable that will keep scanning for small amounts of data until the supplied future returns.  Returns the max time taken to scan.
+ */
+static class ScanCallable extends TimingCallable {
+    private final Table table;
+    public ScanCallable(    Future<?> f) throws IOException {
+      super(f);
+      this.table=util.getConnection().getTable(tableName);
+    }
+    @Override protected boolean doAction() throws Exception {
+      ResultScanner rs=null;
+      try {
+        Scan s=new Scan();
+        s.setBatch(2);
+        s.addFamily(FAMILY);
+        s.setFilter(new KeyOnlyFilter());
+        s.setMaxVersions(1);
+        rs=table.getScanner(s);
+        Result result=rs.next();
+        return result != null && result.size() > 0;
+      }
+  finally {
+        if (rs != null) {
+          rs.close();
+        }
+      }
+    }
+    @Override protected String getSpanName(){
+      return "MTTR Scan Test";
+    }
+  }
+  /** 
+ * Callable that will keep going to the master for cluster status.  Returns the max time taken.
+ */
+static class AdminCallable extends TimingCallable {
+    public AdminCallable(    Future<?> f) throws IOException {
+      super(f);
+    }
+    @Override protected boolean doAction() throws Exception {
+      Admin admin=null;
+      try {
+        admin=util.getAdmin();
+        ClusterStatus status=admin.getClusterStatus();
+        return status != null;
+      }
+  finally {
+        if (admin != null) {
+          admin.close();
+        }
+      }
+    }
+    @Override protected String getSpanName(){
+      return "MTTR Admin Test";
+    }
+  }
+static class ActionCallable implements Callable<Boolean> {
+    private final Action action;
+    public ActionCallable(    Action action){
+      this.action=action;
+    }
+    @Override public Boolean call() throws Exception {
+      this.action.perform();
+      return true;
+    }
+  }
+  /** 
+ * Callable used to make sure the cluster has some load on it. This callable uses LoadTest tool to
+ */
+public static class LoadCallable implements Callable<Boolean> {
+    private final Future<?> future;
+    public LoadCallable(    Future<?> f){
+      future=f;
+    }
+    @Override public Boolean call() throws Exception {
+      int colsPerKey=10;
+      int numServers=util.getHBaseClusterInterface().getInitialClusterMetrics().getLiveServerMetrics().size();
+      int numKeys=numServers * 5000;
+      int writeThreads=10;
+      do {
+        int ret=loadTool.run(new String[]{"-tn",loadTableName.getNameAsString(),"-write",String.format("%d:%d:%d",colsPerKey,500,writeThreads),"-num_keys",String.valueOf(numKeys),"-skip_init"});
+        assertEquals("Load failed",0,ret);
+      }
+ while (!future.isDone());
+      return true;
+    }
+  }
+}

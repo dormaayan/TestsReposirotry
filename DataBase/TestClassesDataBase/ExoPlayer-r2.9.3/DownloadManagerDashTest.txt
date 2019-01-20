@@ -1,0 +1,129 @@
+/** 
+ * Tests  {@link DownloadManager}. 
+ */
+@RunWith(RobolectricTestRunner.class) @Config(shadows={RobolectricUtil.CustomLooper.class,RobolectricUtil.CustomMessageQueue.class}) public class DownloadManagerDashTest {
+  private static final int ASSERT_TRUE_TIMEOUT=1000;
+  private SimpleCache cache;
+  private File tempFolder;
+  private FakeDataSet fakeDataSet;
+  private DownloadManager downloadManager;
+  private StreamKey fakeStreamKey1;
+  private StreamKey fakeStreamKey2;
+  private TestDownloadManagerListener downloadManagerListener;
+  private File actionFile;
+  private DummyMainThread dummyMainThread;
+  @Before public void setUp() throws Exception {
+    dummyMainThread=new DummyMainThread();
+    Context context=RuntimeEnvironment.application;
+    tempFolder=Util.createTempDirectory(context,"ExoPlayerTest");
+    File cacheFolder=new File(tempFolder,"cache");
+    cacheFolder.mkdir();
+    cache=new SimpleCache(cacheFolder,new NoOpCacheEvictor());
+    MockitoAnnotations.initMocks(this);
+    fakeDataSet=new FakeDataSet().setData(TEST_MPD_URI,TEST_MPD).setRandomData("audio_init_data",10).setRandomData("audio_segment_1",4).setRandomData("audio_segment_2",5).setRandomData("audio_segment_3",6).setRandomData("text_segment_1",1).setRandomData("text_segment_2",2).setRandomData("text_segment_3",3);
+    fakeStreamKey1=new StreamKey(0,0,0);
+    fakeStreamKey2=new StreamKey(0,1,0);
+    actionFile=new File(tempFolder,"actionFile");
+    createDownloadManager();
+  }
+  @After public void tearDown() throws Exception {
+    downloadManager.release();
+    Util.recursiveDelete(tempFolder);
+    dummyMainThread.release();
+  }
+  @Ignore @Test public void testSaveAndLoadActionFile() throws Throwable {
+    fakeDataSet.newData(TEST_MPD_URI).appendReadAction(() -> {
+      try {
+        while (true) {
+          Thread.sleep(100000);
+        }
+      }
+ catch (      InterruptedException ignored) {
+        Thread.currentThread().interrupt();
+      }
+    }
+).appendReadData(TEST_MPD).endData();
+    dummyMainThread.runOnMainThread(() -> {
+      handleDownloadAction(fakeStreamKey1,fakeStreamKey2);
+      downloadManager.release();
+    }
+);
+    assertThat(actionFile.exists()).isTrue();
+    assertThat(actionFile.length()).isGreaterThan(0L);
+    assertCacheEmpty(cache);
+    fakeDataSet.setData(TEST_MPD_URI,TEST_MPD);
+    dummyMainThread.runOnMainThread(this::createDownloadManager);
+    blockUntilTasksCompleteAndThrowAnyDownloadError();
+    assertCachedData(cache,fakeDataSet);
+  }
+  @Test public void testHandleDownloadAction() throws Throwable {
+    handleDownloadAction(fakeStreamKey1,fakeStreamKey2);
+    blockUntilTasksCompleteAndThrowAnyDownloadError();
+    assertCachedData(cache,fakeDataSet);
+  }
+  @Test public void testHandleMultipleDownloadAction() throws Throwable {
+    handleDownloadAction(fakeStreamKey1);
+    handleDownloadAction(fakeStreamKey2);
+    blockUntilTasksCompleteAndThrowAnyDownloadError();
+    assertCachedData(cache,fakeDataSet);
+  }
+  @Test public void testHandleInterferingDownloadAction() throws Throwable {
+    fakeDataSet.newData("audio_segment_2").appendReadAction(() -> handleDownloadAction(fakeStreamKey2)).appendReadData(TestUtil.buildTestData(5)).endData();
+    handleDownloadAction(fakeStreamKey1);
+    blockUntilTasksCompleteAndThrowAnyDownloadError();
+    assertCachedData(cache,fakeDataSet);
+  }
+  @Test public void testHandleRemoveAction() throws Throwable {
+    handleDownloadAction(fakeStreamKey1);
+    blockUntilTasksCompleteAndThrowAnyDownloadError();
+    handleRemoveAction();
+    blockUntilTasksCompleteAndThrowAnyDownloadError();
+    assertCacheEmpty(cache);
+  }
+  @Ignore @Test public void testHandleRemoveActionBeforeDownloadFinish() throws Throwable {
+    handleDownloadAction(fakeStreamKey1);
+    handleRemoveAction();
+    blockUntilTasksCompleteAndThrowAnyDownloadError();
+    assertCacheEmpty(cache);
+  }
+  @Test public void testHandleInterferingRemoveAction() throws Throwable {
+    final ConditionVariable downloadInProgressCondition=new ConditionVariable();
+    fakeDataSet.newData("audio_segment_2").appendReadAction(downloadInProgressCondition::open).appendReadData(TestUtil.buildTestData(5)).endData();
+    handleDownloadAction(fakeStreamKey1);
+    assertThat(downloadInProgressCondition.block(ASSERT_TRUE_TIMEOUT)).isTrue();
+    handleRemoveAction();
+    blockUntilTasksCompleteAndThrowAnyDownloadError();
+    assertCacheEmpty(cache);
+  }
+  private void blockUntilTasksCompleteAndThrowAnyDownloadError() throws Throwable {
+    downloadManagerListener.blockUntilTasksCompleteAndThrowAnyDownloadError();
+  }
+  private void handleDownloadAction(  StreamKey... keys){
+    downloadManager.handleAction(newAction(TEST_MPD_URI,false,null,keys));
+  }
+  private void handleRemoveAction(){
+    downloadManager.handleAction(newAction(TEST_MPD_URI,true,null));
+  }
+  private void createDownloadManager(){
+    dummyMainThread.runOnMainThread(() -> {
+      Factory fakeDataSourceFactory=new FakeDataSource.Factory().setFakeDataSet(fakeDataSet);
+      downloadManager=new DownloadManager(new DownloaderConstructorHelper(cache,fakeDataSourceFactory),1,3,actionFile,DashDownloadAction.DESERIALIZER);
+      downloadManagerListener=new TestDownloadManagerListener(downloadManager,dummyMainThread);
+      downloadManager.addListener(downloadManagerListener);
+      downloadManager.startDownloads();
+    }
+);
+  }
+  private static DownloadAction newAction(  Uri uri,  boolean isRemoveAction,  @Nullable byte[] data,  StreamKey... keys){
+    ArrayList<StreamKey> keysList=new ArrayList<>();
+    Collections.addAll(keysList,keys);
+    DownloadAction result;
+    if (isRemoveAction) {
+      result=DashDownloadAction.createRemoveAction(uri,data);
+    }
+ else {
+      result=DashDownloadAction.createDownloadAction(uri,data,keysList);
+    }
+    return result;
+  }
+}

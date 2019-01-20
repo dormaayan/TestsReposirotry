@@ -1,0 +1,163 @@
+public class RecoveryCleanupIT {
+  @Rule public TestDirectory testDirectory=TestDirectory.testDirectory();
+  private GraphDatabaseService db;
+  private File storeDir;
+  private final TestGraphDatabaseFactory factory=new TestGraphDatabaseFactory();
+  private final ExecutorService executor=Executors.newFixedThreadPool(2);
+  private final Label label=Label.label("label");
+  private final String propKey="propKey";
+  private Map<Setting,String> testSpecificConfig=new HashMap<>();
+  @Before public void setup(){
+    storeDir=testDirectory.storeDir();
+    testSpecificConfig.clear();
+  }
+  @After public void tearDown() throws InterruptedException {
+    executor.shutdown();
+    executor.awaitTermination(10,TimeUnit.SECONDS);
+  }
+  @Test public void recoveryCleanupShouldBlockCheckpoint() throws Throwable {
+    AtomicReference<Throwable> error=new AtomicReference<>();
+    try {
+      dirtyDatabase();
+      Barrier.Control recoveryCompleteBarrier=new Barrier.Control();
+      LabelScanStore.Monitor recoveryBarrierMonitor=new RecoveryBarrierMonitor(recoveryCompleteBarrier);
+      setMonitor(recoveryBarrierMonitor);
+      db=startDatabase();
+      recoveryCompleteBarrier.awaitUninterruptibly();
+      Future<?> checkpointFuture=executor.submit(() -> reportError(() -> checkpoint(db),error));
+      shouldWait(checkpointFuture);
+      recoveryCompleteBarrier.release();
+      checkpointFuture.get();
+      db.shutdown();
+    }
+  finally {
+      Throwable throwable=error.get();
+      if (throwable != null) {
+        throw throwable;
+      }
+    }
+  }
+  @Test public void scanStoreMustLogCrashPointerCleanupDuringRecovery() throws Exception {
+    dirtyDatabase();
+    AssertableLogProvider logProvider=new AssertableLogProvider(true);
+    factory.setUserLogProvider(logProvider);
+    factory.setInternalLogProvider(logProvider);
+    startDatabase().shutdown();
+    logProvider.assertContainsLogCallContaining("Label index cleanup job registered");
+    logProvider.assertContainsLogCallContaining("Label index cleanup job started");
+    logProvider.assertContainsMessageMatching(Matchers.stringContainsInOrder(Iterables.asIterable("Label index cleanup job finished","Number of pages visited","Number of cleaned crashed pointers","Time spent")));
+    logProvider.assertContainsLogCallContaining("Label index cleanup job closed");
+  }
+  @Test public void nativeIndexFusion10MustLogCrashPointerCleanupDuringRecovery() throws Exception {
+    nativeIndexMustLogCrashPointerCleanupDuringRecovery(GraphDatabaseSettings.SchemaIndex.NATIVE10,"native","spatial","temporal");
+  }
+  @Test public void nativeIndexFusion20MustLogCrashPointerCleanupDuringRecovery() throws Exception {
+    nativeIndexMustLogCrashPointerCleanupDuringRecovery(GraphDatabaseSettings.SchemaIndex.NATIVE20,"string","native","spatial","temporal");
+  }
+  @Test public void nativeIndexBTreeMustLogCrashPointerCleanupDuringRecovery() throws Exception {
+    nativeIndexMustLogCrashPointerCleanupDuringRecovery(GraphDatabaseSettings.SchemaIndex.NATIVE_BTREE10,"index");
+  }
+  private void nativeIndexMustLogCrashPointerCleanupDuringRecovery(  GraphDatabaseSettings.SchemaIndex setting,  String... subTypes) throws Exception {
+    setTestConfig(GraphDatabaseSettings.default_schema_provider,setting.providerName());
+    dirtyDatabase();
+    AssertableLogProvider logProvider=new AssertableLogProvider(true);
+    factory.setInternalLogProvider(logProvider);
+    startDatabase().shutdown();
+    List<Matcher<String>> matchers=new ArrayList<>();
+    for (    String subType : subTypes) {
+      matchers.add(indexRecoveryLogMatcher("Schema index cleanup job registered",subType));
+      matchers.add(indexRecoveryLogMatcher("Schema index cleanup job started",subType));
+      matchers.add(indexRecoveryFinishedLogMatcher(subType));
+      matchers.add(indexRecoveryLogMatcher("Schema index cleanup job closed",subType));
+    }
+    matchers.forEach(logProvider::assertContainsExactlyOneMessageMatching);
+  }
+  private Matcher<String> indexRecoveryLogMatcher(  String logMessage,  String subIndexProviderKey){
+    return Matchers.stringContainsInOrder(Iterables.asIterable(logMessage,"descriptor","indexFile=",File.separator + subIndexProviderKey));
+  }
+  private Matcher<String> indexRecoveryFinishedLogMatcher(  String subIndexProviderKey){
+    return Matchers.stringContainsInOrder(Iterables.asIterable("Schema index cleanup job finished","descriptor","indexFile=",File.separator + subIndexProviderKey,"Number of pages visited","Number of cleaned crashed pointers","Time spent"));
+  }
+  private void dirtyDatabase() throws IOException {
+    db=startDatabase();
+    DatabaseHealth databaseHealth=databaseHealth(db);
+    index(db);
+    someData(db);
+    checkpoint(db);
+    someData(db);
+    databaseHealth.panic(new Throwable("Trigger recovery on next startup"));
+    db.shutdown();
+    db=null;
+  }
+  private void setTestConfig(  Setting<?> setting,  String value){
+    testSpecificConfig.put(setting,value);
+  }
+  private void setMonitor(  Object monitor){
+    Monitors monitors=new Monitors();
+    monitors.addMonitorListener(monitor);
+    factory.setMonitors(monitors);
+  }
+  private void index(  GraphDatabaseService db){
+    try (Transaction tx=db.beginTx()){
+      db.schema().indexFor(label).on(propKey).create();
+      tx.success();
+    }
+     try (Transaction tx=db.beginTx()){
+      db.schema().awaitIndexesOnline(1,TimeUnit.MINUTES);
+      tx.success();
+    }
+   }
+  private void reportError(  Race.ThrowingRunnable checkpoint,  AtomicReference<Throwable> error){
+    try {
+      checkpoint.run();
+    }
+ catch (    Throwable t) {
+      error.compareAndSet(null,t);
+    }
+  }
+  private void checkpoint(  GraphDatabaseService db) throws IOException {
+    CheckPointer checkPointer=checkPointer(db);
+    checkPointer.forceCheckPoint(new SimpleTriggerInfo("test"));
+  }
+  private void someData(  GraphDatabaseService db){
+    try (Transaction tx=db.beginTx()){
+      db.createNode(label).setProperty(propKey,1);
+      db.createNode(label).setProperty(propKey,"string");
+      db.createNode(label).setProperty(propKey,Values.pointValue(Cartesian,0.5,0.5));
+      db.createNode(label).setProperty(propKey,LocalTime.of(0,0));
+      tx.success();
+    }
+   }
+  private void shouldWait(  Future<?> future) throws InterruptedException, ExecutionException {
+    try {
+      future.get(200L,TimeUnit.MILLISECONDS);
+      fail("Expected timeout");
+    }
+ catch (    TimeoutException e) {
+    }
+  }
+  private GraphDatabaseService startDatabase(){
+    GraphDatabaseBuilder builder=factory.newEmbeddedDatabaseBuilder(storeDir);
+    testSpecificConfig.forEach(builder::setConfig);
+    return builder.newGraphDatabase();
+  }
+  private DatabaseHealth databaseHealth(  GraphDatabaseService db){
+    return dependencyResolver(db).resolveDependency(DatabaseHealth.class);
+  }
+  private CheckPointer checkPointer(  GraphDatabaseService db){
+    DependencyResolver dependencyResolver=dependencyResolver(db);
+    return dependencyResolver.resolveDependency(NeoStoreDataSource.class).getDependencyResolver().resolveDependency(CheckPointer.class);
+  }
+  private DependencyResolver dependencyResolver(  GraphDatabaseService db){
+    return ((GraphDatabaseAPI)db).getDependencyResolver();
+  }
+private class RecoveryBarrierMonitor extends LabelScanStore.Monitor.Adaptor {
+    private final Barrier.Control barrier;
+    RecoveryBarrierMonitor(    Barrier.Control barrier){
+      this.barrier=barrier;
+    }
+    @Override public void recoveryCleanupFinished(    long numberOfPagesVisited,    long numberOfCleanedCrashPointers,    long durationMillis){
+      barrier.reached();
+    }
+  }
+}

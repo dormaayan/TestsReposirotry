@@ -1,0 +1,222 @@
+public class AuthenticationIT extends AbstractBoltTransportsTest {
+  protected EphemeralFileSystemRule fsRule=new EphemeralFileSystemRule();
+  protected final AssertableLogProvider logProvider=new AssertableLogProvider();
+  protected Neo4jWithSocket server=new Neo4jWithSocket(getClass(),getTestGraphDatabaseFactory(),fsRule,getSettingsFunction());
+  @Rule public RuleChain ruleChain=RuleChain.outerRule(fsRule).around(server);
+  protected TestGraphDatabaseFactory getTestGraphDatabaseFactory(){
+    return new TestGraphDatabaseFactory(logProvider);
+  }
+  protected Consumer<Map<String,String>> getSettingsFunction(){
+    return settings -> settings.put(GraphDatabaseSettings.auth_enabled.name(),"true");
+  }
+  private HostnamePort address;
+  private final String version="Neo4j/" + Version.getNeo4jVersion();
+  @Before public void setup(){
+    address=server.lookupDefaultConnector();
+  }
+  @Test public void shouldRespondWithCredentialsExpiredOnFirstUse() throws Throwable {
+    connection.connect(address).send(util.defaultAcceptedVersions()).send(util.chunk(new InitMessage("TestClient/1.1",map("principal","neo4j","credentials","neo4j","scheme","basic"))));
+    assertThat(connection,util.eventuallyReceivesSelectedProtocolVersion());
+    assertThat(connection,util.eventuallyReceives(msgSuccess(map("credentials_expired",true,"server",version))));
+    verifyConnectionOpen();
+  }
+  private void verifyConnectionOpen() throws IOException {
+    connection.send(util.chunk(ResetMessage.INSTANCE));
+    assertThat(connection,util.eventuallyReceives(msgSuccess()));
+  }
+  @Test public void shouldFailIfWrongCredentials() throws Throwable {
+    connection.connect(address).send(util.defaultAcceptedVersions()).send(util.chunk(new InitMessage("TestClient/1.1",map("principal","neo4j","credentials","wrong","scheme","basic"))));
+    assertThat(connection,util.eventuallyReceivesSelectedProtocolVersion());
+    assertThat(connection,util.eventuallyReceives(msgFailure(Status.Security.Unauthorized,"The client is unauthorized due to authentication failure.")));
+    assertThat(connection,eventuallyDisconnects());
+    assertEventually(ignore -> "Matching log call not found in\n" + logProvider.serialize(),this::authFailureLoggedToUserLog,is(true),30,SECONDS);
+  }
+  private boolean authFailureLoggedToUserLog(){
+    String boltPackageName=BoltServer.class.getPackage().getName();
+    return logProvider.containsMatchingLogCall(inLog(containsString(boltPackageName)).warn(containsString("The client is unauthorized due to authentication failure.")));
+  }
+  @Test public void shouldFailIfWrongCredentialsFollowingSuccessfulLogin() throws Throwable {
+    connection.connect(address).send(util.defaultAcceptedVersions()).send(util.chunk(new InitMessage("TestClient/1.1",map("principal","neo4j","credentials","neo4j","new_credentials","secret","scheme","basic"))));
+    assertThat(connection,util.eventuallyReceivesSelectedProtocolVersion());
+    assertThat(connection,util.eventuallyReceives(msgSuccess()));
+    reconnect();
+    connection.connect(address).send(util.defaultAcceptedVersions()).send(util.chunk(new InitMessage("TestClient/1.1",map("principal","neo4j","credentials","secret","scheme","basic"))));
+    assertThat(connection,util.eventuallyReceivesSelectedProtocolVersion());
+    assertThat(connection,util.eventuallyReceives(msgSuccess()));
+    reconnect();
+    connection.connect(address).send(util.defaultAcceptedVersions()).send(util.chunk(new InitMessage("TestClient/1.1",map("principal","neo4j","credentials","wrong","scheme","basic"))));
+    assertThat(connection,util.eventuallyReceivesSelectedProtocolVersion());
+    assertThat(connection,util.eventuallyReceives(msgFailure(Status.Security.Unauthorized,"The client is unauthorized due to authentication failure.")));
+    assertThat(connection,eventuallyDisconnects());
+  }
+  @Test public void shouldFailIfMalformedAuthTokenWrongType() throws Throwable {
+    connection.connect(address).send(util.defaultAcceptedVersions()).send(util.chunk(new InitMessage("TestClient/1.1",map("principal",singletonList("neo4j"),"credentials","neo4j","scheme","basic"))));
+    assertThat(connection,util.eventuallyReceivesSelectedProtocolVersion());
+    assertThat(connection,util.eventuallyReceives(msgFailure(Status.Security.Unauthorized,"Unsupported authentication token, the value associated with the key `principal` " + "must be a String but was: ArrayList")));
+    assertThat(connection,eventuallyDisconnects());
+  }
+  @Test public void shouldFailIfMalformedAuthTokenMissingKey() throws Throwable {
+    connection.connect(address).send(util.defaultAcceptedVersions()).send(util.chunk(new InitMessage("TestClient/1.1",map("principal","neo4j","this-should-have-been-credentials","neo4j","scheme","basic"))));
+    assertThat(connection,util.eventuallyReceivesSelectedProtocolVersion());
+    assertThat(connection,util.eventuallyReceives(msgFailure(Status.Security.Unauthorized,"Unsupported authentication token, missing key `credentials`")));
+    assertThat(connection,eventuallyDisconnects());
+  }
+  @Test public void shouldFailIfMalformedAuthTokenMissingScheme() throws Throwable {
+    connection.connect(address).send(util.defaultAcceptedVersions()).send(util.chunk(new InitMessage("TestClient/1.1",map("principal","neo4j","credentials","neo4j"))));
+    assertThat(connection,util.eventuallyReceivesSelectedProtocolVersion());
+    assertThat(connection,util.eventuallyReceives(msgFailure(Status.Security.Unauthorized,"Unsupported authentication token, missing key `scheme`")));
+    assertThat(connection,eventuallyDisconnects());
+  }
+  @Test public void shouldFailIfMalformedAuthTokenUnknownScheme() throws Throwable {
+    connection.connect(address).send(util.defaultAcceptedVersions()).send(util.chunk(new InitMessage("TestClient/1.1",map("principal","neo4j","credentials","neo4j","scheme","unknown"))));
+    assertThat(connection,util.eventuallyReceivesSelectedProtocolVersion());
+    assertThat(connection,util.eventuallyReceives(msgFailure(Status.Security.Unauthorized,"Unsupported authentication token, scheme 'unknown' is not supported.")));
+    assertThat(connection,eventuallyDisconnects());
+  }
+  @Test public void shouldFailDifferentlyIfTooManyFailedAuthAttempts() throws Exception {
+    final long timeout=System.currentTimeMillis() + 60_000;
+    FailureMessage failureMessage=null;
+    while (failureMessage == null) {
+      if (System.currentTimeMillis() > timeout) {
+        fail("Timed out waiting for the authentication failure to occur.");
+      }
+      ExecutorService executor=Executors.newFixedThreadPool(10);
+      List<CompletableFuture<FailureMessage>> futures=new ArrayList<>();
+      for (int i=0; i < 10; i++) {
+        futures.add(CompletableFuture.supplyAsync(this::collectAuthFailureOnFailedAuth,executor));
+      }
+      try {
+        CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).get(30,SECONDS);
+        for (int i=0; i < futures.size(); i++) {
+          FailureMessage recordedMessage=futures.get(i).get();
+          if (recordedMessage != null) {
+            failureMessage=recordedMessage;
+            break;
+          }
+        }
+      }
+ catch (      TimeoutException ex) {
+      }
+ finally {
+        executor.shutdown();
+      }
+    }
+    assertThat(failureMessage.status(),equalTo(Status.Security.AuthenticationRateLimit));
+    assertThat(failureMessage.message(),containsString("The client has provided incorrect authentication details too many times in a row."));
+  }
+  @Test public void shouldBeAbleToUpdateCredentials() throws Throwable {
+    connection.connect(address).send(util.defaultAcceptedVersions()).send(util.chunk(new InitMessage("TestClient/1.1",map("principal","neo4j","credentials","neo4j","new_credentials","secret","scheme","basic"))));
+    assertThat(connection,util.eventuallyReceivesSelectedProtocolVersion());
+    assertThat(connection,util.eventuallyReceives(msgSuccess()));
+    reconnect();
+    connection.connect(address).send(util.defaultAcceptedVersions()).send(util.chunk(new InitMessage("TestClient/1.1",map("principal","neo4j","credentials","neo4j","scheme","basic"))));
+    assertThat(connection,util.eventuallyReceivesSelectedProtocolVersion());
+    assertThat(connection,util.eventuallyReceives(msgFailure(Status.Security.Unauthorized,"The client is unauthorized due to authentication failure.")));
+    reconnect();
+    connection.connect(address).send(util.defaultAcceptedVersions()).send(util.chunk(new InitMessage("TestClient/1.1",map("principal","neo4j","credentials","secret","scheme","basic"))));
+    assertThat(connection,util.eventuallyReceivesSelectedProtocolVersion());
+    assertThat(connection,util.eventuallyReceives(msgSuccess()));
+  }
+  @Test public void shouldBeAuthenticatedAfterUpdatingCredentials() throws Throwable {
+    connection.connect(address).send(util.defaultAcceptedVersions()).send(util.chunk(new InitMessage("TestClient/1.1",map("principal","neo4j","credentials","neo4j","new_credentials","secret","scheme","basic"))));
+    assertThat(connection,util.eventuallyReceivesSelectedProtocolVersion());
+    assertThat(connection,util.eventuallyReceives(msgSuccess()));
+    connection.send(util.chunk(new RunMessage("MATCH (n) RETURN n",EMPTY_MAP),PullAllMessage.INSTANCE));
+    assertThat(connection,util.eventuallyReceives(msgSuccess(),msgSuccess()));
+  }
+  @Test public void shouldBeAbleToChangePasswordUsingBuiltInProcedure() throws Throwable {
+    connection.connect(address).send(util.defaultAcceptedVersions()).send(util.chunk(new InitMessage("TestClient/1.1",map("principal","neo4j","credentials","neo4j","scheme","basic"))));
+    assertThat(connection,util.eventuallyReceivesSelectedProtocolVersion());
+    assertThat(connection,util.eventuallyReceives(msgSuccess(map("credentials_expired",true,"server",version))));
+    connection.send(util.chunk(new RunMessage("CALL dbms.security.changePassword",singletonMap("password","secret")),PullAllMessage.INSTANCE));
+    assertThat(connection,util.eventuallyReceives(msgSuccess()));
+    reconnect();
+    connection.connect(address).send(util.defaultAcceptedVersions()).send(util.chunk(new InitMessage("TestClient/1.1",map("principal","neo4j","credentials","neo4j","scheme","basic"))));
+    assertThat(connection,util.eventuallyReceivesSelectedProtocolVersion());
+    assertThat(connection,util.eventuallyReceives(msgFailure(Status.Security.Unauthorized,"The client is unauthorized due to authentication failure.")));
+    reconnect();
+    connection.connect(address).send(util.defaultAcceptedVersions()).send(util.chunk(new InitMessage("TestClient/1.1",map("principal","neo4j","credentials","secret","scheme","basic"))));
+    assertThat(connection,util.eventuallyReceivesSelectedProtocolVersion());
+    assertThat(connection,util.eventuallyReceives(msgSuccess()));
+  }
+  @Test public void shouldBeAuthenticatedAfterChangePasswordUsingBuiltInProcedure() throws Throwable {
+    connection.connect(address).send(util.defaultAcceptedVersions()).send(util.chunk(new InitMessage("TestClient/1.1",map("principal","neo4j","credentials","neo4j","scheme","basic"))));
+    assertThat(connection,util.eventuallyReceivesSelectedProtocolVersion());
+    assertThat(connection,util.eventuallyReceives(msgSuccess(map("credentials_expired",true,"server",version))));
+    connection.send(util.chunk(new RunMessage("CALL dbms.security.changePassword",singletonMap("password","secret")),PullAllMessage.INSTANCE));
+    assertThat(connection,util.eventuallyReceives(msgSuccess(),msgSuccess()));
+    connection.send(util.chunk(new RunMessage("MATCH (n) RETURN n",EMPTY_MAP),PullAllMessage.INSTANCE));
+    assertThat(connection,util.eventuallyReceives(msgSuccess(),msgSuccess()));
+  }
+  @Test public void shouldFailWhenReusingTheSamePassword() throws Throwable {
+    connection.connect(address).send(util.defaultAcceptedVersions()).send(util.chunk(new InitMessage("TestClient/1.1",map("principal","neo4j","credentials","neo4j","scheme","basic"))));
+    assertThat(connection,util.eventuallyReceivesSelectedProtocolVersion());
+    assertThat(connection,util.eventuallyReceives(msgSuccess(map("credentials_expired",true,"server",version))));
+    connection.send(util.chunk(new RunMessage("CALL dbms.security.changePassword",singletonMap("password","neo4j")),PullAllMessage.INSTANCE));
+    assertThat(connection,util.eventuallyReceives(msgFailure(Status.General.InvalidArguments,"Old password and new password cannot be the same.")));
+    connection.send(util.chunk(AckFailureMessage.INSTANCE,new RunMessage("CALL dbms.security.changePassword",singletonMap("password","abc")),PullAllMessage.INSTANCE));
+    assertThat(connection,util.eventuallyReceives(msgIgnored(),msgSuccess(),msgSuccess(),msgSuccess()));
+  }
+  @Test public void shouldFailWhenSubmittingEmptyPassword() throws Throwable {
+    connection.connect(address).send(util.defaultAcceptedVersions()).send(util.chunk(new InitMessage("TestClient/1.1",map("principal","neo4j","credentials","neo4j","scheme","basic"))));
+    assertThat(connection,util.eventuallyReceivesSelectedProtocolVersion());
+    assertThat(connection,util.eventuallyReceives(msgSuccess(map("credentials_expired",true,"server",version))));
+    connection.send(util.chunk(new RunMessage("CALL dbms.security.changePassword",singletonMap("password","")),PullAllMessage.INSTANCE));
+    assertThat(connection,util.eventuallyReceives(msgFailure(Status.General.InvalidArguments,"A password cannot be empty.")));
+    connection.send(util.chunk(AckFailureMessage.INSTANCE,new RunMessage("CALL dbms.security.changePassword",singletonMap("password","abc")),PullAllMessage.INSTANCE));
+    assertThat(connection,util.eventuallyReceives(msgIgnored(),msgSuccess(),msgSuccess(),msgSuccess()));
+  }
+  @Test public void shouldNotBeAbleToReadWhenPasswordChangeRequired() throws Throwable {
+    connection.connect(address).send(util.defaultAcceptedVersions()).send(util.chunk(new InitMessage("TestClient/1.1",map("principal","neo4j","credentials","neo4j","scheme","basic"))));
+    assertThat(connection,util.eventuallyReceivesSelectedProtocolVersion());
+    assertThat(connection,util.eventuallyReceives(msgSuccess(map("credentials_expired",true,"server",version))));
+    connection.send(util.chunk(new RunMessage("MATCH (n) RETURN n",EMPTY_MAP),PullAllMessage.INSTANCE));
+    assertThat(connection,util.eventuallyReceives(msgFailure(Status.Security.CredentialsExpired,"The credentials you provided were valid, but must be changed before you can use this instance.")));
+    assertThat(connection,eventuallyDisconnects());
+  }
+class FailureMsgMatcher extends TypeSafeMatcher<ResponseMessage> {
+    FailureMessage specialMessage;
+    @Override public void describeTo(    Description description){
+      description.appendText("FAILURE");
+    }
+    @Override protected boolean matchesSafely(    ResponseMessage t){
+      assertThat(t,instanceOf(FailureMessage.class));
+      FailureMessage msg=(FailureMessage)t;
+      if (!msg.status().equals(Status.Security.Unauthorized) || !msg.message().contains("The client is unauthorized due to authentication failure.")) {
+        specialMessage=msg;
+      }
+      return true;
+    }
+    public boolean gotSpecialMessage(){
+      return specialMessage != null;
+    }
+  }
+  private MapValue singletonMap(  String key,  Object value){
+    return VirtualValues.map(new String[]{key},new AnyValue[]{ValueUtils.of(value)});
+  }
+  private FailureMessage collectAuthFailureOnFailedAuth(){
+    FailureMsgMatcher failureRecorder=new FailureMsgMatcher();
+    TransportConnection connection=null;
+    try {
+      connection=newConnection();
+      connection.connect(address).send(util.defaultAcceptedVersions()).send(util.chunk(new InitMessage("TestClient/1.1",map("principal","neo4j","credentials","WHAT_WAS_THE_PASSWORD_AGAIN","scheme","basic"))));
+      assertThat(connection,util.eventuallyReceivesSelectedProtocolVersion());
+      assertThat(connection,util.eventuallyReceives(failureRecorder));
+      assertThat(connection,eventuallyDisconnects());
+    }
+ catch (    Exception ex) {
+      throw new RuntimeException(ex);
+    }
+ finally {
+      if (connection != null) {
+        try {
+          connection.disconnect();
+        }
+ catch (        IOException ex) {
+          throw new RuntimeException(ex);
+        }
+      }
+    }
+    return failureRecorder.specialMessage;
+  }
+}

@@ -1,0 +1,287 @@
+@SuppressWarnings("WeakerAccess") public class ReflectiveProcedureTest {
+  @Rule public ExpectedException exception=ExpectedException.none();
+  private ReflectiveProcedureCompiler procedureCompiler;
+  private ComponentRegistry components;
+  private final ResourceTracker resourceTracker=new StubResourceManager();
+  @Before public void setUp(){
+    components=new ComponentRegistry();
+    procedureCompiler=new ReflectiveProcedureCompiler(new TypeMappers(),components,components,NullLog.getInstance(),ProcedureConfig.DEFAULT);
+  }
+  @Test public void shouldInjectLogging() throws KernelException {
+    Log log=spy(Log.class);
+    components.register(Log.class,ctx -> log);
+    CallableProcedure procedure=procedureCompiler.compileProcedure(LoggingProcedure.class,null,true).get(0);
+    procedure.apply(new BasicContext(),new Object[0],resourceTracker);
+    verify(log).debug("1");
+    verify(log).info("2");
+    verify(log).warn("3");
+    verify(log).error("4");
+  }
+  @Test public void shouldCompileProcedure() throws Throwable {
+    List<CallableProcedure> procedures=compile(SingleReadOnlyProcedure.class);
+    assertEquals(1,procedures.size());
+    assertThat(procedures.get(0).signature(),Matchers.equalTo(procedureSignature("org","neo4j","kernel","impl","proc","listCoolPeople").out("name",Neo4jTypes.NTString).build()));
+  }
+  @Test public void shouldRunSimpleReadOnlyProcedure() throws Throwable {
+    CallableProcedure proc=compile(SingleReadOnlyProcedure.class).get(0);
+    RawIterator<Object[],ProcedureException> out=proc.apply(new BasicContext(),new Object[0],resourceTracker);
+    assertThat(asList(out),contains(new Object[]{"Bonnie"},new Object[]{"Clyde"}));
+  }
+  @Test public void shouldIgnoreClassesWithNoProcedures() throws Throwable {
+    List<CallableProcedure> procedures=compile(PrivateConstructorButNoProcedures.class);
+    assertEquals(0,procedures.size());
+  }
+  @Test public void shouldRunClassWithMultipleProceduresDeclared() throws Throwable {
+    List<CallableProcedure> compiled=compile(MultiProcedureProcedure.class);
+    CallableProcedure bananaPeople=compiled.get(0);
+    CallableProcedure coolPeople=compiled.get(1);
+    RawIterator<Object[],ProcedureException> coolOut=coolPeople.apply(new BasicContext(),new Object[0],resourceTracker);
+    RawIterator<Object[],ProcedureException> bananaOut=bananaPeople.apply(new BasicContext(),new Object[0],resourceTracker);
+    assertThat(asList(coolOut),contains(new Object[]{"Bonnie"},new Object[]{"Clyde"}));
+    assertThat(asList(bananaOut),contains(new Object[]{"Jake",18L},new Object[]{"Pontus",2L}));
+  }
+  @Test public void shouldGiveHelpfulErrorOnConstructorThatRequiresArgument() throws Throwable {
+    exception.expect(ProcedureException.class);
+    exception.expectMessage("Unable to find a usable public no-argument constructor " + "in the class `WierdConstructorProcedure`. Please add a " + "valid, public constructor, recompile the class and try again.");
+    compile(WierdConstructorProcedure.class);
+  }
+  @Test public void shouldGiveHelpfulErrorOnNoPublicConstructor() throws Throwable {
+    exception.expect(ProcedureException.class);
+    exception.expectMessage("Unable to find a usable public no-argument constructor " + "in the class `PrivateConstructorProcedure`. Please add " + "a valid, public constructor, recompile the class and try again.");
+    compile(PrivateConstructorProcedure.class);
+  }
+  @Test public void shouldAllowVoidOutput() throws Throwable {
+    CallableProcedure proc=compile(ProcedureWithVoidOutput.class).get(0);
+    assertEquals(0,proc.signature().outputSignature().size());
+    assertFalse(proc.apply(null,new Object[0],resourceTracker).hasNext());
+  }
+  @Test public void shouldGiveHelpfulErrorOnProcedureReturningInvalidRecordType() throws Throwable {
+    exception.expect(ProcedureException.class);
+    exception.expectMessage(String.format("Procedures must return a Stream of records, where a record is a concrete class%n" + "that you define, with public non-final fields defining the fields in the record.%n" + "If you''d like your procedure to return `String`, you could define a record class "+ "like:%n"+ "public class Output '{'%n"+ "    public String out;%n"+ "'}'%n"+ "%n"+ "And then define your procedure as returning `Stream<Output>`."));
+    compile(ProcedureWithInvalidRecordOutput.class).get(0);
+  }
+  @Test public void shouldGiveHelpfulErrorOnContextAnnotatedStaticField() throws Throwable {
+    exception.expect(ProcedureException.class);
+    exception.expectMessage(String.format("The field `gdb` in the class named `ProcedureWithStaticContextAnnotatedField` is " + "annotated as a @Context field,%n" + "but it is static. @Context fields must be public, non-final and non-static,%n"+ "because they are reset each time a procedure is invoked."));
+    compile(ProcedureWithStaticContextAnnotatedField.class).get(0);
+  }
+  @Test public void shouldAllowNonStaticOutput() throws Throwable {
+    CallableProcedure proc=compile(ProcedureWithNonStaticOutputRecord.class).get(0);
+    assertEquals(1,proc.signature().outputSignature().size());
+  }
+  @Test public void shouldAllowOverridingProcedureName() throws Throwable {
+    CallableProcedure proc=compile(ProcedureWithOverriddenName.class).get(0);
+    assertEquals("org.mystuff.thisisActuallyTheName",proc.signature().name().toString());
+  }
+  @Test public void shouldAllowOverridingProcedureNameWithoutNamespace() throws Throwable {
+    CallableProcedure proc=compile(ProcedureWithSingleName.class).get(0);
+    assertEquals("singleName",proc.signature().name().toString());
+  }
+  @Test public void shouldGiveHelpfulErrorOnNullMessageException() throws Throwable {
+    CallableProcedure proc=compile(ProcedureThatThrowsNullMsgExceptionAtInvocation.class).get(0);
+    exception.expect(ProcedureException.class);
+    exception.expectMessage("Failed to invoke procedure `org.neo4j.kernel.impl.proc.throwsAtInvocation`: " + "Caused by: java.lang.IndexOutOfBoundsException");
+    proc.apply(new BasicContext(),new Object[0],resourceTracker);
+  }
+  @Test public void shouldCloseResourcesAndGiveHelpfulErrorOnMidStreamException() throws Throwable {
+    CallableProcedure proc=compile(ProcedureThatThrowsNullMsgExceptionMidStream.class).get(0);
+    exception.expect(ProcedureException.class);
+    exception.expectMessage("Failed to invoke procedure `org.neo4j.kernel.impl.proc.throwsInStream`: " + "Caused by: java.lang.IndexOutOfBoundsException");
+    exception.expect(new BaseMatcher<Exception>(){
+      @Override public void describeTo(      Description description){
+        description.appendText("a suppressed exception with cause ExceptionDuringClose");
+      }
+      @Override public boolean matches(      Object item){
+        Exception e=(Exception)item;
+        for (        Throwable suppressed : e.getSuppressed()) {
+          if (suppressed instanceof ResourceCloseFailureException) {
+            if (suppressed.getCause() instanceof ExceptionDuringClose) {
+              return true;
+            }
+          }
+        }
+        return false;
+      }
+    }
+);
+    RawIterator<Object[],ProcedureException> stream=proc.apply(new BasicContext(),new Object[0],resourceTracker);
+    if (stream.hasNext()) {
+      stream.next();
+    }
+  }
+  @Test public void shouldSupportProcedureDeprecation() throws Throwable {
+    Log log=mock(Log.class);
+    ReflectiveProcedureCompiler procedureCompiler=new ReflectiveProcedureCompiler(new TypeMappers(),components,components,log,ProcedureConfig.DEFAULT);
+    List<CallableProcedure> procs=procedureCompiler.compileProcedure(ProcedureWithDeprecation.class,null,true);
+    verify(log).warn("Use of @Procedure(deprecatedBy) without @Deprecated in badProc");
+    verifyNoMoreInteractions(log);
+    for (    CallableProcedure proc : procs) {
+      String name=proc.signature().name().name();
+      proc.apply(new BasicContext(),new Object[0],resourceTracker);
+switch (name) {
+case "newProc":
+        assertFalse("Should not be deprecated",proc.signature().deprecated().isPresent());
+      break;
+case "oldProc":
+case "badProc":
+    assertTrue("Should be deprecated",proc.signature().deprecated().isPresent());
+  assertThat(proc.signature().deprecated().get(),equalTo("newProc"));
+break;
+default :
+fail("Unexpected procedure: " + name);
+}
+}
+}
+@Test public void shouldLoadWhiteListedProcedure() throws Throwable {
+ProcedureConfig config=new ProcedureConfig(Config.defaults(procedure_whitelist,"org.neo4j.kernel.impl.proc.listCoolPeople"));
+Log log=mock(Log.class);
+ReflectiveProcedureCompiler procedureCompiler=new ReflectiveProcedureCompiler(new TypeMappers(),components,components,log,config);
+CallableProcedure proc=procedureCompiler.compileProcedure(SingleReadOnlyProcedure.class,null,false).get(0);
+RawIterator<Object[],ProcedureException> result=proc.apply(new BasicContext(),new Object[0],resourceTracker);
+assertEquals(result.next()[0],"Bonnie");
+}
+@Test public void shouldNotLoadNoneWhiteListedProcedure() throws Throwable {
+ProcedureConfig config=new ProcedureConfig(Config.defaults(procedure_whitelist,"org.neo4j.kernel.impl.proc.NOTlistCoolPeople"));
+Log log=mock(Log.class);
+ReflectiveProcedureCompiler procedureCompiler=new ReflectiveProcedureCompiler(new TypeMappers(),components,components,log,config);
+List<CallableProcedure> proc=procedureCompiler.compileProcedure(SingleReadOnlyProcedure.class,null,false);
+verify(log).warn("The procedure 'org.neo4j.kernel.impl.proc.listCoolPeople' is not on the whitelist and won't be loaded.");
+assertThat(proc.isEmpty(),is(true));
+}
+@Test public void shouldIgnoreWhiteListingIfFullAccess() throws Throwable {
+ProcedureConfig config=new ProcedureConfig(Config.defaults(procedure_whitelist,"empty"));
+Log log=mock(Log.class);
+ReflectiveProcedureCompiler procedureCompiler=new ReflectiveProcedureCompiler(new TypeMappers(),components,components,log,config);
+CallableProcedure proc=procedureCompiler.compileProcedure(SingleReadOnlyProcedure.class,null,true).get(0);
+RawIterator<Object[],ProcedureException> result=proc.apply(new BasicContext(),new Object[0],resourceTracker);
+assertEquals(result.next()[0],"Bonnie");
+}
+@Test public void shouldNotLoadAnyProcedureIfConfigIsEmpty() throws Throwable {
+ProcedureConfig config=new ProcedureConfig(Config.defaults(procedure_whitelist,""));
+Log log=mock(Log.class);
+ReflectiveProcedureCompiler procedureCompiler=new ReflectiveProcedureCompiler(new TypeMappers(),components,components,log,config);
+List<CallableProcedure> proc=procedureCompiler.compileProcedure(SingleReadOnlyProcedure.class,null,false);
+verify(log).warn("The procedure 'org.neo4j.kernel.impl.proc.listCoolPeople' is not on the whitelist and won't be loaded.");
+assertThat(proc.isEmpty(),is(true));
+}
+public static class MyOutputRecord {
+public String name;
+public MyOutputRecord(String name){
+this.name=name;
+}
+}
+public static class SomeOtherOutputRecord {
+public String name;
+public long bananas;
+public SomeOtherOutputRecord(String name,long bananas){
+this.name=name;
+this.bananas=bananas;
+}
+}
+public static class LoggingProcedure {
+@Context public Log log;
+@Procedure public Stream<MyOutputRecord> logAround(){
+log.debug("1");
+log.info("2");
+log.warn("3");
+log.error("4");
+return Stream.empty();
+}
+}
+public static class SingleReadOnlyProcedure {
+@Procedure public Stream<MyOutputRecord> listCoolPeople(){
+return Stream.of(new MyOutputRecord("Bonnie"),new MyOutputRecord("Clyde"));
+}
+}
+public static class ProcedureWithVoidOutput {
+@Procedure public void voidOutput(){
+}
+}
+public static class ProcedureWithNonStaticOutputRecord {
+@Procedure public Stream<NonStatic> voidOutput(){
+return Stream.of(new NonStatic());
+}
+public class NonStatic {
+public String field="hello, rodl!";
+}
+}
+public static class MultiProcedureProcedure {
+@Procedure public Stream<MyOutputRecord> listCoolPeople(){
+return Stream.of(new MyOutputRecord("Bonnie"),new MyOutputRecord("Clyde"));
+}
+@Procedure public Stream<SomeOtherOutputRecord> listBananaOwningPeople(){
+return Stream.of(new SomeOtherOutputRecord("Jake",18),new SomeOtherOutputRecord("Pontus",2));
+}
+}
+public static class WierdConstructorProcedure {
+public WierdConstructorProcedure(WierdConstructorProcedure wat){
+}
+@Procedure public Stream<MyOutputRecord> listCoolPeople(){
+return Stream.of(new MyOutputRecord("Bonnie"),new MyOutputRecord("Clyde"));
+}
+}
+public static class ProcedureWithInvalidRecordOutput {
+@Procedure public String test(){
+return "Testing";
+}
+}
+public static class ProcedureWithStaticContextAnnotatedField {
+@Context public static GraphDatabaseService gdb;
+@Procedure public Stream<MyOutputRecord> test(){
+return null;
+}
+}
+public static class ProcedureThatThrowsNullMsgExceptionAtInvocation {
+@Procedure public Stream<MyOutputRecord> throwsAtInvocation(){
+throw new IndexOutOfBoundsException();
+}
+}
+public static class ProcedureThatThrowsNullMsgExceptionMidStream {
+@Procedure public Stream<MyOutputRecord> throwsInStream(){
+return Stream.<MyOutputRecord>generate(() -> {
+throw new IndexOutOfBoundsException();
+}
+).onClose(() -> {
+throw new ExceptionDuringClose();
+}
+);
+}
+}
+public static class PrivateConstructorProcedure {
+private PrivateConstructorProcedure(){
+}
+@Procedure public Stream<MyOutputRecord> listCoolPeople(){
+return Stream.of(new MyOutputRecord("Bonnie"),new MyOutputRecord("Clyde"));
+}
+}
+public static class PrivateConstructorButNoProcedures {
+private PrivateConstructorButNoProcedures(){
+}
+public Stream<MyOutputRecord> thisIsNotAProcedure(){
+return null;
+}
+}
+public static class ProcedureWithOverriddenName {
+@Procedure("org.mystuff.thisisActuallyTheName") public void somethingThatShouldntMatter(){
+}
+@Procedure("singleName") public void blahDoesntMatterEither(){
+}
+}
+public static class ProcedureWithSingleName {
+@Procedure("singleName") public void blahDoesntMatterEither(){
+}
+}
+public static class ProcedureWithDeprecation {
+@Procedure("newProc") public void newProc(){
+}
+@Deprecated @Procedure(value="oldProc",deprecatedBy="newProc") public void oldProc(){
+}
+@Procedure(value="badProc",deprecatedBy="newProc") public void badProc(){
+}
+}
+private List<CallableProcedure> compile(Class<?> clazz) throws KernelException {
+return procedureCompiler.compileProcedure(clazz,null,true);
+}
+private static class ExceptionDuringClose extends RuntimeException {
+}
+}

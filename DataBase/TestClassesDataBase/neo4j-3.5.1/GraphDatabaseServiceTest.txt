@@ -1,0 +1,254 @@
+public class GraphDatabaseServiceTest {
+  @ClassRule public static final DatabaseRule globalDb=new ImpermanentDatabaseRule().withSetting(GraphDatabaseSettings.shutdown_transaction_end_timeout,"10s");
+  private final ExpectedException exception=ExpectedException.none();
+  private final TestDirectory testDirectory=TestDirectory.testDirectory();
+  private final OtherThreadRule<Void> t2=new OtherThreadRule<>("T2-" + getClass().getName());
+  private final OtherThreadRule<Void> t3=new OtherThreadRule<>("T3-" + getClass().getName());
+  @Rule public RuleChain chain=RuleChain.outerRule(testDirectory).around(exception).around(t2).around(t3);
+  @Test public void givenShutdownDatabaseWhenBeginTxThenExceptionIsThrown(){
+    GraphDatabaseService db=getTemporaryDatabase();
+    db.shutdown();
+    exception.expect(DatabaseShutdownException.class);
+    db.beginTx();
+  }
+  @Test public void givenDatabaseAndStartedTxWhenShutdownThenWaitForTxToFinish() throws Exception {
+    final GraphDatabaseService db=getTemporaryDatabase();
+    Barrier.Control barrier=new Barrier.Control();
+    Future<Object> txFuture=t2.execute(state -> {
+      try (Transaction tx=db.beginTx()){
+        barrier.reached();
+        db.createNode();
+        tx.success();
+      }
+       return null;
+    }
+);
+    barrier.await();
+    Future<Object> shutdownFuture=t3.execute(state -> {
+      db.shutdown();
+      return null;
+    }
+);
+    t3.get().waitUntilWaiting(location -> location.isAt(DatabaseAvailability.class,"stop"));
+    barrier.release();
+    try {
+      txFuture.get();
+    }
+ catch (    ExecutionException e) {
+    }
+    shutdownFuture.get();
+  }
+  @Test public void terminateTransactionThrowsExceptionOnNextOperation(){
+    final GraphDatabaseService db=globalDb;
+    try (Transaction tx=db.beginTx()){
+      tx.terminate();
+      try {
+        db.createNode();
+        fail("Failed to throw TransactionTerminateException");
+      }
+ catch (      TransactionTerminatedException ignored) {
+      }
+    }
+   }
+  @Test public void terminateNestedTransactionThrowsExceptionOnNextOperation(){
+    final GraphDatabaseService db=globalDb;
+    try (Transaction tx=db.beginTx()){
+      try (Transaction nested=db.beginTx()){
+        tx.terminate();
+      }
+       try {
+        db.createNode();
+        fail("Failed to throw TransactionTerminateException");
+      }
+ catch (      TransactionTerminatedException ignored) {
+      }
+    }
+   }
+  @Test public void terminateNestedTransactionThrowsExceptionOnNextNestedOperation(){
+    final GraphDatabaseService db=globalDb;
+    try (Transaction tx=db.beginTx()){
+      try (Transaction nested=db.beginTx()){
+        tx.terminate();
+        try {
+          db.createNode();
+          fail("Failed to throw TransactionTerminateException");
+        }
+ catch (        TransactionTerminatedException ignored) {
+        }
+      }
+     }
+   }
+  @Test public void terminateNestedTransactionThrowsExceptionOnNextNestedOperationMultiThreadedVersion() throws Exception {
+    final GraphDatabaseService db=getTemporaryDatabase();
+    try {
+      final CountDownLatch txSet=new CountDownLatch(1);
+      final CountDownLatch terminated=new CountDownLatch(1);
+      final Transaction[] outer={null};
+      final Exception[] threadFail={null};
+      Thread worker=new Thread(() -> {
+        try (Transaction inner=db.beginTx()){
+          outer[0]=inner;
+          txSet.countDown();
+          terminated.await();
+          db.createNode();
+          fail("should have failed earlier");
+        }
+ catch (        Exception e) {
+          threadFail[0]=e;
+        }
+      }
+);
+      worker.start();
+      txSet.await();
+      outer[0].terminate();
+      terminated.countDown();
+      worker.join();
+      assertThat(threadFail[0],instanceOf(TransactionTerminatedException.class));
+    }
+  finally {
+      db.shutdown();
+    }
+  }
+  @Test public void terminateNestedTransactionThrowsExceptionOnNextNestedOperationMultiThreadedVersionWithNestedTx() throws Exception {
+    final GraphDatabaseService db=getTemporaryDatabase();
+    try {
+      final CountDownLatch txSet=new CountDownLatch(1);
+      final CountDownLatch terminated=new CountDownLatch(1);
+      final Transaction[] outer={null};
+      final Exception[] threadFail={null};
+      Thread worker=new Thread(() -> {
+        Transaction transaction=db.beginTx();
+        try (Transaction inner=db.beginTx()){
+          outer[0]=inner;
+          txSet.countDown();
+          terminated.await();
+          db.createNode();
+          fail("should have failed earlier");
+        }
+ catch (        Exception e) {
+          threadFail[0]=e;
+        }
+ finally {
+          transaction.close();
+        }
+      }
+);
+      worker.start();
+      txSet.await();
+      outer[0].terminate();
+      terminated.countDown();
+      worker.join();
+      assertThat(threadFail[0],instanceOf(TransactionTerminatedException.class));
+    }
+  finally {
+      db.shutdown();
+    }
+  }
+  @Test public void givenDatabaseAndStartedTxWhenShutdownAndStartNewTxThenBeginTxTimesOut() throws Exception {
+    GraphDatabaseService db=getTemporaryDatabase();
+    Barrier.Control barrier=new Barrier.Control();
+    t2.execute(state -> {
+      try (Transaction tx=db.beginTx()){
+        barrier.reached();
+      }
+       return null;
+    }
+);
+    barrier.await();
+    Future<Object> shutdownFuture=t3.execute(state -> {
+      db.shutdown();
+      return null;
+    }
+);
+    t3.get().waitUntilWaiting(location -> location.isAt(DatabaseAvailability.class,"stop"));
+    barrier.release();
+    shutdownFuture.get();
+    try {
+      db.beginTx();
+      fail("Should fail");
+    }
+ catch (    DatabaseShutdownException e) {
+    }
+  }
+  @Test public void shouldLetDetectedDeadlocksDuringCommitBeThrownInTheirOriginalForm() throws Exception {
+    GraphDatabaseService db=globalDb;
+    Node n1=createNode(db);
+    Node n2=createNode(db);
+    Relationship r3=createRelationship(n1);
+    Relationship r2=createRelationship(n1);
+    Relationship r1=createRelationship(n1);
+    Transaction t1Tx=db.beginTx();
+    Transaction t2Tx=t2.execute(beginTx(db)).get();
+    n2.setProperty("locked","indeed");
+    t2.execute(setProperty(r1,"locked","absolutely")).get();
+    Future<Object> t2n2Wait=t2.execute(setProperty(n2,"locked","In my dreams"));
+    t2.get().waitUntilWaiting();
+    r2.delete();
+    t1Tx.success();
+    try {
+      t1Tx.close();
+      fail("Should throw exception about deadlock");
+    }
+ catch (    Exception e) {
+      assertEquals(DeadlockDetectedException.class,e.getClass());
+    }
+ finally {
+      t2n2Wait.get();
+      t2.execute(close(t2Tx)).get();
+    }
+  }
+  /** 
+ * GitHub issue #5996
+ */
+  @Test public void terminationOfClosedTransactionDoesNotInfluenceNextTransaction(){
+    GraphDatabaseService db=globalDb;
+    try (Transaction tx=db.beginTx()){
+      db.createNode();
+      tx.success();
+    }
+     Transaction transaction=db.beginTx();
+    try (Transaction tx=transaction){
+      db.createNode();
+      tx.success();
+    }
+     transaction.terminate();
+    try (Transaction tx=db.beginTx()){
+      assertThat(db.getAllNodes(),is(iterableWithSize(2)));
+      tx.success();
+    }
+   }
+  private WorkerCommand<Void,Transaction> beginTx(  final GraphDatabaseService db){
+    return state -> db.beginTx();
+  }
+  private WorkerCommand<Void,Object> setProperty(  final PropertyContainer entity,  final String key,  final String value){
+    return state -> {
+      entity.setProperty(key,value);
+      return null;
+    }
+;
+  }
+  private WorkerCommand<Void,Void> close(  final Transaction tx){
+    return state -> {
+      tx.close();
+      return null;
+    }
+;
+  }
+  private Relationship createRelationship(  Node node){
+    try (Transaction tx=node.getGraphDatabase().beginTx()){
+      Relationship rel=node.createRelationshipTo(node,MyRelTypes.TEST);
+      tx.success();
+      return rel;
+    }
+   }
+  private Node createNode(  GraphDatabaseService db){
+    try (Transaction tx=db.beginTx()){
+      Node node=db.createNode();
+      tx.success();
+      return node;
+    }
+   }
+  private GraphDatabaseService getTemporaryDatabase(){
+    return new TestGraphDatabaseFactory().newImpermanentDatabaseBuilder(testDirectory.directory("impermanent")).setConfig(GraphDatabaseSettings.shutdown_transaction_end_timeout,"10s").newGraphDatabase();
+  }
+}

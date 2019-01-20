@@ -1,0 +1,78 @@
+@Test(timeout=20000) @SuppressWarnings("unchecked") public void testLocalizerHeartbeatWhenAppCleaningUp() throws Exception {
+  conf.set(YarnConfiguration.NM_LOCAL_DIRS,lfs.makeQualified(new Path(basedir,0 + "")).toString());
+  DrainDispatcher dispatcher=new DrainDispatcher();
+  dispatcher.init(conf);
+  dispatcher.start();
+  dispatcher.register(ApplicationEventType.class,mock(EventHandler.class));
+  dispatcher.register(ContainerEventType.class,mock(EventHandler.class));
+  DummyExecutor exec=new DummyExecutor();
+  LocalDirsHandlerService dirsHandler=new LocalDirsHandlerService();
+  dirsHandler.init(conf);
+  ResourceLocalizationService rawService=new ResourceLocalizationService(dispatcher,exec,mock(DeletionService.class),dirsHandler,nmContext,metrics);
+  ResourceLocalizationService spyService=spy(rawService);
+  doReturn(mockServer).when(spyService).createServer();
+  doReturn(lfs).when(spyService).getLocalFileContext(isA(Configuration.class));
+  try {
+    spyService.init(conf);
+    spyService.start();
+    final Application app=mock(Application.class);
+    final ApplicationId appId=BuilderUtils.newApplicationId(1234567890L,3);
+    when(app.getUser()).thenReturn("user0");
+    when(app.getAppId()).thenReturn(appId);
+    when(app.toString()).thenReturn(appId.toString());
+    spyService.handle(new ApplicationLocalizationEvent(LocalizationEventType.INIT_APPLICATION_RESOURCES,app));
+    dispatcher.await();
+    Random r=new Random();
+    long seed=r.nextLong();
+    System.out.println("SEED: " + seed);
+    r.setSeed(seed);
+    final Container c=getMockContainer(appId,46,"user0");
+    FSDataOutputStream out=new FSDataOutputStream(new DataOutputBuffer(),null);
+    doReturn(out).when(spylfs).createInternal(isA(Path.class),isA(EnumSet.class),isA(FsPermission.class),anyInt(),anyShort(),anyLong(),isA(Progressable.class),isA(ChecksumOpt.class),anyBoolean());
+    final LocalResource resource1=getAppMockedResource(r);
+    final LocalResource resource2=getAppMockedResource(r);
+    final LocalResourceRequest req1=new LocalResourceRequest(resource1);
+    final LocalResourceRequest req2=new LocalResourceRequest(resource2);
+    Map<LocalResourceVisibility,Collection<LocalResourceRequest>> rsrcs=new HashMap<LocalResourceVisibility,Collection<LocalResourceRequest>>();
+    List<LocalResourceRequest> appResourceList=Arrays.asList(req1,req2);
+    rsrcs.put(LocalResourceVisibility.APPLICATION,appResourceList);
+    spyService.handle(new ContainerLocalizationRequestEvent(c,rsrcs));
+    dispatcher.await();
+    exec.waitForLocalizers(1);
+    final String containerIdStr=c.getContainerId().toString();
+    LocalizerRunner locRunnerForContainer=spyService.getLocalizerRunner(containerIdStr);
+    LocalResourceStatus rsrcSuccess=mock(LocalResourceStatus.class);
+    LocalizerStatus stat=mock(LocalizerStatus.class);
+    when(stat.getLocalizerId()).thenReturn(containerIdStr);
+    when(rsrcSuccess.getResource()).thenReturn(resource1);
+    when(rsrcSuccess.getLocalSize()).thenReturn(4344L);
+    when(rsrcSuccess.getLocalPath()).thenReturn(getPath("/some/path"));
+    when(rsrcSuccess.getStatus()).thenReturn(ResourceStatusType.FETCH_SUCCESS);
+    when(stat.getResources()).thenReturn(Collections.<LocalResourceStatus>emptyList());
+    LocalizerHeartbeatResponse response=spyService.heartbeat(stat);
+    assertEquals("NM should tell localizer to be LIVE in Heartbeat.",LocalizerAction.LIVE,response.getLocalizerAction());
+    spyService.handle(new ContainerLocalizationCleanupEvent(c,rsrcs));
+    dispatcher.await();
+    try {
+      locRunnerForContainer.processHeartbeat(Collections.singletonList(rsrcSuccess));
+    }
+ catch (    Exception e) {
+      fail("Exception should not have been thrown on processing heartbeat");
+    }
+    spyService.handle(new ApplicationLocalizationEvent(LocalizationEventType.DESTROY_APPLICATION_RESOURCES,app));
+    dispatcher.await();
+    try {
+      locRunnerForContainer.processHeartbeat(Collections.singletonList(rsrcSuccess));
+    }
+ catch (    Exception e) {
+      fail("Exception should not have been thrown on processing heartbeat");
+    }
+    response=spyService.heartbeat(stat);
+    assertEquals("NM should tell localizer to DIE in Heartbeat.",LocalizerAction.DIE,response.getLocalizerAction());
+    exec.setStopLocalization();
+  }
+  finally {
+    spyService.stop();
+    dispatcher.stop();
+  }
+}

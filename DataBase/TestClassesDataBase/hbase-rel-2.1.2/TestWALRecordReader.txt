@@ -1,0 +1,152 @@
+/** 
+ * JUnit tests for the WALRecordReader
+ */
+@Category({MapReduceTests.class,MediumTests.class}) public class TestWALRecordReader {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestWALRecordReader.class);
+  private static final Logger LOG=LoggerFactory.getLogger(TestWALRecordReader.class);
+  private final static HBaseTestingUtility TEST_UTIL=new HBaseTestingUtility();
+  private static Configuration conf;
+  private static FileSystem fs;
+  private static Path hbaseDir;
+  private static FileSystem walFs;
+  private static Path walRootDir;
+  static final TableName tableName=TableName.valueOf(getName());
+  private static final byte[] rowName=tableName.getName();
+  static final RegionInfo info=RegionInfoBuilder.newBuilder(tableName).build();
+  private static final byte[] family=Bytes.toBytes("column");
+  private static final byte[] value=Bytes.toBytes("value");
+  private static Path logDir;
+  protected MultiVersionConcurrencyControl mvcc;
+  protected static NavigableMap<byte[],Integer> scopes=new TreeMap<>(Bytes.BYTES_COMPARATOR);
+  private static String getName(){
+    return "TestWALRecordReader";
+  }
+  @Before public void setUp() throws Exception {
+    fs.delete(hbaseDir,true);
+    walFs.delete(walRootDir,true);
+    mvcc=new MultiVersionConcurrencyControl();
+  }
+  @BeforeClass public static void setUpBeforeClass() throws Exception {
+    conf=TEST_UTIL.getConfiguration();
+    conf.setInt("dfs.blocksize",1024 * 1024);
+    conf.setInt("dfs.replication",1);
+    TEST_UTIL.startMiniDFSCluster(1);
+    conf=TEST_UTIL.getConfiguration();
+    fs=TEST_UTIL.getDFSCluster().getFileSystem();
+    hbaseDir=TEST_UTIL.createRootDir();
+    walRootDir=TEST_UTIL.createWALRootDir();
+    walFs=FSUtils.getWALFileSystem(conf);
+    logDir=new Path(walRootDir,HConstants.HREGION_LOGDIR_NAME);
+  }
+  @AfterClass public static void tearDownAfterClass() throws Exception {
+    fs.delete(hbaseDir,true);
+    walFs.delete(walRootDir,true);
+    TEST_UTIL.shutdownMiniCluster();
+  }
+  /** 
+ * Test partial reads from the log based on passed time range
+ * @throws Exception
+ */
+  @Test public void testPartialRead() throws Exception {
+    final WALFactory walfactory=new WALFactory(conf,getName());
+    WAL log=walfactory.getWAL(info);
+    long ts=System.currentTimeMillis();
+    WALEdit edit=new WALEdit();
+    edit.add(new KeyValue(rowName,family,Bytes.toBytes("1"),ts,value));
+    log.append(info,getWalKeyImpl(ts,scopes),edit,true);
+    edit=new WALEdit();
+    edit.add(new KeyValue(rowName,family,Bytes.toBytes("2"),ts + 1,value));
+    log.append(info,getWalKeyImpl(ts + 1,scopes),edit,true);
+    log.sync();
+    LOG.info("Before 1st WAL roll " + log.toString());
+    log.rollWriter();
+    LOG.info("Past 1st WAL roll " + log.toString());
+    Thread.sleep(1);
+    long ts1=System.currentTimeMillis();
+    edit=new WALEdit();
+    edit.add(new KeyValue(rowName,family,Bytes.toBytes("3"),ts1 + 1,value));
+    log.append(info,getWalKeyImpl(ts1 + 1,scopes),edit,true);
+    edit=new WALEdit();
+    edit.add(new KeyValue(rowName,family,Bytes.toBytes("4"),ts1 + 2,value));
+    log.append(info,getWalKeyImpl(ts1 + 2,scopes),edit,true);
+    log.sync();
+    log.shutdown();
+    walfactory.shutdown();
+    LOG.info("Closed WAL " + log.toString());
+    WALInputFormat input=new WALInputFormat();
+    Configuration jobConf=new Configuration(conf);
+    jobConf.set("mapreduce.input.fileinputformat.inputdir",logDir.toString());
+    jobConf.setLong(WALInputFormat.END_TIME_KEY,ts);
+    List<InputSplit> splits=input.getSplits(MapreduceTestingShim.createJobContext(jobConf));
+    assertEquals(1,splits.size());
+    testSplit(splits.get(0),Bytes.toBytes("1"));
+    jobConf.setLong(WALInputFormat.START_TIME_KEY,ts + 1);
+    jobConf.setLong(WALInputFormat.END_TIME_KEY,ts1 + 1);
+    splits=input.getSplits(MapreduceTestingShim.createJobContext(jobConf));
+    assertEquals(2,splits.size());
+    testSplit(splits.get(0),Bytes.toBytes("2"));
+    testSplit(splits.get(1),Bytes.toBytes("3"));
+  }
+  /** 
+ * Test basic functionality
+ * @throws Exception
+ */
+  @Test public void testWALRecordReader() throws Exception {
+    final WALFactory walfactory=new WALFactory(conf,getName());
+    WAL log=walfactory.getWAL(info);
+    byte[] value=Bytes.toBytes("value");
+    WALEdit edit=new WALEdit();
+    edit.add(new KeyValue(rowName,family,Bytes.toBytes("1"),System.currentTimeMillis(),value));
+    long txid=log.append(info,getWalKeyImpl(System.currentTimeMillis(),scopes),edit,true);
+    log.sync(txid);
+    Thread.sleep(1);
+    long secondTs=System.currentTimeMillis();
+    log.rollWriter();
+    edit=new WALEdit();
+    edit.add(new KeyValue(rowName,family,Bytes.toBytes("2"),System.currentTimeMillis(),value));
+    txid=log.append(info,getWalKeyImpl(System.currentTimeMillis(),scopes),edit,true);
+    log.sync(txid);
+    log.shutdown();
+    walfactory.shutdown();
+    long thirdTs=System.currentTimeMillis();
+    WALInputFormat input=new WALInputFormat();
+    Configuration jobConf=new Configuration(conf);
+    jobConf.set("mapreduce.input.fileinputformat.inputdir",logDir.toString());
+    List<InputSplit> splits=input.getSplits(MapreduceTestingShim.createJobContext(jobConf));
+    assertEquals(2,splits.size());
+    testSplit(splits.get(0),Bytes.toBytes("1"));
+    testSplit(splits.get(1),Bytes.toBytes("2"));
+    jobConf.setLong(WALInputFormat.END_TIME_KEY,secondTs - 1);
+    splits=input.getSplits(MapreduceTestingShim.createJobContext(jobConf));
+    assertEquals(1,splits.size());
+    testSplit(splits.get(0),Bytes.toBytes("1"));
+    jobConf.setLong(WALInputFormat.END_TIME_KEY,Long.MAX_VALUE);
+    jobConf.setLong(WALInputFormat.START_TIME_KEY,thirdTs);
+    splits=input.getSplits(MapreduceTestingShim.createJobContext(jobConf));
+    assertEquals(2,splits.size());
+    testSplit(splits.get(0));
+    testSplit(splits.get(1));
+  }
+  protected WALKeyImpl getWalKeyImpl(  final long time,  NavigableMap<byte[],Integer> scopes){
+    return new WALKeyImpl(info.getEncodedNameAsBytes(),tableName,time,mvcc,scopes);
+  }
+  private WALRecordReader<WALKey> getReader(){
+    return new WALKeyRecordReader();
+  }
+  /** 
+ * Create a new reader from the split, and match the edits against the passed columns.
+ */
+  private void testSplit(  InputSplit split,  byte[]... columns) throws Exception {
+    WALRecordReader<WALKey> reader=getReader();
+    reader.initialize(split,MapReduceTestUtil.createDummyMapTaskAttemptContext(conf));
+    for (    byte[] column : columns) {
+      assertTrue(reader.nextKeyValue());
+      Cell cell=reader.getCurrentValue().getCells().get(0);
+      if (!Bytes.equals(column,0,column.length,cell.getQualifierArray(),cell.getQualifierOffset(),cell.getQualifierLength())) {
+        assertTrue("expected [" + Bytes.toString(column) + "], actual ["+ Bytes.toString(cell.getQualifierArray(),cell.getQualifierOffset(),cell.getQualifierLength())+ "]",false);
+      }
+    }
+    assertFalse(reader.nextKeyValue());
+    reader.close();
+  }
+}

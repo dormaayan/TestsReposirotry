@@ -1,0 +1,96 @@
+@Category({ZKTests.class,MediumTests.class}) public class TestReadOnlyZKClient {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestReadOnlyZKClient.class);
+  private static HBaseZKTestingUtility UTIL=new HBaseZKTestingUtility();
+  private static int PORT;
+  private static String PATH="/test";
+  private static byte[] DATA;
+  private static int CHILDREN=5;
+  private static ReadOnlyZKClient RO_ZK;
+  @BeforeClass public static void setUp() throws Exception {
+    PORT=UTIL.startMiniZKCluster().getClientPort();
+    ZooKeeper zk=ZooKeeperHelper.getConnectedZooKeeper("localhost:" + PORT,10000);
+    DATA=new byte[10];
+    ThreadLocalRandom.current().nextBytes(DATA);
+    zk.create(PATH,DATA,ZooDefs.Ids.OPEN_ACL_UNSAFE,CreateMode.PERSISTENT);
+    for (int i=0; i < CHILDREN; i++) {
+      zk.create(PATH + "/c" + i,new byte[0],ZooDefs.Ids.OPEN_ACL_UNSAFE,CreateMode.PERSISTENT);
+    }
+    zk.close();
+    Configuration conf=UTIL.getConfiguration();
+    conf.set(HConstants.ZOOKEEPER_QUORUM,"localhost:" + PORT);
+    conf.setInt(ReadOnlyZKClient.RECOVERY_RETRY,3);
+    conf.setInt(ReadOnlyZKClient.RECOVERY_RETRY_INTERVAL_MILLIS,100);
+    conf.setInt(ReadOnlyZKClient.KEEPALIVE_MILLIS,3000);
+    RO_ZK=new ReadOnlyZKClient(conf);
+    assertNull(RO_ZK.zookeeper);
+  }
+  @AfterClass public static void tearDown() throws IOException {
+    RO_ZK.close();
+    UTIL.shutdownMiniZKCluster();
+    UTIL.cleanupTestDir();
+  }
+  private void waitForIdleConnectionClosed() throws Exception {
+    UTIL.waitFor(10000,new ExplainingPredicate<Exception>(){
+      @Override public boolean evaluate() throws Exception {
+        return RO_ZK.zookeeper == null;
+      }
+      @Override public String explainFailure() throws Exception {
+        return "Connection to zookeeper is still alive";
+      }
+    }
+);
+  }
+  @Test public void testGetAndExists() throws Exception {
+    assertArrayEquals(DATA,RO_ZK.get(PATH).get());
+    assertEquals(CHILDREN,RO_ZK.exists(PATH).get().getNumChildren());
+    assertNotNull(RO_ZK.zookeeper);
+    waitForIdleConnectionClosed();
+  }
+  @Test public void testNoNode() throws InterruptedException, ExecutionException {
+    String pathNotExists=PATH + "_whatever";
+    try {
+      RO_ZK.get(pathNotExists).get();
+      fail("should fail because of " + pathNotExists + " does not exist");
+    }
+ catch (    ExecutionException e) {
+      assertThat(e.getCause(),instanceOf(KeeperException.class));
+      KeeperException ke=(KeeperException)e.getCause();
+      assertEquals(Code.NONODE,ke.code());
+      assertEquals(pathNotExists,ke.getPath());
+    }
+    assertNull(RO_ZK.exists(pathNotExists).get());
+  }
+  @Test public void testSessionExpire() throws Exception {
+    assertArrayEquals(DATA,RO_ZK.get(PATH).get());
+    ZooKeeper zk=RO_ZK.zookeeper;
+    long sessionId=zk.getSessionId();
+    UTIL.getZkCluster().getZooKeeperServers().get(0).closeSession(sessionId);
+    assertSame(zk,RO_ZK.zookeeper);
+    byte[] got=RO_ZK.get(PATH).get();
+    assertArrayEquals(DATA,got);
+    assertNotNull(RO_ZK.zookeeper);
+    assertNotSame(zk,RO_ZK.zookeeper);
+    assertNotEquals(sessionId,RO_ZK.zookeeper.getSessionId());
+  }
+  @Test public void testNotCloseZkWhenPending() throws Exception {
+    ZooKeeper mockedZK=mock(ZooKeeper.class);
+    Exchanger<AsyncCallback.DataCallback> exchanger=new Exchanger<>();
+    doAnswer(i -> {
+      exchanger.exchange(i.getArgument(2));
+      return null;
+    }
+).when(mockedZK).getData(anyString(),anyBoolean(),any(AsyncCallback.DataCallback.class),any());
+    doAnswer(i -> null).when(mockedZK).close();
+    when(mockedZK.getState()).thenReturn(ZooKeeper.States.CONNECTED);
+    RO_ZK.zookeeper=mockedZK;
+    CompletableFuture<byte[]> future=RO_ZK.get(PATH);
+    AsyncCallback.DataCallback callback=exchanger.exchange(null);
+    Thread.sleep(6000);
+    assertNotNull(RO_ZK.zookeeper);
+    verify(mockedZK,never()).close();
+    callback.processResult(Code.OK.intValue(),PATH,null,DATA,null);
+    assertArrayEquals(DATA,future.get());
+    waitForIdleConnectionClosed();
+    verify(mockedZK,times(1)).close();
+  }
+}

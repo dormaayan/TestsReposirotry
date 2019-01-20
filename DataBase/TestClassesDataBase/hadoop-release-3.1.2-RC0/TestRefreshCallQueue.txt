@@ -1,0 +1,94 @@
+public class TestRefreshCallQueue {
+  private MiniDFSCluster cluster;
+  private Configuration config;
+  static int mockQueueConstructions;
+  static int mockQueuePuts;
+  private int nnPort=0;
+  private void setUp(  Class<?> queueClass) throws IOException {
+    int portRetries=5;
+    Random rand=new Random();
+    for (; portRetries > 0; --portRetries) {
+      nnPort=30000 + rand.nextInt(30000);
+      config=new Configuration();
+      String callQueueConfigKey="ipc." + nnPort + ".callqueue.impl";
+      config.setClass(callQueueConfigKey,queueClass,BlockingQueue.class);
+      config.set("hadoop.security.authorization","true");
+      FileSystem.setDefaultUri(config,"hdfs://localhost:" + nnPort);
+      try {
+        cluster=new MiniDFSCluster.Builder(config).nameNodePort(nnPort).build();
+        cluster.waitActive();
+        break;
+      }
+ catch (      BindException be) {
+      }
+    }
+    if (portRetries == 0) {
+      fail("Failed to pick an ephemeral port for the NameNode RPC server.");
+    }
+  }
+  @After public void tearDown() throws IOException {
+    if (cluster != null) {
+      cluster.shutdown();
+      cluster=null;
+    }
+  }
+@SuppressWarnings("serial") public static class MockCallQueue<E> extends LinkedBlockingQueue<E> {
+    public MockCallQueue(    int levels,    int cap,    String ns,    Configuration conf){
+      super(cap);
+      mockQueueConstructions++;
+    }
+    public void put(    E e) throws InterruptedException {
+      super.put(e);
+      mockQueuePuts++;
+    }
+  }
+  public boolean canPutInMockQueue() throws IOException {
+    FileSystem fs=FileSystem.get(config);
+    int putsBefore=mockQueuePuts;
+    fs.exists(new Path("/"));
+    fs.close();
+    return mockQueuePuts > putsBefore;
+  }
+  @Test public void testRefresh() throws Exception {
+    mockQueueConstructions=0;
+    mockQueuePuts=0;
+    setUp(MockCallQueue.class);
+    assertTrue("Mock queue should have been constructed",mockQueueConstructions > 0);
+    assertTrue("Puts are routed through MockQueue",canPutInMockQueue());
+    int lastMockQueueConstructions=mockQueueConstructions;
+    DFSAdmin admin=new DFSAdmin(config);
+    String[] args=new String[]{"-refreshCallQueue"};
+    int exitCode=admin.run(args);
+    assertEquals("DFSAdmin should return 0",0,exitCode);
+    assertEquals("Mock queue should have no additional constructions",lastMockQueueConstructions,mockQueueConstructions);
+    try {
+      assertFalse("Puts are routed through LBQ instead of MockQueue",canPutInMockQueue());
+    }
+ catch (    IOException ioe) {
+      fail("Could not put into queue at all");
+    }
+  }
+  @Test public void testRefreshCallQueueWithFairCallQueue() throws Exception {
+    setUp(FairCallQueue.class);
+    boolean oldValue=DefaultMetricsSystem.inMiniClusterMode();
+    DefaultMetricsSystem.setMiniClusterMode(false);
+    int serviceHandlerCount=config.getInt(DFSConfigKeys.DFS_NAMENODE_SERVICE_HANDLER_COUNT_KEY,DFSConfigKeys.DFS_NAMENODE_SERVICE_HANDLER_COUNT_DEFAULT);
+    NameNodeRpcServer rpcServer=(NameNodeRpcServer)cluster.getNameNodeRpc();
+    assertEquals(CommonConfigurationKeys.IPC_SERVER_HANDLER_QUEUE_SIZE_DEFAULT * serviceHandlerCount,rpcServer.getClientRpcServer().getMaxQueueSize());
+    config.setInt(CommonConfigurationKeys.IPC_SERVER_HANDLER_QUEUE_SIZE_KEY,150);
+    try {
+      rpcServer.getClientRpcServer().refreshCallQueue(config);
+    }
+ catch (    Exception e) {
+      Throwable cause=e.getCause();
+      if ((cause instanceof MetricsException) && cause.getMessage().contains("Metrics source DecayRpcSchedulerMetrics2.ipc." + nnPort + " already exists!")) {
+        fail("DecayRpcScheduler metrics should be unregistered before" + " reregister");
+      }
+      throw e;
+    }
+ finally {
+      DefaultMetricsSystem.setMiniClusterMode(oldValue);
+    }
+    assertEquals(150 * serviceHandlerCount,rpcServer.getClientRpcServer().getMaxQueueSize());
+  }
+}

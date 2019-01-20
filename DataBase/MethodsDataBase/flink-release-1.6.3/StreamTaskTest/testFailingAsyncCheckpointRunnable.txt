@@ -1,0 +1,49 @@
+/** 
+ * Tests that in case of a failing AsyncCheckpointRunnable all operator snapshot results are cancelled and all non partitioned state handles are discarded.
+ */
+@Test public void testFailingAsyncCheckpointRunnable() throws Exception {
+  final long checkpointId=42L;
+  final long timestamp=1L;
+  MockEnvironment mockEnvironment=new MockEnvironmentBuilder().build();
+  StreamTask<?,?> streamTask=spy(new EmptyStreamTask(mockEnvironment));
+  CheckpointMetaData checkpointMetaData=new CheckpointMetaData(checkpointId,timestamp);
+  StreamOperator<?> streamOperator1=mock(StreamOperator.class);
+  StreamOperator<?> streamOperator2=mock(StreamOperator.class);
+  StreamOperator<?> streamOperator3=mock(StreamOperator.class);
+  OperatorSnapshotFutures operatorSnapshotResult1=mock(OperatorSnapshotFutures.class);
+  OperatorSnapshotFutures operatorSnapshotResult2=mock(OperatorSnapshotFutures.class);
+  OperatorSnapshotFutures operatorSnapshotResult3=mock(OperatorSnapshotFutures.class);
+  RunnableFuture<SnapshotResult<OperatorStateHandle>> failingFuture=mock(RunnableFuture.class);
+  when(failingFuture.get()).thenThrow(new ExecutionException(new Exception("Test exception")));
+  when(operatorSnapshotResult3.getOperatorStateRawFuture()).thenReturn(failingFuture);
+  when(streamOperator1.snapshotState(anyLong(),anyLong(),any(CheckpointOptions.class),any(CheckpointStreamFactory.class))).thenReturn(operatorSnapshotResult1);
+  when(streamOperator2.snapshotState(anyLong(),anyLong(),any(CheckpointOptions.class),any(CheckpointStreamFactory.class))).thenReturn(operatorSnapshotResult2);
+  when(streamOperator3.snapshotState(anyLong(),anyLong(),any(CheckpointOptions.class),any(CheckpointStreamFactory.class))).thenReturn(operatorSnapshotResult3);
+  OperatorID operatorID1=new OperatorID();
+  OperatorID operatorID2=new OperatorID();
+  OperatorID operatorID3=new OperatorID();
+  when(streamOperator1.getOperatorID()).thenReturn(operatorID1);
+  when(streamOperator2.getOperatorID()).thenReturn(operatorID2);
+  when(streamOperator3.getOperatorID()).thenReturn(operatorID3);
+  StreamOperator<?>[] streamOperators={streamOperator1,streamOperator2,streamOperator3};
+  OperatorChain<Void,AbstractStreamOperator<Void>> operatorChain=mock(OperatorChain.class);
+  when(operatorChain.getAllOperators()).thenReturn(streamOperators);
+  Whitebox.setInternalState(streamTask,"isRunning",true);
+  Whitebox.setInternalState(streamTask,"lock",new Object());
+  Whitebox.setInternalState(streamTask,"operatorChain",operatorChain);
+  Whitebox.setInternalState(streamTask,"cancelables",new CloseableRegistry());
+  Whitebox.setInternalState(streamTask,"asyncOperationsThreadPool",new DirectExecutorService());
+  Whitebox.setInternalState(streamTask,"configuration",new StreamConfig(new Configuration()));
+  Whitebox.setInternalState(streamTask,"checkpointStorage",new MemoryBackendCheckpointStorage(new JobID(),null,null,Integer.MAX_VALUE));
+  CheckpointExceptionHandlerFactory checkpointExceptionHandlerFactory=new CheckpointExceptionHandlerFactory();
+  CheckpointExceptionHandler checkpointExceptionHandler=checkpointExceptionHandlerFactory.createCheckpointExceptionHandler(true,mockEnvironment);
+  Whitebox.setInternalState(streamTask,"synchronousCheckpointExceptionHandler",checkpointExceptionHandler);
+  StreamTask.AsyncCheckpointExceptionHandler asyncCheckpointExceptionHandler=new StreamTask.AsyncCheckpointExceptionHandler(streamTask);
+  Whitebox.setInternalState(streamTask,"asynchronousCheckpointExceptionHandler",asyncCheckpointExceptionHandler);
+  mockEnvironment.setExpectedExternalFailureCause(Throwable.class);
+  streamTask.triggerCheckpoint(checkpointMetaData,CheckpointOptions.forCheckpointWithDefaultLocation());
+  verify(streamTask).handleAsyncException(anyString(),any(Throwable.class));
+  verify(operatorSnapshotResult1).cancel();
+  verify(operatorSnapshotResult2).cancel();
+  verify(operatorSnapshotResult3).cancel();
+}

@@ -1,0 +1,61 @@
+private static class DummyFlinkKinesisProducer<T> extends FlinkKinesisProducer<T> {
+  private static final long serialVersionUID=-1212425318784651817L;
+  private static final String DUMMY_STREAM="dummy-stream";
+  private static final String DUMMY_PARTITION="dummy-partition";
+  private transient KinesisProducer mockProducer;
+  private List<SettableFuture<UserRecordResult>> pendingRecordFutures=new LinkedList<>();
+  private transient MultiShotLatch flushLatch;
+  DummyFlinkKinesisProducer(  SerializationSchema<T> schema){
+    super(schema,TestUtils.getStandardProperties());
+    setDefaultStream(DUMMY_STREAM);
+    setDefaultPartition(DUMMY_PARTITION);
+    setFailOnError(true);
+    this.mockProducer=mock(KinesisProducer.class);
+    when(mockProducer.addUserRecord(anyString(),anyString(),anyString(),any(ByteBuffer.class))).thenAnswer(new Answer<Object>(){
+      @Override public Object answer(      InvocationOnMock invocationOnMock) throws Throwable {
+        SettableFuture<UserRecordResult> future=SettableFuture.create();
+        pendingRecordFutures.add(future);
+        return future;
+      }
+    }
+);
+    when(mockProducer.getOutstandingRecordsCount()).thenAnswer(new Answer<Object>(){
+      @Override public Object answer(      InvocationOnMock invocationOnMock) throws Throwable {
+        return getNumPendingRecordFutures();
+      }
+    }
+);
+    doAnswer(new Answer(){
+      @Override public Object answer(      InvocationOnMock invocationOnMock) throws Throwable {
+        flushLatch.trigger();
+        return null;
+      }
+    }
+).when(mockProducer).flush();
+    this.flushLatch=new MultiShotLatch();
+  }
+  @Override protected KinesisProducer getKinesisProducer(  KinesisProducerConfiguration producerConfig){
+    return mockProducer;
+  }
+  @Override public void snapshotState(  FunctionSnapshotContext context) throws Exception {
+    super.snapshotState(context);
+    if (mockProducer.getOutstandingRecordsCount() > 0) {
+      throw new RuntimeException("Flushing is enabled; snapshots should be blocked until all pending records are flushed");
+    }
+  }
+  List<SettableFuture<UserRecordResult>> getPendingRecordFutures(){
+    return pendingRecordFutures;
+  }
+  void waitUntilFlushStarted() throws Exception {
+    flushLatch.await();
+  }
+  private int getNumPendingRecordFutures(){
+    int numPending=0;
+    for (    SettableFuture<UserRecordResult> future : pendingRecordFutures) {
+      if (!future.isDone()) {
+        numPending++;
+      }
+    }
+    return numPending;
+  }
+}

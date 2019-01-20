@@ -1,0 +1,59 @@
+public class ThrottlingExceptionRoutePolicyTest extends ContextTestSupport {
+  private static Logger log=LoggerFactory.getLogger(ThrottlingExceptionRoutePolicyTest.class);
+  private String url="seda:foo?concurrentConsumers=2";
+  private MockEndpoint result;
+  private int size=100;
+  @Before public void setUp() throws Exception {
+    super.setUp();
+    this.setUseRouteBuilder(true);
+    result=getMockEndpoint("mock:result");
+    context.getShutdownStrategy().setTimeout(1);
+  }
+  @Test public void testThrottlingRoutePolicyClosed() throws Exception {
+    result.expectedMinimumMessageCount(size);
+    for (int i=0; i < size; i++) {
+      template.sendBody(url,"Message " + i);
+      Thread.sleep(3);
+    }
+    assertMockEndpointsSatisfied();
+  }
+  @Test public void testOpenCircuitToPreventMessageThree() throws Exception {
+    result.reset();
+    result.expectedMessageCount(2);
+    List<String> bodies=Arrays.asList("Message One","Message Two");
+    result.expectedBodiesReceivedInAnyOrder(bodies);
+    result.whenAnyExchangeReceived(new Processor(){
+      @Override public void process(      Exchange exchange) throws Exception {
+        String msg=exchange.getIn().getBody(String.class);
+        exchange.setException(new ThrottlingException(msg));
+      }
+    }
+);
+    template.sendBody(url,"Message One");
+    template.sendBody(url,"Message Two");
+    final ServiceSupport consumer=(ServiceSupport)context.getRoute("foo").getConsumer();
+    await().atMost(2,TimeUnit.SECONDS).until(consumer::isSuspended);
+    log.debug("sending message three");
+    template.sendBody(url,"Message Three");
+    result.setResultMinimumWaitTime(500);
+    assertMockEndpointsSatisfied();
+  }
+  @Override protected RouteBuilder createRouteBuilder() throws Exception {
+    return new RouteBuilder(){
+      @Override public void configure() throws Exception {
+        int threshold=2;
+        long failureWindow=30;
+        long halfOpenAfter=1000;
+        ThrottlingExceptionRoutePolicy policy=new ThrottlingExceptionRoutePolicy(threshold,failureWindow,halfOpenAfter,null);
+        policy.setHalfOpenHandler(new NeverCloseHandler());
+        from(url).routeId("foo").routePolicy(policy).log("${body}").to("log:foo?groupSize=10").to("mock:result");
+      }
+    }
+;
+  }
+public class NeverCloseHandler implements ThrottlingExceptionHalfOpenHandler {
+    @Override public boolean isReadyToBeClosed(){
+      return false;
+    }
+  }
+}

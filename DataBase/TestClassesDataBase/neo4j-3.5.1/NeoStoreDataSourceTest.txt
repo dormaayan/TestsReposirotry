@@ -1,0 +1,150 @@
+public class NeoStoreDataSourceTest {
+  @Rule public EphemeralFileSystemRule fs=new EphemeralFileSystemRule();
+  @Rule public TestDirectory dir=TestDirectory.testDirectory(fs.get());
+  @Rule public NeoStoreDataSourceRule dsRule=new NeoStoreDataSourceRule();
+  @Rule public PageCacheRule pageCacheRule=new PageCacheRule();
+  @Test public void databaseHealthShouldBeHealedOnStart() throws Throwable {
+    NeoStoreDataSource theDataSource=null;
+    try {
+      DatabaseHealth databaseHealth=new DatabaseHealth(mock(DatabasePanicEventGenerator.class),NullLogProvider.getInstance().getLog(DatabaseHealth.class));
+      Dependencies dependencies=new Dependencies();
+      dependencies.satisfyDependency(databaseHealth);
+      theDataSource=dsRule.getDataSource(dir.databaseLayout(),fs.get(),pageCacheRule.getPageCache(fs.get()),dependencies);
+      databaseHealth.panic(new Throwable());
+      theDataSource.start();
+      databaseHealth.assertHealthy(Throwable.class);
+    }
+  finally {
+      if (theDataSource != null) {
+        theDataSource.stop();
+        theDataSource.shutdown();
+      }
+    }
+  }
+  @Test public void flushOfThePageCacheHappensOnlyOnceDuringShutdown() throws Throwable {
+    PageCache pageCache=spy(pageCacheRule.getPageCache(fs.get()));
+    NeoStoreDataSource ds=dsRule.getDataSource(dir.databaseLayout(),fs.get(),pageCache);
+    ds.start();
+    verify(pageCache,never()).flushAndForce();
+    verify(pageCache,never()).flushAndForce(any(IOLimiter.class));
+    ds.stop();
+    ds.shutdown();
+    verify(pageCache).flushAndForce(IOLimiter.UNLIMITED);
+  }
+  @Test public void flushOfThePageCacheOnShutdownHappensIfTheDbIsHealthy() throws Throwable {
+    PageCache pageCache=spy(pageCacheRule.getPageCache(fs.get()));
+    NeoStoreDataSource ds=dsRule.getDataSource(dir.databaseLayout(),fs.get(),pageCache);
+    ds.start();
+    verify(pageCache,never()).flushAndForce();
+    ds.stop();
+    ds.shutdown();
+    verify(pageCache).flushAndForce(IOLimiter.UNLIMITED);
+  }
+  @Test public void flushOfThePageCacheOnShutdownDoesNotHappenIfTheDbIsUnhealthy() throws Throwable {
+    DatabaseHealth health=mock(DatabaseHealth.class);
+    when(health.isHealthy()).thenReturn(false);
+    PageCache pageCache=spy(pageCacheRule.getPageCache(fs.get()));
+    Dependencies dependencies=new Dependencies();
+    dependencies.satisfyDependency(health);
+    NeoStoreDataSource ds=dsRule.getDataSource(dir.databaseLayout(),fs.get(),pageCache,dependencies);
+    ds.start();
+    verify(pageCache,never()).flushAndForce();
+    ds.stop();
+    ds.shutdown();
+    verify(pageCache,never()).flushAndForce(IOLimiter.UNLIMITED);
+  }
+  @Test public void shouldLogCorrectTransactionLogDiagnosticsForNoTransactionLogs(){
+    NeoStoreDataSource dataSource=neoStoreDataSourceWithLogFilesContainingLowestTxId(noLogs());
+    AssertableLogProvider logProvider=new AssertableLogProvider();
+    Logger logger=logProvider.getLog(getClass()).infoLogger();
+    DataSourceDiagnostics.TRANSACTION_RANGE.dump(dataSource,logger);
+    logProvider.assertContainsMessageContaining("No transactions");
+  }
+  @Test public void shouldLogCorrectTransactionLogDiagnosticsForTransactionsInOldestLog() throws Exception {
+    long logVersion=2;
+    long prevLogLastTxId=45;
+    NeoStoreDataSource dataSource=neoStoreDataSourceWithLogFilesContainingLowestTxId(logWithTransactions(logVersion,prevLogLastTxId));
+    AssertableLogProvider logProvider=new AssertableLogProvider();
+    Logger logger=logProvider.getLog(getClass()).infoLogger();
+    DataSourceDiagnostics.TRANSACTION_RANGE.dump(dataSource,logger);
+    logProvider.assertContainsMessageContaining("transaction " + (prevLogLastTxId + 1));
+    logProvider.assertContainsMessageContaining("version " + logVersion);
+  }
+  @Test public void shouldLogCorrectTransactionLogDiagnosticsForTransactionsInSecondOldestLog() throws Exception {
+    long logVersion=2;
+    long prevLogLastTxId=45;
+    NeoStoreDataSource dataSource=neoStoreDataSourceWithLogFilesContainingLowestTxId(logWithTransactionsInNextToOldestLog(logVersion,prevLogLastTxId));
+    AssertableLogProvider logProvider=new AssertableLogProvider();
+    Logger logger=logProvider.getLog(getClass()).infoLogger();
+    DataSourceDiagnostics.TRANSACTION_RANGE.dump(dataSource,logger);
+    logProvider.assertContainsMessageContaining("transaction " + (prevLogLastTxId + 1));
+    logProvider.assertContainsMessageContaining("version " + (logVersion + 1));
+  }
+  @Test public void logModuleSetUpError(){
+    Config config=Config.defaults();
+    IdGeneratorFactory idGeneratorFactory=mock(IdGeneratorFactory.class);
+    Throwable openStoresError=new RuntimeException("Can't set up modules");
+    doThrow(openStoresError).when(idGeneratorFactory).create(any(File.class),anyLong(),anyBoolean());
+    CommunityIdTypeConfigurationProvider idTypeConfigurationProvider=new CommunityIdTypeConfigurationProvider();
+    AssertableLogProvider logProvider=new AssertableLogProvider();
+    SimpleLogService logService=new SimpleLogService(logProvider,logProvider);
+    PageCache pageCache=pageCacheRule.getPageCache(fs.get());
+    Dependencies dependencies=new Dependencies();
+    dependencies.satisfyDependencies(idGeneratorFactory,idTypeConfigurationProvider,config,logService);
+    NeoStoreDataSource dataSource=dsRule.getDataSource(dir.databaseLayout(),fs.get(),pageCache,dependencies);
+    try {
+      dataSource.start();
+      fail("Exception expected");
+    }
+ catch (    Exception e) {
+      assertEquals(openStoresError,e);
+    }
+    logProvider.assertAtLeastOnce(inLog(NeoStoreDataSource.class).warn(equalTo("Exception occurred while setting up store modules. Attempting to close things down."),equalTo(openStoresError)));
+  }
+  @Test public void shouldAlwaysShutdownLifeEvenWhenCheckPointingFails() throws Exception {
+    FileSystemAbstraction fs=this.fs.get();
+    PageCache pageCache=pageCacheRule.getPageCache(fs);
+    DatabaseHealth databaseHealth=mock(DatabaseHealth.class);
+    when(databaseHealth.isHealthy()).thenReturn(true);
+    IOException ex=new IOException("boom!");
+    doThrow(ex).when(databaseHealth).assertHealthy(IOException.class);
+    Dependencies dependencies=new Dependencies();
+    dependencies.satisfyDependencies(databaseHealth);
+    NeoStoreDataSource dataSource=dsRule.getDataSource(dir.databaseLayout(),fs,pageCache,dependencies);
+    dataSource.start();
+    try {
+      dataSource.stop();
+      fail("it should have thrown");
+    }
+ catch (    LifecycleException e) {
+      assertEquals(ex,e.getCause());
+    }
+  }
+  private static NeoStoreDataSource neoStoreDataSourceWithLogFilesContainingLowestTxId(  LogFiles files){
+    DependencyResolver resolver=mock(DependencyResolver.class);
+    when(resolver.resolveDependency(LogFiles.class)).thenReturn(files);
+    NeoStoreDataSource dataSource=mock(NeoStoreDataSource.class);
+    when(dataSource.getDependencyResolver()).thenReturn(resolver);
+    return dataSource;
+  }
+  private static LogFiles noLogs(){
+    LogFiles files=mock(TransactionLogFiles.class);
+    when(files.getLowestLogVersion()).thenReturn(-1L);
+    return files;
+  }
+  private static LogFiles logWithTransactions(  long logVersion,  long headerTxId) throws IOException {
+    LogFiles files=mock(TransactionLogFiles.class);
+    when(files.getLowestLogVersion()).thenReturn(logVersion);
+    when(files.hasAnyEntries(logVersion)).thenReturn(true);
+    when(files.versionExists(logVersion)).thenReturn(true);
+    when(files.extractHeader(logVersion)).thenReturn(new LogHeader(LogEntryVersion.CURRENT.byteCode(),logVersion,headerTxId));
+    return files;
+  }
+  private static LogFiles logWithTransactionsInNextToOldestLog(  long logVersion,  long prevLogLastTxId) throws IOException {
+    LogFiles files=logWithTransactions(logVersion + 1,prevLogLastTxId);
+    when(files.getLowestLogVersion()).thenReturn(logVersion);
+    when(files.hasAnyEntries(logVersion)).thenReturn(false);
+    when(files.versionExists(logVersion)).thenReturn(true);
+    return files;
+  }
+}

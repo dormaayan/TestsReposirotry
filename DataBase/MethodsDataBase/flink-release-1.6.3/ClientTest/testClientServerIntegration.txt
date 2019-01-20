@@ -1,0 +1,141 @@
+/** 
+ * Tests multiple clients querying multiple servers until 100k queries have been processed. At this point, the client is shut down and its verified that all ongoing requests are failed.
+ */
+@Test public void testClientServerIntegration() throws Throwable {
+  final int numServers=2;
+  final int numServerEventLoopThreads=2;
+  final int numServerQueryThreads=2;
+  final int numClientEventLoopThreads=4;
+  final int numClientsTasks=8;
+  final int batchSize=16;
+  final int numKeyGroups=1;
+  AbstractStateBackend abstractBackend=new MemoryStateBackend();
+  KvStateRegistry dummyRegistry=new KvStateRegistry();
+  DummyEnvironment dummyEnv=new DummyEnvironment("test",1,0);
+  dummyEnv.setKvStateRegistry(dummyRegistry);
+  AbstractKeyedStateBackend<Integer> backend=abstractBackend.createKeyedStateBackend(dummyEnv,new JobID(),"test_op",IntSerializer.INSTANCE,numKeyGroups,new KeyGroupRange(0,0),dummyRegistry.createTaskRegistry(new JobID(),new JobVertexID()));
+  final FiniteDuration timeout=new FiniteDuration(10,TimeUnit.SECONDS);
+  AtomicKvStateRequestStats clientStats=new AtomicKvStateRequestStats();
+  final MessageSerializer<KvStateInternalRequest,KvStateResponse> serializer=new MessageSerializer<>(new KvStateInternalRequest.KvStateInternalRequestDeserializer(),new KvStateResponse.KvStateResponseDeserializer());
+  Client<KvStateInternalRequest,KvStateResponse> client=null;
+  ExecutorService clientTaskExecutor=null;
+  final KvStateServerImpl[] server=new KvStateServerImpl[numServers];
+  try {
+    client=new Client<>("Test Client",numClientEventLoopThreads,serializer,clientStats);
+    clientTaskExecutor=Executors.newFixedThreadPool(numClientsTasks);
+    ValueStateDescriptor<Integer> desc=new ValueStateDescriptor<>("any",IntSerializer.INSTANCE);
+    desc.setQueryable("any");
+    KvStateRegistry[] registry=new KvStateRegistry[numServers];
+    AtomicKvStateRequestStats[] serverStats=new AtomicKvStateRequestStats[numServers];
+    final KvStateID[] ids=new KvStateID[numServers];
+    for (int i=0; i < numServers; i++) {
+      registry[i]=new KvStateRegistry();
+      serverStats[i]=new AtomicKvStateRequestStats();
+      server[i]=new KvStateServerImpl(InetAddress.getLocalHost(),Collections.singletonList(0).iterator(),numServerEventLoopThreads,numServerQueryThreads,registry[i],serverStats[i]);
+      server[i].start();
+      backend.setCurrentKey(1010 + i);
+      ValueState<Integer> state=backend.getPartitionedState(VoidNamespace.INSTANCE,VoidNamespaceSerializer.INSTANCE,desc);
+      state.update(201 + i);
+      InternalKvState<Integer,?,Integer> kvState=(InternalKvState<Integer,?,Integer>)state;
+      ids[i]=registry[i].registerKvState(new JobID(),new JobVertexID(),new KeyGroupRange(0,0),"any",kvState);
+    }
+    final Client<KvStateInternalRequest,KvStateResponse> finalClient=client;
+    Callable<Void> queryTask=() -> {
+      while (true) {
+        if (Thread.interrupted()) {
+          throw new InterruptedException();
+        }
+        List<Integer> random=new ArrayList<>();
+        for (int j=0; j < batchSize; j++) {
+          random.add(j);
+        }
+        Collections.shuffle(random);
+        List<CompletableFuture<KvStateResponse>> futures=new ArrayList<>(batchSize);
+        for (int j=0; j < batchSize; j++) {
+          int targetServer=random.get(j) % numServers;
+          byte[] serializedKeyAndNamespace=KvStateSerializer.serializeKeyAndNamespace(1010 + targetServer,IntSerializer.INSTANCE,VoidNamespace.INSTANCE,VoidNamespaceSerializer.INSTANCE);
+          KvStateInternalRequest request=new KvStateInternalRequest(ids[targetServer],serializedKeyAndNamespace);
+          futures.add(finalClient.sendRequest(server[targetServer].getServerAddress(),request));
+        }
+        for (int j=0; j < batchSize; j++) {
+          int targetServer=random.get(j) % numServers;
+          Future<KvStateResponse> future=futures.get(j);
+          byte[] buf=future.get(timeout.toMillis(),TimeUnit.MILLISECONDS).getContent();
+          int value=KvStateSerializer.deserializeValue(buf,IntSerializer.INSTANCE);
+          assertEquals(201L + targetServer,value);
+        }
+      }
+    }
+;
+    List<Future<Void>> taskFutures=new ArrayList<>();
+    for (int i=0; i < numClientsTasks; i++) {
+      taskFutures.add(clientTaskExecutor.submit(queryTask));
+    }
+    long numRequests;
+    while ((numRequests=clientStats.getNumRequests()) < 100_000L) {
+      Thread.sleep(100L);
+      LOG.info("Number of requests {}/100_000",numRequests);
+    }
+    try {
+      client.shutdown().get(10L,TimeUnit.SECONDS);
+    }
+ catch (    Exception e) {
+      e.printStackTrace();
+    }
+    Assert.assertTrue(client.isEventGroupShutdown());
+    for (    Future<Void> future : taskFutures) {
+      try {
+        future.get();
+        fail("Did not throw expected Exception after shut down");
+      }
+ catch (      ExecutionException t) {
+        if (t.getCause().getCause() instanceof ClosedChannelException || t.getCause().getCause() instanceof IllegalStateException) {
+        }
+ else {
+          t.printStackTrace();
+          fail("Failed with unexpected Exception type: " + t.getClass().getName());
+        }
+      }
+    }
+    assertEquals("Connection leak (client)",0L,clientStats.getNumConnections());
+    for (int i=0; i < numServers; i++) {
+      boolean success=false;
+      int numRetries=0;
+      while (!success) {
+        try {
+          assertEquals("Connection leak (server)",0L,serverStats[i].getNumConnections());
+          success=true;
+        }
+ catch (        Throwable t) {
+          if (numRetries < 10) {
+            LOG.info("Retrying connection leak check (server)");
+            Thread.sleep((numRetries + 1) * 50L);
+            numRetries++;
+          }
+ else {
+            throw t;
+          }
+        }
+      }
+    }
+  }
+  finally {
+    if (client != null) {
+      try {
+        client.shutdown().get(10L,TimeUnit.SECONDS);
+      }
+ catch (      Exception e) {
+        e.printStackTrace();
+      }
+      Assert.assertTrue(client.isEventGroupShutdown());
+    }
+    for (int i=0; i < numServers; i++) {
+      if (server[i] != null) {
+        server[i].shutdown();
+      }
+    }
+    if (clientTaskExecutor != null) {
+      clientTaskExecutor.shutdown();
+    }
+  }
+}

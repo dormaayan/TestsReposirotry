@@ -1,0 +1,91 @@
+/** 
+ * Test deleting a directory which is a descendant of a snapshottable directory. In the test we need to cover the following cases: <pre> 1. Delete current INodeFile/INodeDirectory without taking any snapshot. 2. Delete current INodeFile/INodeDirectory while snapshots have been taken  on ancestor(s). 3. Delete current INodeFileWithSnapshot. 4. Delete current INodeDirectoryWithSnapshot. </pre>
+ */
+@Test(timeout=300000) public void testDeleteCurrentFileDirectory() throws Exception {
+  Path deleteDir=new Path(subsub,"deleteDir");
+  Path deleteFile=new Path(deleteDir,"deleteFile");
+  Path noChangeDirParent=new Path(sub,"noChangeDirParent");
+  Path noChangeDir=new Path(noChangeDirParent,"noChangeDir");
+  Path noChangeFile=new Path(noChangeDir,"noChangeFile");
+  DFSTestUtil.createFile(hdfs,deleteFile,BLOCKSIZE,REPLICATION,seed);
+  DFSTestUtil.createFile(hdfs,noChangeFile,BLOCKSIZE,REPLICATION,seed);
+  Path metaChangeFile1=new Path(subsub,"metaChangeFile1");
+  DFSTestUtil.createFile(hdfs,metaChangeFile1,BLOCKSIZE,REPLICATION,seed);
+  Path metaChangeFile2=new Path(noChangeDir,"metaChangeFile2");
+  DFSTestUtil.createFile(hdfs,metaChangeFile2,BLOCKSIZE,REPLICATION,seed);
+  hdfs.setQuota(dir,Long.MAX_VALUE - 1,Long.MAX_VALUE - 1);
+  checkQuotaUsageComputation(dir,10,BLOCKSIZE * REPLICATION * 4);
+  hdfs.delete(deleteDir,true);
+  checkQuotaUsageComputation(dir,8,BLOCKSIZE * REPLICATION * 3);
+  SnapshotTestHelper.createSnapshot(hdfs,dir,"s0");
+  Path tempDir=new Path(dir,"tempdir");
+  Path tempFile=new Path(tempDir,"tempfile");
+  DFSTestUtil.createFile(hdfs,tempFile,BLOCKSIZE,REPLICATION,seed);
+  final INodeFile temp=TestSnapshotBlocksMap.assertBlockCollection(tempFile.toString(),1,fsdir,blockmanager);
+  BlockInfo[] blocks=temp.getBlocks();
+  hdfs.delete(tempDir,true);
+  checkQuotaUsageComputation(dir,8,BLOCKSIZE * REPLICATION * 3);
+  for (  BlockInfo b : blocks) {
+    assertEquals(INVALID_INODE_ID,b.getBlockCollectionId());
+  }
+  Path newFileAfterS0=new Path(subsub,"newFile");
+  DFSTestUtil.createFile(hdfs,newFileAfterS0,BLOCKSIZE,REPLICATION,seed);
+  hdfs.setReplication(metaChangeFile1,REPLICATION_1);
+  hdfs.setReplication(metaChangeFile2,REPLICATION_1);
+  SnapshotTestHelper.createSnapshot(hdfs,dir,"s1");
+  checkQuotaUsageComputation(dir,9L,BLOCKSIZE * REPLICATION * 4);
+  Snapshot snapshot0=fsdir.getINode(dir.toString()).asDirectory().getSnapshot(DFSUtil.string2Bytes("s0"));
+  Snapshot snapshot1=fsdir.getINode(dir.toString()).asDirectory().getSnapshot(DFSUtil.string2Bytes("s1"));
+  hdfs.delete(noChangeDirParent,true);
+  checkQuotaUsageComputation(dir,9L,BLOCKSIZE * REPLICATION * 4);
+  Path snapshotNoChangeDir=SnapshotTestHelper.getSnapshotPath(dir,"s1",sub.getName() + "/" + noChangeDirParent.getName()+ "/"+ noChangeDir.getName());
+  INodeDirectory snapshotNode=(INodeDirectory)fsdir.getINode(snapshotNoChangeDir.toString());
+  assertEquals(INodeDirectory.class,snapshotNode.getClass());
+  ReadOnlyList<INode> children=snapshotNode.getChildrenList(Snapshot.CURRENT_STATE_ID);
+  assertEquals(2,children.size());
+  INode noChangeFileSCopy=children.get(1);
+  assertEquals(noChangeFile.getName(),noChangeFileSCopy.getLocalName());
+  assertEquals(INodeFile.class,noChangeFileSCopy.getClass());
+  TestSnapshotBlocksMap.assertBlockCollection(new Path(snapshotNoChangeDir,noChangeFileSCopy.getLocalName()).toString(),1,fsdir,blockmanager);
+  INodeFile metaChangeFile2SCopy=children.get(0).asFile();
+  assertEquals(metaChangeFile2.getName(),metaChangeFile2SCopy.getLocalName());
+  assertTrue(metaChangeFile2SCopy.isWithSnapshot());
+  assertFalse(metaChangeFile2SCopy.isUnderConstruction());
+  TestSnapshotBlocksMap.assertBlockCollection(new Path(snapshotNoChangeDir,metaChangeFile2SCopy.getLocalName()).toString(),1,fsdir,blockmanager);
+  assertEquals(REPLICATION_1,metaChangeFile2SCopy.getFileReplication(Snapshot.CURRENT_STATE_ID));
+  assertEquals(REPLICATION_1,metaChangeFile2SCopy.getFileReplication(snapshot1.getId()));
+  assertEquals(REPLICATION,metaChangeFile2SCopy.getFileReplication(snapshot0.getId()));
+  Path newFile=new Path(sub,"newFile");
+  DFSTestUtil.createFile(hdfs,newFile,BLOCKSIZE,REPLICATION,seed);
+  final INodeFile newFileNode=TestSnapshotBlocksMap.assertBlockCollection(newFile.toString(),1,fsdir,blockmanager);
+  blocks=newFileNode.getBlocks();
+  checkQuotaUsageComputation(dir,10L,BLOCKSIZE * REPLICATION * 5);
+  hdfs.delete(sub,true);
+  checkQuotaUsageComputation(dir,9L,BLOCKSIZE * REPLICATION * 4);
+  for (  BlockInfo b : blocks) {
+    assertEquals(INVALID_INODE_ID,b.getBlockCollectionId());
+  }
+  Path snapshotSub=SnapshotTestHelper.getSnapshotPath(dir,"s1",sub.getName());
+  INodeDirectory snapshotNode4Sub=fsdir.getINode(snapshotSub.toString()).asDirectory();
+  assertTrue(snapshotNode4Sub.isWithSnapshot());
+  assertEquals(1,snapshotNode4Sub.getChildrenList(Snapshot.CURRENT_STATE_ID).size());
+  assertEquals(2,snapshotNode4Sub.getChildrenList(snapshot1.getId()).size());
+  INode snapshotNode4Subsub=snapshotNode4Sub.getChildrenList(Snapshot.CURRENT_STATE_ID).get(0);
+  assertTrue(snapshotNode4Subsub.asDirectory().isWithSnapshot());
+  assertTrue(snapshotNode4Sub == snapshotNode4Subsub.getParent());
+  INodeDirectory snapshotSubsubDir=(INodeDirectory)snapshotNode4Subsub;
+  children=snapshotSubsubDir.getChildrenList(Snapshot.CURRENT_STATE_ID);
+  assertEquals(2,children.size());
+  assertEquals(children.get(0).getLocalName(),metaChangeFile1.getName());
+  assertEquals(children.get(1).getLocalName(),newFileAfterS0.getName());
+  children=snapshotSubsubDir.getChildrenList(snapshot0.getId());
+  assertEquals(1,children.size());
+  INode child=children.get(0);
+  assertEquals(child.getLocalName(),metaChangeFile1.getName());
+  INodeFile metaChangeFile1SCopy=child.asFile();
+  assertTrue(metaChangeFile1SCopy.isWithSnapshot());
+  assertFalse(metaChangeFile1SCopy.isUnderConstruction());
+  assertEquals(REPLICATION_1,metaChangeFile1SCopy.getFileReplication(Snapshot.CURRENT_STATE_ID));
+  assertEquals(REPLICATION_1,metaChangeFile1SCopy.getFileReplication(snapshot1.getId()));
+  assertEquals(REPLICATION,metaChangeFile1SCopy.getFileReplication(snapshot0.getId()));
+}

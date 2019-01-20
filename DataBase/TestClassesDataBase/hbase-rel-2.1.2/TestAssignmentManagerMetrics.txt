@@ -1,0 +1,59 @@
+@Category({MasterTests.class,MediumTests.class}) public class TestAssignmentManagerMetrics {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestAssignmentManagerMetrics.class);
+  private static final Logger LOG=LoggerFactory.getLogger(TestAssignmentManagerMetrics.class);
+  private static final MetricsAssertHelper METRICS_HELPER=CompatibilityFactory.getInstance(MetricsAssertHelper.class);
+  private static MiniHBaseCluster CLUSTER;
+  private static HMaster MASTER;
+  private static HBaseTestingUtility TEST_UTIL=new HBaseTestingUtility();
+  private static final int MSG_INTERVAL=1000;
+  @Rule public TestName name=new TestName();
+  @BeforeClass public static void startCluster() throws Exception {
+    LOG.info("Starting cluster");
+    Configuration conf=TEST_UTIL.getConfiguration();
+    conf.setBoolean("hbase.table.sanity.checks",false);
+    conf.setInt(HConstants.METRICS_RIT_STUCK_WARNING_THRESHOLD,20);
+    conf.setInt("hbase.regionserver.msginterval",MSG_INTERVAL);
+    conf.set("hbase.balancer.tablesOnMaster","none");
+    conf.setInt("hbase.client.sync.wait.timeout.msec",5000);
+    conf.setInt(HConstants.HBASE_CLIENT_RETRIES_NUMBER,1);
+    conf.setInt(HConstants.HBASE_CLIENT_OPERATION_TIMEOUT,2500);
+    conf.setInt(AssignmentManager.RIT_CHORE_INTERVAL_MSEC_CONF_KEY,MSG_INTERVAL);
+    conf.setInt(AssignmentManager.ASSIGN_MAX_ATTEMPTS,3);
+    conf.setBoolean(CoprocessorHost.ABORT_ON_ERROR_KEY,false);
+    TEST_UTIL.startMiniCluster(1);
+    CLUSTER=TEST_UTIL.getHBaseCluster();
+    MASTER=CLUSTER.getMaster();
+  }
+  @AfterClass public static void after() throws Exception {
+    LOG.info("AFTER {} <= IS THIS NULL?",TEST_UTIL);
+    TEST_UTIL.shutdownMiniCluster();
+  }
+  @Test public void testRITAssignmentManagerMetrics() throws Exception {
+    final TableName TABLENAME=TableName.valueOf(name.getMethodName());
+    final byte[] FAMILY=Bytes.toBytes("family");
+    try (Table table=TEST_UTIL.createTable(TABLENAME,FAMILY)){
+      final byte[] row=Bytes.toBytes("row");
+      final byte[] qualifier=Bytes.toBytes("qualifier");
+      final byte[] value=Bytes.toBytes("value");
+      Put put=new Put(row);
+      put.addColumn(FAMILY,qualifier,value);
+      table.put(put);
+      Thread.sleep(MSG_INTERVAL * 3);
+      MetricsAssignmentManagerSource amSource=MASTER.getAssignmentManager().getAssignmentManagerMetrics().getMetricsProcSource();
+      METRICS_HELPER.assertGauge(MetricsAssignmentManagerSource.RIT_COUNT_NAME,0,amSource);
+      METRICS_HELPER.assertGauge(MetricsAssignmentManagerSource.RIT_COUNT_OVER_THRESHOLD_NAME,0,amSource);
+      TableDescriptor htd=TableDescriptorBuilder.newBuilder(TABLENAME).setColumnFamily(ColumnFamilyDescriptorBuilder.of(FAMILY)).setCoprocessor(CoprocessorDescriptorBuilder.newBuilder("com.foo.FooRegionObserver").setJarPath("hdfs:///foo.jar").setPriority(1001).setProperty("arg1","1").setProperty("arg2","2").build()).build();
+      try {
+        TEST_UTIL.getAdmin().modifyTable(htd);
+        fail("Expected region failed to open");
+      }
+ catch (      IOException e) {
+        LOG.info("Expected error",e);
+      }
+      TEST_UTIL.waitUntilNoRegionsInTransition();
+      Thread.sleep(MSG_INTERVAL * 5);
+      METRICS_HELPER.assertGauge(MetricsAssignmentManagerSource.RIT_COUNT_NAME,1,amSource);
+      METRICS_HELPER.assertGauge(MetricsAssignmentManagerSource.RIT_COUNT_OVER_THRESHOLD_NAME,1,amSource);
+    }
+   }
+}

@@ -1,0 +1,43 @@
+@ExtendWith({DefaultFileSystemExtension.class,TestDirectoryExtension.class}) class LuceneSchemaIndexPopulationIT {
+  private final IndexDescriptor descriptor=TestIndexDescriptorFactory.uniqueForLabel(0,0);
+  @Inject private TestDirectory testDir;
+  @Inject private DefaultFileSystemAbstraction fileSystem;
+  @BeforeEach void before(){
+    System.setProperty("luceneSchemaIndex.maxPartitionSize","10");
+  }
+  @AfterEach void after(){
+    System.setProperty("luceneSchemaIndex.maxPartitionSize","");
+  }
+  @ParameterizedTest @ValueSource(ints={7,11,14,20,35,58}) void partitionedIndexPopulation(  int affectedNodes) throws Exception {
+    File rootFolder=new File(testDir.directory("partitionIndex" + affectedNodes),"uniqueIndex" + affectedNodes);
+    try (SchemaIndex uniqueIndex=LuceneSchemaIndexBuilder.create(descriptor,Config.defaults()).withFileSystem(fileSystem).withIndexRootFolder(rootFolder).build()){
+      uniqueIndex.open();
+      assertEquals(0,uniqueIndex.allDocumentsReader().maxCount());
+      assertFalse(uniqueIndex.exists());
+      try (LuceneIndexAccessor indexAccessor=new LuceneIndexAccessor(uniqueIndex,descriptor)){
+        generateUpdates(indexAccessor,affectedNodes);
+        indexAccessor.force(IOLimiter.UNLIMITED);
+        assertTrue(uniqueIndex.isOnline());
+        try (IndexReader indexReader=indexAccessor.newReader()){
+          long[] nodes=PrimitiveLongCollections.asArray(indexReader.query(IndexQuery.exists(1)));
+          assertEquals(affectedNodes,nodes.length);
+          IndexSampler indexSampler=indexReader.createSampler();
+          IndexSample sample=indexSampler.sampleIndex();
+          assertEquals(affectedNodes,sample.indexSize());
+          assertEquals(affectedNodes,sample.uniqueValues());
+          assertEquals(affectedNodes,sample.sampleSize());
+        }
+       }
+     }
+   }
+  private void generateUpdates(  LuceneIndexAccessor indexAccessor,  int nodesToUpdate) throws IOException, IndexEntryConflictException {
+    try (IndexUpdater updater=indexAccessor.newUpdater(IndexUpdateMode.ONLINE)){
+      for (int nodeId=0; nodeId < nodesToUpdate; nodeId++) {
+        updater.process(add(nodeId,nodeId));
+      }
+    }
+   }
+  private IndexEntryUpdate<?> add(  long nodeId,  Object value){
+    return IndexEntryUpdate.add(nodeId,descriptor.schema(),Values.of(value));
+  }
+}

@@ -1,0 +1,48 @@
+/** 
+ * Tests that formerly used task managers can again timeout after all of their slots have been freed.
+ */
+@Test public void testTimeoutForUnusedTaskManager() throws Exception {
+  final long taskManagerTimeout=50L;
+  final long verifyTimeout=taskManagerTimeout * 10L;
+  final ResourceManagerId resourceManagerId=ResourceManagerId.generate();
+  final ResourceActions resourceManagerActions=mock(ResourceActions.class);
+  final ScheduledExecutor scheduledExecutor=TestingUtils.defaultScheduledExecutor();
+  final ResourceID resourceId=ResourceID.generate();
+  final JobID jobId=new JobID();
+  final AllocationID allocationId=new AllocationID();
+  final ResourceProfile resourceProfile=new ResourceProfile(1.0,1);
+  final SlotRequest slotRequest=new SlotRequest(jobId,allocationId,resourceProfile,"foobar");
+  final TaskExecutorGateway taskExecutorGateway=mock(TaskExecutorGateway.class);
+  when(taskExecutorGateway.requestSlot(any(SlotID.class),eq(jobId),eq(allocationId),anyString(),eq(resourceManagerId),any(Time.class))).thenReturn(CompletableFuture.completedFuture(Acknowledge.get()));
+  final TaskExecutorConnection taskManagerConnection=new TaskExecutorConnection(resourceId,taskExecutorGateway);
+  final SlotID slotId1=new SlotID(resourceId,0);
+  final SlotID slotId2=new SlotID(resourceId,1);
+  final SlotStatus slotStatus1=new SlotStatus(slotId1,resourceProfile);
+  final SlotStatus slotStatus2=new SlotStatus(slotId2,resourceProfile);
+  final SlotReport initialSlotReport=new SlotReport(Arrays.asList(slotStatus1,slotStatus2));
+  final Executor mainThreadExecutor=TestingUtils.defaultExecutor();
+  try (final SlotManager slotManager=new SlotManager(scheduledExecutor,TestingUtils.infiniteTime(),TestingUtils.infiniteTime(),Time.of(taskManagerTimeout,TimeUnit.MILLISECONDS))){
+    slotManager.start(resourceManagerId,mainThreadExecutor,resourceManagerActions);
+    CompletableFuture.supplyAsync(() -> {
+      try {
+        return slotManager.registerSlotRequest(slotRequest);
+      }
+ catch (      SlotManagerException e) {
+        throw new CompletionException(e);
+      }
+    }
+,mainThreadExecutor).thenAccept((    Object value) -> slotManager.registerTaskManager(taskManagerConnection,initialSlotReport));
+    ArgumentCaptor<SlotID> slotIdArgumentCaptor=ArgumentCaptor.forClass(SlotID.class);
+    verify(taskExecutorGateway,timeout(verifyTimeout)).requestSlot(slotIdArgumentCaptor.capture(),eq(jobId),eq(allocationId),anyString(),eq(resourceManagerId),any(Time.class));
+    CompletableFuture<Boolean> idleFuture=CompletableFuture.supplyAsync(() -> slotManager.isTaskManagerIdle(taskManagerConnection.getInstanceID()),mainThreadExecutor);
+    assertFalse(idleFuture.get());
+    final SlotID slotId=slotIdArgumentCaptor.getValue();
+    CompletableFuture<TaskManagerSlot> slotFuture=CompletableFuture.supplyAsync(() -> slotManager.getSlot(slotId),mainThreadExecutor);
+    TaskManagerSlot slot=slotFuture.get();
+    assertTrue(slot.getState() == TaskManagerSlot.State.ALLOCATED);
+    assertEquals(allocationId,slot.getAllocationId());
+    CompletableFuture<Boolean> idleFuture2=CompletableFuture.runAsync(() -> slotManager.freeSlot(slotId,allocationId),mainThreadExecutor).thenApply((    Object value) -> slotManager.isTaskManagerIdle(taskManagerConnection.getInstanceID()));
+    assertTrue(idleFuture2.get());
+    verify(resourceManagerActions,timeout(verifyTimeout).times(1)).releaseResource(eq(taskManagerConnection.getInstanceID()),any(Exception.class));
+  }
+ }

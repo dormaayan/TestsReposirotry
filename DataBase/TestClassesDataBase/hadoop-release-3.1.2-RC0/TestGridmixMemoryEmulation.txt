@@ -1,0 +1,220 @@
+/** 
+ * Test Gridmix memory emulation.
+ */
+public class TestGridmixMemoryEmulation {
+  /** 
+ * This is a dummy class that fakes heap usage.
+ */
+private static class FakeHeapUsageEmulatorCore extends DefaultHeapUsageEmulator {
+    private int numCalls=0;
+    @Override public void load(    long sizeInMB){
+      ++numCalls;
+      super.load(sizeInMB);
+    }
+    int getNumCalls(){
+      return numCalls;
+    }
+    long getHeapUsageInMB(){
+      return getHeapSpaceSize();
+    }
+    @Override public void reset(){
+    }
+    /** 
+ * For re-testing purpose.
+ */
+    void resetFake(){
+      numCalls=0;
+      super.reset();
+    }
+  }
+  /** 
+ * This is a dummy class that fakes the heap usage emulator plugin.
+ */
+private static class FakeHeapUsageEmulatorPlugin extends TotalHeapUsageEmulatorPlugin {
+    private FakeHeapUsageEmulatorCore core;
+    public FakeHeapUsageEmulatorPlugin(    FakeHeapUsageEmulatorCore core){
+      super(core);
+      this.core=core;
+    }
+    @Override protected long getMaxHeapUsageInMB(){
+      return Long.MAX_VALUE / ONE_MB;
+    }
+    @Override protected long getTotalHeapUsageInMB(){
+      return core.getHeapUsageInMB();
+    }
+  }
+  /** 
+ * Test  {@link TotalHeapUsageEmulatorPlugin}'s core heap usage emulation  engine.
+ */
+  @Test public void testHeapUsageEmulator() throws IOException {
+    FakeHeapUsageEmulatorCore heapEmulator=new FakeHeapUsageEmulatorCore();
+    long testSizeInMB=10;
+    long previousHeap=heapEmulator.getHeapUsageInMB();
+    heapEmulator.load(testSizeInMB);
+    long currentHeap=heapEmulator.getHeapUsageInMB();
+    assertEquals("Default heap emulator failed to load 10mb",previousHeap + testSizeInMB,currentHeap);
+    heapEmulator.resetFake();
+    assertEquals("Default heap emulator failed to reset",0,heapEmulator.getHeapUsageInMB());
+  }
+  /** 
+ * Test  {@link TotalHeapUsageEmulatorPlugin}.
+ */
+  @Test public void testTotalHeapUsageEmulatorPlugin() throws Exception {
+    Configuration conf=new Configuration();
+    ResourceCalculatorPlugin monitor=new DummyResourceCalculatorPlugin();
+    long maxHeapUsage=1024 * TotalHeapUsageEmulatorPlugin.ONE_MB;
+    conf.setLong(DummyResourceCalculatorPlugin.MAXPMEM_TESTING_PROPERTY,maxHeapUsage);
+    monitor.setConf(conf);
+    conf.setFloat(TotalHeapUsageEmulatorPlugin.MIN_HEAP_FREE_RATIO,0F);
+    conf.setFloat(TotalHeapUsageEmulatorPlugin.HEAP_LOAD_RATIO,1F);
+    long targetHeapUsageInMB=200;
+    FakeProgressive fakeProgress=new FakeProgressive();
+    FakeHeapUsageEmulatorCore fakeCore=new FakeHeapUsageEmulatorCore();
+    FakeHeapUsageEmulatorPlugin heapPlugin=new FakeHeapUsageEmulatorPlugin(fakeCore);
+    ResourceUsageMetrics invalidUsage=TestResourceUsageEmulators.createMetrics(0);
+    heapPlugin.initialize(conf,invalidUsage,null,null);
+    int numCallsPre=fakeCore.getNumCalls();
+    long heapUsagePre=fakeCore.getHeapUsageInMB();
+    heapPlugin.emulate();
+    int numCallsPost=fakeCore.getNumCalls();
+    long heapUsagePost=fakeCore.getHeapUsageInMB();
+    assertEquals("Disabled heap usage emulation plugin works!",numCallsPre,numCallsPost);
+    assertEquals("Disabled heap usage emulation plugin works!",heapUsagePre,heapUsagePost);
+    float progress=heapPlugin.getProgress();
+    assertEquals("Invalid progress of disabled cumulative heap usage emulation " + "plugin!",1.0f,progress,0f);
+    Boolean failed=null;
+    invalidUsage=TestResourceUsageEmulators.createMetrics(maxHeapUsage + TotalHeapUsageEmulatorPlugin.ONE_MB);
+    try {
+      heapPlugin.initialize(conf,invalidUsage,monitor,null);
+      failed=false;
+    }
+ catch (    Exception e) {
+      failed=true;
+    }
+    assertNotNull("Fail case failure!",failed);
+    assertTrue("Expected failure!",failed);
+    ResourceUsageMetrics metrics=TestResourceUsageEmulators.createMetrics(targetHeapUsageInMB * TotalHeapUsageEmulatorPlugin.ONE_MB);
+    testEmulationAccuracy(conf,fakeCore,monitor,metrics,heapPlugin,200,10);
+    conf.setFloat(TotalHeapUsageEmulatorPlugin.HEAP_EMULATION_PROGRESS_INTERVAL,0.2F);
+    testEmulationAccuracy(conf,fakeCore,monitor,metrics,heapPlugin,200,5);
+    conf.setFloat(TotalHeapUsageEmulatorPlugin.HEAP_LOAD_RATIO,1F);
+    conf.setFloat(TotalHeapUsageEmulatorPlugin.MIN_HEAP_FREE_RATIO,0.5F);
+    testEmulationAccuracy(conf,fakeCore,monitor,metrics,heapPlugin,120,2);
+    conf.setFloat(TotalHeapUsageEmulatorPlugin.HEAP_LOAD_RATIO,0.5F);
+    conf.setFloat(TotalHeapUsageEmulatorPlugin.MIN_HEAP_FREE_RATIO,0F);
+    testEmulationAccuracy(conf,fakeCore,monitor,metrics,heapPlugin,200,10);
+    conf.setFloat(TotalHeapUsageEmulatorPlugin.MIN_HEAP_FREE_RATIO,0.25F);
+    conf.setFloat(TotalHeapUsageEmulatorPlugin.HEAP_LOAD_RATIO,0.5F);
+    testEmulationAccuracy(conf,fakeCore,monitor,metrics,heapPlugin,162,6);
+    fakeProgress=new FakeProgressive();
+    conf.setFloat(TotalHeapUsageEmulatorPlugin.MIN_HEAP_FREE_RATIO,0F);
+    conf.setFloat(TotalHeapUsageEmulatorPlugin.HEAP_LOAD_RATIO,1F);
+    conf.setFloat(TotalHeapUsageEmulatorPlugin.HEAP_EMULATION_PROGRESS_INTERVAL,0.25F);
+    heapPlugin.initialize(conf,metrics,monitor,fakeProgress);
+    fakeCore.resetFake();
+    long initHeapUsage=fakeCore.getHeapUsageInMB();
+    long initNumCallsUsage=fakeCore.getNumCalls();
+    testEmulationBoundary(0F,fakeCore,fakeProgress,heapPlugin,initHeapUsage,initNumCallsUsage,"[no-op, 0 progress]");
+    testEmulationBoundary(0.24F,fakeCore,fakeProgress,heapPlugin,initHeapUsage,initNumCallsUsage,"[no-op, 24% progress]");
+    testEmulationBoundary(0.25F,fakeCore,fakeProgress,heapPlugin,targetHeapUsageInMB / 4,1,"[op, 25% progress]");
+    testEmulationBoundary(0.80F,fakeCore,fakeProgress,heapPlugin,(targetHeapUsageInMB * 4) / 5,2,"[op, 80% progress]");
+    testEmulationBoundary(1F,fakeCore,fakeProgress,heapPlugin,targetHeapUsageInMB,3,"[op, 100% progress]");
+  }
+  private static void testEmulationAccuracy(  Configuration conf,  FakeHeapUsageEmulatorCore fakeCore,  ResourceCalculatorPlugin monitor,  ResourceUsageMetrics metrics,  TotalHeapUsageEmulatorPlugin heapPlugin,  long expectedTotalHeapUsageInMB,  long expectedTotalNumCalls) throws Exception {
+    FakeProgressive fakeProgress=new FakeProgressive();
+    fakeCore.resetFake();
+    heapPlugin.initialize(conf,metrics,monitor,fakeProgress);
+    int numLoops=0;
+    while (fakeProgress.getProgress() < 1) {
+      ++numLoops;
+      float progress=numLoops / 100.0F;
+      fakeProgress.setProgress(progress);
+      heapPlugin.emulate();
+    }
+    assertEquals("Cumulative heap usage emulator plugin failed (total usage)!",expectedTotalHeapUsageInMB,fakeCore.getHeapUsageInMB(),1L);
+    assertEquals("Cumulative heap usage emulator plugin failed (num calls)!",expectedTotalNumCalls,fakeCore.getNumCalls(),0L);
+  }
+  private static void testEmulationBoundary(  float progress,  FakeHeapUsageEmulatorCore fakeCore,  FakeProgressive fakeProgress,  TotalHeapUsageEmulatorPlugin heapPlugin,  long expectedTotalHeapUsageInMB,  long expectedTotalNumCalls,  String info) throws Exception {
+    fakeProgress.setProgress(progress);
+    heapPlugin.emulate();
+    assertEquals("Emulation interval test for heap usage failed " + info + "!",expectedTotalHeapUsageInMB,fakeCore.getHeapUsageInMB(),0L);
+    assertEquals("Emulation interval test for heap usage failed " + info + "!",expectedTotalNumCalls,fakeCore.getNumCalls(),0L);
+  }
+  /** 
+ * Test the specified task java heap options.
+ */
+  @SuppressWarnings("deprecation") private void testJavaHeapOptions(  String mapOptions,  String reduceOptions,  String taskOptions,  String defaultMapOptions,  String defaultReduceOptions,  String defaultTaskOptions,  String expectedMapOptions,  String expectedReduceOptions,  String expectedTaskOptions) throws Exception {
+    Configuration simulatedConf=new Configuration();
+    simulatedConf.unset(MRJobConfig.MAP_JAVA_OPTS);
+    simulatedConf.unset(MRJobConfig.REDUCE_JAVA_OPTS);
+    simulatedConf.unset(JobConf.MAPRED_TASK_JAVA_OPTS);
+    if (defaultMapOptions != null) {
+      simulatedConf.set(MRJobConfig.MAP_JAVA_OPTS,defaultMapOptions);
+    }
+    if (defaultReduceOptions != null) {
+      simulatedConf.set(MRJobConfig.REDUCE_JAVA_OPTS,defaultReduceOptions);
+    }
+    if (defaultTaskOptions != null) {
+      simulatedConf.set(JobConf.MAPRED_TASK_JAVA_OPTS,defaultTaskOptions);
+    }
+    Configuration originalConf=new Configuration();
+    originalConf.unset(MRJobConfig.MAP_JAVA_OPTS);
+    originalConf.unset(MRJobConfig.REDUCE_JAVA_OPTS);
+    originalConf.unset(JobConf.MAPRED_TASK_JAVA_OPTS);
+    if (mapOptions != null) {
+      originalConf.set(MRJobConfig.MAP_JAVA_OPTS,mapOptions);
+    }
+    if (reduceOptions != null) {
+      originalConf.set(MRJobConfig.REDUCE_JAVA_OPTS,reduceOptions);
+    }
+    if (taskOptions != null) {
+      originalConf.set(JobConf.MAPRED_TASK_JAVA_OPTS,taskOptions);
+    }
+    GridmixJob.configureTaskJVMOptions(originalConf,simulatedConf);
+    assertEquals("Map heap options mismatch!",expectedMapOptions,simulatedConf.get(MRJobConfig.MAP_JAVA_OPTS));
+    assertEquals("Reduce heap options mismatch!",expectedReduceOptions,simulatedConf.get(MRJobConfig.REDUCE_JAVA_OPTS));
+    assertEquals("Task heap options mismatch!",expectedTaskOptions,simulatedConf.get(JobConf.MAPRED_TASK_JAVA_OPTS));
+  }
+  /** 
+ * Test task-level java heap options configuration in  {@link GridmixJob}.
+ */
+  @Test public void testJavaHeapOptions() throws Exception {
+    testJavaHeapOptions(null,null,null,null,null,null,null,null,null);
+    testJavaHeapOptions("-Xms10m","-Xms20m","-Xms30m",null,null,null,null,null,null);
+    testJavaHeapOptions(null,null,null,"-Xms10m","-Xms20m","-Xms30m","-Xms10m","-Xms20m","-Xms30m");
+    testJavaHeapOptions("","","",null,null,null,null,null,null);
+    testJavaHeapOptions(null,null,null,"","","","","","");
+    testJavaHeapOptions("","","","-Xmx10m -Xms1m","-Xmx50m -Xms2m","-Xms2m -Xmx100m","-Xmx10m -Xms1m","-Xmx50m -Xms2m","-Xms2m -Xmx100m");
+    testJavaHeapOptions("-Xmx10m","-Xmx20m","-Xmx30m",null,null,null,"-Xmx10m","-Xmx20m","-Xmx30m");
+    testJavaHeapOptions("-Xms5m -Xmx200m","-Xms15m -Xmx300m","-Xms25m -Xmx50m","-XXabc","-XXxyz","-XXdef","-XXabc -Xmx200m","-XXxyz -Xmx300m","-XXdef -Xmx50m");
+    testJavaHeapOptions("-Xms5m -Xmx200m","-Xms15m -Xmx300m","-Xms25m -Xmx50m","-XXabc -Xmx500m","-XXxyz -Xmx600m","-XXdef -Xmx700m","-XXabc -Xmx200m","-XXxyz -Xmx300m","-XXdef -Xmx50m");
+    testJavaHeapOptions("-Xmx10m","-Xmx20m","-Xmx50m","-Xms2m","-Xms3m","-Xms5m","-Xms2m -Xmx10m","-Xms3m -Xmx20m","-Xms5m -Xmx50m");
+    testJavaHeapOptions("-Xmx10m","-Xmx20m","-Xmx50m","-Xmx2m","-Xmx3m","-Xmx5m","-Xmx10m","-Xmx20m","-Xmx50m");
+  }
+  /** 
+ * Test disabled task heap options configuration in  {@link GridmixJob}.
+ */
+  @Test @SuppressWarnings("deprecation") public void testJavaHeapOptionsDisabled() throws Exception {
+    Configuration gridmixConf=new Configuration();
+    gridmixConf.setBoolean(GridmixJob.GRIDMIX_TASK_JVM_OPTIONS_ENABLE,false);
+    gridmixConf.set(MRJobConfig.MAP_JAVA_OPTS,"-Xmx1m");
+    gridmixConf.set(MRJobConfig.REDUCE_JAVA_OPTS,"-Xmx2m");
+    gridmixConf.set(JobConf.MAPRED_TASK_JAVA_OPTS,"-Xmx3m");
+    final JobConf originalConf=new JobConf();
+    originalConf.set(MRJobConfig.MAP_JAVA_OPTS,"-Xmx10m");
+    originalConf.set(MRJobConfig.REDUCE_JAVA_OPTS,"-Xmx20m");
+    originalConf.set(JobConf.MAPRED_TASK_JAVA_OPTS,"-Xmx30m");
+    MockJob story=new MockJob(originalConf){
+      public JobConf getJobConf(){
+        return originalConf;
+      }
+    }
+;
+    GridmixJob job=new DummyGridmixJob(gridmixConf,story);
+    Job simulatedJob=job.getJob();
+    Configuration simulatedConf=simulatedJob.getConfiguration();
+    assertEquals("Map heap options works when disabled!","-Xmx1m",simulatedConf.get(MRJobConfig.MAP_JAVA_OPTS));
+    assertEquals("Reduce heap options works when disabled!","-Xmx2m",simulatedConf.get(MRJobConfig.REDUCE_JAVA_OPTS));
+    assertEquals("Task heap options works when disabled!","-Xmx3m",simulatedConf.get(JobConf.MAPRED_TASK_JAVA_OPTS));
+  }
+}

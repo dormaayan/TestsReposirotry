@@ -1,0 +1,122 @@
+public abstract class TableSnapshotInputFormatTestBase {
+  private static final Logger LOG=LoggerFactory.getLogger(TableSnapshotInputFormatTestBase.class);
+  protected final HBaseTestingUtility UTIL=new HBaseTestingUtility();
+  protected static final int NUM_REGION_SERVERS=2;
+  protected static final byte[][] FAMILIES={Bytes.toBytes("f1"),Bytes.toBytes("f2")};
+  protected FileSystem fs;
+  protected Path rootDir;
+  public void setupCluster() throws Exception {
+    setupConf(UTIL.getConfiguration());
+    UTIL.startMiniCluster(NUM_REGION_SERVERS,true);
+    rootDir=UTIL.getHBaseCluster().getMaster().getMasterFileSystem().getRootDir();
+    fs=rootDir.getFileSystem(UTIL.getConfiguration());
+  }
+  public void tearDownCluster() throws Exception {
+    UTIL.shutdownMiniCluster();
+  }
+  private static void setupConf(  Configuration conf){
+    conf.setBoolean(SnapshotManager.HBASE_SNAPSHOT_ENABLED,true);
+  }
+  protected abstract void testWithMockedMapReduce(  HBaseTestingUtility util,  String snapshotName,  int numRegions,  int numSplitsPerRegion,  int expectedNumSplits,  boolean setLocalityEnabledTo) throws Exception ;
+  protected abstract void testWithMapReduceImpl(  HBaseTestingUtility util,  TableName tableName,  String snapshotName,  Path tableDir,  int numRegions,  int numSplitsPerRegion,  int expectedNumSplits,  boolean shutdownCluster) throws Exception ;
+  protected abstract byte[] getStartRow();
+  protected abstract byte[] getEndRow();
+  @Test public void testWithMockedMapReduceSingleRegion() throws Exception {
+    testWithMockedMapReduce(UTIL,"testWithMockedMapReduceSingleRegion",1,1,1,true);
+  }
+  @Test public void testWithMockedMapReduceMultiRegion() throws Exception {
+    testWithMockedMapReduce(UTIL,"testWithMockedMapReduceMultiRegion",10,1,8,false);
+  }
+  @Test public void testWithMapReduceSingleRegion() throws Exception {
+    testWithMapReduce(UTIL,"testWithMapReduceSingleRegion",1,1,1,false);
+  }
+  @Test public void testWithMapReduceMultiRegion() throws Exception {
+    testWithMapReduce(UTIL,"testWithMapReduceMultiRegion",10,1,8,false);
+  }
+  @Test public void testWithMapReduceAndOfflineHBaseMultiRegion() throws Exception {
+    testWithMapReduce(UTIL,"testWithMapReduceAndOfflineHBaseMultiRegion",10,1,8,true);
+  }
+  @Test public void testRestoreSnapshotDoesNotCreateBackRefLinks() throws Exception {
+    setupCluster();
+    TableName tableName=TableName.valueOf("testRestoreSnapshotDoesNotCreateBackRefLinks");
+    String snapshotName="foo";
+    try {
+      createTableAndSnapshot(UTIL,tableName,snapshotName,getStartRow(),getEndRow(),1);
+      Path tmpTableDir=UTIL.getDataTestDirOnTestFS(snapshotName);
+      testRestoreSnapshotDoesNotCreateBackRefLinksInit(tableName,snapshotName,tmpTableDir);
+      Path rootDir=FSUtils.getRootDir(UTIL.getConfiguration());
+      for (      Path regionDir : FSUtils.getRegionDirs(fs,FSUtils.getTableDir(rootDir,tableName))) {
+        for (        Path storeDir : FSUtils.getFamilyDirs(fs,regionDir)) {
+          for (          FileStatus status : fs.listStatus(storeDir)) {
+            System.out.println(status.getPath());
+            if (StoreFileInfo.isValid(status)) {
+              Path archiveStoreDir=HFileArchiveUtil.getStoreArchivePath(UTIL.getConfiguration(),tableName,regionDir.getName(),storeDir.getName());
+              Path path=HFileLink.getBackReferencesDir(storeDir,status.getPath().getName());
+              assertFalse("There is a back reference in " + path,fs.exists(path));
+              path=HFileLink.getBackReferencesDir(archiveStoreDir,status.getPath().getName());
+              assertFalse("There is a back reference in " + path,fs.exists(path));
+            }
+          }
+        }
+      }
+    }
+  finally {
+      UTIL.getAdmin().deleteSnapshot(snapshotName);
+      UTIL.deleteTable(tableName);
+      tearDownCluster();
+    }
+  }
+  public abstract void testRestoreSnapshotDoesNotCreateBackRefLinksInit(  TableName tableName,  String snapshotName,  Path tmpTableDir) throws Exception ;
+  protected void testWithMapReduce(  HBaseTestingUtility util,  String snapshotName,  int numRegions,  int numSplitsPerRegion,  int expectedNumSplits,  boolean shutdownCluster) throws Exception {
+    setupCluster();
+    try {
+      Path tableDir=util.getDataTestDirOnTestFS(snapshotName);
+      TableName tableName=TableName.valueOf("testWithMapReduce");
+      testWithMapReduceImpl(util,tableName,snapshotName,tableDir,numRegions,numSplitsPerRegion,expectedNumSplits,shutdownCluster);
+    }
+  finally {
+      tearDownCluster();
+    }
+  }
+  protected static void verifyRowFromMap(  ImmutableBytesWritable key,  Result result) throws IOException {
+    byte[] row=key.get();
+    CellScanner scanner=result.cellScanner();
+    while (scanner.advance()) {
+      Cell cell=scanner.current();
+      Assert.assertEquals(0,Bytes.compareTo(row,0,row.length,cell.getRowArray(),cell.getRowOffset(),cell.getRowLength()));
+    }
+    for (int j=0; j < FAMILIES.length; j++) {
+      byte[] actual=result.getValue(FAMILIES[j],FAMILIES[j]);
+      Assert.assertArrayEquals("Row in snapshot does not match, expected:" + Bytes.toString(row) + " ,actual:"+ Bytes.toString(actual),row,actual);
+    }
+  }
+  protected static void createTableAndSnapshot(  HBaseTestingUtility util,  TableName tableName,  String snapshotName,  byte[] startRow,  byte[] endRow,  int numRegions) throws Exception {
+    try {
+      LOG.debug("Ensuring table doesn't exist.");
+      util.deleteTable(tableName);
+    }
+ catch (    Exception ex) {
+    }
+    LOG.info("creating table '" + tableName + "'");
+    if (numRegions > 1) {
+      util.createTable(tableName,FAMILIES,1,startRow,endRow,numRegions);
+    }
+ else {
+      util.createTable(tableName,FAMILIES);
+    }
+    Admin admin=util.getAdmin();
+    LOG.info("put some stuff in the table");
+    Table table=util.getConnection().getTable(tableName);
+    util.loadTable(table,FAMILIES);
+    Path rootDir=FSUtils.getRootDir(util.getConfiguration());
+    FileSystem fs=rootDir.getFileSystem(util.getConfiguration());
+    LOG.info("snapshot");
+    SnapshotTestingUtils.createSnapshotAndValidate(admin,tableName,Arrays.asList(FAMILIES),null,snapshotName,rootDir,fs,true);
+    LOG.info("load different values");
+    byte[] value=Bytes.toBytes("after_snapshot_value");
+    util.loadTable(table,FAMILIES,value);
+    LOG.info("cause flush to create new files in the region");
+    admin.flush(tableName);
+    table.close();
+  }
+}

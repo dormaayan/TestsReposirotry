@@ -1,0 +1,226 @@
+public class PropertyCreatorTest {
+  @Rule public final PageCacheAndDependenciesRule storage=new PageCacheAndDependenciesRule();
+  private final MyPrimitiveProxy primitive=new MyPrimitiveProxy();
+  private NeoStores neoStores;
+  private PropertyStore propertyStore;
+  private PropertyCreator creator;
+  private DirectRecordAccess<PropertyRecord,PrimitiveRecord> records;
+  @Before public void startStore(){
+    neoStores=new StoreFactory(storage.directory().databaseLayout(),Config.defaults(),new DefaultIdGeneratorFactory(storage.fileSystem()),storage.pageCache(),storage.fileSystem(),NullLogProvider.getInstance(),EmptyVersionContextSupplier.EMPTY).openNeoStores(true,StoreType.PROPERTY,StoreType.PROPERTY_STRING,StoreType.PROPERTY_ARRAY);
+    propertyStore=neoStores.getPropertyStore();
+    records=new DirectRecordAccess<>(propertyStore,Loaders.propertyLoader(propertyStore));
+    creator=new PropertyCreator(propertyStore,new PropertyTraverser());
+  }
+  @After public void closeStore(){
+    neoStores.close();
+  }
+  @Test public void shouldAddPropertyToEmptyChain(){
+    existingChain();
+    setProperty(1,"value");
+    assertChain(record(property(1,"value")));
+  }
+  @Test public void shouldAddPropertyToChainContainingOtherFullRecords(){
+    existingChain(record(property(0,0),property(1,1),property(2,2),property(3,3)),record(property(4,4),property(5,5),property(6,6),property(7,7)));
+    setProperty(10,10);
+    assertChain(record(property(10,10)),record(property(0,0),property(1,1),property(2,2),property(3,3)),record(property(4,4),property(5,5),property(6,6),property(7,7)));
+  }
+  @Test public void shouldAddPropertyToChainContainingOtherNonFullRecords(){
+    existingChain(record(property(0,0),property(1,1),property(2,2),property(3,3)),record(property(4,4),property(5,5),property(6,6)));
+    setProperty(10,10);
+    assertChain(record(property(0,0),property(1,1),property(2,2),property(3,3)),record(property(4,4),property(5,5),property(6,6),property(10,10)));
+  }
+  @Test public void shouldAddPropertyToChainContainingOtherNonFullRecordsInMiddle(){
+    existingChain(record(property(0,0),property(1,1),property(2,2)),record(property(3,3),property(4,4),property(5,5),property(6,6)));
+    setProperty(10,10);
+    assertChain(record(property(0,0),property(1,1),property(2,2),property(10,10)),record(property(3,3),property(4,4),property(5,5),property(6,6)));
+  }
+  @Test public void shouldChangeOnlyProperty(){
+    existingChain(record(property(0,"one")));
+    setProperty(0,"two");
+    assertChain(record(property(0,"two")));
+  }
+  @Test public void shouldChangePropertyInChainWithOthersBeforeIt(){
+    existingChain(record(property(0,"one"),property(1,1)),record(property(2,"two"),property(3,3)));
+    setProperty(2,"two*");
+    assertChain(record(property(0,"one"),property(1,1)),record(property(2,"two*"),property(3,3)));
+  }
+  @Test public void shouldChangePropertyInChainWithOthersAfterIt(){
+    existingChain(record(property(0,"one"),property(1,1)),record(property(2,"two"),property(3,3)));
+    setProperty(0,"one*");
+    assertChain(record(property(0,"one*"),property(1,1)),record(property(2,"two"),property(3,3)));
+  }
+  @Test public void shouldChangePropertyToBiggerInFullChain(){
+    existingChain(record(property(0,0),property(1,1),property(2,2),property(3,3)));
+    setProperty(1,Long.MAX_VALUE);
+    assertChain(record(property(1,Long.MAX_VALUE)),record(property(0,0),property(2,2),property(3,3)));
+  }
+  @Test public void shouldChangePropertyToBiggerInChainWithHoleAfter(){
+    existingChain(record(property(0,0),property(1,1),property(2,2),property(3,3)),record(property(4,4),property(5,5)));
+    setProperty(1,Long.MAX_VALUE);
+    assertChain(record(property(0,0),property(2,2),property(3,3)),record(property(4,4),property(5,5),property(1,Long.MAX_VALUE)));
+  }
+  @Test public void shouldChangePropertyToBiggerInChainWithHoleBefore(){
+    existingChain(record(property(0,0),property(1,1)),record(property(2,2),property(3,3),property(4,4),property(5,5)));
+    setProperty(2,Long.MAX_VALUE);
+    assertChain(record(property(0,0),property(1,1),property(2,Long.MAX_VALUE)),record(property(3,3),property(4,4),property(5,5)));
+  }
+  @Test public void canAddMultipleShortStringsToTheSameNode(){
+    existingChain();
+    setProperty(0,"value");
+    setProperty(1,"esrever");
+    assertChain(record(property(0,"value",false),property(1,"esrever",false)));
+  }
+  @Test public void canUpdateShortStringInplace(){
+    existingChain(record(property(0,"value")));
+    long before=propertyRecordsInUse();
+    setProperty(0,"other");
+    long after=propertyRecordsInUse();
+    assertChain(record(property(0,"other")));
+    assertEquals(before,after);
+  }
+  @Test public void canReplaceLongStringWithShortString(){
+    long recordCount=dynamicStringRecordsInUse();
+    long propCount=propertyRecordsInUse();
+    existingChain(record(property(0,"this is a really long string, believe me!")));
+    assertEquals(recordCount + 1,dynamicStringRecordsInUse());
+    assertEquals(propCount + 1,propertyRecordsInUse());
+    setProperty(0,"value");
+    assertChain(record(property(0,"value",false)));
+    assertEquals(recordCount + 1,dynamicStringRecordsInUse());
+    assertEquals(propCount + 1,propertyRecordsInUse());
+  }
+  @Test public void canReplaceShortStringWithLongString(){
+    long recordCount=dynamicStringRecordsInUse();
+    long propCount=propertyRecordsInUse();
+    existingChain(record(property(0,"value")));
+    assertEquals(recordCount,dynamicStringRecordsInUse());
+    assertEquals(propCount + 1,propertyRecordsInUse());
+    String longString="this is a really long string, believe me!";
+    setProperty(0,longString);
+    assertChain(record(property(0,longString,true)));
+    assertEquals(recordCount + 1,dynamicStringRecordsInUse());
+    assertEquals(propCount + 1,propertyRecordsInUse());
+  }
+  private void existingChain(  ExpectedRecord... initialRecords){
+    PropertyRecord prev=null;
+    for (    ExpectedRecord initialRecord : initialRecords) {
+      PropertyRecord record=this.records.create(propertyStore.nextId(),primitive.record).forChangingData();
+      record.setInUse(true);
+      existingRecord(record,initialRecord);
+      if (prev == null) {
+        primitive.record.setNextProp(record.getId());
+      }
+ else {
+        record.setPrevProp(prev.getId());
+        prev.setNextProp(record.getId());
+      }
+      prev=record;
+    }
+  }
+  private void existingRecord(  PropertyRecord record,  ExpectedRecord initialRecord){
+    for (    ExpectedProperty initialProperty : initialRecord.properties) {
+      PropertyBlock block=new PropertyBlock();
+      propertyStore.encodeValue(block,initialProperty.key,initialProperty.value);
+      record.addPropertyBlock(block);
+    }
+    assertTrue(record.size() <= PropertyType.getPayloadSize());
+  }
+  private void setProperty(  int key,  Object value){
+    creator.primitiveSetProperty(primitive,key,Values.of(value),records);
+  }
+  private void assertChain(  ExpectedRecord... expectedRecords){
+    long nextProp=primitive.forReadingLinkage().getNextProp();
+    int expectedRecordCursor=0;
+    while (!Record.NO_NEXT_PROPERTY.is(nextProp)) {
+      PropertyRecord record=records.getIfLoaded(nextProp).forReadingData();
+      assertRecord(record,expectedRecords[expectedRecordCursor++]);
+      nextProp=record.getNextProp();
+    }
+  }
+  private void assertRecord(  PropertyRecord record,  ExpectedRecord expectedRecord){
+    assertEquals(expectedRecord.properties.length,record.numberOfProperties());
+    for (    ExpectedProperty expectedProperty : expectedRecord.properties) {
+      PropertyBlock block=record.getPropertyBlock(expectedProperty.key);
+      assertNotNull(block);
+      assertEquals(expectedProperty.value,block.getType().value(block,propertyStore));
+      if (expectedProperty.assertHasDynamicRecords != null) {
+        if (expectedProperty.assertHasDynamicRecords) {
+          assertThat(block.getValueRecords().size(),Matchers.greaterThan(0));
+        }
+ else {
+          assertEquals(0,block.getValueRecords().size());
+        }
+      }
+    }
+  }
+private static class ExpectedProperty {
+    private final int key;
+    private final Value value;
+    private final Boolean assertHasDynamicRecords;
+    ExpectedProperty(    int key,    Object value){
+      this(key,value,null);
+    }
+    ExpectedProperty(    int key,    Object value,    Boolean assertHasDynamicRecords){
+      this.key=key;
+      this.value=Values.of(value);
+      this.assertHasDynamicRecords=assertHasDynamicRecords;
+    }
+  }
+private static class ExpectedRecord {
+    private final ExpectedProperty[] properties;
+    ExpectedRecord(    ExpectedProperty... properties){
+      this.properties=properties;
+    }
+  }
+  private static ExpectedProperty property(  int key,  Object value){
+    return new ExpectedProperty(key,value);
+  }
+  private static ExpectedProperty property(  int key,  Object value,  boolean hasDynamicRecords){
+    return new ExpectedProperty(key,value,hasDynamicRecords);
+  }
+  private ExpectedRecord record(  ExpectedProperty... properties){
+    return new ExpectedRecord(properties);
+  }
+private static class MyPrimitiveProxy implements RecordProxy<NodeRecord,Void> {
+    private final NodeRecord record=new NodeRecord(5);
+    private boolean changed;
+    MyPrimitiveProxy(){
+      record.setInUse(true);
+    }
+    @Override public long getKey(){
+      return record.getId();
+    }
+    @Override public NodeRecord forChangingLinkage(){
+      changed=true;
+      return record;
+    }
+    @Override public NodeRecord forChangingData(){
+      changed=true;
+      return record;
+    }
+    @Override public NodeRecord forReadingLinkage(){
+      return record;
+    }
+    @Override public NodeRecord forReadingData(){
+      return record;
+    }
+    @Override public Void getAdditionalData(){
+      return null;
+    }
+    @Override public NodeRecord getBefore(){
+      return record;
+    }
+    @Override public boolean isChanged(){
+      return changed;
+    }
+    @Override public boolean isCreated(){
+      return false;
+    }
+  }
+  private long propertyRecordsInUse(){
+    return propertyStore.getHighId();
+  }
+  private long dynamicStringRecordsInUse(){
+    return propertyStore.getStringStore().getHighId();
+  }
+}

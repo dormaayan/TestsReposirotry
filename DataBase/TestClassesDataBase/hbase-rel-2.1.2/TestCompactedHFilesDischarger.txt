@@ -1,0 +1,295 @@
+@Category({MediumTests.class,RegionServerTests.class}) public class TestCompactedHFilesDischarger {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestCompactedHFilesDischarger.class);
+  private final HBaseTestingUtility testUtil=new HBaseTestingUtility();
+  private HRegion region;
+  private final static byte[] fam=Bytes.toBytes("cf_1");
+  private final static byte[] qual1=Bytes.toBytes("qf_1");
+  private final static byte[] val=Bytes.toBytes("val");
+  private static CountDownLatch latch=new CountDownLatch(3);
+  private static AtomicInteger counter=new AtomicInteger(0);
+  private static AtomicInteger scanCompletedCounter=new AtomicInteger(0);
+  private RegionServerServices rss;
+  @Before public void setUp() throws Exception {
+    TableName tableName=TableName.valueOf(getClass().getSimpleName());
+    HTableDescriptor htd=new HTableDescriptor(tableName);
+    htd.addFamily(new HColumnDescriptor(fam));
+    HRegionInfo info=new HRegionInfo(tableName,null,null,false);
+    Path path=testUtil.getDataTestDir(getClass().getSimpleName());
+    region=HBaseTestingUtility.createRegionAndWAL(info,path,testUtil.getConfiguration(),htd);
+    rss=mock(RegionServerServices.class);
+    List<HRegion> regions=new ArrayList<>(1);
+    regions.add(region);
+    Mockito.doReturn(regions).when(rss).getRegions();
+  }
+  @After public void tearDown() throws IOException {
+    counter.set(0);
+    scanCompletedCounter.set(0);
+    latch=new CountDownLatch(3);
+    HBaseTestingUtility.closeRegionAndWAL(region);
+    testUtil.cleanupTestDir();
+  }
+  @Test public void testCompactedHFilesCleaner() throws Exception {
+    CompactedHFilesDischarger cleaner=new CompactedHFilesDischarger(1000,(Stoppable)null,rss,false);
+    for (int i=1; i < 10; i++) {
+      Put p=new Put(Bytes.toBytes("row" + i));
+      p.addColumn(fam,qual1,val);
+      region.put(p);
+    }
+    region.flush(true);
+    for (int i=11; i < 20; i++) {
+      Put p=new Put(Bytes.toBytes("row" + i));
+      p.addColumn(fam,qual1,val);
+      region.put(p);
+    }
+    region.flush(true);
+    for (int i=21; i < 30; i++) {
+      Put p=new Put(Bytes.toBytes("row" + i));
+      p.addColumn(fam,qual1,val);
+      region.put(p);
+    }
+    region.flush(true);
+    HStore store=region.getStore(fam);
+    assertEquals(3,store.getStorefilesCount());
+    Collection<HStoreFile> storefiles=store.getStorefiles();
+    Collection<HStoreFile> compactedfiles=store.getStoreEngine().getStoreFileManager().getCompactedfiles();
+    for (    HStoreFile file : storefiles) {
+      assertFalse(file.isCompactedAway());
+    }
+    cleaner.chore();
+    storefiles=store.getStorefiles();
+    for (    HStoreFile file : storefiles) {
+      assertFalse(file.isCompactedAway());
+    }
+    region.compact(true);
+    assertEquals(1,store.getStorefilesCount());
+    assertEquals(3,((HStore)store).getStoreEngine().getStoreFileManager().getCompactedfiles().size());
+    cleaner.chore();
+    assertEquals(1,store.getStorefilesCount());
+    storefiles=store.getStorefiles();
+    for (    HStoreFile file : storefiles) {
+      assertFalse(file.isCompactedAway());
+    }
+    compactedfiles=((HStore)store).getStoreEngine().getStoreFileManager().getCompactedfiles();
+    assertTrue(compactedfiles.isEmpty());
+  }
+  @Test public void testCleanerWithParallelScannersAfterCompaction() throws Exception {
+    CompactedHFilesDischarger cleaner=new CompactedHFilesDischarger(1000,(Stoppable)null,rss,false);
+    for (int i=1; i < 10; i++) {
+      Put p=new Put(Bytes.toBytes("row" + i));
+      p.addColumn(fam,qual1,val);
+      region.put(p);
+    }
+    region.flush(true);
+    for (int i=11; i < 20; i++) {
+      Put p=new Put(Bytes.toBytes("row" + i));
+      p.addColumn(fam,qual1,val);
+      region.put(p);
+    }
+    region.flush(true);
+    for (int i=21; i < 30; i++) {
+      Put p=new Put(Bytes.toBytes("row" + i));
+      p.addColumn(fam,qual1,val);
+      region.put(p);
+    }
+    region.flush(true);
+    HStore store=region.getStore(fam);
+    assertEquals(3,store.getStorefilesCount());
+    Collection<HStoreFile> storefiles=store.getStorefiles();
+    Collection<HStoreFile> compactedfiles=store.getStoreEngine().getStoreFileManager().getCompactedfiles();
+    for (    HStoreFile file : storefiles) {
+      assertFalse(file.isCompactedAway());
+    }
+    region.compact(true);
+    startScannerThreads();
+    storefiles=store.getStorefiles();
+    int usedReaderCount=0;
+    int unusedReaderCount=0;
+    for (    HStoreFile file : storefiles) {
+      if (((HStoreFile)file).getRefCount() == 3) {
+        usedReaderCount++;
+      }
+    }
+    compactedfiles=((HStore)store).getStoreEngine().getStoreFileManager().getCompactedfiles();
+    for (    HStoreFile file : compactedfiles) {
+      assertEquals("Refcount should be 3",0,((HStoreFile)file).getRefCount());
+      unusedReaderCount++;
+    }
+    assertEquals("unused reader count should be 3",3,unusedReaderCount);
+    assertEquals("used reader count should be 1",1,usedReaderCount);
+    cleaner.chore();
+    countDown();
+    assertEquals(1,store.getStorefilesCount());
+    storefiles=store.getStorefiles();
+    for (    HStoreFile file : storefiles) {
+      assertFalse(file.isCompactedAway());
+    }
+    compactedfiles=((HStore)store).getStoreEngine().getStoreFileManager().getCompactedfiles();
+    assertTrue(compactedfiles.isEmpty());
+  }
+  @Test public void testCleanerWithParallelScanners() throws Exception {
+    CompactedHFilesDischarger cleaner=new CompactedHFilesDischarger(1000,(Stoppable)null,rss,false);
+    for (int i=1; i < 10; i++) {
+      Put p=new Put(Bytes.toBytes("row" + i));
+      p.addColumn(fam,qual1,val);
+      region.put(p);
+    }
+    region.flush(true);
+    for (int i=11; i < 20; i++) {
+      Put p=new Put(Bytes.toBytes("row" + i));
+      p.addColumn(fam,qual1,val);
+      region.put(p);
+    }
+    region.flush(true);
+    for (int i=21; i < 30; i++) {
+      Put p=new Put(Bytes.toBytes("row" + i));
+      p.addColumn(fam,qual1,val);
+      region.put(p);
+    }
+    region.flush(true);
+    HStore store=region.getStore(fam);
+    assertEquals(3,store.getStorefilesCount());
+    Collection<HStoreFile> storefiles=store.getStorefiles();
+    Collection<HStoreFile> compactedfiles=store.getStoreEngine().getStoreFileManager().getCompactedfiles();
+    for (    HStoreFile file : storefiles) {
+      assertFalse(file.isCompactedAway());
+    }
+    startScannerThreads();
+    region.compact(true);
+    storefiles=store.getStorefiles();
+    int usedReaderCount=0;
+    int unusedReaderCount=0;
+    for (    HStoreFile file : storefiles) {
+      if (file.getRefCount() == 0) {
+        unusedReaderCount++;
+      }
+    }
+    compactedfiles=store.getStoreEngine().getStoreFileManager().getCompactedfiles();
+    for (    HStoreFile file : compactedfiles) {
+      assertEquals("Refcount should be 3",3,((HStoreFile)file).getRefCount());
+      usedReaderCount++;
+    }
+    assertEquals("unused reader count should be 1",1,unusedReaderCount);
+    assertEquals("used reader count should be 3",3,usedReaderCount);
+    cleaner.chore();
+    countDown();
+    assertEquals(1,store.getStorefilesCount());
+    assertEquals(3,((HStore)store).getStoreEngine().getStoreFileManager().getCompactedfiles().size());
+    while (scanCompletedCounter.get() != 3) {
+      Thread.sleep(100);
+    }
+    latch=new CountDownLatch(3);
+    scanCompletedCounter.set(0);
+    counter.set(0);
+    startScannerThreads();
+    storefiles=store.getStorefiles();
+    usedReaderCount=0;
+    unusedReaderCount=0;
+    for (    HStoreFile file : storefiles) {
+      if (file.getRefCount() == 3) {
+        usedReaderCount++;
+      }
+    }
+    compactedfiles=((HStore)store).getStoreEngine().getStoreFileManager().getCompactedfiles();
+    for (    HStoreFile file : compactedfiles) {
+      assertEquals("Refcount should be 0",0,file.getRefCount());
+      unusedReaderCount++;
+    }
+    assertEquals("unused reader count should be 3",3,unusedReaderCount);
+    assertEquals("used reader count should be 1",1,usedReaderCount);
+    countDown();
+    while (scanCompletedCounter.get() != 3) {
+      Thread.sleep(100);
+    }
+    cleaner.chore();
+    assertEquals(1,store.getStorefilesCount());
+    storefiles=store.getStorefiles();
+    for (    HStoreFile file : storefiles) {
+      assertFalse(file.isCompactedAway());
+    }
+    compactedfiles=((HStore)store).getStoreEngine().getStoreFileManager().getCompactedfiles();
+    assertTrue(compactedfiles.isEmpty());
+  }
+  @Test public void testStoreFileMissing() throws Exception {
+    write("row1");
+    region.flush(true);
+    write("row2");
+    region.flush(true);
+    write("row3");
+    region.flush(true);
+    Scan scan=new Scan();
+    scan.setCaching(1);
+    RegionScanner scanner=region.getScanner(scan);
+    List<Cell> res=new ArrayList<Cell>();
+    scanner.next(res);
+    assertEquals("row1",Bytes.toString(CellUtil.cloneRow(res.get(0))));
+    res.clear();
+    write("row4");
+    region.flush(true);
+    region.compact(true);
+    CompactedHFilesDischarger cleaner=new CompactedHFilesDischarger(1000,(Stoppable)null,rss,false);
+    cleaner.chore();
+    scanner.next(res);
+    assertEquals("row2",Bytes.toString(CellUtil.cloneRow(res.get(0))));
+    scanner.close();
+  }
+  private void write(  String row1) throws IOException {
+    byte[] row=Bytes.toBytes(row1);
+    Put put=new Put(row);
+    put.addColumn(fam,qual1,row);
+    region.put(put);
+  }
+  protected void countDown(){
+    latch.countDown();
+    latch.countDown();
+    latch.countDown();
+  }
+  protected void startScannerThreads() throws InterruptedException {
+    ScanThread[] scanThreads=new ScanThread[3];
+    for (int i=0; i < 3; i++) {
+      scanThreads[i]=new ScanThread((HRegion)region);
+    }
+    for (    ScanThread thread : scanThreads) {
+      thread.start();
+    }
+    while (counter.get() != 3) {
+      Thread.sleep(100);
+    }
+  }
+private static class ScanThread extends Thread {
+    private final HRegion region;
+    public ScanThread(    HRegion region){
+      this.region=region;
+    }
+    @Override public void run(){
+      try {
+        initiateScan(region);
+      }
+ catch (      IOException e) {
+        e.printStackTrace();
+      }
+    }
+    private void initiateScan(    HRegion region) throws IOException {
+      Scan scan=new Scan();
+      scan.setCaching(1);
+      RegionScanner resScanner=null;
+      try {
+        resScanner=region.getScanner(scan);
+        List<Cell> results=new ArrayList<>();
+        boolean next=resScanner.next(results);
+        try {
+          counter.incrementAndGet();
+          latch.await();
+        }
+ catch (        InterruptedException e) {
+        }
+        while (next) {
+          next=resScanner.next(results);
+        }
+      }
+  finally {
+        scanCompletedCounter.incrementAndGet();
+        resScanner.close();
+      }
+    }
+  }
+}

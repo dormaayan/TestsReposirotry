@@ -1,0 +1,115 @@
+public class AdminFilePathFilterTest {
+  @Rule public JenkinsRule r=new JenkinsRule();
+  @Inject AdminWhitelistRule rule;
+  @Before public void setUp(){
+    r.jenkins.getInjector().injectMembers(this);
+    rule.setMasterKillSwitch(false);
+  }
+  @Issue({"JENKINS-27055","SECURITY-358"}) @Test public void matchBuildDir() throws Exception {
+    File buildDir=r.buildAndAssertSuccess(r.createFreeStyleProject()).getRootDir();
+    assertTrue(rule.checkFileAccess("write",new File(buildDir,"whatever")));
+    assertFalse(rule.checkFileAccess("write",new File(buildDir,"build.xml")));
+    assertFalse(rule.checkFileAccess("write",new File(buildDir,"program.dat")));
+    assertFalse(rule.checkFileAccess("write",new File(buildDir,"workflow/23.xml")));
+  }
+  @Test public void slaveCannotReadFileFromSecrets_butCanFromUserContent() throws Exception {
+    Slave s=r.createOnlineSlave();
+    FilePath root=r.jenkins.getRootPath();
+{
+      FilePath rootUserContentFolder=root.child("userContent");
+      FilePath rootTargetPublic=rootUserContentFolder.child("target_public.txt");
+      rootTargetPublic.write("target_public",null);
+      checkSlave_can_readFile(s,rootTargetPublic);
+    }
+{
+      FilePath rootSecretFolder=root.child("secrets");
+      FilePath rootTargetPrivate=rootSecretFolder.child("target_private.txt");
+      rootTargetPrivate.write("target_private",null);
+      checkSlave_cannot_readFile(s,rootTargetPrivate);
+    }
+    rule.setMasterKillSwitch(true);
+{
+      FilePath rootSecretFolder=root.child("secrets");
+      FilePath rootTargetPrivate=rootSecretFolder.child("target_private.txt");
+      checkSlave_can_readFile(s,rootTargetPrivate);
+    }
+  }
+private static class ReadFileS2MCallable implements Callable<String,Exception> {
+    private final FilePath p;
+    ReadFileS2MCallable(    FilePath p){
+      this.p=p;
+    }
+    @Override public String call() throws Exception {
+      assertTrue(p.isRemote());
+      return p.readToString();
+    }
+    @Override public void checkRoles(    RoleChecker checker) throws SecurityException {
+      throw new NoSuchMethodError();
+    }
+  }
+  @Test @Issue("SECURITY-788") public void slaveCannotUse_dotDotSlashStuff_toBypassRestriction() throws Exception {
+    Slave s=r.createOnlineSlave();
+    FilePath root=r.jenkins.getRootPath();
+{
+      FilePath rootUserContentFolder=root.child("userContent");
+      FilePath rootTargetPublic=rootUserContentFolder.child("target_public.txt");
+      rootTargetPublic.write("target_public",null);
+      FilePath dotDotSlashTargetPublic=root.child("logs/target_public.txt");
+      replaceRemote(dotDotSlashTargetPublic,"logs","logs/../userContent");
+      checkSlave_can_readFile(s,dotDotSlashTargetPublic);
+    }
+{
+      FilePath rootSecretFolder=root.child("secrets");
+      FilePath rootTargetPrivate=rootSecretFolder.child("target_private.txt");
+      rootTargetPrivate.write("target_private",null);
+      FilePath dotDotSlashTargetPrivate=root.child("userContent/target_private.txt");
+      replaceRemote(dotDotSlashTargetPrivate,"userContent","userContent/../secrets");
+      checkSlave_cannot_readFile(s,dotDotSlashTargetPrivate);
+    }
+  }
+  @Test @Issue("SECURITY-788") public void slaveCannotUse_encodedCharacters_toBypassRestriction() throws Exception {
+    Slave s=r.createOnlineSlave();
+    FilePath root=r.jenkins.getRootPath();
+{
+      FilePath rootUserContentFolder=root.child("userContent");
+      FilePath rootTargetPublic=rootUserContentFolder.child("target_public.txt");
+      rootTargetPublic.write("target_public",null);
+      FilePath dotDotSlashTargetPublic=root.child("logs/target_public.txt");
+      replaceRemote(dotDotSlashTargetPublic,"logs","logs/\u002e\u002e/userContent");
+      checkSlave_can_readFile(s,dotDotSlashTargetPublic);
+    }
+{
+      FilePath rootSecretFolder=root.child("secrets");
+      FilePath rootTargetPrivate=rootSecretFolder.child("target_private.txt");
+      rootTargetPrivate.write("target_private",null);
+      FilePath dotDotSlashTargetPrivate=root.child("userContent/target_private.txt");
+      replaceRemote(dotDotSlashTargetPrivate,"userContent","userContent/\u002e\u002e/secrets");
+      checkSlave_cannot_readFile(s,dotDotSlashTargetPrivate);
+    }
+  }
+  private void checkSlave_can_readFile(  Slave s,  FilePath target) throws Exception {
+    String content=s.getChannel().call(new ReadFileS2MCallable(target));
+    assertEquals(target.readToString(),content);
+  }
+  private void checkSlave_cannot_readFile(  Slave s,  FilePath target) throws Exception {
+    try {
+      s.getChannel().call(new ReadFileS2MCallable(target));
+      fail("Slave should not be able to read file in " + target.getRemote());
+    }
+ catch (    IOException e) {
+      Throwable t=e.getCause();
+      assertTrue(t instanceof SecurityException);
+      SecurityException se=(SecurityException)t;
+      StringWriter sw=new StringWriter();
+      se.printStackTrace(new PrintWriter(sw));
+      assertTrue(sw.toString().contains("agent may not read"));
+    }
+  }
+  private void replaceRemote(  FilePath p,  String before,  String after) throws Exception {
+    Field field=FilePath.class.getDeclaredField("remote");
+    field.setAccessible(true);
+    String currentRemote=(String)field.get(p);
+    String newRemote=currentRemote.replace(before,after);
+    field.set(p,newRemote);
+  }
+}

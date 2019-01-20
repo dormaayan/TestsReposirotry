@@ -1,0 +1,63 @@
+@Test(timeout=100000) @SuppressWarnings("unchecked") public void testParallelDownloadAttemptsForPublicResource() throws Exception {
+  DrainDispatcher dispatcher1=null;
+  String user="testuser";
+  try {
+    List<Path> localDirs=new ArrayList<Path>();
+    String[] sDirs=new String[1];
+    for (int i=0; i < 1; ++i) {
+      localDirs.add(lfs.makeQualified(new Path(basedir,i + "")));
+      sDirs[i]=localDirs.get(i).toString();
+    }
+    conf.setStrings(YarnConfiguration.NM_LOCAL_DIRS,sDirs);
+    EventHandler<ApplicationEvent> applicationBus=mock(EventHandler.class);
+    dispatcher1=new DrainDispatcher();
+    dispatcher1.register(ApplicationEventType.class,applicationBus);
+    EventHandler<ContainerEvent> containerBus=mock(EventHandler.class);
+    dispatcher1.register(ContainerEventType.class,containerBus);
+    ContainerExecutor exec=mock(ContainerExecutor.class);
+    DeletionService delService=mock(DeletionService.class);
+    LocalDirsHandlerService dirsHandler=new LocalDirsHandlerService();
+    dirsHandler.init(conf);
+    dispatcher1.init(conf);
+    dispatcher1.start();
+    ResourceLocalizationService rawService=new ResourceLocalizationService(dispatcher1,exec,delService,dirsHandler,nmContext,metrics);
+    ResourceLocalizationService spyService=spy(rawService);
+    dispatcher1.register(LocalizationEventType.class,spyService);
+    spyService.init(conf);
+    Assert.assertEquals(0,spyService.getPublicLocalizer().pending.size());
+    LocalResourceRequest req=new LocalResourceRequest(new Path("/tmp"),123L,LocalResourceType.FILE,LocalResourceVisibility.PUBLIC,"");
+    ApplicationImpl app=mock(ApplicationImpl.class);
+    ApplicationId appId=BuilderUtils.newApplicationId(1,1);
+    when(app.getAppId()).thenReturn(appId);
+    when(app.getUser()).thenReturn(user);
+    dispatcher1.getEventHandler().handle(new ApplicationLocalizationEvent(LocalizationEventType.INIT_APPLICATION_RESOURCES,app));
+    ContainerImpl container1=createMockContainer(user,1);
+    dispatcher1.getEventHandler().handle(createContainerLocalizationEvent(container1,LocalResourceVisibility.PUBLIC,req));
+    Assert.assertTrue(waitForResourceState(null,spyService,req,LocalResourceVisibility.PUBLIC,user,null,ResourceState.DOWNLOADING,5000));
+    Assert.assertTrue(waitForPublicDownloadToStart(spyService,1,5000));
+    LocalizedResource lr=getLocalizedResource(spyService,req,LocalResourceVisibility.PUBLIC,user,null);
+    Assert.assertEquals(ResourceState.DOWNLOADING,lr.getState());
+    Assert.assertEquals(1,spyService.getPublicLocalizer().pending.size());
+    Assert.assertEquals(0,lr.sem.availablePermits());
+    ContainerImpl container2=createMockContainer(user,2);
+    dispatcher1.getEventHandler().handle(createContainerLocalizationEvent(container2,LocalResourceVisibility.PUBLIC,req));
+    Assert.assertFalse(waitForPublicDownloadToStart(spyService,2,5000));
+    ResourceFailedLocalizationEvent locFailedEvent=new ResourceFailedLocalizationEvent(req,new Exception("test").toString());
+    spyService.getLocalResourcesTracker(LocalResourceVisibility.PUBLIC,user,null).handle(locFailedEvent);
+    Assert.assertTrue(waitForResourceState(lr,spyService,req,LocalResourceVisibility.PUBLIC,user,null,ResourceState.FAILED,5000));
+    Assert.assertTrue(waitForResourceState(lr,spyService,req,LocalResourceVisibility.APPLICATION,user,appId,ResourceState.FAILED,5000));
+    lr.unlock();
+    spyService.getPublicLocalizer().pending.clear();
+    LocalizerContext lc=mock(LocalizerContext.class);
+    when(lc.getContainerId()).thenReturn(ContainerId.newContainerId(ApplicationAttemptId.newInstance(ApplicationId.newInstance(1L,1),1),1L));
+    LocalizerResourceRequestEvent localizerEvent=new LocalizerResourceRequestEvent(lr,null,lc,null);
+    dispatcher1.getEventHandler().handle(localizerEvent);
+    Assert.assertFalse(waitForPublicDownloadToStart(spyService,1,5000));
+    Assert.assertEquals(1,lr.sem.availablePermits());
+  }
+  finally {
+    if (dispatcher1 != null) {
+      dispatcher1.stop();
+    }
+  }
+}

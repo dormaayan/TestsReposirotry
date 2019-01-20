@@ -1,0 +1,85 @@
+public class SqlLicenseIT extends AbstractLicensesIntegrationTestCase {
+  @Override protected boolean ignoreExternalCluster(){
+    return true;
+  }
+  @Before public void resetLicensing() throws Exception {
+    enableJdbcLicensing();
+  }
+  @Override protected Collection<Class<? extends Plugin>> nodePlugins(){
+    List<Class<? extends Plugin>> plugins=new ArrayList<>(super.nodePlugins());
+    plugins.add(Netty4Plugin.class);
+    return plugins;
+  }
+  @Override protected Settings nodeSettings(  int nodeOrdinal){
+    return Settings.builder().put(super.nodeSettings(nodeOrdinal)).put(NetworkModule.HTTP_ENABLED.getKey(),true).put(NetworkModule.HTTP_TYPE_KEY,Netty4Plugin.NETTY_HTTP_TRANSPORT_NAME).build();
+  }
+  private static OperationMode randomValidSqlLicenseType(){
+    return randomTrialBasicStandardGoldOrPlatinumMode();
+  }
+  private static OperationMode randomInvalidSqlLicenseType(){
+    return OperationMode.MISSING;
+  }
+  private static OperationMode randomValidJdbcLicenseType(){
+    return randomTrialOrPlatinumMode();
+  }
+  private static OperationMode randomInvalidJdbcLicenseType(){
+    return randomBasicStandardOrGold();
+  }
+  public void enableSqlLicensing() throws Exception {
+    updateLicensing(randomValidSqlLicenseType());
+  }
+  public void disableSqlLicensing() throws Exception {
+    updateLicensing(randomInvalidSqlLicenseType());
+  }
+  public void enableJdbcLicensing() throws Exception {
+    updateLicensing(randomValidJdbcLicenseType());
+  }
+  public void disableJdbcLicensing() throws Exception {
+    updateLicensing(randomInvalidJdbcLicenseType());
+  }
+  public void updateLicensing(  OperationMode licenseOperationMode) throws Exception {
+    String licenseType=licenseOperationMode.name().toLowerCase(Locale.ROOT);
+    wipeAllLicenses();
+    if (licenseType.equals("missing")) {
+      putLicenseTombstone();
+    }
+ else {
+      License license=org.elasticsearch.license.TestUtils.generateSignedLicense(licenseType,TimeValue.timeValueMinutes(1));
+      putLicense(license);
+    }
+  }
+  public void testSqlQueryActionLicense() throws Exception {
+    setupTestIndex();
+    disableSqlLicensing();
+    ElasticsearchSecurityException e=expectThrows(ElasticsearchSecurityException.class,() -> client().prepareExecute(SqlQueryAction.INSTANCE).query("SELECT * FROM test").get());
+    assertThat(e.getMessage(),equalTo("current license is non-compliant for [sql]"));
+    enableSqlLicensing();
+    SqlQueryResponse response=client().prepareExecute(SqlQueryAction.INSTANCE).query("SELECT * FROM test").get();
+    assertThat(response.size(),Matchers.equalTo(2L));
+  }
+  public void testSqlQueryActionJdbcModeLicense() throws Exception {
+    setupTestIndex();
+    disableJdbcLicensing();
+    ElasticsearchSecurityException e=expectThrows(ElasticsearchSecurityException.class,() -> client().prepareExecute(SqlQueryAction.INSTANCE).query("SELECT * FROM test").mode("jdbc").get());
+    assertThat(e.getMessage(),equalTo("current license is non-compliant for [jdbc]"));
+    enableJdbcLicensing();
+    SqlQueryResponse response=client().prepareExecute(SqlQueryAction.INSTANCE).query("SELECT * FROM test").mode("jdbc").get();
+    assertThat(response.size(),Matchers.equalTo(2L));
+  }
+  public void testSqlTranslateActionLicense() throws Exception {
+    setupTestIndex();
+    disableSqlLicensing();
+    ElasticsearchSecurityException e=expectThrows(ElasticsearchSecurityException.class,() -> client().prepareExecute(SqlTranslateAction.INSTANCE).query("SELECT * FROM test").get());
+    assertThat(e.getMessage(),equalTo("current license is non-compliant for [sql]"));
+    enableSqlLicensing();
+    SqlTranslateResponse response=client().prepareExecute(SqlTranslateAction.INSTANCE).query("SELECT * FROM test").get();
+    SearchSourceBuilder source=response.source();
+    assertThat(source.docValueFields(),Matchers.contains(new DocValueFieldsContext.FieldAndFormat("count",DocValueFieldsContext.USE_DEFAULT_FORMAT)));
+    FetchSourceContext fetchSource=source.fetchSource();
+    assertThat(fetchSource.includes(),Matchers.arrayContaining("data"));
+  }
+  private void setupTestIndex(){
+    ElasticsearchAssertions.assertAcked(client().admin().indices().prepareCreate("test").get());
+    client().prepareBulk().add(new IndexRequest("test","doc","1").source("data","bar","count",42)).add(new IndexRequest("test","doc","2").source("data","baz","count",43)).setRefreshPolicy(WriteRequest.RefreshPolicy.IMMEDIATE).get();
+  }
+}

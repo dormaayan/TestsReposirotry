@@ -1,0 +1,48 @@
+/** 
+ * Test case which restarts the standby node in such a way that, when it exits safemode, it will want to invalidate a bunch of over-replicated block replicas. Ensures that if we failover at this point it won't lose data.
+ */
+@Test public void testNNClearsCommandsOnFailoverAfterStartup() throws Exception {
+  DFSTestUtil.createFile(fs,TEST_FILE_PATH,30 * SMALL_BLOCK,(short)3,1L);
+  banner("Shutting down NN2");
+  cluster.shutdownNameNode(1);
+  banner("Setting replication to 1, rolling edit log.");
+  nn1.getRpcServer().setReplication(TEST_FILE,(short)1);
+  nn1.getRpcServer().rollEditLog();
+  banner("Starting NN2 again.");
+  cluster.restartNameNode(1);
+  nn2=cluster.getNameNode(1);
+  banner("triggering BRs");
+  cluster.triggerBlockReports();
+  banner("computing invalidation on nn1");
+  BlockManagerTestUtil.computeInvalidationWork(nn1.getNamesystem().getBlockManager());
+  banner("computing invalidation on nn2");
+  BlockManagerTestUtil.computeInvalidationWork(nn2.getNamesystem().getBlockManager());
+  banner("Metadata immediately before failover");
+  doMetasave(nn2);
+  banner("Failing to NN2 but let NN1 continue to think it's active");
+  NameNodeAdapter.abortEditLogs(nn1);
+  NameNodeAdapter.enterSafeMode(nn1,false);
+  cluster.transitionToActive(1);
+  assertEquals(1,nn2.getRpcServer().getFileInfo(TEST_FILE).getReplication());
+  banner("Metadata immediately after failover");
+  doMetasave(nn2);
+  banner("Triggering heartbeats and block reports so that fencing is completed");
+  cluster.triggerHeartbeats();
+  cluster.triggerBlockReports();
+  banner("Metadata after nodes have all block-reported");
+  doMetasave(nn2);
+  BlockManager nn2BM=nn2.getNamesystem().getBlockManager();
+  BlockManagerTestUtil.checkHeartbeat(nn2BM);
+  BlockManagerTestUtil.rescanPostponedMisreplicatedBlocks(nn2BM);
+  assertEquals(0,nn2.getNamesystem().getPostponedMisreplicatedBlocks());
+  BlockManagerTestUtil.computeInvalidationWork(nn2.getNamesystem().getBlockManager());
+  HATestUtil.waitForNNToIssueDeletions(nn2);
+  cluster.triggerHeartbeats();
+  HATestUtil.waitForDNDeletions(cluster);
+  cluster.triggerDeletionReports();
+  assertEquals(0,nn2.getNamesystem().getUnderReplicatedBlocks());
+  assertEquals(0,nn2.getNamesystem().getPendingReplicationBlocks());
+  banner("Making sure the file is still readable");
+  FileSystem fs2=cluster.getFileSystem(1);
+  DFSTestUtil.readFile(fs2,TEST_FILE_PATH);
+}

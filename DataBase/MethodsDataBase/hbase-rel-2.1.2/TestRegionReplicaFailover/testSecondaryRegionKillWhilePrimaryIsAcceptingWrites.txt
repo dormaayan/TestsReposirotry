@@ -1,0 +1,60 @@
+/** 
+ * Tests the case where there are 3 region replicas and the primary is continuously accepting new writes while one of the secondaries is killed. Verification is done for both of the secondary replicas.
+ */
+@Test public void testSecondaryRegionKillWhilePrimaryIsAcceptingWrites() throws Exception {
+  try (Connection connection=ConnectionFactory.createConnection(HTU.getConfiguration());Table table=connection.getTable(htd.getTableName());Admin admin=connection.getAdmin()){
+    HTU.loadNumericRows(table,fam,0,1000);
+    admin.flush(table.getName());
+    HTU.loadNumericRows(table,fam,1000,2000);
+    final AtomicReference<Throwable> ex=new AtomicReference<>(null);
+    final AtomicBoolean done=new AtomicBoolean(false);
+    final AtomicInteger key=new AtomicInteger(2000);
+    Thread loader=new Thread(){
+      @Override public void run(){
+        while (!done.get()) {
+          try {
+            HTU.loadNumericRows(table,fam,key.get(),key.get() + 1000);
+            key.addAndGet(1000);
+          }
+ catch (          Throwable e) {
+            ex.compareAndSet(null,e);
+          }
+        }
+      }
+    }
+;
+    loader.start();
+    Thread aborter=new Thread(){
+      @Override public void run(){
+        try {
+          boolean aborted=false;
+          for (          RegionServerThread rs : HTU.getMiniHBaseCluster().getRegionServerThreads()) {
+            for (            Region r : rs.getRegionServer().getRegions(htd.getTableName())) {
+              if (r.getRegionInfo().getReplicaId() == 1) {
+                LOG.info("Aborting region server hosting secondary region replica");
+                rs.getRegionServer().abort("for test");
+                aborted=true;
+              }
+            }
+          }
+          assertTrue(aborted);
+        }
+ catch (        Throwable e) {
+          ex.compareAndSet(null,e);
+        }
+      }
+    }
+;
+    aborter.start();
+    aborter.join();
+    done.set(true);
+    loader.join();
+    assertNull(ex.get());
+    assertTrue(key.get() > 1000);
+    LOG.info("Loaded up to key :" + key.get());
+    verifyNumericRowsWithTimeout(table,fam,0,key.get(),0,30000);
+    verifyNumericRowsWithTimeout(table,fam,0,key.get(),1,30000);
+    verifyNumericRowsWithTimeout(table,fam,0,key.get(),2,30000);
+  }
+   HTU.getMiniHBaseCluster().startRegionServer();
+}

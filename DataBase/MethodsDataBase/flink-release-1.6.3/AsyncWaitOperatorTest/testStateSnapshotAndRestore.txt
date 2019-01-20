@@ -1,0 +1,62 @@
+@Test public void testStateSnapshotAndRestore() throws Exception {
+  final OneInputStreamTaskTestHarness<Integer,Integer> testHarness=new OneInputStreamTaskTestHarness<>(OneInputStreamTask::new,1,1,BasicTypeInfo.INT_TYPE_INFO,BasicTypeInfo.INT_TYPE_INFO);
+  testHarness.setupOutputForSingletonOperatorChain();
+  AsyncWaitOperator<Integer,Integer> operator=new AsyncWaitOperator<>(new LazyAsyncFunction(),TIMEOUT,3,AsyncDataStream.OutputMode.ORDERED);
+  final StreamConfig streamConfig=testHarness.getStreamConfig();
+  OperatorID operatorID=new OperatorID(42L,4711L);
+  streamConfig.setStreamOperator(operator);
+  streamConfig.setOperatorID(operatorID);
+  final TestTaskStateManager taskStateManagerMock=testHarness.getTaskStateManager();
+  taskStateManagerMock.setWaitForReportLatch(new OneShotLatch());
+  testHarness.invoke();
+  testHarness.waitForTaskRunning();
+  final OneInputStreamTask<Integer,Integer> task=testHarness.getTask();
+  final long initialTime=0L;
+  testHarness.processElement(new StreamRecord<>(1,initialTime + 1));
+  testHarness.processElement(new StreamRecord<>(2,initialTime + 2));
+  testHarness.processElement(new StreamRecord<>(3,initialTime + 3));
+  testHarness.processElement(new StreamRecord<>(4,initialTime + 4));
+  testHarness.waitForInputProcessing();
+  final long checkpointId=1L;
+  final long checkpointTimestamp=1L;
+  final CheckpointMetaData checkpointMetaData=new CheckpointMetaData(checkpointId,checkpointTimestamp);
+  task.triggerCheckpoint(checkpointMetaData,CheckpointOptions.forCheckpointWithDefaultLocation());
+  taskStateManagerMock.getWaitForReportLatch().await();
+  assertEquals(checkpointId,taskStateManagerMock.getReportedCheckpointId());
+  LazyAsyncFunction.countDown();
+  testHarness.endInput();
+  testHarness.waitForTaskCompletion();
+  TaskStateSnapshot subtaskStates=taskStateManagerMock.getLastJobManagerTaskStateSnapshot();
+  final OneInputStreamTaskTestHarness<Integer,Integer> restoredTaskHarness=new OneInputStreamTaskTestHarness<>(OneInputStreamTask::new,BasicTypeInfo.INT_TYPE_INFO,BasicTypeInfo.INT_TYPE_INFO);
+  restoredTaskHarness.setTaskStateSnapshot(checkpointId,subtaskStates);
+  restoredTaskHarness.setupOutputForSingletonOperatorChain();
+  AsyncWaitOperator<Integer,Integer> restoredOperator=new AsyncWaitOperator<>(new MyAsyncFunction(),TIMEOUT,6,AsyncDataStream.OutputMode.ORDERED);
+  restoredTaskHarness.getStreamConfig().setStreamOperator(restoredOperator);
+  restoredTaskHarness.getStreamConfig().setOperatorID(operatorID);
+  restoredTaskHarness.invoke();
+  restoredTaskHarness.waitForTaskRunning();
+  final OneInputStreamTask<Integer,Integer> restoredTask=restoredTaskHarness.getTask();
+  restoredTaskHarness.processElement(new StreamRecord<>(5,initialTime + 5));
+  restoredTaskHarness.processElement(new StreamRecord<>(6,initialTime + 6));
+  restoredTaskHarness.processElement(new StreamRecord<>(7,initialTime + 7));
+  restoredTask.triggerCheckpoint(new CheckpointMetaData(checkpointId,checkpointTimestamp),CheckpointOptions.forCheckpointWithDefaultLocation());
+  restoredTaskHarness.processElement(new StreamRecord<>(8,initialTime + 8));
+  restoredTaskHarness.endInput();
+  restoredTaskHarness.waitForTaskCompletion();
+  ConcurrentLinkedQueue<Object> expectedOutput=new ConcurrentLinkedQueue<>();
+  expectedOutput.add(new StreamRecord<>(2,initialTime + 1));
+  expectedOutput.add(new StreamRecord<>(4,initialTime + 2));
+  expectedOutput.add(new StreamRecord<>(6,initialTime + 3));
+  expectedOutput.add(new StreamRecord<>(8,initialTime + 4));
+  expectedOutput.add(new StreamRecord<>(10,initialTime + 5));
+  expectedOutput.add(new StreamRecord<>(12,initialTime + 6));
+  expectedOutput.add(new StreamRecord<>(14,initialTime + 7));
+  expectedOutput.add(new StreamRecord<>(16,initialTime + 8));
+  Iterator<Object> iterator=restoredTaskHarness.getOutput().iterator();
+  while (iterator.hasNext()) {
+    if (iterator.next() instanceof CheckpointBarrier) {
+      iterator.remove();
+    }
+  }
+  TestHarnessUtil.assertOutputEquals("StateAndRestored Test Output was not correct.",expectedOutput,restoredTaskHarness.getOutput());
+}

@@ -1,0 +1,70 @@
+@Test public void testZeroCopyMmapCache() throws Exception {
+  HdfsConfiguration conf=initZeroCopyTest();
+  MiniDFSCluster cluster=null;
+  final Path TEST_PATH=new Path("/a");
+  final int TEST_FILE_LENGTH=5 * BLOCK_SIZE;
+  final int RANDOM_SEED=23453;
+  final String CONTEXT="testZeroCopyMmapCacheContext";
+  FSDataInputStream fsIn=null;
+  ByteBuffer results[]={null,null,null,null};
+  DistributedFileSystem fs=null;
+  conf.set(HdfsClientConfigKeys.DFS_CLIENT_CONTEXT,CONTEXT);
+  cluster=new MiniDFSCluster.Builder(conf).numDataNodes(1).build();
+  cluster.waitActive();
+  fs=cluster.getFileSystem();
+  DFSTestUtil.createFile(fs,TEST_PATH,TEST_FILE_LENGTH,(short)1,RANDOM_SEED);
+  try {
+    DFSTestUtil.waitReplication(fs,TEST_PATH,(short)1);
+  }
+ catch (  InterruptedException e) {
+    Assert.fail("unexpected InterruptedException during " + "waitReplication: " + e);
+  }
+catch (  TimeoutException e) {
+    Assert.fail("unexpected TimeoutException during " + "waitReplication: " + e);
+  }
+  fsIn=fs.open(TEST_PATH);
+  byte original[]=new byte[TEST_FILE_LENGTH];
+  IOUtils.readFully(fsIn,original,0,TEST_FILE_LENGTH);
+  fsIn.close();
+  fsIn=fs.open(TEST_PATH);
+  final ShortCircuitCache cache=ClientContext.get(CONTEXT,conf).getShortCircuitCache();
+  cache.accept(new CountingVisitor(0,5,5,0));
+  results[0]=fsIn.read(null,BLOCK_SIZE,EnumSet.of(ReadOption.SKIP_CHECKSUMS));
+  fsIn.seek(0);
+  results[1]=fsIn.read(null,BLOCK_SIZE,EnumSet.of(ReadOption.SKIP_CHECKSUMS));
+  final ExtendedBlock firstBlock=DFSTestUtil.getFirstBlock(fs,TEST_PATH);
+  cache.accept(new CacheVisitor(){
+    @Override public void visit(    int numOutstandingMmaps,    Map<ExtendedBlockId,ShortCircuitReplica> replicas,    Map<ExtendedBlockId,InvalidToken> failedLoads,    LinkedMap evictable,    LinkedMap evictableMmapped){
+      ShortCircuitReplica replica=replicas.get(new ExtendedBlockId(firstBlock.getBlockId(),firstBlock.getBlockPoolId()));
+      Assert.assertNotNull(replica);
+      Assert.assertTrue(replica.hasMmap());
+      Assert.assertNull(replica.getEvictableTimeNs());
+    }
+  }
+);
+  results[2]=fsIn.read(null,BLOCK_SIZE,EnumSet.of(ReadOption.SKIP_CHECKSUMS));
+  results[3]=fsIn.read(null,BLOCK_SIZE,EnumSet.of(ReadOption.SKIP_CHECKSUMS));
+  cache.accept(new CountingVisitor(3,5,2,0));
+  for (  ByteBuffer buffer : results) {
+    if (buffer != null) {
+      fsIn.releaseBuffer(buffer);
+    }
+  }
+  fsIn.close();
+  GenericTestUtils.waitFor(new Supplier<Boolean>(){
+    public Boolean get(){
+      final MutableBoolean finished=new MutableBoolean(false);
+      cache.accept(new CacheVisitor(){
+        @Override public void visit(        int numOutstandingMmaps,        Map<ExtendedBlockId,ShortCircuitReplica> replicas,        Map<ExtendedBlockId,InvalidToken> failedLoads,        LinkedMap evictable,        LinkedMap evictableMmapped){
+          finished.setValue(evictableMmapped.isEmpty());
+        }
+      }
+);
+      return finished.booleanValue();
+    }
+  }
+,10,60000);
+  cache.accept(new CountingVisitor(0,-1,-1,-1));
+  fs.close();
+  cluster.shutdown();
+}

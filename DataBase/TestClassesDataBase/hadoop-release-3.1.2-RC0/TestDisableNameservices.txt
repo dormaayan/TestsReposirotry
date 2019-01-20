@@ -1,0 +1,121 @@
+/** 
+ * Test the behavior when disabling name services.
+ */
+public class TestDisableNameservices {
+  private static StateStoreDFSCluster cluster;
+  private static RouterContext routerContext;
+  private static RouterClient routerAdminClient;
+  private static ClientProtocol routerProtocol;
+  @BeforeClass public static void setUp() throws Exception {
+    cluster=new StateStoreDFSCluster(false,2);
+    Configuration routerConf=new RouterConfigBuilder().stateStore().metrics().admin().rpc().build();
+    routerConf.setInt(RBFConfigKeys.DFS_ROUTER_HANDLER_COUNT_KEY,8);
+    routerConf.setInt(RBFConfigKeys.DFS_ROUTER_CLIENT_THREADS_SIZE,4);
+    cluster.setIndependentDNs();
+    cluster.addRouterOverrides(routerConf);
+    cluster.startCluster();
+    cluster.startRouters();
+    cluster.waitClusterUp();
+    routerContext=cluster.getRandomRouter();
+    routerProtocol=routerContext.getClient().getNamenode();
+    routerAdminClient=routerContext.getAdminClient();
+    setupNamespace();
+    MiniDFSCluster dfsCluster=cluster.getCluster();
+    NameNode nn0=dfsCluster.getNameNode(0);
+    simulateSlowNamenode(nn0,1);
+  }
+  private static void setupNamespace() throws IOException {
+    MountTableManager mountTable=routerAdminClient.getMountTableManager();
+    Map<String,String> destinations=new TreeMap<>();
+    destinations.put("ns0","/");
+    destinations.put("ns1","/");
+    MountTable newEntry=MountTable.newInstance("/",destinations);
+    newEntry.setDestOrder(DestinationOrder.RANDOM);
+    AddMountTableEntryRequest request=AddMountTableEntryRequest.newInstance(newEntry);
+    mountTable.addMountTableEntry(request);
+    Router router=routerContext.getRouter();
+    MountTableResolver mountTableResolver=(MountTableResolver)router.getSubclusterResolver();
+    mountTableResolver.loadCache(true);
+    NamenodeContext nn0=cluster.getNamenode("ns0",null);
+    nn0.getFileSystem().mkdirs(new Path("/dirns0"));
+    NamenodeContext nn1=cluster.getNamenode("ns1",null);
+    nn1.getFileSystem().mkdirs(new Path("/dirns1"));
+  }
+  @AfterClass public static void tearDown(){
+    if (cluster != null) {
+      cluster.stopRouter(routerContext);
+      cluster.shutdown();
+      cluster=null;
+    }
+  }
+  @After public void cleanup() throws IOException {
+    Router router=routerContext.getRouter();
+    StateStoreService stateStore=router.getStateStore();
+    DisabledNameserviceStore store=stateStore.getRegisteredRecordStore(DisabledNameserviceStore.class);
+    store.loadCache(true);
+    Set<String> disabled=store.getDisabledNameservices();
+    for (    String nsId : disabled) {
+      store.enableNameservice(nsId);
+    }
+    store.loadCache(true);
+  }
+  @Test public void testWithoutDisabling() throws IOException {
+    long t0=monotonicNow();
+    routerProtocol.renewLease("client0");
+    long t=monotonicNow() - t0;
+    assertTrue("It took too little: " + t + "ms",t > TimeUnit.SECONDS.toMillis(1));
+    FileSystem routerFs=routerContext.getFileSystem();
+    FileStatus[] filesStatus=routerFs.listStatus(new Path("/"));
+    assertEquals(2,filesStatus.length);
+    assertEquals("dirns0",filesStatus[0].getPath().getName());
+    assertEquals("dirns1",filesStatus[1].getPath().getName());
+  }
+  @Test public void testDisabling() throws Exception {
+    disableNameservice("ns0");
+    long t0=monotonicNow();
+    routerProtocol.renewLease("client0");
+    long t=monotonicNow() - t0;
+    assertTrue("It took too long: " + t + "ms",t < TimeUnit.SECONDS.toMillis(1));
+    FileSystem routerFs=routerContext.getFileSystem();
+    FileStatus[] filesStatus=routerFs.listStatus(new Path("/"));
+    assertEquals(1,filesStatus.length);
+    assertEquals("dirns1",filesStatus[0].getPath().getName());
+  }
+  @Test public void testMetrics() throws Exception {
+    disableNameservice("ns0");
+    int numActive=0;
+    int numDisabled=0;
+    Router router=routerContext.getRouter();
+    FederationMetrics metrics=router.getMetrics();
+    String jsonString=metrics.getNameservices();
+    JSONObject jsonObject=new JSONObject(jsonString);
+    Iterator<?> keys=jsonObject.keys();
+    while (keys.hasNext()) {
+      String key=(String)keys.next();
+      JSONObject json=jsonObject.getJSONObject(key);
+      String nsId=json.getString("nameserviceId");
+      String state=json.getString("state");
+      if (nsId.equals("ns0")) {
+        assertEquals("DISABLED",state);
+        numDisabled++;
+      }
+ else {
+        assertEquals("ACTIVE",state);
+        numActive++;
+      }
+    }
+    assertEquals(1,numActive);
+    assertEquals(1,numDisabled);
+  }
+  private static void disableNameservice(  final String nsId) throws IOException {
+    NameserviceManager nsManager=routerAdminClient.getNameserviceManager();
+    DisableNameserviceRequest req=DisableNameserviceRequest.newInstance(nsId);
+    nsManager.disableNameservice(req);
+    Router router=routerContext.getRouter();
+    StateStoreService stateStore=router.getStateStore();
+    DisabledNameserviceStore store=stateStore.getRegisteredRecordStore(DisabledNameserviceStore.class);
+    store.loadCache(true);
+    MembershipNamenodeResolver resolver=(MembershipNamenodeResolver)router.getNamenodeResolver();
+    resolver.loadCache(true);
+  }
+}

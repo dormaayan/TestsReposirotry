@@ -1,0 +1,40 @@
+class Follower extends Thread {
+  private final Engine leader;
+  private final InternalEngine engine;
+  private final TranslogHandler translogHandler;
+  private final AtomicBoolean isDone;
+  private final CountDownLatch readLatch;
+  Follower(  Engine leader,  AtomicBoolean isDone,  CountDownLatch readLatch) throws IOException {
+    this.leader=leader;
+    this.isDone=isDone;
+    this.readLatch=readLatch;
+    this.translogHandler=new TranslogHandler(xContentRegistry(),IndexSettingsModule.newIndexSettings(shardId.getIndexName(),leader.engineConfig.getIndexSettings().getSettings()));
+    this.engine=createEngine(createStore(),createTempDir());
+  }
+  void pullOperations(  Engine follower) throws IOException {
+    long leaderCheckpoint=leader.getLocalCheckpoint();
+    long followerCheckpoint=follower.getLocalCheckpoint();
+    if (followerCheckpoint < leaderCheckpoint) {
+      long fromSeqNo=followerCheckpoint + 1;
+      long batchSize=randomLongBetween(0,100);
+      long toSeqNo=Math.min(fromSeqNo + batchSize,leaderCheckpoint);
+      try (Translog.Snapshot snapshot=leader.newChangesSnapshot("test",mapperService,fromSeqNo,toSeqNo,true)){
+        translogHandler.run(follower,snapshot);
+      }
+     }
+  }
+  @Override public void run(){
+    try {
+      readLatch.countDown();
+      readLatch.await();
+      while (isDone.get() == false || engine.getLocalCheckpointTracker().getCheckpoint() < leader.getLocalCheckpoint()) {
+        pullOperations(engine);
+      }
+      assertConsistentHistoryBetweenTranslogAndLuceneIndex(engine,mapperService);
+      assertThat(getDocIds(engine,true),equalTo(getDocIds(leader,true)));
+    }
+ catch (    Exception ex) {
+      throw new AssertionError(ex);
+    }
+  }
+}

@@ -1,0 +1,92 @@
+public static class TimeBoundedMultiThreadedReader extends MultiThreadedReader {
+  protected long timeoutNano;
+  protected AtomicLong timedOutReads=new AtomicLong();
+  protected long runTime;
+  protected Thread timeoutThread;
+  protected AtomicLong staleReads=new AtomicLong();
+  public TimeBoundedMultiThreadedReader(  LoadTestDataGenerator dataGen,  Configuration conf,  TableName tableName,  double verifyPercent) throws IOException {
+    super(dataGen,conf,tableName,verifyPercent);
+    long timeoutMs=conf.getLong(String.format("%s.%s",TEST_NAME,GET_TIMEOUT_KEY),DEFAULT_GET_TIMEOUT);
+    timeoutNano=timeoutMs * 1000000;
+    LOG.info("Timeout for gets: " + timeoutMs);
+    String runTimeKey=String.format(RUN_TIME_KEY,this.getClass().getSimpleName());
+    this.runTime=conf.getLong(runTimeKey,-1);
+    if (this.runTime <= 0) {
+      throw new IllegalArgumentException("Please configure " + runTimeKey);
+    }
+  }
+  @Override public void waitForFinish(){
+    try {
+      this.timeoutThread.join();
+    }
+ catch (    InterruptedException e) {
+      e.printStackTrace();
+    }
+    this.aborted=true;
+    super.waitForFinish();
+  }
+  @Override protected String progressInfo(){
+    StringBuilder builder=new StringBuilder(super.progressInfo());
+    appendToStatus(builder,"stale_reads",staleReads.get());
+    appendToStatus(builder,"get_timeouts",timedOutReads.get());
+    return builder.toString();
+  }
+  @Override public void start(  long startKey,  long endKey,  int numThreads) throws IOException {
+    super.start(startKey,endKey,numThreads);
+    this.timeoutThread=new TimeoutThread(this.runTime);
+    this.timeoutThread.start();
+  }
+  @Override protected HBaseReaderThread createReaderThread(  int readerId) throws IOException {
+    return new TimeBoundedMultiThreadedReaderThread(readerId);
+  }
+private class TimeoutThread extends Thread {
+    long timeout;
+    long reportInterval=60000;
+    public TimeoutThread(    long timeout){
+      this.timeout=timeout;
+    }
+    @Override public void run(){
+      while (true) {
+        long rem=Math.min(timeout,reportInterval);
+        if (rem <= 0) {
+          break;
+        }
+        LOG.info("Remaining execution time:" + timeout / 60000 + " min");
+        Threads.sleep(rem);
+        timeout-=rem;
+      }
+    }
+  }
+public class TimeBoundedMultiThreadedReaderThread extends MultiThreadedReader.HBaseReaderThread {
+    public TimeBoundedMultiThreadedReaderThread(    int readerId) throws IOException {
+      super(readerId);
+    }
+    @Override protected Get createGet(    long keyToRead) throws IOException {
+      Get get=super.createGet(keyToRead);
+      get.setConsistency(Consistency.TIMELINE);
+      return get;
+    }
+    @Override protected long getNextKeyToRead(){
+      long key=startKey + Math.abs(RandomUtils.nextLong()) % (endKey - startKey);
+      return key;
+    }
+    @Override protected void verifyResultsAndUpdateMetrics(    boolean verify,    Get[] gets,    long elapsedNano,    Result[] results,    Table table,    boolean isNullExpected) throws IOException {
+      super.verifyResultsAndUpdateMetrics(verify,gets,elapsedNano,results,table,isNullExpected);
+      for (      Result r : results) {
+        if (r.isStale())         staleReads.incrementAndGet();
+      }
+      if (elapsedNano > timeoutNano) {
+        timedOutReads.incrementAndGet();
+        numReadFailures.addAndGet(1);
+        for (        Result r : results) {
+          LOG.error("FAILED FOR " + r);
+          RegionLocations rl=((ClusterConnection)connection).locateRegion(tableName,r.getRow(),true,true);
+          HRegionLocation locations[]=rl.getRegionLocations();
+          for (          HRegionLocation h : locations) {
+            LOG.error("LOCATION " + h);
+          }
+        }
+      }
+    }
+  }
+}

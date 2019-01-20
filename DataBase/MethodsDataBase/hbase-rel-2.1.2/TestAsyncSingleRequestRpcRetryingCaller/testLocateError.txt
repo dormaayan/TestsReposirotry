@@ -1,0 +1,41 @@
+@Test public void testLocateError() throws IOException, InterruptedException, ExecutionException {
+  AtomicBoolean errorTriggered=new AtomicBoolean(false);
+  AtomicInteger count=new AtomicInteger(0);
+  HRegionLocation loc=CONN.getRegionLocator(TABLE_NAME).getRegionLocation(ROW).get();
+  AsyncRegionLocator mockedLocator=new AsyncRegionLocator(CONN,AsyncConnectionImpl.RETRY_TIMER){
+    @Override CompletableFuture<HRegionLocation> getRegionLocation(    TableName tableName,    byte[] row,    RegionLocateType locateType,    long timeoutNs){
+      if (tableName.equals(TABLE_NAME)) {
+        CompletableFuture<HRegionLocation> future=new CompletableFuture<>();
+        if (count.getAndIncrement() == 0) {
+          errorTriggered.set(true);
+          future.completeExceptionally(new RuntimeException("Inject error!"));
+        }
+ else {
+          future.complete(loc);
+        }
+        return future;
+      }
+ else {
+        return super.getRegionLocation(tableName,row,locateType,timeoutNs);
+      }
+    }
+    @Override void updateCachedLocation(    HRegionLocation loc,    Throwable exception){
+    }
+  }
+;
+  try (AsyncConnectionImpl mockedConn=new AsyncConnectionImpl(CONN.getConfiguration(),CONN.registry,CONN.registry.getClusterId().get(),User.getCurrent()){
+    @Override AsyncRegionLocator getLocator(){
+      return mockedLocator;
+    }
+  }
+){
+    AsyncTable<?> table=mockedConn.getTableBuilder(TABLE_NAME).setRetryPause(100,TimeUnit.MILLISECONDS).setMaxRetries(5).build();
+    table.put(new Put(ROW).addColumn(FAMILY,QUALIFIER,VALUE)).get();
+    assertTrue(errorTriggered.get());
+    errorTriggered.set(false);
+    count.set(0);
+    Result result=table.get(new Get(ROW).addColumn(FAMILY,QUALIFIER)).get();
+    assertArrayEquals(VALUE,result.getValue(FAMILY,QUALIFIER));
+    assertTrue(errorTriggered.get());
+  }
+ }

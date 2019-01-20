@@ -1,0 +1,76 @@
+@Test public void testScanWithException() throws IOException, InterruptedException {
+  Table table=null;
+  try {
+    latch=new CountDownLatch(1);
+    exceptionLatch=new CountDownLatch(1);
+    final TableName tableName=TableName.valueOf(name.getMethodName());
+    table=TEST_UTIL.createTable(tableName,FAMILIES_1,1,1024,CustomInnerRegionObserverWrapper.class.getName());
+    RegionLocator locator=TEST_UTIL.getConnection().getRegionLocator(tableName);
+    String regionName=locator.getAllRegionLocations().get(0).getRegionInfo().getEncodedName();
+    HRegion region=TEST_UTIL.getRSForFirstRegionInTable(tableName).getRegion(regionName);
+    HStore store=region.getStores().iterator().next();
+    CacheConfig cacheConf=store.getCacheConfig();
+    cacheConf.setCacheDataOnWrite(true);
+    cacheConf.setEvictOnClose(true);
+    BlockCache cache=cacheConf.getBlockCache();
+    insertData(table);
+    System.out.println("Flushing cache");
+    region.flush(true);
+    CustomInnerRegionObserver.throwException.set(true);
+    ScanThread[] scanThreads=initiateScan(table,false);
+    Thread.sleep(100);
+    Iterator<CachedBlock> iterator=cache.iterator();
+    boolean usedBlocksFound=false;
+    int refCount=0;
+    while (iterator.hasNext()) {
+      CachedBlock next=iterator.next();
+      BlockCacheKey cacheKey=new BlockCacheKey(next.getFilename(),next.getOffset());
+      if (cache instanceof BucketCache) {
+        refCount=((BucketCache)cache).getRefCount(cacheKey);
+      }
+ else       if (cache instanceof CombinedBlockCache) {
+        refCount=((CombinedBlockCache)cache).getRefCount(cacheKey);
+      }
+ else {
+        continue;
+      }
+      if (refCount != 0) {
+        assertEquals(NO_OF_THREADS,refCount);
+        usedBlocksFound=true;
+      }
+    }
+    assertTrue(usedBlocksFound);
+    exceptionLatch.countDown();
+    CustomInnerRegionObserver.getCdl().get().countDown();
+    for (    ScanThread thread : scanThreads) {
+      thread.join();
+    }
+    iterator=cache.iterator();
+    usedBlocksFound=false;
+    refCount=0;
+    while (iterator.hasNext()) {
+      CachedBlock next=iterator.next();
+      BlockCacheKey cacheKey=new BlockCacheKey(next.getFilename(),next.getOffset());
+      if (cache instanceof BucketCache) {
+        refCount=((BucketCache)cache).getRefCount(cacheKey);
+      }
+ else       if (cache instanceof CombinedBlockCache) {
+        refCount=((CombinedBlockCache)cache).getRefCount(cacheKey);
+      }
+ else {
+        continue;
+      }
+      if (refCount != 0) {
+        assertEquals(NO_OF_THREADS,refCount);
+        usedBlocksFound=true;
+      }
+    }
+    assertFalse(usedBlocksFound);
+    assertEquals(0,refCount);
+  }
+  finally {
+    if (table != null) {
+      table.close();
+    }
+  }
+}

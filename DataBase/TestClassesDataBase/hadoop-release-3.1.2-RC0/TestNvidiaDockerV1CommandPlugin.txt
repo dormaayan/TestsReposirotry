@@ -1,0 +1,106 @@
+public class TestNvidiaDockerV1CommandPlugin {
+  private Map<String,List<String>> copyCommandLine(  Map<String,List<String>> map){
+    Map<String,List<String>> ret=new HashMap<>();
+    for (    Map.Entry<String,List<String>> entry : map.entrySet()) {
+      ret.put(entry.getKey(),new ArrayList<>(entry.getValue()));
+    }
+    return ret;
+  }
+  private boolean commandlinesEquals(  Map<String,List<String>> cli1,  Map<String,List<String>> cli2){
+    if (!Sets.symmetricDifference(cli1.keySet(),cli2.keySet()).isEmpty()) {
+      return false;
+    }
+    for (    String key : cli1.keySet()) {
+      List<String> value1=cli1.get(key);
+      List<String> value2=cli2.get(key);
+      if (!value1.equals(value2)) {
+        return false;
+      }
+    }
+    return true;
+  }
+static class MyHandler implements HttpHandler {
+    String response="This is the response";
+    @Override public void handle(    HttpExchange t) throws IOException {
+      t.sendResponseHeaders(200,response.length());
+      OutputStream os=t.getResponseBody();
+      os.write(response.getBytes());
+      os.close();
+    }
+  }
+static class MyNvidiaDockerV1CommandPlugin extends NvidiaDockerV1CommandPlugin {
+    private boolean requestsGpu=false;
+    public MyNvidiaDockerV1CommandPlugin(    Configuration conf){
+      super(conf);
+    }
+    public void setRequestsGpu(    boolean r){
+      requestsGpu=r;
+    }
+    @Override protected boolean requestsGpu(    Container container){
+      return requestsGpu;
+    }
+  }
+  @Test public void testPlugin() throws Exception {
+    Configuration conf=new Configuration();
+    DockerRunCommand runCommand=new DockerRunCommand("container_1","user","fakeimage");
+    Map<String,List<String>> originalCommandline=copyCommandLine(runCommand.getDockerCommandWithArguments());
+    MyNvidiaDockerV1CommandPlugin commandPlugin=new MyNvidiaDockerV1CommandPlugin(conf);
+    Container nmContainer=mock(Container.class);
+    commandPlugin.updateDockerRunCommand(runCommand,nmContainer);
+    Assert.assertTrue(commandlinesEquals(originalCommandline,runCommand.getDockerCommandWithArguments()));
+    ResourceMappings resourceMappings=new ResourceMappings();
+    when(nmContainer.getResourceMappings()).thenReturn(resourceMappings);
+    commandPlugin.updateDockerRunCommand(runCommand,nmContainer);
+    Assert.assertTrue(commandlinesEquals(originalCommandline,runCommand.getDockerCommandWithArguments()));
+    ResourceMappings.AssignedResources assigned=new ResourceMappings.AssignedResources();
+    assigned.updateAssignedResources(ImmutableList.of(new GpuDevice(0,0),new GpuDevice(1,1)));
+    resourceMappings.addAssignedResources(ResourceInformation.GPU_URI,assigned);
+    commandPlugin.setRequestsGpu(true);
+    boolean caughtException=false;
+    try {
+      commandPlugin.updateDockerRunCommand(runCommand,nmContainer);
+    }
+ catch (    ContainerExecutionException e) {
+      caughtException=true;
+    }
+    Assert.assertTrue(caughtException);
+    MyHandler handler=new MyHandler();
+    HttpServer server=HttpServer.create(new InetSocketAddress(60111),0);
+    server.createContext("/test",handler);
+    server.start();
+    String hostName=server.getAddress().getHostName();
+    int port=server.getAddress().getPort();
+    String httpUrl="http://" + hostName + ":"+ port+ "/test";
+    conf.set(YarnConfiguration.NVIDIA_DOCKER_PLUGIN_V1_ENDPOINT,httpUrl);
+    commandPlugin=new MyNvidiaDockerV1CommandPlugin(conf);
+    handler.response="INVALID_RESPONSE";
+    try {
+      commandPlugin.updateDockerRunCommand(runCommand,nmContainer);
+    }
+ catch (    ContainerExecutionException e) {
+      caughtException=true;
+    }
+    Assert.assertTrue(caughtException);
+    handler.response="INVALID_RESPONSE";
+    try {
+      commandPlugin.updateDockerRunCommand(runCommand,nmContainer);
+    }
+ catch (    ContainerExecutionException e) {
+      caughtException=true;
+    }
+    Assert.assertTrue(caughtException);
+    handler.response="--device=/dev/nvidiactl --device=/dev/nvidia-uvm " + "--device=/dev/nvidia0 --device=/dev/nvidia1 " + "--volume-driver=nvidia-docker "+ "--volume=nvidia_driver_352.68:/usr/local/nvidia:ro";
+    commandPlugin.setRequestsGpu(true);
+    commandPlugin.updateDockerRunCommand(runCommand,nmContainer);
+    Map<String,List<String>> newCommandLine=runCommand.getDockerCommandWithArguments();
+    Assert.assertFalse(commandlinesEquals(originalCommandline,newCommandLine));
+    Assert.assertFalse(newCommandLine.containsKey("volume-driver"));
+    Assert.assertTrue(newCommandLine.containsKey("devices"));
+    Assert.assertTrue(newCommandLine.containsKey("mounts"));
+    commandPlugin=new MyNvidiaDockerV1CommandPlugin(conf);
+    Assert.assertNull(commandPlugin.getCreateDockerVolumeCommand(nmContainer));
+    commandPlugin.setRequestsGpu(true);
+    DockerVolumeCommand dockerVolumeCommand=commandPlugin.getCreateDockerVolumeCommand(nmContainer);
+    Assert.assertEquals("volume docker-command=volume " + "driver=nvidia-docker " + "sub-command=create "+ "volume=nvidia_driver_352.68",dockerVolumeCommand.toString());
+  }
+}

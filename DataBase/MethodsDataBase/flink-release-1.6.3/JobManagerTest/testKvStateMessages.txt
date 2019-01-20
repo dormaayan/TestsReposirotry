@@ -1,0 +1,86 @@
+/** 
+ * Tests that the JobManager handles  {@link org.apache.flink.runtime.query.KvStateMessage}instances as expected.
+ */
+@Test public void testKvStateMessages() throws Exception {
+  Deadline deadline=new FiniteDuration(100,TimeUnit.SECONDS).fromNow();
+  Configuration config=new Configuration();
+  config.setString(AkkaOptions.ASK_TIMEOUT,"100ms");
+  ActorRef jobManagerActor=JobManager.startJobManagerActors(config,system,TestingUtils.defaultExecutor(),TestingUtils.defaultExecutor(),highAvailabilityServices,NoOpMetricRegistry.INSTANCE,Option.empty(),TestingJobManager.class,MemoryArchivist.class)._1();
+  UUID leaderId=LeaderRetrievalUtils.retrieveLeaderSessionId(highAvailabilityServices.getJobManagerLeaderRetriever(HighAvailabilityServices.DEFAULT_JOB_ID),TestingUtils.TESTING_TIMEOUT());
+  ActorGateway jobManager=new AkkaActorGateway(jobManagerActor,leaderId);
+  Configuration tmConfig=new Configuration();
+  tmConfig.setString(TaskManagerOptions.MANAGED_MEMORY_SIZE,"4m");
+  tmConfig.setInteger(TaskManagerOptions.NUM_TASK_SLOTS,8);
+  ActorRef taskManager=TaskManager.startTaskManagerComponentsAndActor(tmConfig,ResourceID.generate(),system,highAvailabilityServices,NoOpMetricRegistry.INSTANCE,"localhost",scala.Option.<String>empty(),true,TestingTaskManager.class);
+  Future<Object> registrationFuture=jobManager.ask(new NotifyWhenAtLeastNumTaskManagerAreRegistered(1),deadline.timeLeft());
+  Await.ready(registrationFuture,deadline.timeLeft());
+  LookupKvStateLocation lookupNonExistingJob=new LookupKvStateLocation(new JobID(),"any-name");
+  Future<KvStateLocation> lookupFuture=jobManager.ask(lookupNonExistingJob,deadline.timeLeft()).mapTo(ClassTag$.MODULE$.<KvStateLocation>apply(KvStateLocation.class));
+  try {
+    Await.result(lookupFuture,deadline.timeLeft());
+    fail("Did not throw expected Exception");
+  }
+ catch (  FlinkJobNotFoundException ignored) {
+  }
+  JobGraph jobGraph=new JobGraph("croissant");
+  JobVertex jobVertex1=new JobVertex("cappuccino");
+  jobVertex1.setParallelism(4);
+  jobVertex1.setMaxParallelism(16);
+  jobVertex1.setInvokableClass(BlockingNoOpInvokable.class);
+  JobVertex jobVertex2=new JobVertex("americano");
+  jobVertex2.setParallelism(4);
+  jobVertex2.setMaxParallelism(16);
+  jobVertex2.setInvokableClass(BlockingNoOpInvokable.class);
+  jobGraph.addVertex(jobVertex1);
+  jobGraph.addVertex(jobVertex2);
+  Future<JobSubmitSuccess> submitFuture=jobManager.ask(new SubmitJob(jobGraph,ListeningBehaviour.DETACHED),deadline.timeLeft()).mapTo(ClassTag$.MODULE$.<JobSubmitSuccess>apply(JobSubmitSuccess.class));
+  Await.result(submitFuture,deadline.timeLeft());
+  Object lookupUnknownRegistrationName=new LookupKvStateLocation(jobGraph.getJobID(),"unknown");
+  lookupFuture=jobManager.ask(lookupUnknownRegistrationName,deadline.timeLeft()).mapTo(ClassTag$.MODULE$.<KvStateLocation>apply(KvStateLocation.class));
+  try {
+    Await.result(lookupFuture,deadline.timeLeft());
+    fail("Did not throw expected Exception");
+  }
+ catch (  UnknownKvStateLocation ignored) {
+  }
+  NotifyKvStateRegistered registerNonExistingJob=new NotifyKvStateRegistered(new JobID(),new JobVertexID(),new KeyGroupRange(0,0),"any-name",new KvStateID(),new InetSocketAddress(InetAddress.getLocalHost(),1233));
+  jobManager.tell(registerNonExistingJob);
+  LookupKvStateLocation lookupAfterRegistration=new LookupKvStateLocation(registerNonExistingJob.getJobId(),registerNonExistingJob.getRegistrationName());
+  lookupFuture=jobManager.ask(lookupAfterRegistration,deadline.timeLeft()).mapTo(ClassTag$.MODULE$.<KvStateLocation>apply(KvStateLocation.class));
+  try {
+    Await.result(lookupFuture,deadline.timeLeft());
+    fail("Did not throw expected Exception");
+  }
+ catch (  FlinkJobNotFoundException ignored) {
+  }
+  NotifyKvStateRegistered registerForExistingJob=new NotifyKvStateRegistered(jobGraph.getJobID(),jobVertex1.getID(),new KeyGroupRange(0,0),"register-me",new KvStateID(),new InetSocketAddress(InetAddress.getLocalHost(),1293));
+  jobManager.tell(registerForExistingJob);
+  lookupAfterRegistration=new LookupKvStateLocation(registerForExistingJob.getJobId(),registerForExistingJob.getRegistrationName());
+  lookupFuture=jobManager.ask(lookupAfterRegistration,deadline.timeLeft()).mapTo(ClassTag$.MODULE$.<KvStateLocation>apply(KvStateLocation.class));
+  KvStateLocation location=Await.result(lookupFuture,deadline.timeLeft());
+  assertNotNull(location);
+  assertEquals(jobGraph.getJobID(),location.getJobId());
+  assertEquals(jobVertex1.getID(),location.getJobVertexId());
+  assertEquals(jobVertex1.getMaxParallelism(),location.getNumKeyGroups());
+  assertEquals(1,location.getNumRegisteredKeyGroups());
+  KeyGroupRange keyGroupRange=registerForExistingJob.getKeyGroupRange();
+  assertEquals(1,keyGroupRange.getNumberOfKeyGroups());
+  assertEquals(registerForExistingJob.getKvStateId(),location.getKvStateID(keyGroupRange.getStartKeyGroup()));
+  assertEquals(registerForExistingJob.getKvStateServerAddress(),location.getKvStateServerAddress(keyGroupRange.getStartKeyGroup()));
+  NotifyKvStateUnregistered unregister=new NotifyKvStateUnregistered(registerForExistingJob.getJobId(),registerForExistingJob.getJobVertexId(),registerForExistingJob.getKeyGroupRange(),registerForExistingJob.getRegistrationName());
+  jobManager.tell(unregister);
+  lookupFuture=jobManager.ask(lookupAfterRegistration,deadline.timeLeft()).mapTo(ClassTag$.MODULE$.<KvStateLocation>apply(KvStateLocation.class));
+  try {
+    Await.result(lookupFuture,deadline.timeLeft());
+    fail("Did not throw expected Exception");
+  }
+ catch (  UnknownKvStateLocation ignored) {
+  }
+  NotifyKvStateRegistered register=new NotifyKvStateRegistered(jobGraph.getJobID(),jobVertex1.getID(),new KeyGroupRange(0,0),"duplicate-me",new KvStateID(),new InetSocketAddress(InetAddress.getLocalHost(),1293));
+  NotifyKvStateRegistered duplicate=new NotifyKvStateRegistered(jobGraph.getJobID(),jobVertex2.getID(),new KeyGroupRange(0,0),"duplicate-me",new KvStateID(),new InetSocketAddress(InetAddress.getLocalHost(),1293));
+  Future<TestingJobManagerMessages.JobStatusIs> failedFuture=jobManager.ask(new NotifyWhenJobStatus(jobGraph.getJobID(),JobStatus.FAILED),deadline.timeLeft()).mapTo(ClassTag$.MODULE$.<JobStatusIs>apply(JobStatusIs.class));
+  jobManager.tell(register);
+  jobManager.tell(duplicate);
+  JobStatusIs jobStatus=Await.result(failedFuture,deadline.timeLeft());
+  assertEquals(JobStatus.FAILED,jobStatus.state());
+}

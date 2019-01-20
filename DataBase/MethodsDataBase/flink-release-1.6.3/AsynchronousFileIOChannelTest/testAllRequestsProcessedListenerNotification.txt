@@ -1,0 +1,83 @@
+@Test public void testAllRequestsProcessedListenerNotification() throws Exception {
+  final int numberOfRuns=10;
+  final int numberOfRequests=100;
+  final IOManagerAsync ioManager=new IOManagerAsync();
+  final ExecutorService executor=Executors.newFixedThreadPool(3);
+  final Random random=new Random();
+  final RequestQueue<WriteRequest> requestQueue=new RequestQueue<WriteRequest>();
+  final RequestDoneCallback<Buffer> ioChannelCallback=mock(RequestDoneCallback.class);
+  final TestNotificationListener listener=new TestNotificationListener();
+  try {
+    for (int run=0; run < numberOfRuns; run++) {
+      final TestAsyncFileIOChannel ioChannel=new TestAsyncFileIOChannel(ioManager.createChannel(),requestQueue,ioChannelCallback,true);
+      final CountDownLatch sync=new CountDownLatch(3);
+      final Buffer buffer=mock(Buffer.class);
+      final WriteRequest request=mock(WriteRequest.class);
+      Callable<Void> addRequestsTask=new Callable<Void>(){
+        @Override public Void call() throws Exception {
+          for (int i=0; i < numberOfRuns; i++) {
+            LOG.debug("Starting run {}.",i + 1);
+            for (int j=0; j < numberOfRequests; j++) {
+              ioChannel.addRequest(request);
+            }
+            LOG.debug("Added all ({}) requests of run {}.",numberOfRequests,i + 1);
+            int sleep=random.nextInt(10);
+            LOG.debug("Sleeping for {} ms before next run.",sleep);
+            Thread.sleep(sleep);
+          }
+          LOG.debug("Done. Closing channel.");
+          ioChannel.close();
+          sync.countDown();
+          return null;
+        }
+      }
+;
+      Callable<Void> processRequestsTask=new Callable<Void>(){
+        @Override public Void call() throws Exception {
+          int total=numberOfRequests * numberOfRuns;
+          for (int i=0; i < total; i++) {
+            requestQueue.take();
+            ioChannel.handleProcessedBuffer(buffer,null);
+          }
+          LOG.debug("Processed all ({}) requests.",numberOfRequests);
+          sync.countDown();
+          return null;
+        }
+      }
+;
+      Callable<Void> registerListenerTask=new Callable<Void>(){
+        @Override public Void call() throws Exception {
+          while (true) {
+            int current=listener.getNumberOfNotifications();
+            if (ioChannel.registerAllRequestsProcessedListener(listener)) {
+              listener.waitForNotification(current);
+            }
+ else             if (ioChannel.isClosed()) {
+              break;
+            }
+          }
+          LOG.debug("Stopping listener. Channel closed.");
+          sync.countDown();
+          return null;
+        }
+      }
+;
+      final List<Callable<?>> tasks=new LinkedList<Callable<?>>();
+      tasks.add(addRequestsTask);
+      tasks.add(processRequestsTask);
+      tasks.add(registerListenerTask);
+      Collections.shuffle(tasks);
+      for (      Callable<?> task : tasks) {
+        executor.submit(task);
+      }
+      if (!sync.await(2,TimeUnit.MINUTES)) {
+        fail("Test failed due to a timeout. This indicates a deadlock due to the way" + "that listeners are registered/notified in the asynchronous file I/O" + "channel.");
+      }
+      listener.reset();
+    }
+  }
+  finally {
+    ioManager.shutdown();
+    executor.shutdown();
+  }
+}

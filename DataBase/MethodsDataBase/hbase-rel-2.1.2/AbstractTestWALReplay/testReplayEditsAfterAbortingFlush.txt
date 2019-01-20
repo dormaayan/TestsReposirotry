@@ -1,0 +1,61 @@
+/** 
+ * Test that we could recover the data correctly after aborting flush. In the test, first we abort flush after writing some data, then writing more data and flush again, at last verify the data.
+ * @throws IOException
+ */
+@Test public void testReplayEditsAfterAbortingFlush() throws IOException {
+  final TableName tableName=TableName.valueOf("testReplayEditsAfterAbortingFlush");
+  final HRegionInfo hri=createBasic3FamilyHRegionInfo(tableName);
+  final Path basedir=FSUtils.getTableDir(this.hbaseRootDir,tableName);
+  deleteDir(basedir);
+  final HTableDescriptor htd=createBasic3FamilyHTD(tableName);
+  HRegion region3=HBaseTestingUtility.createRegionAndWAL(hri,hbaseRootDir,this.conf,htd);
+  HBaseTestingUtility.closeRegionAndWAL(region3);
+  WAL wal=createWAL(this.conf,hbaseRootDir,logName);
+  RegionServerServices rsServices=Mockito.mock(RegionServerServices.class);
+  Mockito.doReturn(false).when(rsServices).isAborted();
+  when(rsServices.getServerName()).thenReturn(ServerName.valueOf("foo",10,10));
+  Configuration customConf=new Configuration(this.conf);
+  customConf.set(DefaultStoreEngine.DEFAULT_STORE_FLUSHER_CLASS_KEY,CustomStoreFlusher.class.getName());
+  HRegion region=HRegion.openHRegion(this.hbaseRootDir,hri,htd,wal,customConf,rsServices,null);
+  int writtenRowCount=10;
+  List<HColumnDescriptor> families=new ArrayList<>(htd.getFamilies());
+  for (int i=0; i < writtenRowCount; i++) {
+    Put put=new Put(Bytes.toBytes(tableName + Integer.toString(i)));
+    put.addColumn(families.get(i % families.size()).getName(),Bytes.toBytes("q"),Bytes.toBytes("val"));
+    region.put(put);
+  }
+  RegionScanner scanner=region.getScanner(new Scan());
+  assertEquals(writtenRowCount,getScannedCount(scanner));
+  CustomStoreFlusher.throwExceptionWhenFlushing.set(true);
+  try {
+    region.flush(true);
+    fail("Injected exception hasn't been thrown");
+  }
+ catch (  IOException e) {
+    LOG.info("Expected simulated exception when flushing region, {}",e.getMessage());
+    Mockito.doReturn(true).when(rsServices).isAborted();
+    region.setClosing(false);
+  }
+  int moreRow=10;
+  for (int i=writtenRowCount; i < writtenRowCount + moreRow; i++) {
+    Put put=new Put(Bytes.toBytes(tableName + Integer.toString(i)));
+    put.addColumn(families.get(i % families.size()).getName(),Bytes.toBytes("q"),Bytes.toBytes("val"));
+    region.put(put);
+  }
+  writtenRowCount+=moreRow;
+  CustomStoreFlusher.throwExceptionWhenFlushing.set(false);
+  try {
+    region.flush(true);
+  }
+ catch (  IOException t) {
+    LOG.info("Expected exception when flushing region because server is stopped," + t.getMessage());
+  }
+  region.close(true);
+  wal.shutdown();
+  runWALSplit(this.conf);
+  WAL wal2=createWAL(this.conf,hbaseRootDir,logName);
+  Mockito.doReturn(false).when(rsServices).isAborted();
+  HRegion region2=HRegion.openHRegion(this.hbaseRootDir,hri,htd,wal2,this.conf,rsServices,null);
+  scanner=region2.getScanner(new Scan());
+  assertEquals(writtenRowCount,getScannedCount(scanner));
+}

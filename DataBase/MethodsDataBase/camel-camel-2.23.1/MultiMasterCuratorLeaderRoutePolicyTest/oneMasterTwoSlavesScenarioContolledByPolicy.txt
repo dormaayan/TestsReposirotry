@@ -1,0 +1,80 @@
+@Test public void oneMasterTwoSlavesScenarioContolledByPolicy() throws Exception {
+  final String path="oneMasterTwoSlavesScenarioContolledByPolicy";
+  final String master="master" + System.currentTimeMillis();
+  final String secondDestination="second" + System.currentTimeMillis();
+  final String thirdDestination="third" + System.currentTimeMillis();
+  final CountDownLatch waitForNonActiveRoutesLatch=new CountDownLatch(2);
+  final int activeNodesDesired=1;
+  LOG.info("Starting first CamelContext");
+  MultiMasterZookeeperPolicyEnforcedContext first=createEnforcedContext(master,activeNodesDesired,path);
+  DefaultCamelContext controlledContext=(DefaultCamelContext)first.controlledContext;
+  CuratorMultiMasterLeaderRoutePolicy routePolicy=(CuratorMultiMasterLeaderRoutePolicy)controlledContext.getRouteDefinition(master).getRoutePolicies().get(0);
+  assertWeHaveMasters(routePolicy);
+  final MultiMasterZookeeperPolicyEnforcedContext[] arr=new MultiMasterZookeeperPolicyEnforcedContext[2];
+  new Thread(){
+    @Override public void run(){
+      MultiMasterZookeeperPolicyEnforcedContext second=null;
+      try {
+        LOG.info("Starting second CamelContext");
+        second=createEnforcedContext(secondDestination,activeNodesDesired,path);
+        arr[0]=second;
+        second.sendMessageToEnforcedRoute("message for second",0);
+        waitForNonActiveRoutesLatch.countDown();
+      }
+ catch (      Exception e) {
+        LOG.error("Error in the thread controlling the second context",e);
+        fail("Error in the thread controlling the second context: " + e.getMessage());
+      }
+    }
+  }
+.start();
+  new Thread(){
+    @Override public void run(){
+      MultiMasterZookeeperPolicyEnforcedContext third=null;
+      try {
+        LOG.info("Starting third CamelContext");
+        third=createEnforcedContext(thirdDestination,activeNodesDesired,path);
+        arr[1]=third;
+        third.sendMessageToEnforcedRoute("message for third",0);
+        waitForNonActiveRoutesLatch.countDown();
+      }
+ catch (      Exception e) {
+        LOG.error("Error in the thread controlling the third context",e);
+        fail("Error in the thread controlling the third context: " + e.getMessage());
+      }
+    }
+  }
+.start();
+  first.sendMessageToEnforcedRoute("message for master",1);
+  waitForNonActiveRoutesLatch.await();
+  LOG.info("Explicitly shutting down the first camel context.");
+  first.shutdown();
+  CuratorMultiMasterLeaderRoutePolicy routePolicySecond=(CuratorMultiMasterLeaderRoutePolicy)arr[0].controlledContext.getRouteDefinition(secondDestination).getRoutePolicies().get(0);
+  CuratorMultiMasterLeaderRoutePolicy routePolicyThird=(CuratorMultiMasterLeaderRoutePolicy)arr[1].controlledContext.getRouteDefinition(thirdDestination).getRoutePolicies().get(0);
+  MultiMasterZookeeperPolicyEnforcedContext newMaster=null;
+  MultiMasterZookeeperPolicyEnforcedContext slave=null;
+  final int maxWait=20;
+  for (int i=0; i < maxWait; i++) {
+    if (routePolicySecond.getElection().isMaster()) {
+      newMaster=arr[0];
+      slave=arr[1];
+      LOG.info("[second] is the new master");
+      break;
+    }
+ else     if (routePolicyThird.getElection().isMaster()) {
+      newMaster=arr[1];
+      slave=arr[0];
+      LOG.info("[third] is the new master");
+      break;
+    }
+ else {
+      Thread.sleep(2000);
+      LOG.info("waiting for a new master to be elected");
+    }
+  }
+  assertThat(newMaster,is(notNullValue()));
+  newMaster.sendMessageToEnforcedRoute("message for second",1);
+  slave.sendMessageToEnforcedRoute("message for third",0);
+  slave.shutdown();
+  newMaster.shutdown();
+}

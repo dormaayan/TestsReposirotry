@@ -1,0 +1,58 @@
+/** 
+ * Tests that all slots are being returned to the  {@link SlotOwner} if the{@link ExecutionGraph} is being cancelled. See FLINK-9908
+ */
+@Test public void testCancellationOfIncompleteScheduling() throws Exception {
+  final int parallelism=10;
+  final JobVertex jobVertex=new JobVertex("Test job vertex");
+  jobVertex.setInvokableClass(NoOpInvokable.class);
+  jobVertex.setParallelism(parallelism);
+  final JobGraph jobGraph=new JobGraph(jobVertex);
+  jobGraph.setAllowQueuedScheduling(true);
+  jobGraph.setScheduleMode(ScheduleMode.EAGER);
+  final TestingSlotOwner slotOwner=new TestingSlotOwner();
+  final SimpleAckingTaskManagerGateway taskManagerGateway=new SimpleAckingTaskManagerGateway();
+  final ConcurrentMap<SlotRequestId,Integer> slotRequestIds=new ConcurrentHashMap<>(parallelism);
+  final CountDownLatch requestedSlotsLatch=new CountDownLatch(parallelism);
+  final TestingSlotProvider slotProvider=new TestingSlotProvider((  SlotRequestId slotRequestId) -> {
+    slotRequestIds.put(slotRequestId,1);
+    requestedSlotsLatch.countDown();
+    return new CompletableFuture<>();
+  }
+);
+  final ExecutionGraph executionGraph=createExecutionGraph(jobGraph,slotProvider);
+  executionGraph.scheduleForExecution();
+  requestedSlotsLatch.await();
+  final Set<SlotRequestId> slotRequestIdsToReturn=ConcurrentHashMap.newKeySet(slotRequestIds.size());
+  slotRequestIdsToReturn.addAll(slotRequestIds.keySet());
+  final CountDownLatch countDownLatch=new CountDownLatch(slotRequestIds.size());
+  slotOwner.setReturnAllocatedSlotConsumer(logicalSlot -> {
+    slotRequestIdsToReturn.remove(logicalSlot.getSlotRequestId());
+    countDownLatch.countDown();
+  }
+);
+  slotProvider.setSlotCanceller(slotRequestId -> {
+    slotRequestIdsToReturn.remove(slotRequestId);
+    countDownLatch.countDown();
+  }
+);
+  final OneShotLatch slotRequestsBeingFulfilled=new OneShotLatch();
+  executor.execute(() -> {
+    slotRequestsBeingFulfilled.trigger();
+    for (    SlotRequestId slotRequestId : slotRequestIds.keySet()) {
+      final SingleLogicalSlot singleLogicalSlot=createSingleLogicalSlot(slotOwner,taskManagerGateway,slotRequestId);
+      slotProvider.complete(slotRequestId,singleLogicalSlot);
+    }
+  }
+);
+  taskManagerGateway.setCancelConsumer((  ExecutionAttemptID executionAttemptId) -> {
+    final Execution execution=executionGraph.getRegisteredExecutions().get(executionAttemptId);
+    if (execution != null) {
+      execution.cancelingComplete();
+    }
+  }
+);
+  slotRequestsBeingFulfilled.await();
+  executionGraph.cancel();
+  countDownLatch.await();
+  assertThat(slotRequestIdsToReturn,is(empty()));
+}

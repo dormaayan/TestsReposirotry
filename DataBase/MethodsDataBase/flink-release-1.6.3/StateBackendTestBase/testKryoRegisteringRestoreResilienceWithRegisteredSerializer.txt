@@ -1,0 +1,44 @@
+/** 
+ * Verify state restore resilience when: - snapshot was taken without any Kryo registrations, specific serializers or default serializers for the state type - restored with a specific serializer for the state type <p> The specific serializer used on restore is  {@link CustomKryoTestSerializer}, which deliberately fails only on deserialization. We use the deliberate deserialization failure to acknowledge test success.
+ * @throws Exception expects {@link ExpectedKryoTestException} to be thrown.
+ */
+@Test public void testKryoRegisteringRestoreResilienceWithRegisteredSerializer() throws Exception {
+  CheckpointStreamFactory streamFactory=createStreamFactory();
+  SharedStateRegistry sharedStateRegistry=new SharedStateRegistry();
+  Environment env=new DummyEnvironment();
+  AbstractKeyedStateBackend<Integer> backend=null;
+  try {
+    backend=createKeyedBackend(IntSerializer.INSTANCE,env);
+    TypeInformation<TestPojo> pojoType=new GenericTypeInfo<>(TestPojo.class);
+    assertTrue(pojoType.createSerializer(env.getExecutionConfig()) instanceof KryoSerializer);
+    ValueStateDescriptor<TestPojo> kvId=new ValueStateDescriptor<>("id",pojoType);
+    ValueState<TestPojo> state=backend.getPartitionedState(VoidNamespace.INSTANCE,VoidNamespaceSerializer.INSTANCE,kvId);
+    backend.setCurrentKey(1);
+    state.update(new TestPojo("u1",1));
+    backend.setCurrentKey(2);
+    state.update(new TestPojo("u2",2));
+    KeyedStateHandle snapshot=runSnapshot(backend.snapshot(682375462378L,2,streamFactory,CheckpointOptions.forCheckpointWithDefaultLocation()),sharedStateRegistry);
+    backend.dispose();
+    env.getExecutionConfig().registerTypeWithKryoSerializer(TestPojo.class,CustomKryoTestSerializer.class);
+    backend=restoreKeyedBackend(IntSerializer.INSTANCE,snapshot,env);
+    kvId=new ValueStateDescriptor<>("id",pojoType);
+    state=backend.getPartitionedState(VoidNamespace.INSTANCE,VoidNamespaceSerializer.INSTANCE,kvId);
+    backend.setCurrentKey(1);
+    state.update(new TestPojo("u1",11));
+    KeyedStateHandle snapshot2=runSnapshot(backend.snapshot(682375462378L,2,streamFactory,CheckpointOptions.forCheckpointWithDefaultLocation()),sharedStateRegistry);
+    snapshot.discardState();
+    backend.dispose();
+    env.getExecutionConfig().registerTypeWithKryoSerializer(TestPojo.class,CustomKryoTestSerializer.class);
+    expectedException.expect(ExpectedKryoTestException.class);
+    backend=restoreKeyedBackend(IntSerializer.INSTANCE,snapshot2,env);
+    state=backend.getPartitionedState(VoidNamespace.INSTANCE,VoidNamespaceSerializer.INSTANCE,kvId);
+    backend.setCurrentKey(1);
+    state.value();
+    backend.dispose();
+  }
+  finally {
+    if (backend != null) {
+      backend.dispose();
+    }
+  }
+}

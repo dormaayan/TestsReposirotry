@@ -1,0 +1,537 @@
+/** 
+ * End to end tests to test deploying services with MiniYarnCluster and a in-JVM ZK testing cluster.
+ */
+public class TestYarnNativeServices extends ServiceTestUtils {
+  private static final Logger LOG=LoggerFactory.getLogger(TestYarnNativeServices.class);
+  @Rule public TemporaryFolder tmpFolder=new TemporaryFolder();
+  @Before public void setup() throws Exception {
+    File tmpYarnDir=new File("target","tmp");
+    FileUtils.deleteQuietly(tmpYarnDir);
+  }
+  @After public void tearDown() throws IOException {
+    shutdown();
+  }
+  @Test(timeout=200000) public void testCreateFlexStopDestroyService() throws Exception {
+    setupInternal(NUM_NMS);
+    ServiceClient client=createClient(getConf());
+    Service exampleApp=createExampleApplication();
+    client.actionCreate(exampleApp);
+    SliderFileSystem fileSystem=new SliderFileSystem(getConf());
+    Path appDir=fileSystem.buildClusterDirPath(exampleApp.getName());
+    Assert.assertTrue(getFS().exists(new Path(appDir,exampleApp.getName() + ".json")));
+    waitForServiceToBeStable(client,exampleApp);
+    flexComponents(client,exampleApp,3L);
+    waitForServiceToBeStable(client,exampleApp);
+    checkCompInstancesInOrder(client,exampleApp);
+    flexComponents(client,exampleApp,1L);
+    waitForServiceToBeStable(client,exampleApp);
+    checkCompInstancesInOrder(client,exampleApp);
+    flexComponents(client,exampleApp,2L);
+    waitForServiceToBeStable(client,exampleApp);
+    checkCompInstancesInOrder(client,exampleApp);
+    LOG.info("Stop the service");
+    client.actionStop(exampleApp.getName(),true);
+    ApplicationReport report=client.getYarnClient().getApplicationReport(ApplicationId.fromString(exampleApp.getId()));
+    Assert.assertEquals(FINISHED,report.getYarnApplicationState());
+    Assert.assertEquals(FinalApplicationStatus.ENDED,report.getFinalApplicationStatus());
+    String serviceZKPath=RegistryUtils.servicePath(RegistryUtils.currentUser(),YarnServiceConstants.APP_TYPE,exampleApp.getName());
+    Assert.assertFalse("Registry ZK service path still exists after stop",getCuratorService().zkPathExists(serviceZKPath));
+    LOG.info("Destroy the service");
+    Assert.assertEquals(0,client.actionDestroy(exampleApp.getName()));
+    Assert.assertFalse(getFS().exists(appDir));
+    Assert.assertEquals(EXIT_NOT_FOUND,client.actionDestroy(exampleApp.getName()));
+  }
+  @Test(timeout=200000) public void testStopDestroySavedService() throws Exception {
+    setupInternal(NUM_NMS);
+    ServiceClient client=createClient(getConf());
+    Service exampleApp=createExampleApplication();
+    client.actionBuild(exampleApp);
+    Assert.assertEquals(EXIT_COMMAND_ARGUMENT_ERROR,client.actionStop(exampleApp.getName()));
+    Assert.assertEquals(0,client.actionDestroy(exampleApp.getName()));
+  }
+  @Test(timeout=200000) public void testComponentStartOrder() throws Exception {
+    setupInternal(NUM_NMS);
+    ServiceClient client=createClient(getConf());
+    Service exampleApp=new Service();
+    exampleApp.setName("teststartorder");
+    exampleApp.setVersion("v1");
+    exampleApp.addComponent(createComponent("compa",2,"sleep 1000"));
+    Component compb=createComponent("compb",2,"sleep 1000");
+    compb.setDependencies(Collections.singletonList("compa"));
+    exampleApp.addComponent(compb);
+    Component compc=createComponent("compc",2,"sleep 1000");
+    compc.setDependencies(Collections.singletonList("compb"));
+    exampleApp.addComponent(compc);
+    client.actionCreate(exampleApp);
+    waitForServiceToBeStable(client,exampleApp);
+    checkContainerLaunchDependencies(client,exampleApp,"compa","compb","compc");
+    client.actionStop(exampleApp.getName(),true);
+    client.actionDestroy(exampleApp.getName());
+  }
+  @Test(timeout=200000) public void testCreateServiceSameNameDifferentUser() throws Exception {
+    String sameAppName="same-name";
+    String userA="usera";
+    String userB="userb";
+    setupInternal(NUM_NMS);
+    ServiceClient client=createClient(getConf());
+    String origBasePath=getConf().get(YARN_SERVICE_BASE_PATH);
+    Service userAApp=new Service();
+    userAApp.setName(sameAppName);
+    userAApp.setVersion("v1");
+    userAApp.addComponent(createComponent("comp",1,"sleep 1000"));
+    Service userBApp=new Service();
+    userBApp.setName(sameAppName);
+    userBApp.setVersion("v1");
+    userBApp.addComponent(createComponent("comp",1,"sleep 1000"));
+    File userABasePath=null, userBBasePath=null;
+    try {
+      userABasePath=new File(origBasePath,userA);
+      userABasePath.mkdirs();
+      getConf().set(YARN_SERVICE_BASE_PATH,userABasePath.getAbsolutePath());
+      client.actionCreate(userAApp);
+      waitForServiceToBeStarted(client,userAApp);
+      userBBasePath=new File(origBasePath,userB);
+      userBBasePath.mkdirs();
+      getConf().set(YARN_SERVICE_BASE_PATH,userBBasePath.getAbsolutePath());
+      client.actionBuild(userBApp);
+    }
+ catch (    Exception e) {
+      Assert.fail("Exception should not be thrown - " + e.getLocalizedMessage());
+    }
+ finally {
+      if (userABasePath != null) {
+        getConf().set(YARN_SERVICE_BASE_PATH,userABasePath.getAbsolutePath());
+        client.actionStop(sameAppName,true);
+        client.actionDestroy(sameAppName);
+      }
+      if (userBBasePath != null) {
+        getConf().set(YARN_SERVICE_BASE_PATH,userBBasePath.getAbsolutePath());
+        client.actionDestroy(sameAppName);
+      }
+    }
+  }
+  @Test(timeout=200000) public void testCreateServiceSameNameSameUser() throws Exception {
+    String sameAppName="same-name";
+    String user=UserGroupInformation.getCurrentUser().getUserName();
+    System.setProperty("user.name",user);
+    setupInternal(NUM_NMS);
+    ServiceClient client=createClient(getConf());
+    Service appA=new Service();
+    appA.setName(sameAppName);
+    appA.setVersion("v1");
+    appA.addComponent(createComponent("comp",1,"sleep 1000"));
+    Service appB=new Service();
+    appB.setName(sameAppName);
+    appB.setVersion("v1");
+    appB.addComponent(createComponent("comp",1,"sleep 1000"));
+    try {
+      client.actionBuild(appA);
+      client.actionBuild(appB);
+    }
+ catch (    Exception e) {
+      String expectedMsg="Service Instance dir already exists:";
+      if (e.getLocalizedMessage() != null) {
+        Assert.assertThat(e.getLocalizedMessage(),CoreMatchers.containsString(expectedMsg));
+      }
+ else {
+        Assert.fail("Message cannot be null. It has to say - " + expectedMsg);
+      }
+    }
+ finally {
+      client.actionDestroy(sameAppName);
+    }
+    try {
+      client.actionCreate(appA);
+      waitForServiceToBeStarted(client,appA);
+      client.actionCreate(appB);
+      waitForServiceToBeStarted(client,appB);
+    }
+ catch (    Exception e) {
+      String expectedMsg="Failed to create service " + sameAppName + ", because it already exists.";
+      if (e.getLocalizedMessage() != null) {
+        Assert.assertThat(e.getLocalizedMessage(),CoreMatchers.containsString(expectedMsg));
+      }
+ else {
+        Assert.fail("Message cannot be null. It has to say - " + expectedMsg);
+      }
+    }
+ finally {
+      client.actionStop(sameAppName,true);
+      client.actionDestroy(sameAppName);
+    }
+  }
+  @Test(timeout=200000) public void testRecoverComponentsAfterRMRestart() throws Exception {
+    YarnConfiguration conf=new YarnConfiguration();
+    conf.setBoolean(YarnConfiguration.RECOVERY_ENABLED,true);
+    conf.setBoolean(YarnConfiguration.RM_WORK_PRESERVING_RECOVERY_ENABLED,true);
+    conf.setLong(YarnConfiguration.NM_RESOURCEMANAGER_CONNECT_RETRY_INTERVAL_MS,500L);
+    conf.setBoolean(YarnConfiguration.YARN_MINICLUSTER_FIXED_PORTS,true);
+    conf.setBoolean(YarnConfiguration.YARN_MINICLUSTER_USE_RPC,true);
+    setConf(conf);
+    setupInternal(NUM_NMS);
+    ServiceClient client=createClient(getConf());
+    Service exampleApp=createExampleApplication();
+    client.actionCreate(exampleApp);
+    Multimap<String,String> containersBeforeFailure=waitForAllCompToBeReady(client,exampleApp);
+    LOG.info("Restart the resource manager");
+    getYarnCluster().restartResourceManager(getYarnCluster().getActiveRMIndex());
+    GenericTestUtils.waitFor(() -> getYarnCluster().getResourceManager().getServiceState() == org.apache.hadoop.service.Service.STATE.STARTED,2000,200000);
+    Assert.assertTrue("node managers connected",getYarnCluster().waitForNodeManagersToConnect(5000));
+    ApplicationId exampleAppId=ApplicationId.fromString(exampleApp.getId());
+    ApplicationAttemptId applicationAttemptId=client.getYarnClient().getApplicationReport(exampleAppId).getCurrentApplicationAttemptId();
+    LOG.info("Fail the application attempt {}",applicationAttemptId);
+    client.getYarnClient().failApplicationAttempt(applicationAttemptId);
+    GenericTestUtils.waitFor(() -> {
+      try {
+        ApplicationReport ar=client.getYarnClient().getApplicationReport(exampleAppId);
+        return ar.getCurrentApplicationAttemptId().getAttemptId() == 2 && ar.getYarnApplicationState() == YarnApplicationState.RUNNING;
+      }
+ catch (      YarnException|IOException e) {
+        throw new RuntimeException("while waiting",e);
+      }
+    }
+,2000,200000);
+    Multimap<String,String> containersAfterFailure=waitForAllCompToBeReady(client,exampleApp);
+    containersBeforeFailure.keys().forEach(compName -> {
+      Assert.assertEquals("num containers after by restart for " + compName,containersBeforeFailure.get(compName).size(),containersAfterFailure.get(compName) == null ? 0 : containersAfterFailure.get(compName).size());
+    }
+);
+    LOG.info("Stop/destroy service {}",exampleApp);
+    client.actionStop(exampleApp.getName(),true);
+    client.actionDestroy(exampleApp.getName());
+  }
+  @Test(timeout=200000) public void testUpgrade() throws Exception {
+    setupInternal(NUM_NMS);
+    getConf().setBoolean(YARN_SERVICE_UPGRADE_ENABLED,true);
+    ServiceClient client=createClient(getConf());
+    Service service=createExampleApplication();
+    client.actionCreate(service);
+    waitForServiceToBeStable(client,service);
+    Component component=service.getComponents().iterator().next();
+    service.setState(ServiceState.UPGRADING);
+    service.setVersion("v2");
+    component.getConfiguration().getEnv().put("key1","val1");
+    client.initiateUpgrade(service);
+    waitForServiceToBeInState(client,service,ServiceState.UPGRADING);
+    SliderFileSystem fs=new SliderFileSystem(getConf());
+    Service fromFs=ServiceApiUtil.loadServiceUpgrade(fs,service.getName(),service.getVersion());
+    Assert.assertEquals(service.getName(),fromFs.getName());
+    Assert.assertEquals(service.getVersion(),fromFs.getVersion());
+    Service liveService=client.getStatus(service.getName());
+    client.actionUpgrade(service,liveService.getComponent(component.getName()).getContainers());
+    waitForAllCompToBeReady(client,service);
+    client.actionStart(service.getName());
+    waitForServiceToBeStable(client,service);
+    Service active=client.getStatus(service.getName());
+    Assert.assertEquals("component not stable",ComponentState.STABLE,active.getComponent(component.getName()).getState());
+    Assert.assertEquals("comp does not have new env","val1",active.getComponent(component.getName()).getConfiguration().getEnv("key1"));
+    LOG.info("Stop/destroy service {}",service);
+    client.actionStop(service.getName(),true);
+    client.actionDestroy(service.getName());
+  }
+  @Test(timeout=200000) public void testExpressUpgrade() throws Exception {
+    setupInternal(NUM_NMS);
+    getConf().setBoolean(YARN_SERVICE_UPGRADE_ENABLED,true);
+    ServiceClient client=createClient(getConf());
+    Service service=createExampleApplication();
+    client.actionCreate(service);
+    waitForServiceToBeStable(client,service);
+    Component component=service.getComponents().iterator().next();
+    service.setState(ServiceState.EXPRESS_UPGRADING);
+    service.setVersion("v2");
+    component.getConfiguration().getEnv().put("key1","val1");
+    Component component2=service.getComponent("compb");
+    component2.getConfiguration().getEnv().put("key2","val2");
+    client.actionUpgradeExpress(service);
+    waitForServiceToBeStable(client,service);
+    Service active=client.getStatus(service.getName());
+    Assert.assertEquals("component not stable",ComponentState.STABLE,active.getComponent(component.getName()).getState());
+    Assert.assertEquals("compa does not have new env","val1",active.getComponent(component.getName()).getConfiguration().getEnv("key1"));
+    Assert.assertEquals("compb does not have new env","val2",active.getComponent(component2.getName()).getConfiguration().getEnv("key2"));
+    LOG.info("Stop/destroy service {}",service);
+    client.actionStop(service.getName(),true);
+    client.actionDestroy(service.getName());
+  }
+  @Test(timeout=200000) public void testCancelUpgrade() throws Exception {
+    setupInternal(NUM_NMS);
+    getConf().setBoolean(YARN_SERVICE_UPGRADE_ENABLED,true);
+    ServiceClient client=createClient(getConf());
+    Service service=createExampleApplication();
+    Component component=service.getComponents().iterator().next();
+    component.getConfiguration().getEnv().put("key1","val0");
+    client.actionCreate(service);
+    waitForServiceToBeStable(client,service);
+    service.setState(ServiceState.UPGRADING);
+    service.setVersion("v2");
+    component.getConfiguration().getEnv().put("key1","val1");
+    client.initiateUpgrade(service);
+    waitForServiceToBeInState(client,service,ServiceState.UPGRADING);
+    Service liveService=client.getStatus(service.getName());
+    Container container=liveService.getComponent(component.getName()).getContainers().iterator().next();
+    client.actionUpgrade(service,Lists.newArrayList(container));
+    Thread.sleep(500);
+    client.actionCancelUpgrade(service.getName());
+    waitForServiceToBeStable(client,service);
+    Service active=client.getStatus(service.getName());
+    Assert.assertEquals("component not stable",ComponentState.STABLE,active.getComponent(component.getName()).getState());
+    Assert.assertEquals("comp does not have new env","val0",active.getComponent(component.getName()).getConfiguration().getEnv("key1"));
+    LOG.info("Stop/destroy service {}",service);
+    client.actionStop(service.getName(),true);
+    client.actionDestroy(service.getName());
+  }
+  @Test(timeout=200000) public void testCreateServiceWithPlacementPolicy() throws Exception {
+    YarnConfiguration conf=new YarnConfiguration();
+    conf.set(YarnConfiguration.RM_PLACEMENT_CONSTRAINTS_HANDLER,YarnConfiguration.SCHEDULER_RM_PLACEMENT_CONSTRAINTS_HANDLER);
+    setConf(conf);
+    setupInternal(3);
+    ServiceClient client=createClient(getConf());
+    Service exampleApp=new Service();
+    exampleApp.setName("example-app");
+    exampleApp.setVersion("v1");
+    Component comp=createComponent("compa",3L,"sleep 1000");
+    PlacementPolicy pp=new PlacementPolicy();
+    PlacementConstraint pc=new PlacementConstraint();
+    pc.setName("CA1");
+    pc.setTargetTags(Collections.singletonList("compa"));
+    pc.setScope(PlacementScope.NODE);
+    pc.setType(PlacementType.ANTI_AFFINITY);
+    pp.setConstraints(Collections.singletonList(pc));
+    comp.setPlacementPolicy(pp);
+    exampleApp.addComponent(comp);
+    client.actionCreate(exampleApp);
+    waitForServiceToBeStable(client,exampleApp);
+    Service service=client.getStatus(exampleApp.getName());
+    Component component=service.getComponent("compa");
+    Assert.assertEquals("Service state should be STABLE",ServiceState.STABLE,service.getState());
+    Assert.assertEquals("3 containers are expected to be running",3,component.getContainers().size());
+    Set<String> nonAMContainerIdSet=new HashSet<>();
+    for (    Container cont : component.getContainers()) {
+      nonAMContainerIdSet.add(cont.getId());
+    }
+    Set<String> hosts=new HashSet<>();
+    ApplicationReport report=client.getYarnClient().getApplicationReport(ApplicationId.fromString(exampleApp.getId()));
+    GetContainersRequest req=GetContainersRequest.newInstance(report.getCurrentApplicationAttemptId());
+    ResourceManager rm=getYarnCluster().getResourceManager();
+    for (    ContainerReport contReport : rm.getClientRMService().getContainers(req).getContainerList()) {
+      if (!nonAMContainerIdSet.contains(contReport.getContainerId().toString())) {
+        continue;
+      }
+      if (hosts.contains(contReport.getNodeHttpAddress())) {
+        Assert.fail("Container " + contReport.getContainerId() + " came up in the same host as another container.");
+      }
+ else {
+        hosts.add(contReport.getNodeHttpAddress());
+      }
+    }
+    Map<String,Long> compCounts=new HashMap<>();
+    compCounts.put("compa",5L);
+    exampleApp.getComponent("compa").setNumberOfContainers(5L);
+    client.flexByRestService(exampleApp.getName(),compCounts);
+    try {
+      waitForServiceToBeStable(client,exampleApp,10000);
+      Assert.fail("Service should not be in a stable state. It should throw " + "a timeout exception.");
+    }
+ catch (    Exception e) {
+      service=client.getStatus(exampleApp.getName());
+      component=service.getComponent("compa");
+      Assert.assertNotEquals("Service state should not be STABLE",ServiceState.STABLE,service.getState());
+      Assert.assertEquals("Component state should be FLEXING",ComponentState.FLEXING,component.getState());
+      Assert.assertEquals("3 containers are expected to be running",3,component.getContainers().size());
+    }
+    compCounts=new HashMap<>();
+    compCounts.put("compa",4L);
+    exampleApp.getComponent("compa").setNumberOfContainers(4L);
+    client.flexByRestService(exampleApp.getName(),compCounts);
+    try {
+      waitForServiceToBeStable(client,exampleApp,10000);
+      Assert.fail("Service should not be in a stable state. It should throw " + "a timeout exception.");
+    }
+ catch (    Exception e) {
+      service=client.getStatus(exampleApp.getName());
+      component=service.getComponent("compa");
+      Assert.assertNotEquals("Service state should not be STABLE",ServiceState.STABLE,service.getState());
+      Assert.assertEquals("Component state should be FLEXING",ComponentState.FLEXING,component.getState());
+      Assert.assertEquals("3 containers are expected to be running",3,component.getContainers().size());
+    }
+    compCounts=new HashMap<>();
+    compCounts.put("compa",3L);
+    exampleApp.getComponent("compa").setNumberOfContainers(3L);
+    client.flexByRestService(exampleApp.getName(),compCounts);
+    waitForServiceToBeStable(client,exampleApp);
+    LOG.info("Stop/destroy service {}",exampleApp);
+    client.actionStop(exampleApp.getName(),true);
+    client.actionDestroy(exampleApp.getName());
+  }
+  @Test(timeout=200000) public void testAMSigtermDoesNotKillApplication() throws Exception {
+    runAMSignalTest(SignalContainerCommand.GRACEFUL_SHUTDOWN);
+  }
+  @Test(timeout=200000) public void testAMSigkillDoesNotKillApplication() throws Exception {
+    runAMSignalTest(SignalContainerCommand.FORCEFUL_SHUTDOWN);
+  }
+  public void runAMSignalTest(  SignalContainerCommand signal) throws Exception {
+    setupInternal(NUM_NMS);
+    ServiceClient client=createClient(getConf());
+    Service exampleApp=createExampleApplication();
+    client.actionCreate(exampleApp);
+    waitForServiceToBeStable(client,exampleApp);
+    Service appStatus1=client.getStatus(exampleApp.getName());
+    ApplicationId exampleAppId=ApplicationId.fromString(appStatus1.getId());
+    YarnClient yarnClient=createYarnClient(getConf());
+    ApplicationReport applicationReport=yarnClient.getApplicationReport(exampleAppId);
+    ApplicationAttemptId firstAttemptId=applicationReport.getCurrentApplicationAttemptId();
+    ApplicationAttemptReport attemptReport=yarnClient.getApplicationAttemptReport(firstAttemptId);
+    yarnClient.signalToContainer(attemptReport.getAMContainerId(),signal);
+    GenericTestUtils.waitFor(() -> {
+      try {
+        ApplicationReport ar=client.getYarnClient().getApplicationReport(exampleAppId);
+        YarnApplicationState state=ar.getYarnApplicationState();
+        Assert.assertTrue(state == YarnApplicationState.RUNNING || state == YarnApplicationState.ACCEPTED);
+        if (state != YarnApplicationState.RUNNING) {
+          return false;
+        }
+        if (ar.getCurrentApplicationAttemptId() == null || ar.getCurrentApplicationAttemptId().equals(firstAttemptId)) {
+          return false;
+        }
+        Service appStatus2=client.getStatus(exampleApp.getName());
+        if (appStatus2.getState() != ServiceState.STABLE) {
+          return false;
+        }
+        Assert.assertEquals(getSortedContainerIds(appStatus1).toString(),getSortedContainerIds(appStatus2).toString());
+        return true;
+      }
+ catch (      YarnException|IOException e) {
+        throw new RuntimeException("while waiting",e);
+      }
+    }
+,2000,200000);
+  }
+  private static List<String> getSortedContainerIds(  Service s){
+    List<String> containerIds=new ArrayList<>();
+    for (    Component component : s.getComponents()) {
+      for (      Container container : component.getContainers()) {
+        containerIds.add(container.getId());
+      }
+    }
+    Collections.sort(containerIds);
+    return containerIds;
+  }
+  @Test(timeout=200000) public void testComponentHealthThresholdMonitor() throws Exception {
+    YarnConfiguration conf=new YarnConfiguration();
+    conf.set(YarnConfiguration.RM_PLACEMENT_CONSTRAINTS_HANDLER,YarnConfiguration.SCHEDULER_RM_PLACEMENT_CONSTRAINTS_HANDLER);
+    setConf(conf);
+    setupInternal(3);
+    ServiceClient client=createClient(getConf());
+    Service exampleApp=new Service();
+    exampleApp.setName("example-app");
+    exampleApp.setVersion("v1");
+    Component comp=createComponent("compa",3L,"sleep 1000");
+    PlacementPolicy pp=new PlacementPolicy();
+    PlacementConstraint pc=new PlacementConstraint();
+    pc.setName("CA1");
+    pc.setTargetTags(Collections.singletonList("compa"));
+    pc.setScope(PlacementScope.NODE);
+    pc.setType(PlacementType.ANTI_AFFINITY);
+    pp.setConstraints(Collections.singletonList(pc));
+    comp.setPlacementPolicy(pp);
+    Configuration config=new Configuration();
+    config.setProperty(CONTAINER_HEALTH_THRESHOLD_PERCENT,"65");
+    config.setProperty(CONTAINER_HEALTH_THRESHOLD_WINDOW_SEC,"3");
+    config.setProperty(CONTAINER_HEALTH_THRESHOLD_INIT_DELAY_SEC,"0");
+    config.setProperty(CONTAINER_HEALTH_THRESHOLD_POLL_FREQUENCY_SEC,"1");
+    config.setProperty(DEFAULT_READINESS_CHECK_ENABLED,"false");
+    comp.setConfiguration(config);
+    exampleApp.addComponent(comp);
+    Configuration serviceConfig=new Configuration();
+    serviceConfig.setProperty(AM_RESTART_MAX,"1");
+    exampleApp.setConfiguration(serviceConfig);
+    client.actionCreate(exampleApp);
+    waitForServiceToBeStable(client,exampleApp);
+    Service service=client.getStatus(exampleApp.getName());
+    Component component=service.getComponent("compa");
+    Assert.assertEquals("Service state should be STABLE",ServiceState.STABLE,service.getState());
+    Assert.assertEquals("3 containers are expected to be running",3,component.getContainers().size());
+    Map<String,Long> compCounts=new HashMap<>();
+    compCounts.put("compa",4L);
+    exampleApp.getComponent("compa").setNumberOfContainers(4L);
+    client.flexByRestService(exampleApp.getName(),compCounts);
+    try {
+      waitForServiceToBeStable(client,exampleApp,6000);
+      Assert.fail("Service should not be in a stable state. It should throw " + "a timeout exception.");
+    }
+ catch (    Exception e) {
+      service=client.getStatus(exampleApp.getName());
+      component=service.getComponent("compa");
+      Assert.assertEquals("Service state should be STARTED",ServiceState.STARTED,service.getState());
+      Assert.assertEquals("Component state should be FLEXING",ComponentState.FLEXING,component.getState());
+      Assert.assertEquals("3 containers are expected to be running",3,component.getContainers().size());
+    }
+    compCounts.put("compa",5L);
+    exampleApp.getComponent("compa").setNumberOfContainers(5L);
+    client.flexByRestService(exampleApp.getName(),compCounts);
+    try {
+      waitForServiceToBeInState(client,exampleApp,ServiceState.FAILED,14000);
+    }
+ catch (    Exception e) {
+      Assert.fail("Should not have thrown exception");
+    }
+    LOG.info("Destroy service {}",exampleApp);
+    client.actionDestroy(exampleApp.getName());
+  }
+  private void checkContainerLaunchDependencies(  ServiceClient client,  Service exampleApp,  String... compOrder) throws IOException, YarnException {
+    Service retrievedApp=client.getStatus(exampleApp.getName());
+    List<Container> containerList=new ArrayList<>();
+    for (    Component component : retrievedApp.getComponents()) {
+      containerList.addAll(component.getContainers());
+    }
+    containerList.sort((o1,o2) -> o1.getLaunchTime().compareTo(o2.getLaunchTime()));
+    LOG.info("containerList: " + containerList);
+    int index=0;
+    for (    String comp : compOrder) {
+      long num=retrievedApp.getComponent(comp).getNumberOfContainers();
+      for (int i=0; i < num; i++) {
+        String compInstanceName=containerList.get(index).getComponentInstanceName();
+        String compName=compInstanceName.substring(0,compInstanceName.lastIndexOf('-'));
+        Assert.assertEquals(comp,compName);
+        index++;
+      }
+    }
+  }
+  private Map<String,Long> flexComponents(  ServiceClient client,  Service exampleApp,  long count) throws YarnException, IOException {
+    Map<String,Long> compCounts=new HashMap<>();
+    compCounts.put("compa",count);
+    compCounts.put("compb",count);
+    exampleApp.getComponent("compa").setNumberOfContainers(count);
+    exampleApp.getComponent("compb").setNumberOfContainers(count);
+    client.flexByRestService(exampleApp.getName(),compCounts);
+    return compCounts;
+  }
+  private void checkCompInstancesInOrder(  ServiceClient client,  Service exampleApp) throws IOException, YarnException, TimeoutException, InterruptedException {
+    Service service=client.getStatus(exampleApp.getName());
+    for (    Component comp : service.getComponents()) {
+      checkEachCompInstancesInOrder(comp,exampleApp.getName());
+    }
+  }
+  private void checkEachCompInstancesInOrder(  Component component,  String serviceName) throws TimeoutException, InterruptedException {
+    long expectedNumInstances=component.getNumberOfContainers();
+    Assert.assertEquals(expectedNumInstances,component.getContainers().size());
+    TreeSet<String> instances=new TreeSet<>();
+    for (    Container container : component.getContainers()) {
+      instances.add(container.getComponentInstanceName());
+      String componentZKPath=RegistryUtils.componentPath(RegistryUtils.currentUser(),YarnServiceConstants.APP_TYPE,serviceName,RegistryPathUtils.encodeYarnID(container.getId()));
+      GenericTestUtils.waitFor(() -> {
+        try {
+          return getCuratorService().zkPathExists(componentZKPath);
+        }
+ catch (        IOException e) {
+          return false;
+        }
+      }
+,1000,60000);
+    }
+    int i=0;
+    for (    String s : instances) {
+      Assert.assertEquals(component.getName() + "-" + i,s);
+      i++;
+    }
+  }
+}

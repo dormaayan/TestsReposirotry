@@ -1,0 +1,73 @@
+@Test public void testCancelWithSavepoint() throws Exception {
+  File defaultSavepointDir=tmpFolder.newFolder();
+  FiniteDuration timeout=new FiniteDuration(30,TimeUnit.SECONDS);
+  Configuration config=new Configuration();
+  config.setString(CheckpointingOptions.SAVEPOINT_DIRECTORY,defaultSavepointDir.toURI().toString());
+  ActorSystem actorSystem=null;
+  ActorGateway jobManager=null;
+  ActorGateway archiver=null;
+  ActorGateway taskManager=null;
+  try {
+    actorSystem=AkkaUtils.createLocalActorSystem(new Configuration());
+    Tuple2<ActorRef,ActorRef> master=JobManager.startJobManagerActors(config,actorSystem,TestingUtils.defaultExecutor(),TestingUtils.defaultExecutor(),highAvailabilityServices,NoOpMetricRegistry.INSTANCE,Option.empty(),Option.apply("jm"),Option.apply("arch"),TestingJobManager.class,TestingMemoryArchivist.class);
+    UUID leaderId=LeaderRetrievalUtils.retrieveLeaderSessionId(highAvailabilityServices.getJobManagerLeaderRetriever(HighAvailabilityServices.DEFAULT_JOB_ID),TestingUtils.TESTING_TIMEOUT());
+    jobManager=new AkkaActorGateway(master._1(),leaderId);
+    archiver=new AkkaActorGateway(master._2(),leaderId);
+    ActorRef taskManagerRef=TaskManager.startTaskManagerComponentsAndActor(config,ResourceID.generate(),actorSystem,highAvailabilityServices,NoOpMetricRegistry.INSTANCE,"localhost",Option.apply("tm"),true,TestingTaskManager.class);
+    taskManager=new AkkaActorGateway(taskManagerRef,leaderId);
+    Object msg=new TestingTaskManagerMessages.NotifyWhenRegisteredAtJobManager(jobManager.actor());
+    Await.ready(taskManager.ask(msg,timeout),timeout);
+    JobVertex sourceVertex=new JobVertex("Source");
+    sourceVertex.setInvokableClass(BlockingStatefulInvokable.class);
+    sourceVertex.setParallelism(1);
+    JobGraph jobGraph=new JobGraph("TestingJob",sourceVertex);
+    JobCheckpointingSettings snapshottingSettings=new JobCheckpointingSettings(Collections.singletonList(sourceVertex.getID()),Collections.singletonList(sourceVertex.getID()),Collections.singletonList(sourceVertex.getID()),new CheckpointCoordinatorConfiguration(3600000,3600000,0,Integer.MAX_VALUE,CheckpointRetentionPolicy.NEVER_RETAIN_AFTER_TERMINATION,true),null);
+    jobGraph.setSnapshotSettings(snapshottingSettings);
+    msg=new SubmitJob(jobGraph,ListeningBehaviour.DETACHED);
+    Await.result(jobManager.ask(msg,timeout),timeout);
+    msg=new TestingJobManagerMessages.WaitForAllVerticesToBeRunning(jobGraph.getJobID());
+    Await.result(jobManager.ask(msg,timeout),timeout);
+    msg=new NotifyWhenJobStatus(jobGraph.getJobID(),JobStatus.CANCELED);
+    Future<Object> cancelled=jobManager.ask(msg,timeout);
+    String savepointPath=null;
+    for (int i=0; i < 10; i++) {
+      msg=new CancelJobWithSavepoint(jobGraph.getJobID(),null);
+      CancellationResponse cancelResp=(CancellationResponse)Await.result(jobManager.ask(msg,timeout),timeout);
+      if (cancelResp instanceof CancellationFailure) {
+        CancellationFailure failure=(CancellationFailure)cancelResp;
+        if (failure.cause().getMessage().contains(CheckpointDeclineReason.NOT_ALL_REQUIRED_TASKS_RUNNING.message())) {
+          Thread.sleep(10);
+        }
+ else {
+          failure.cause().printStackTrace();
+          fail("Failed to cancel job: " + failure.cause().getMessage());
+        }
+      }
+ else {
+        savepointPath=((CancellationSuccess)cancelResp).savepointPath();
+        break;
+      }
+    }
+    assertNotNull("Savepoint not triggered",savepointPath);
+    Await.ready(cancelled,timeout);
+    File savepointFile=new File(new Path(savepointPath).getPath());
+    assertTrue(savepointFile.exists());
+  }
+  finally {
+    if (actorSystem != null) {
+      actorSystem.shutdown();
+    }
+    if (archiver != null) {
+      archiver.actor().tell(PoisonPill.getInstance(),ActorRef.noSender());
+    }
+    if (jobManager != null) {
+      jobManager.actor().tell(PoisonPill.getInstance(),ActorRef.noSender());
+    }
+    if (taskManager != null) {
+      taskManager.actor().tell(PoisonPill.getInstance(),ActorRef.noSender());
+    }
+    if (actorSystem != null) {
+      actorSystem.awaitTermination(TESTING_TIMEOUT());
+    }
+  }
+}

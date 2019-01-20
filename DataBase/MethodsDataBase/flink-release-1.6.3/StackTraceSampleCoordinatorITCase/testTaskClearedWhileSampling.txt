@@ -1,0 +1,69 @@
+/** 
+ * Tests that a cleared task is answered with a partial success response.
+ */
+@Test public void testTaskClearedWhileSampling() throws Exception {
+  new JavaTestKit(testActorSystem){
+{
+      final FiniteDuration deadline=new FiniteDuration(60,TimeUnit.SECONDS);
+      final JobGraph jobGraph=new JobGraph();
+      final int parallelism=1;
+      final JobVertex task=new JobVertex("Task");
+      task.setInvokableClass(BlockingNoOpInvokable.class);
+      task.setParallelism(parallelism);
+      jobGraph.addVertex(task);
+      final Configuration config=new Configuration();
+      final HighAvailabilityServices highAvailabilityServices=HighAvailabilityServicesUtils.createAvailableOrEmbeddedServices(config,TestingUtils.defaultExecutor());
+      ActorGateway jobManger=null;
+      ActorGateway taskManager=null;
+      try {
+        jobManger=TestingUtils.createJobManager(testActorSystem,TestingUtils.defaultExecutor(),TestingUtils.defaultExecutor(),config,highAvailabilityServices);
+        config.setInteger(TaskManagerOptions.NUM_TASK_SLOTS,parallelism);
+        taskManager=TestingUtils.createTaskManager(testActorSystem,highAvailabilityServices,config,true,true);
+        final ActorGateway jm=jobManger;
+        new Within(deadline){
+          @Override protected void run(){
+            try {
+              ActorGateway testActor=new AkkaActorGateway(getTestActor(),HighAvailabilityServices.DEFAULT_LEADER_ID);
+              int maxAttempts=10;
+              int sleepTime=100;
+              for (int i=0; i < maxAttempts; i++, sleepTime*=2) {
+                JobClient.submitJobDetached(new AkkaJobManagerGateway(jm),config,jobGraph,Time.milliseconds(deadline.toMillis()),ClassLoader.getSystemClassLoader());
+                jm.tell(new WaitForAllVerticesToBeRunning(jobGraph.getJobID()),testActor);
+                expectMsgEquals(new AllVerticesRunning(jobGraph.getJobID()));
+                jm.tell(new RequestExecutionGraph(jobGraph.getJobID()),testActor);
+                ExecutionGraphFound executionGraphResponse=expectMsgClass(ExecutionGraphFound.class);
+                ExecutionGraph executionGraph=(ExecutionGraph)executionGraphResponse.executionGraph();
+                ExecutionJobVertex vertex=executionGraph.getJobVertex(task.getID());
+                StackTraceSampleCoordinator coordinator=new StackTraceSampleCoordinator(testActorSystem.dispatcher(),60000);
+                CompletableFuture<StackTraceSample> sampleFuture=coordinator.triggerStackTraceSample(vertex.getTaskVertices(),21474700 * 100,Time.milliseconds(10L),0);
+                Thread.sleep(sleepTime);
+                Future<?> removeFuture=jm.ask(new TestingJobManagerMessages.NotifyWhenJobRemoved(jobGraph.getJobID()),remaining());
+                jm.tell(new JobManagerMessages.CancelJob(jobGraph.getJobID()));
+                try {
+                  sampleFuture.get(remaining().toMillis(),TimeUnit.MILLISECONDS);
+                  break;
+                }
+ catch (                Throwable t) {
+                }
+ finally {
+                  Await.ready(removeFuture,remaining());
+                }
+              }
+            }
+ catch (            Exception e) {
+              e.printStackTrace();
+              Assert.fail(e.getMessage());
+            }
+          }
+        }
+;
+      }
+  finally {
+        TestingUtils.stopActor(jobManger);
+        TestingUtils.stopActor(taskManager);
+        highAvailabilityServices.closeAndCleanupAllData();
+      }
+    }
+  }
+;
+}

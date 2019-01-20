@@ -1,0 +1,93 @@
+/** 
+ * Tests that the JobManager logs failures during recovery properly.
+ * @see <a href="https://issues.apache.org/jira/browse/FLINK-3185">FLINK-3185</a>
+ */
+@Test @RetryOnFailure(times=1) public void testCheckpointRecoveryFailure() throws Exception {
+  final Deadline testDeadline=TestTimeOut.fromNow();
+  final String zooKeeperQuorum=ZooKeeper.getConnectString();
+  final String fileStateBackendPath=FileStateBackendBasePath.getAbsoluteFile().toString();
+  Configuration config=ZooKeeperTestUtils.createZooKeeperHAConfig(zooKeeperQuorum,fileStateBackendPath);
+  config.setInteger(ConfigConstants.LOCAL_NUMBER_JOB_MANAGER,2);
+  JobManagerProcess[] jobManagerProcess=new JobManagerProcess[2];
+  LeaderRetrievalService leaderRetrievalService=null;
+  ActorSystem taskManagerSystem=null;
+  ActorSystem testActorSystem=null;
+  final HighAvailabilityServices highAvailabilityServices=HighAvailabilityServicesUtils.createHighAvailabilityServices(config,TestingUtils.defaultExecutor(),HighAvailabilityServicesUtils.AddressResolution.NO_ADDRESS_RESOLUTION);
+  try {
+    testActorSystem=AkkaUtils.createActorSystem(new Configuration(),new Some<>(new Tuple2<String,Object>("localhost",0)));
+    jobManagerProcess[0]=new JobManagerProcess(0,config);
+    jobManagerProcess[1]=new JobManagerProcess(1,config);
+    jobManagerProcess[0].startProcess();
+    jobManagerProcess[1].startProcess();
+    TestingListener leaderListener=new TestingListener();
+    leaderRetrievalService=highAvailabilityServices.getJobManagerLeaderRetriever(HighAvailabilityServices.DEFAULT_JOB_ID);
+    leaderRetrievalService.start(leaderListener);
+    taskManagerSystem=AkkaUtils.createActorSystem(config,Option.apply(new Tuple2<String,Object>("localhost",0)));
+    TaskManager.startTaskManagerComponentsAndActor(config,ResourceID.generate(),taskManagerSystem,highAvailabilityServices,NoOpMetricRegistry.INSTANCE,"localhost",Option.<String>empty(),false,TaskManager.class);
+    leaderListener.waitForNewLeader(testDeadline.timeLeft().toMillis());
+    String leaderAddress=leaderListener.getAddress();
+    UUID leaderId=leaderListener.getLeaderSessionID();
+    ActorRef leaderRef=AkkaUtils.getActorRef(leaderAddress,testActorSystem,testDeadline.timeLeft());
+    ActorGateway leader=new AkkaActorGateway(leaderRef,leaderId);
+    JobManagerProcess leadingJobManagerProcess;
+    JobManagerProcess nonLeadingJobManagerProcess;
+    if (jobManagerProcess[0].getJobManagerAkkaURL(testDeadline.timeLeft()).equals(leaderListener.getAddress())) {
+      leadingJobManagerProcess=jobManagerProcess[0];
+      nonLeadingJobManagerProcess=jobManagerProcess[1];
+    }
+ else {
+      leadingJobManagerProcess=jobManagerProcess[1];
+      nonLeadingJobManagerProcess=jobManagerProcess[0];
+    }
+    JobVertex blockingVertex=new JobVertex("Blocking vertex");
+    blockingVertex.setInvokableClass(BlockingNoOpInvokable.class);
+    JobGraph jobGraph=new JobGraph(blockingVertex);
+    leader.tell(new SubmitJob(jobGraph,ListeningBehaviour.DETACHED));
+    JobManagerActorTestUtils.waitForJobStatus(jobGraph.getJobID(),JobStatus.RUNNING,leader,testDeadline.timeLeft());
+    FileUtils.deleteDirectory(FileStateBackendBasePath);
+    leadingJobManagerProcess.destroy();
+    boolean success=false;
+    while (testDeadline.hasTimeLeft()) {
+      String output=nonLeadingJobManagerProcess.getProcessOutput();
+      if (output != null) {
+        if (output.contains("Failed to recover job") && output.contains("java.io.FileNotFoundException")) {
+          success=true;
+          break;
+        }
+      }
+ else {
+        log.warn("No process output available.");
+      }
+      Thread.sleep(500);
+    }
+    assertTrue("Did not find expected output in logs.",success);
+  }
+ catch (  Throwable t) {
+    t.printStackTrace();
+    if (jobManagerProcess[0] != null) {
+      jobManagerProcess[0].printProcessLog();
+    }
+    if (jobManagerProcess[1] != null) {
+      jobManagerProcess[1].printProcessLog();
+    }
+    throw t;
+  }
+ finally {
+    if (jobManagerProcess[0] != null) {
+      jobManagerProcess[0].destroy();
+    }
+    if (jobManagerProcess[1] != null) {
+      jobManagerProcess[1].destroy();
+    }
+    if (leaderRetrievalService != null) {
+      leaderRetrievalService.stop();
+    }
+    if (taskManagerSystem != null) {
+      taskManagerSystem.shutdown();
+    }
+    if (testActorSystem != null) {
+      testActorSystem.shutdown();
+    }
+    highAvailabilityServices.closeAndCleanupAllData();
+  }
+}

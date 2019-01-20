@@ -1,0 +1,50 @@
+@Test public void testDistributedScoring(){
+  ComputationGraphConfiguration conf=new NeuralNetConfiguration.Builder().l1(0.1).l2(0.1).seed(123).updater(new Nesterovs(0.1,0.9)).graphBuilder().addInputs("in").addLayer("0",new org.deeplearning4j.nn.conf.layers.DenseLayer.Builder().nIn(nIn).nOut(3).activation(Activation.TANH).build(),"in").addLayer("1",new org.deeplearning4j.nn.conf.layers.OutputLayer.Builder(LossFunctions.LossFunction.MCXENT).nIn(3).nOut(nOut).activation(Activation.SOFTMAX).build(),"0").setOutputs("1").build();
+  TrainingMaster tm=new ParameterAveragingTrainingMaster(true,numExecutors(),1,10,1,0);
+  SparkComputationGraph sparkNet=new SparkComputationGraph(sc,conf,tm);
+  ComputationGraph netCopy=sparkNet.getNetwork().clone();
+  int nRows=100;
+  INDArray features=Nd4j.rand(nRows,nIn);
+  INDArray labels=Nd4j.zeros(nRows,nOut);
+  Random r=new Random(12345);
+  for (int i=0; i < nRows; i++) {
+    labels.putScalar(new int[]{i,r.nextInt(nOut)},1.0);
+  }
+  INDArray localScoresWithReg=netCopy.scoreExamples(new DataSet(features,labels),true);
+  INDArray localScoresNoReg=netCopy.scoreExamples(new DataSet(features,labels),false);
+  List<Tuple2<String,DataSet>> dataWithKeys=new ArrayList<>();
+  for (int i=0; i < nRows; i++) {
+    DataSet ds=new DataSet(features.getRow(i).dup(),labels.getRow(i).dup());
+    dataWithKeys.add(new Tuple2<>(String.valueOf(i),ds));
+  }
+  JavaPairRDD<String,DataSet> dataWithKeysRdd=sc.parallelizePairs(dataWithKeys);
+  JavaPairRDD<String,Double> sparkScoresWithReg=sparkNet.scoreExamples(dataWithKeysRdd,true,4);
+  JavaPairRDD<String,Double> sparkScoresNoReg=sparkNet.scoreExamples(dataWithKeysRdd,false,4);
+  Map<String,Double> sparkScoresWithRegMap=sparkScoresWithReg.collectAsMap();
+  Map<String,Double> sparkScoresNoRegMap=sparkScoresNoReg.collectAsMap();
+  for (int i=0; i < nRows; i++) {
+    double scoreRegExp=localScoresWithReg.getDouble(i);
+    double scoreRegAct=sparkScoresWithRegMap.get(String.valueOf(i));
+    assertEquals(scoreRegExp,scoreRegAct,1e-5);
+    double scoreNoRegExp=localScoresNoReg.getDouble(i);
+    double scoreNoRegAct=sparkScoresNoRegMap.get(String.valueOf(i));
+    assertEquals(scoreNoRegExp,scoreNoRegAct,1e-5);
+  }
+  List<DataSet> dataNoKeys=new ArrayList<>();
+  for (int i=0; i < nRows; i++) {
+    dataNoKeys.add(new DataSet(features.getRow(i).dup(),labels.getRow(i).dup()));
+  }
+  JavaRDD<DataSet> dataNoKeysRdd=sc.parallelize(dataNoKeys);
+  List<Double> scoresWithReg=new ArrayList<>(sparkNet.scoreExamples(dataNoKeysRdd,true,4).collect());
+  List<Double> scoresNoReg=new ArrayList<>(sparkNet.scoreExamples(dataNoKeysRdd,false,4).collect());
+  Collections.sort(scoresWithReg);
+  Collections.sort(scoresNoReg);
+  double[] localScoresWithRegDouble=localScoresWithReg.data().asDouble();
+  double[] localScoresNoRegDouble=localScoresNoReg.data().asDouble();
+  Arrays.sort(localScoresWithRegDouble);
+  Arrays.sort(localScoresNoRegDouble);
+  for (int i=0; i < localScoresWithRegDouble.length; i++) {
+    assertEquals(localScoresWithRegDouble[i],scoresWithReg.get(i),1e-5);
+    assertEquals(localScoresNoRegDouble[i],scoresNoReg.get(i),1e-5);
+  }
+}

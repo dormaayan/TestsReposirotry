@@ -1,0 +1,75 @@
+@Test(timeout=10000) @SuppressWarnings("unchecked") public void testLocalResourceCache(){
+  String user="testuser";
+  DrainDispatcher dispatcher=null;
+  try {
+    Configuration conf=new Configuration();
+    dispatcher=createDispatcher(conf);
+    EventHandler<LocalizerEvent> localizerEventHandler=mock(EventHandler.class);
+    EventHandler<ContainerEvent> containerEventHandler=mock(EventHandler.class);
+    dispatcher.register(LocalizerEventType.class,localizerEventHandler);
+    dispatcher.register(ContainerEventType.class,containerEventHandler);
+    ConcurrentMap<LocalResourceRequest,LocalizedResource> localrsrc=new ConcurrentHashMap<LocalResourceRequest,LocalizedResource>();
+    LocalResourcesTracker tracker=new LocalResourcesTrackerImpl(user,null,dispatcher,localrsrc,true,conf,new NMNullStateStoreService(),null);
+    LocalResourceRequest lr=createLocalResourceRequest(user,1,1,LocalResourceVisibility.PUBLIC);
+    ContainerId cId1=BuilderUtils.newContainerId(1,1,1,1);
+    LocalizerContext lc1=new LocalizerContext(user,cId1,null);
+    ResourceEvent reqEvent1=new ResourceRequestEvent(lr,LocalResourceVisibility.PRIVATE,lc1);
+    Assert.assertEquals(0,localrsrc.size());
+    tracker.handle(reqEvent1);
+    dispatcher.await();
+    Assert.assertEquals(1,localrsrc.size());
+    Assert.assertTrue(localrsrc.containsKey(lr));
+    Assert.assertEquals(1,localrsrc.get(lr).getRefCount());
+    Assert.assertTrue(localrsrc.get(lr).ref.contains(cId1));
+    Assert.assertEquals(ResourceState.DOWNLOADING,localrsrc.get(lr).getState());
+    ContainerId cId2=BuilderUtils.newContainerId(1,1,1,2);
+    LocalizerContext lc2=new LocalizerContext(user,cId2,null);
+    ResourceEvent reqEvent2=new ResourceRequestEvent(lr,LocalResourceVisibility.PRIVATE,lc2);
+    tracker.handle(reqEvent2);
+    dispatcher.await();
+    Assert.assertEquals(2,localrsrc.get(lr).getRefCount());
+    Assert.assertTrue(localrsrc.get(lr).ref.contains(cId2));
+    ResourceEvent resourceFailedEvent=new ResourceFailedLocalizationEvent(lr,(new Exception("test").getMessage()));
+    LocalizedResource localizedResource=localrsrc.get(lr);
+    tracker.handle(resourceFailedEvent);
+    dispatcher.await();
+    Assert.assertEquals(0,localrsrc.size());
+    verify(containerEventHandler,timeout(1000).times(2)).handle(isA(ContainerResourceFailedEvent.class));
+    Assert.assertEquals(ResourceState.FAILED,localizedResource.getState());
+    ResourceReleaseEvent relEvent1=new ResourceReleaseEvent(lr,cId1);
+    tracker.handle(relEvent1);
+    dispatcher.await();
+    ContainerId cId3=BuilderUtils.newContainerId(1,1,1,3);
+    LocalizerContext lc3=new LocalizerContext(user,cId3,null);
+    ResourceEvent reqEvent3=new ResourceRequestEvent(lr,LocalResourceVisibility.PRIVATE,lc3);
+    tracker.handle(reqEvent3);
+    dispatcher.await();
+    Assert.assertEquals(1,localrsrc.size());
+    Assert.assertTrue(localrsrc.containsKey(lr));
+    Assert.assertEquals(1,localrsrc.get(lr).getRefCount());
+    Assert.assertTrue(localrsrc.get(lr).ref.contains(cId3));
+    ResourceReleaseEvent relEvent2=new ResourceReleaseEvent(lr,cId2);
+    tracker.handle(relEvent2);
+    dispatcher.await();
+    Assert.assertEquals(1,localrsrc.size());
+    Assert.assertTrue(localrsrc.containsKey(lr));
+    Assert.assertEquals(1,localrsrc.get(lr).getRefCount());
+    Assert.assertTrue(localrsrc.get(lr).ref.contains(cId3));
+    Path localizedPath=new Path("/tmp/file1");
+    ResourceLocalizedEvent localizedEvent=new ResourceLocalizedEvent(lr,localizedPath,123L);
+    tracker.handle(localizedEvent);
+    dispatcher.await();
+    verify(containerEventHandler,timeout(1000).times(1)).handle(isA(ContainerResourceLocalizedEvent.class));
+    Assert.assertEquals(ResourceState.LOCALIZED,localrsrc.get(lr).getState());
+    Assert.assertEquals(1,localrsrc.get(lr).getRefCount());
+    ResourceReleaseEvent relEvent3=new ResourceReleaseEvent(lr,cId3);
+    tracker.handle(relEvent3);
+    dispatcher.await();
+    Assert.assertEquals(0,localrsrc.get(lr).getRefCount());
+  }
+  finally {
+    if (dispatcher != null) {
+      dispatcher.stop();
+    }
+  }
+}

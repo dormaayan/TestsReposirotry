@@ -1,0 +1,183 @@
+@Category({MasterTests.class,MediumTests.class}) public class TestAssignmentListener {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestAssignmentListener.class);
+  private static final Logger LOG=LoggerFactory.getLogger(TestAssignmentListener.class);
+  private static final HBaseTestingUtility TEST_UTIL=new HBaseTestingUtility();
+  @Rule public TestName name=new TestName();
+static class DummyListener {
+    protected AtomicInteger modified=new AtomicInteger(0);
+    public void awaitModifications(    int count) throws InterruptedException {
+      while (!modified.compareAndSet(count,0)) {
+        Thread.sleep(100);
+      }
+    }
+  }
+static class DummyAssignmentListener extends DummyListener implements AssignmentListener {
+    private AtomicInteger closeCount=new AtomicInteger(0);
+    private AtomicInteger openCount=new AtomicInteger(0);
+    public DummyAssignmentListener(){
+    }
+    @Override public void regionOpened(    final RegionInfo regionInfo,    final ServerName serverName){
+      LOG.info("Assignment open region=" + regionInfo + " server="+ serverName);
+      openCount.incrementAndGet();
+      modified.incrementAndGet();
+    }
+    @Override public void regionClosed(    final RegionInfo regionInfo){
+      LOG.info("Assignment close region=" + regionInfo);
+      closeCount.incrementAndGet();
+      modified.incrementAndGet();
+    }
+    public void reset(){
+      openCount.set(0);
+      closeCount.set(0);
+    }
+    public int getLoadCount(){
+      return openCount.get();
+    }
+    public int getCloseCount(){
+      return closeCount.get();
+    }
+  }
+static class DummyServerListener extends DummyListener implements ServerListener {
+    private AtomicInteger removedCount=new AtomicInteger(0);
+    private AtomicInteger addedCount=new AtomicInteger(0);
+    public DummyServerListener(){
+    }
+    @Override public void serverAdded(    final ServerName serverName){
+      LOG.info("Server added " + serverName);
+      addedCount.incrementAndGet();
+      modified.incrementAndGet();
+    }
+    @Override public void serverRemoved(    final ServerName serverName){
+      LOG.info("Server removed " + serverName);
+      removedCount.incrementAndGet();
+      modified.incrementAndGet();
+    }
+    public void reset(){
+      addedCount.set(0);
+      removedCount.set(0);
+    }
+    public int getAddedCount(){
+      return addedCount.get();
+    }
+    public int getRemovedCount(){
+      return removedCount.get();
+    }
+  }
+  @BeforeClass public static void beforeAllTests() throws Exception {
+    TEST_UTIL.startMiniCluster(2);
+  }
+  @AfterClass public static void afterAllTests() throws Exception {
+    TEST_UTIL.shutdownMiniCluster();
+  }
+  @Test public void testServerListener() throws IOException, InterruptedException {
+    ServerManager serverManager=TEST_UTIL.getHBaseCluster().getMaster().getServerManager();
+    DummyServerListener listener=new DummyServerListener();
+    serverManager.registerListener(listener);
+    try {
+      MiniHBaseCluster miniCluster=TEST_UTIL.getMiniHBaseCluster();
+      miniCluster.startRegionServer();
+      listener.awaitModifications(1);
+      assertEquals(1,listener.getAddedCount());
+      assertEquals(0,listener.getRemovedCount());
+      listener.reset();
+      miniCluster.startRegionServer();
+      listener.awaitModifications(1);
+      assertEquals(1,listener.getAddedCount());
+      assertEquals(0,listener.getRemovedCount());
+      int nrs=miniCluster.getRegionServerThreads().size();
+      listener.reset();
+      miniCluster.stopRegionServer(nrs - 1);
+      listener.awaitModifications(1);
+      assertEquals(0,listener.getAddedCount());
+      assertEquals(1,listener.getRemovedCount());
+      listener.reset();
+      miniCluster.stopRegionServer(nrs - 2);
+      listener.awaitModifications(1);
+      assertEquals(0,listener.getAddedCount());
+      assertEquals(1,listener.getRemovedCount());
+    }
+  finally {
+      serverManager.unregisterListener(listener);
+    }
+  }
+  @Test public void testAssignmentListener() throws IOException, InterruptedException {
+    AssignmentManager am=TEST_UTIL.getHBaseCluster().getMaster().getAssignmentManager();
+    Admin admin=TEST_UTIL.getAdmin();
+    DummyAssignmentListener listener=new DummyAssignmentListener();
+    am.registerListener(listener);
+    try {
+      final TableName tableName=TableName.valueOf(name.getMethodName());
+      final byte[] FAMILY=Bytes.toBytes("cf");
+      LOG.info("Create Table");
+      TEST_UTIL.createTable(tableName,FAMILY);
+      listener.awaitModifications(1);
+      assertEquals(1,listener.getLoadCount());
+      assertEquals(0,listener.getCloseCount());
+      Table table=TEST_UTIL.getConnection().getTable(tableName);
+      try {
+        for (int i=0; i < 10; ++i) {
+          byte[] key=Bytes.toBytes("row-" + i);
+          Put put=new Put(key);
+          put.addColumn(FAMILY,null,key);
+          table.put(put);
+        }
+      }
+  finally {
+        table.close();
+      }
+      LOG.info("Split Table");
+      listener.reset();
+      admin.split(tableName,Bytes.toBytes("row-3"));
+      listener.awaitModifications(3);
+      assertEquals(2,listener.getLoadCount());
+      assertEquals(1,listener.getCloseCount());
+      MiniHBaseCluster miniCluster=TEST_UTIL.getMiniHBaseCluster();
+      int mergeable=0;
+      while (mergeable < 2) {
+        Thread.sleep(100);
+        admin.majorCompact(tableName);
+        mergeable=0;
+        for (        JVMClusterUtil.RegionServerThread regionThread : miniCluster.getRegionServerThreads()) {
+          for (          Region region : regionThread.getRegionServer().getRegions(tableName)) {
+            mergeable+=((HRegion)region).isMergeable() ? 1 : 0;
+          }
+        }
+      }
+      LOG.info("Merge Regions");
+      listener.reset();
+      List<RegionInfo> regions=admin.getRegions(tableName);
+      assertEquals(2,regions.size());
+      boolean sameServer=areAllRegionsLocatedOnSameServer(tableName);
+      final int expectedModifications=sameServer ? 3 : 5;
+      final int expectedLoadCount=sameServer ? 1 : 2;
+      final int expectedCloseCount=sameServer ? 2 : 3;
+      admin.mergeRegionsAsync(regions.get(0).getEncodedNameAsBytes(),regions.get(1).getEncodedNameAsBytes(),true);
+      listener.awaitModifications(expectedModifications);
+      assertEquals(1,admin.getRegions(tableName).size());
+      assertEquals(expectedLoadCount,listener.getLoadCount());
+      assertEquals(expectedCloseCount,listener.getCloseCount());
+      LOG.info("Drop Table");
+      listener.reset();
+      TEST_UTIL.deleteTable(tableName);
+      listener.awaitModifications(1);
+      assertEquals(0,listener.getLoadCount());
+      assertEquals(1,listener.getCloseCount());
+    }
+  finally {
+      am.unregisterListener(listener);
+    }
+  }
+  private boolean areAllRegionsLocatedOnSameServer(  TableName TABLE_NAME){
+    MiniHBaseCluster miniCluster=TEST_UTIL.getMiniHBaseCluster();
+    int serverCount=0;
+    for (    JVMClusterUtil.RegionServerThread regionThread : miniCluster.getRegionServerThreads()) {
+      if (!regionThread.getRegionServer().getRegions(TABLE_NAME).isEmpty()) {
+        ++serverCount;
+      }
+      if (serverCount > 1) {
+        return false;
+      }
+    }
+    return serverCount == 1;
+  }
+}

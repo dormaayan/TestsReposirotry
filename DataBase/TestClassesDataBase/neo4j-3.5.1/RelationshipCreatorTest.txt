@@ -1,0 +1,85 @@
+public class RelationshipCreatorTest {
+  private static final int DENSE_NODE_THRESHOLD=5;
+  @Rule public final DatabaseRule dbRule=new ImpermanentDatabaseRule().withSetting(GraphDatabaseSettings.dense_node_threshold,String.valueOf(DENSE_NODE_THRESHOLD));
+  private IdGeneratorFactory idGeneratorFactory;
+  @Before public void before(){
+    idGeneratorFactory=dbRule.getGraphDatabaseAPI().getDependencyResolver().resolveDependency(IdGeneratorFactory.class);
+  }
+  @Test public void shouldOnlyChangeLockedRecordsWhenUpgradingToDenseNode(){
+    long nodeId=createNodeWithRelationships(DENSE_NODE_THRESHOLD);
+    NeoStores neoStores=flipToNeoStores();
+    Tracker tracker=new Tracker(neoStores);
+    RelationshipGroupGetter groupGetter=new RelationshipGroupGetter(neoStores.getRelationshipGroupStore());
+    RelationshipCreator relationshipCreator=new RelationshipCreator(groupGetter,5);
+    relationshipCreator.relationshipCreate(idGeneratorFactory.get(IdType.RELATIONSHIP).nextId(),0,nodeId,nodeId,tracker,tracker);
+    assertEquals(tracker.relationshipLocksAcquired.size(),tracker.changedRelationships.size());
+    assertFalse(tracker.relationshipLocksAcquired.isEmpty());
+  }
+  private NeoStores flipToNeoStores(){
+    return dbRule.getGraphDatabaseAPI().getDependencyResolver().resolveDependency(RecordStorageEngine.class).testAccessNeoStores();
+  }
+  private long createNodeWithRelationships(  int count){
+    GraphDatabaseService db=dbRule.getGraphDatabaseAPI();
+    try (Transaction tx=db.beginTx()){
+      Node node=db.createNode();
+      for (int i=0; i < count; i++) {
+        node.createRelationshipTo(db.createNode(),MyRelTypes.TEST);
+      }
+      tx.success();
+      return node.getId();
+    }
+   }
+static class Tracker extends NoOpClient implements RecordAccessSet {
+    private final RecordAccessSet delegate;
+    private final TrackingRecordAccess<RelationshipRecord,Void> relRecords;
+    private final Set<Long> relationshipLocksAcquired=new HashSet<>();
+    private final Set<Long> changedRelationships=new HashSet<>();
+    Tracker(    NeoStores neoStores){
+      this.delegate=new DirectRecordAccessSet(neoStores);
+      this.relRecords=new TrackingRecordAccess<>(delegate.getRelRecords(),this);
+    }
+    @Override public void acquireExclusive(    LockTracer tracer,    ResourceType resourceType,    long... resourceIds) throws AcquireLockTimeoutException {
+      assertEquals(ResourceTypes.RELATIONSHIP,resourceType);
+      for (      long resourceId : resourceIds) {
+        relationshipLocksAcquired.add(resourceId);
+      }
+    }
+    protected void changingRelationship(    long relId){
+      assertTrue("Tried to change relationship " + relId + " without this transaction having it locked",relationshipLocksAcquired.contains(relId));
+      changedRelationships.add(relId);
+    }
+    @Override public RecordAccess<NodeRecord,Void> getNodeRecords(){
+      return delegate.getNodeRecords();
+    }
+    @Override public RecordAccess<PropertyRecord,PrimitiveRecord> getPropertyRecords(){
+      return delegate.getPropertyRecords();
+    }
+    @Override public RecordAccess<RelationshipRecord,Void> getRelRecords(){
+      return relRecords;
+    }
+    @Override public RecordAccess<RelationshipGroupRecord,Integer> getRelGroupRecords(){
+      return delegate.getRelGroupRecords();
+    }
+    @Override public RecordAccess<SchemaRecord,SchemaRule> getSchemaRuleChanges(){
+      return delegate.getSchemaRuleChanges();
+    }
+    @Override public RecordAccess<PropertyKeyTokenRecord,Void> getPropertyKeyTokenChanges(){
+      return delegate.getPropertyKeyTokenChanges();
+    }
+    @Override public RecordAccess<LabelTokenRecord,Void> getLabelTokenChanges(){
+      return delegate.getLabelTokenChanges();
+    }
+    @Override public RecordAccess<RelationshipTypeTokenRecord,Void> getRelationshipTypeTokenChanges(){
+      return delegate.getRelationshipTypeTokenChanges();
+    }
+    @Override public void close(){
+      delegate.close();
+    }
+    @Override public boolean hasChanges(){
+      return delegate.hasChanges();
+    }
+    @Override public int changeSize(){
+      return delegate.changeSize();
+    }
+  }
+}

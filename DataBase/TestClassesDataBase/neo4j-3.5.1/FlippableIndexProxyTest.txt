@@ -1,0 +1,97 @@
+public class FlippableIndexProxyTest {
+  @Rule public final CleanupRule cleanup=new CleanupRule();
+  @Rule public ExpectedException expectedException=ExpectedException.none();
+  @Test public void shouldBeAbleToSwitchDelegate() throws Exception {
+    IndexProxy actual=mockIndexProxy();
+    IndexProxy other=mockIndexProxy();
+    FlippableIndexProxy delegate=new FlippableIndexProxy(actual);
+    delegate.setFlipTarget(singleProxy(other));
+    delegate.flip(noOp(),null);
+    delegate.drop();
+    verify(other).drop();
+  }
+  @Test public void shouldNotBeAbleToFlipAfterClosed() throws Exception {
+    IndexProxy actual=mockIndexProxy();
+    IndexProxyFactory indexContextFactory=mock(IndexProxyFactory.class);
+    FlippableIndexProxy delegate=new FlippableIndexProxy(actual);
+    delegate.close();
+    delegate.setFlipTarget(indexContextFactory);
+    expectedException.expect(IndexProxyAlreadyClosedKernelException.class);
+    delegate.flip(noOp(),null);
+  }
+  @Test public void shouldNotBeAbleToFlipAfterDrop() throws Exception {
+    IndexProxy actual=mockIndexProxy();
+    IndexProxy failed=mockIndexProxy();
+    IndexProxyFactory indexContextFactory=mock(IndexProxyFactory.class);
+    FlippableIndexProxy delegate=new FlippableIndexProxy(actual);
+    delegate.setFlipTarget(indexContextFactory);
+    delegate.drop();
+    expectedException.expect(IndexProxyAlreadyClosedKernelException.class);
+    delegate.flip(noOp(),singleFailedDelegate(failed));
+  }
+  @Test public void shouldBlockAccessDuringFlipAndThenDelegateToCorrectContext() throws Exception {
+    final IndexProxy contextBeforeFlip=mockIndexProxy();
+    final IndexProxy contextAfterFlip=mockIndexProxy();
+    final FlippableIndexProxy flippable=new FlippableIndexProxy(contextBeforeFlip);
+    flippable.setFlipTarget(singleProxy(contextAfterFlip));
+    final CountDownLatch triggerFinishFlip=new CountDownLatch(1);
+    final CountDownLatch triggerExternalAccess=new CountDownLatch(1);
+    OtherThreadExecutor<Void> flippingThread=cleanup.add(new OtherThreadExecutor<>("Flipping thread",null));
+    OtherThreadExecutor<Void> dropIndexThread=cleanup.add(new OtherThreadExecutor<>("Drop index thread",null));
+    Future<Void> flipContextFuture=flippingThread.executeDontWait(startFlipAndWaitForLatchBeforeFinishing(flippable,triggerFinishFlip,triggerExternalAccess));
+    assertTrue(triggerExternalAccess.await(10,SECONDS));
+    Future<Void> dropIndexFuture=dropIndexThread.executeDontWait(dropTheIndex(flippable));
+    dropIndexThread.waitUntilWaiting();
+    triggerFinishFlip.countDown();
+    dropIndexFuture.get(10,SECONDS);
+    flipContextFuture.get(10,SECONDS);
+    verifyNoMoreInteractions(contextBeforeFlip);
+    verify(contextAfterFlip).drop();
+  }
+  @Test public void shouldAbortStoreScanWaitOnDrop() throws Exception {
+    FakePopulatingIndexProxy delegate=new FakePopulatingIndexProxy();
+    FlippableIndexProxy flipper=new FlippableIndexProxy(delegate);
+    OtherThreadExecutor<Void> waiter=cleanup.add(new OtherThreadExecutor<>("Waiter",null));
+    Future<Object> waiting=waiter.executeDontWait(state -> flipper.awaitStoreScanCompleted());
+    while (!delegate.awaitCalled) {
+      Thread.sleep(10);
+    }
+    flipper.drop();
+    waiting.get(10,SECONDS);
+  }
+  private OtherThreadExecutor.WorkerCommand<Void,Void> dropTheIndex(  final FlippableIndexProxy flippable) throws IOException {
+    return state -> {
+      flippable.drop();
+      return null;
+    }
+;
+  }
+  private OtherThreadExecutor.WorkerCommand<Void,Void> startFlipAndWaitForLatchBeforeFinishing(  final FlippableIndexProxy flippable,  final CountDownLatch triggerFinishFlip,  final CountDownLatch triggerExternalAccess){
+    return state -> {
+      flippable.flip(() -> {
+        triggerExternalAccess.countDown();
+        assertTrue(awaitLatch(triggerFinishFlip));
+        return Boolean.TRUE;
+      }
+,null);
+      return null;
+    }
+;
+  }
+  private Callable<Boolean> noOp(){
+    return () -> Boolean.TRUE;
+  }
+  public static IndexProxyFactory singleProxy(  final IndexProxy proxy){
+    return () -> proxy;
+  }
+  private FailedIndexProxyFactory singleFailedDelegate(  final IndexProxy failed){
+    return failure -> failed;
+  }
+private static class FakePopulatingIndexProxy extends IndexProxyAdapter {
+    private volatile boolean awaitCalled;
+    @Override public boolean awaitStoreScanCompleted(){
+      awaitCalled=true;
+      return true;
+    }
+  }
+}

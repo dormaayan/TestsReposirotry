@@ -1,0 +1,40 @@
+/** 
+ * Test case where two secondary namenodes are checkpointing the same NameNode. This differs from  {@link #testMultipleSecondaryNamenodes()}since that test runs against two distinct NNs. This case tests the following interleaving: - 2NN A downloads image (up to txid 2) - 2NN A about to save its own checkpoint - 2NN B downloads image (up to txid 4) - 2NN B uploads checkpoint (txid 4) - 2NN A uploads checkpoint (txid 2) It verifies that this works even though the earlier-txid checkpoint gets uploaded after the later-txid checkpoint.
+ */
+@Test public void testMultipleSecondaryNNsAgainstSameNN() throws Exception {
+  Configuration conf=new HdfsConfiguration();
+  MiniDFSCluster cluster=null;
+  SecondaryNameNode secondary1=null, secondary2=null;
+  try {
+    cluster=new MiniDFSCluster.Builder(conf).numDataNodes(0).format(true).build();
+    secondary1=startSecondaryNameNode(conf,1);
+    secondary2=startSecondaryNameNode(conf,2);
+    CheckpointStorage spyImage1=spyOnSecondaryImage(secondary1);
+    DelayAnswer delayer=new DelayAnswer(LOG);
+    Mockito.doAnswer(delayer).when(spyImage1).saveFSImageInAllDirs(Mockito.<FSNamesystem>any(),Mockito.anyLong());
+    DoCheckpointThread checkpointThread=new DoCheckpointThread(secondary1);
+    checkpointThread.start();
+    delayer.waitForCall();
+    secondary2.doCheckpoint();
+    delayer.proceed();
+    checkpointThread.join();
+    checkpointThread.propagateExceptions();
+    NNStorage storage=cluster.getNameNode().getFSImage().getStorage();
+    assertEquals(4,storage.getMostRecentCheckpointTxId());
+    assertNNHasCheckpoints(cluster,ImmutableList.of(2,4));
+    secondary2.doCheckpoint();
+    assertEquals(6,storage.getMostRecentCheckpointTxId());
+    assertParallelFilesInvariant(cluster,ImmutableList.of(secondary1,secondary2));
+    assertNNHasCheckpoints(cluster,ImmutableList.of(4,6));
+  }
+  finally {
+    cleanup(secondary1);
+    secondary1=null;
+    cleanup(secondary2);
+    secondary2=null;
+    if (cluster != null) {
+      cluster.shutdown();
+      cluster=null;
+    }
+  }
+}

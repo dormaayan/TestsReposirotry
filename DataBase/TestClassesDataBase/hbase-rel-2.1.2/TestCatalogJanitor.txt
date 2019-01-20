@@ -1,0 +1,301 @@
+@Category({MasterTests.class,SmallTests.class}) public class TestCatalogJanitor {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestCatalogJanitor.class);
+  private static final Logger LOG=LoggerFactory.getLogger(TestCatalogJanitor.class);
+  @Rule public final TestName name=new TestName();
+  private static final HBaseTestingUtility HTU=new HBaseTestingUtility();
+  private MockMasterServices masterServices;
+  private CatalogJanitor janitor;
+  @BeforeClass public static void beforeClass() throws Exception {
+    ChunkCreator.initialize(MemStoreLABImpl.CHUNK_SIZE_DEFAULT,false,0,0,0,null);
+  }
+  @Before public void setup() throws IOException, KeeperException {
+    setRootDirAndCleanIt(HTU,this.name.getMethodName());
+    NavigableMap<ServerName,SortedSet<byte[]>> regionsToRegionServers=new ConcurrentSkipListMap<ServerName,SortedSet<byte[]>>();
+    this.masterServices=new MockMasterServices(HTU.getConfiguration(),regionsToRegionServers);
+    this.masterServices.start(10,null);
+    this.janitor=new CatalogJanitor(masterServices);
+  }
+  @After public void teardown(){
+    this.janitor.cancel(true);
+    this.masterServices.stop("DONE");
+  }
+  /** 
+ * Test clearing a split parent.
+ */
+  @Test public void testCleanParent() throws IOException, InterruptedException {
+    TableDescriptor td=createTableDescriptorForCurrentMethod();
+    HRegionInfo parent=new HRegionInfo(td.getTableName(),Bytes.toBytes("aaa"),Bytes.toBytes("eee"));
+    HRegionInfo splita=new HRegionInfo(td.getTableName(),Bytes.toBytes("aaa"),Bytes.toBytes("ccc"));
+    HRegionInfo splitb=new HRegionInfo(td.getTableName(),Bytes.toBytes("ccc"),Bytes.toBytes("eee"));
+    Result r=createResult(parent,splita,splitb);
+    Path rootdir=this.masterServices.getMasterFileSystem().getRootDir();
+    Path tabledir=FSUtils.getTableDir(rootdir,td.getTableName());
+    Path parentdir=new Path(tabledir,parent.getEncodedName());
+    Path storedir=HStore.getStoreHomedir(tabledir,splita,td.getColumnFamilies()[0].getName());
+    Reference ref=Reference.createTopReference(Bytes.toBytes("ccc"));
+    long now=System.currentTimeMillis();
+    Path p=new Path(storedir,Long.toString(now) + "." + parent.getEncodedName());
+    FileSystem fs=this.masterServices.getMasterFileSystem().getFileSystem();
+    Path path=ref.write(fs,p);
+    assertTrue(fs.exists(path));
+    LOG.info("Created reference " + path);
+    fs.mkdirs(parentdir);
+    assertFalse(this.janitor.cleanParent(parent,r));
+    ProcedureTestingUtility.waitAllProcedures(masterServices.getMasterProcedureExecutor());
+    assertTrue(fs.exists(parentdir));
+    assertTrue(fs.delete(p,true));
+    assertTrue(this.janitor.cleanParent(parent,r));
+    ProcedureTestingUtility.waitAllProcedures(masterServices.getMasterProcedureExecutor());
+    assertTrue(!fs.exists(parentdir));
+  }
+  /** 
+ * Make sure parent gets cleaned up even if daughter is cleaned up before it.
+ */
+  @Test public void testParentCleanedEvenIfDaughterGoneFirst() throws IOException, InterruptedException {
+    parentWithSpecifiedEndKeyCleanedEvenIfDaughterGoneFirst(this.name.getMethodName(),Bytes.toBytes("eee"));
+  }
+  /** 
+ * Make sure last parent with empty end key gets cleaned up even if daughter is cleaned up before it.
+ */
+  @Test public void testLastParentCleanedEvenIfDaughterGoneFirst() throws IOException, InterruptedException {
+    parentWithSpecifiedEndKeyCleanedEvenIfDaughterGoneFirst(this.name.getMethodName(),new byte[0]);
+  }
+  /** 
+ * @return A TableDescriptor with a tableName of current method name and a columnfamily that is MockMasterServices.DEFAULT_COLUMN_FAMILY_NAME)
+ */
+  private TableDescriptor createTableDescriptorForCurrentMethod(){
+    return TableDescriptorBuilder.newBuilder(TableName.valueOf(this.name.getMethodName())).setColumnFamily(new HColumnDescriptor(MockMasterServices.DEFAULT_COLUMN_FAMILY_NAME)).build();
+  }
+  /** 
+ * Make sure parent with specified end key gets cleaned up even if daughter is cleaned up before it.
+ * @param rootDir the test case name, used as the HBase testing utility root
+ * @param lastEndKey the end key of the split parent
+ */
+  private void parentWithSpecifiedEndKeyCleanedEvenIfDaughterGoneFirst(  final String rootDir,  final byte[] lastEndKey) throws IOException, InterruptedException {
+    TableDescriptor td=createTableDescriptorForCurrentMethod();
+    HRegionInfo parent=new HRegionInfo(td.getTableName(),Bytes.toBytes("aaa"),lastEndKey);
+    Thread.sleep(1001);
+    HRegionInfo splita=new HRegionInfo(td.getTableName(),Bytes.toBytes("aaa"),Bytes.toBytes("ccc"));
+    Thread.sleep(1001);
+    HRegionInfo splitaa=new HRegionInfo(td.getTableName(),Bytes.toBytes("aaa"),Bytes.toBytes("bbb"));
+    HRegionInfo splitab=new HRegionInfo(td.getTableName(),Bytes.toBytes("bbb"),Bytes.toBytes("ccc"));
+    HRegionInfo splitb=new HRegionInfo(td.getTableName(),Bytes.toBytes("ccc"),lastEndKey);
+    Thread.sleep(1001);
+    HRegionInfo splitba=new HRegionInfo(td.getTableName(),Bytes.toBytes("ccc"),Bytes.toBytes("ddd"));
+    HRegionInfo splitbb=new HRegionInfo(td.getTableName(),Bytes.toBytes("ddd"),lastEndKey);
+    SortedMap<HRegionInfo,Result> regions=new TreeMap<>(new CatalogJanitor.SplitParentFirstComparator());
+    regions.put(parent,createResult(parent,splita,splitb));
+    regions.put(splitb,createResult(splitb,splitba,splitbb));
+    regions.put(splita,createResult(splita,splitaa,splitab));
+    int index=0;
+    for (    Map.Entry<HRegionInfo,Result> e : regions.entrySet()) {
+      if (index == 0) {
+        assertTrue(e.getKey().getEncodedName().equals(parent.getEncodedName()));
+      }
+ else       if (index == 1) {
+        assertTrue(e.getKey().getEncodedName().equals(splita.getEncodedName()));
+      }
+ else       if (index == 2) {
+        assertTrue(e.getKey().getEncodedName().equals(splitb.getEncodedName()));
+      }
+      index++;
+    }
+    Path splitaRef=createReferences(this.masterServices,td,parent,splita,Bytes.toBytes("ccc"),false);
+    assertFalse(janitor.cleanParent(parent,regions.get(parent)));
+    assertTrue(janitor.cleanParent(splitb,regions.get(splitb)));
+    FileSystem fs=FileSystem.get(HTU.getConfiguration());
+    assertTrue(fs.delete(splitaRef,true));
+    Path splitaaRef=createReferences(this.masterServices,td,splita,splitaa,Bytes.toBytes("bbb"),false);
+    Path splitabRef=createReferences(this.masterServices,td,splita,splitab,Bytes.toBytes("bbb"),true);
+    assertFalse(janitor.cleanParent(splita,regions.get(splita)));
+    assertTrue(fs.delete(splitaaRef,true));
+    assertTrue(fs.delete(splitabRef,true));
+    assertTrue(janitor.cleanParent(splita,regions.get(splita)));
+    assertTrue(janitor.cleanParent(parent,regions.get(parent)));
+  }
+  /** 
+ * CatalogJanitor.scan() should not clean parent regions if their own parents are still referencing them. This ensures that grandparent regions do not point to deleted parent regions.
+ */
+  @Test public void testScanDoesNotCleanRegionsWithExistingParents() throws Exception {
+    TableDescriptor td=createTableDescriptorForCurrentMethod();
+    HRegionInfo parent=new HRegionInfo(td.getTableName(),Bytes.toBytes("aaa"),HConstants.EMPTY_BYTE_ARRAY,true);
+    Thread.sleep(1001);
+    HRegionInfo splita=new HRegionInfo(td.getTableName(),Bytes.toBytes("aaa"),Bytes.toBytes("ccc"),true);
+    Thread.sleep(1001);
+    HRegionInfo splitaa=new HRegionInfo(td.getTableName(),Bytes.toBytes("aaa"),Bytes.toBytes("bbb"),false);
+    HRegionInfo splitab=new HRegionInfo(td.getTableName(),Bytes.toBytes("bbb"),Bytes.toBytes("ccc"),false);
+    HRegionInfo splitb=new HRegionInfo(td.getTableName(),Bytes.toBytes("ccc"),HConstants.EMPTY_BYTE_ARRAY);
+    Thread.sleep(1001);
+    final Map<HRegionInfo,Result> splitParents=new TreeMap<>(new SplitParentFirstComparator());
+    splitParents.put(parent,createResult(parent,splita,splitb));
+    splita.setOffline(true);
+    splitParents.put(splita,createResult(splita,splitaa,splitab));
+    final Map<HRegionInfo,Result> mergedRegions=new TreeMap<>();
+    CatalogJanitor spy=spy(this.janitor);
+    doReturn(new Triple<>(10,mergedRegions,splitParents)).when(spy).getMergedRegionsAndSplitParents();
+    LOG.info("parent=" + parent.getShortNameToLog() + ", splita="+ splita.getShortNameToLog());
+    Path splitaRef=createReferences(this.masterServices,td,parent,splita,Bytes.toBytes("ccc"),false);
+    LOG.info("Created reference " + splitaRef);
+    assertEquals(0,spy.scan());
+    FileSystem fs=FileSystem.get(HTU.getConfiguration());
+    assertTrue(fs.delete(splitaRef,true));
+    assertEquals(2,spy.scan());
+  }
+  /** 
+ * Test that we correctly archive all the storefiles when a region is deleted
+ * @throws Exception
+ */
+  @Test public void testSplitParentFirstComparator(){
+    SplitParentFirstComparator comp=new SplitParentFirstComparator();
+    TableDescriptor td=createTableDescriptorForCurrentMethod();
+    HRegionInfo rootRegion=new HRegionInfo(td.getTableName(),HConstants.EMPTY_START_ROW,HConstants.EMPTY_END_ROW,true);
+    HRegionInfo firstRegion=new HRegionInfo(td.getTableName(),HConstants.EMPTY_START_ROW,Bytes.toBytes("bbb"),true);
+    HRegionInfo lastRegion=new HRegionInfo(td.getTableName(),Bytes.toBytes("bbb"),HConstants.EMPTY_END_ROW,true);
+    assertTrue(comp.compare(rootRegion,rootRegion) == 0);
+    assertTrue(comp.compare(firstRegion,firstRegion) == 0);
+    assertTrue(comp.compare(lastRegion,lastRegion) == 0);
+    assertTrue(comp.compare(rootRegion,firstRegion) < 0);
+    assertTrue(comp.compare(rootRegion,lastRegion) < 0);
+    assertTrue(comp.compare(firstRegion,lastRegion) < 0);
+    HRegionInfo firstRegiona=new HRegionInfo(td.getTableName(),HConstants.EMPTY_START_ROW,Bytes.toBytes("aaa"),true);
+    HRegionInfo firstRegionb=new HRegionInfo(td.getTableName(),Bytes.toBytes("aaa"),Bytes.toBytes("bbb"),true);
+    HRegionInfo lastRegiona=new HRegionInfo(td.getTableName(),Bytes.toBytes("bbb"),Bytes.toBytes("ddd"),true);
+    HRegionInfo lastRegionb=new HRegionInfo(td.getTableName(),Bytes.toBytes("ddd"),HConstants.EMPTY_END_ROW,true);
+    assertTrue(comp.compare(firstRegiona,firstRegiona) == 0);
+    assertTrue(comp.compare(firstRegionb,firstRegionb) == 0);
+    assertTrue(comp.compare(rootRegion,firstRegiona) < 0);
+    assertTrue(comp.compare(rootRegion,firstRegionb) < 0);
+    assertTrue(comp.compare(firstRegion,firstRegiona) < 0);
+    assertTrue(comp.compare(firstRegion,firstRegionb) < 0);
+    assertTrue(comp.compare(firstRegiona,firstRegionb) < 0);
+    assertTrue(comp.compare(lastRegiona,lastRegiona) == 0);
+    assertTrue(comp.compare(lastRegionb,lastRegionb) == 0);
+    assertTrue(comp.compare(rootRegion,lastRegiona) < 0);
+    assertTrue(comp.compare(rootRegion,lastRegionb) < 0);
+    assertTrue(comp.compare(lastRegion,lastRegiona) < 0);
+    assertTrue(comp.compare(lastRegion,lastRegionb) < 0);
+    assertTrue(comp.compare(lastRegiona,lastRegionb) < 0);
+    assertTrue(comp.compare(firstRegiona,lastRegiona) < 0);
+    assertTrue(comp.compare(firstRegiona,lastRegionb) < 0);
+    assertTrue(comp.compare(firstRegionb,lastRegiona) < 0);
+    assertTrue(comp.compare(firstRegionb,lastRegionb) < 0);
+    HRegionInfo lastRegionaa=new HRegionInfo(td.getTableName(),Bytes.toBytes("bbb"),Bytes.toBytes("ccc"),false);
+    HRegionInfo lastRegionab=new HRegionInfo(td.getTableName(),Bytes.toBytes("ccc"),Bytes.toBytes("ddd"),false);
+    assertTrue(comp.compare(lastRegiona,lastRegionaa) < 0);
+    assertTrue(comp.compare(lastRegiona,lastRegionab) < 0);
+    assertTrue(comp.compare(lastRegionaa,lastRegionab) < 0);
+  }
+  @Test public void testArchiveOldRegion() throws Exception {
+    TableDescriptor td=createTableDescriptorForCurrentMethod();
+    HRegionInfo parent=new HRegionInfo(td.getTableName(),Bytes.toBytes("aaa"),Bytes.toBytes("eee"));
+    HRegionInfo splita=new HRegionInfo(td.getTableName(),Bytes.toBytes("aaa"),Bytes.toBytes("ccc"));
+    HRegionInfo splitb=new HRegionInfo(td.getTableName(),Bytes.toBytes("ccc"),Bytes.toBytes("eee"));
+    Result parentMetaRow=createResult(parent,splita,splitb);
+    FileSystem fs=FileSystem.get(HTU.getConfiguration());
+    Path rootdir=this.masterServices.getMasterFileSystem().getRootDir();
+    FSUtils.setRootDir(fs.getConf(),rootdir);
+    Path tabledir=FSUtils.getTableDir(rootdir,td.getTableName());
+    Path storedir=HStore.getStoreHomedir(tabledir,parent,td.getColumnFamilies()[0].getName());
+    Path storeArchive=HFileArchiveUtil.getStoreArchivePath(this.masterServices.getConfiguration(),parent,tabledir,td.getColumnFamilies()[0].getName());
+    LOG.debug("Table dir:" + tabledir);
+    LOG.debug("Store dir:" + storedir);
+    LOG.debug("Store archive dir:" + storeArchive);
+    FileStatus[] mockFiles=addMockStoreFiles(2,this.masterServices,storedir);
+    FileStatus[] storeFiles=fs.listStatus(storedir);
+    int index=0;
+    for (    FileStatus file : storeFiles) {
+      LOG.debug("Have store file:" + file.getPath());
+      assertEquals("Got unexpected store file",mockFiles[index].getPath(),storeFiles[index].getPath());
+      index++;
+    }
+    assertTrue(janitor.cleanParent(parent,parentMetaRow));
+    Path parentDir=new Path(tabledir,parent.getEncodedName());
+    ProcedureTestingUtility.waitAllProcedures(masterServices.getMasterProcedureExecutor());
+    assertTrue(!fs.exists(parentDir));
+    LOG.debug("Finished cleanup of parent region");
+    FileStatus[] archivedStoreFiles=fs.listStatus(storeArchive);
+    logFiles("archived files",storeFiles);
+    logFiles("archived files",archivedStoreFiles);
+    assertArchiveEqualToOriginal(storeFiles,archivedStoreFiles,fs);
+    FSUtils.delete(fs,rootdir,true);
+  }
+  /** 
+ * @param description description of the files for logging
+ * @param storeFiles the status of the files to log
+ */
+  private void logFiles(  String description,  FileStatus[] storeFiles){
+    LOG.debug("Current " + description + ": ");
+    for (    FileStatus file : storeFiles) {
+      LOG.debug(Objects.toString(file.getPath()));
+    }
+  }
+  /** 
+ * Test that if a store file with the same name is present as those already backed up cause the already archived files to be timestamped backup
+ */
+  @Test public void testDuplicateHFileResolution() throws Exception {
+    TableDescriptor td=createTableDescriptorForCurrentMethod();
+    HRegionInfo parent=new HRegionInfo(td.getTableName(),Bytes.toBytes("aaa"),Bytes.toBytes("eee"));
+    HRegionInfo splita=new HRegionInfo(td.getTableName(),Bytes.toBytes("aaa"),Bytes.toBytes("ccc"));
+    HRegionInfo splitb=new HRegionInfo(td.getTableName(),Bytes.toBytes("ccc"),Bytes.toBytes("eee"));
+    Result r=createResult(parent,splita,splitb);
+    FileSystem fs=FileSystem.get(HTU.getConfiguration());
+    Path rootdir=this.masterServices.getMasterFileSystem().getRootDir();
+    FSUtils.setRootDir(fs.getConf(),rootdir);
+    Path tabledir=FSUtils.getTableDir(rootdir,parent.getTable());
+    Path storedir=HStore.getStoreHomedir(tabledir,parent,td.getColumnFamilies()[0].getName());
+    System.out.println("Old root:" + rootdir);
+    System.out.println("Old table:" + tabledir);
+    System.out.println("Old store:" + storedir);
+    Path storeArchive=HFileArchiveUtil.getStoreArchivePath(this.masterServices.getConfiguration(),parent,tabledir,td.getColumnFamilies()[0].getName());
+    System.out.println("Old archive:" + storeArchive);
+    addMockStoreFiles(2,this.masterServices,storedir);
+    FileStatus[] storeFiles=fs.listStatus(storedir);
+    assertTrue(janitor.cleanParent(parent,r));
+    Path parentDir=new Path(tabledir,parent.getEncodedName());
+    ProcedureTestingUtility.waitAllProcedures(masterServices.getMasterProcedureExecutor());
+    assertTrue(!fs.exists(parentDir));
+    FileStatus[] archivedStoreFiles=fs.listStatus(storeArchive);
+    assertArchiveEqualToOriginal(storeFiles,archivedStoreFiles,fs);
+    addMockStoreFiles(2,this.masterServices,storedir);
+    assertTrue(janitor.cleanParent(parent,r));
+    ProcedureTestingUtility.waitAllProcedures(masterServices.getMasterProcedureExecutor());
+    assertTrue(!fs.exists(parentDir));
+    archivedStoreFiles=fs.listStatus(storeArchive);
+    assertArchiveEqualToOriginal(storeFiles,archivedStoreFiles,fs,true);
+  }
+  private FileStatus[] addMockStoreFiles(  int count,  MasterServices services,  Path storedir) throws IOException {
+    FileSystem fs=services.getMasterFileSystem().getFileSystem();
+    fs.mkdirs(storedir);
+    for (int i=0; i < count; i++) {
+      Path storeFile=new Path(storedir,"_store" + i);
+      FSDataOutputStream dos=fs.create(storeFile,true);
+      dos.writeBytes("Some data: " + i);
+      dos.close();
+    }
+    LOG.debug("Adding " + count + " store files to the storedir:"+ storedir);
+    FileStatus[] storeFiles=fs.listStatus(storedir);
+    assertEquals("Didn't have expected store files",count,storeFiles.length);
+    return storeFiles;
+  }
+  private String setRootDirAndCleanIt(  final HBaseTestingUtility htu,  final String subdir) throws IOException {
+    Path testdir=htu.getDataTestDir(subdir);
+    FileSystem fs=FileSystem.get(htu.getConfiguration());
+    if (fs.exists(testdir))     assertTrue(fs.delete(testdir,true));
+    FSUtils.setRootDir(htu.getConfiguration(),testdir);
+    return FSUtils.getRootDir(htu.getConfiguration()).toString();
+  }
+  private Path createReferences(  final MasterServices services,  final TableDescriptor td,  final HRegionInfo parent,  final HRegionInfo daughter,  final byte[] midkey,  final boolean top) throws IOException {
+    Path rootdir=services.getMasterFileSystem().getRootDir();
+    Path tabledir=FSUtils.getTableDir(rootdir,parent.getTable());
+    Path storedir=HStore.getStoreHomedir(tabledir,daughter,td.getColumnFamilies()[0].getName());
+    Reference ref=top ? Reference.createTopReference(midkey) : Reference.createBottomReference(midkey);
+    long now=System.currentTimeMillis();
+    Path p=new Path(storedir,Long.toString(now) + "." + parent.getEncodedName());
+    FileSystem fs=services.getMasterFileSystem().getFileSystem();
+    ref.write(fs,p);
+    return p;
+  }
+  private Result createResult(  final HRegionInfo parent,  final HRegionInfo a,  final HRegionInfo b) throws IOException {
+    return MetaMockingUtil.getMetaTableRowResult(parent,null,a,b);
+  }
+}

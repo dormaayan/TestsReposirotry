@@ -1,0 +1,91 @@
+@Category(MediumTests.class) public class TestRefreshHFilesEndpoint {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestRefreshHFilesEndpoint.class);
+  private static final Logger LOG=LoggerFactory.getLogger(TestRefreshHFilesEndpoint.class);
+  private static final HBaseTestingUtility HTU=new HBaseTestingUtility();
+  private static final int NUM_MASTER=1;
+  private static final int NUM_RS=2;
+  private static final TableName TABLE_NAME=TableName.valueOf("testRefreshRegionHFilesEP");
+  private static final byte[] FAMILY=Bytes.toBytes("family");
+  private static final byte[] QUALIFIER=Bytes.toBytes("qualifier");
+  private static final byte[][] SPLIT_KEY=new byte[][]{Bytes.toBytes("30")};
+  private static final int NUM_ROWS=5;
+  private static final String HFILE_NAME="123abcdef";
+  private static Configuration CONF=HTU.getConfiguration();
+  private static MiniHBaseCluster cluster;
+  private static Table table;
+  public static void setUp(  String regionImpl){
+    try {
+      CONF.set(HConstants.REGION_IMPL,regionImpl);
+      CONF.setInt(HConstants.HBASE_CLIENT_RETRIES_NUMBER,2);
+      CONF.setStrings(CoprocessorHost.REGION_COPROCESSOR_CONF_KEY,RefreshHFilesEndpoint.class.getName());
+      cluster=HTU.startMiniCluster(NUM_MASTER,NUM_RS);
+      table=HTU.createTable(TABLE_NAME,FAMILY,SPLIT_KEY);
+      HTU.loadNumericRows(table,FAMILY,1,20);
+      HTU.flush(TABLE_NAME);
+    }
+ catch (    Exception ex) {
+      LOG.error("Couldn't finish setup",ex);
+    }
+  }
+  @After public void tearDown() throws Exception {
+    HTU.shutdownMiniCluster();
+  }
+  @Test public void testRefreshRegionHFilesEndpoint() throws Exception {
+    setUp(HRegion.class.getName());
+    MasterFileSystem mfs=HTU.getMiniHBaseCluster().getMaster().getMasterFileSystem();
+    Path tableDir=FSUtils.getTableDir(mfs.getRootDir(),TABLE_NAME);
+    for (    Region region : cluster.getRegions(TABLE_NAME)) {
+      Path regionDir=new Path(tableDir,region.getRegionInfo().getEncodedName());
+      Path familyDir=new Path(regionDir,Bytes.toString(FAMILY));
+      HFileTestUtil.createHFile(HTU.getConfiguration(),HTU.getTestFileSystem(),new Path(familyDir,HFILE_NAME),FAMILY,QUALIFIER,Bytes.toBytes("50"),Bytes.toBytes("60"),NUM_ROWS);
+    }
+    assertEquals(2,HTU.getNumHFiles(TABLE_NAME,FAMILY));
+    callRefreshRegionHFilesEndPoint();
+    assertEquals(4,HTU.getNumHFiles(TABLE_NAME,FAMILY));
+  }
+  @Test(expected=IOException.class) public void testRefreshRegionHFilesEndpointWithException() throws IOException {
+    setUp(HRegionForRefreshHFilesEP.class.getName());
+    callRefreshRegionHFilesEndPoint();
+  }
+  private void callRefreshRegionHFilesEndPoint() throws IOException {
+    try {
+      RefreshHFilesClient refreshHFilesClient=new RefreshHFilesClient(CONF);
+      refreshHFilesClient.refreshHFiles(TABLE_NAME);
+    }
+ catch (    RetriesExhaustedException rex) {
+      if (rex.getCause() instanceof IOException)       throw new IOException();
+    }
+catch (    Throwable ex) {
+      LOG.error(ex.toString(),ex);
+      fail("Couldn't call the RefreshRegionHFilesEndpoint");
+    }
+  }
+public static class HRegionForRefreshHFilesEP extends HRegion {
+    HStoreWithFaultyRefreshHFilesAPI store;
+    public HRegionForRefreshHFilesEP(    final Path tableDir,    final WAL wal,    final FileSystem fs,    final Configuration confParam,    final RegionInfo regionInfo,    final TableDescriptor htd,    final RegionServerServices rsServices){
+      super(tableDir,wal,fs,confParam,regionInfo,htd,rsServices);
+    }
+    @Override public List<HStore> getStores(){
+      List<HStore> list=new ArrayList<>(stores.size());
+      try {
+        if (this.store == null) {
+          store=new HStoreWithFaultyRefreshHFilesAPI(this,ColumnFamilyDescriptorBuilder.of(FAMILY),this.conf);
+        }
+        list.add(store);
+      }
+ catch (      IOException ioe) {
+        LOG.info("Couldn't instantiate custom store implementation",ioe);
+      }
+      list.addAll(stores.values());
+      return list;
+    }
+  }
+public static class HStoreWithFaultyRefreshHFilesAPI extends HStore {
+    public HStoreWithFaultyRefreshHFilesAPI(    final HRegion region,    final ColumnFamilyDescriptor family,    final Configuration confParam) throws IOException {
+      super(region,family,confParam);
+    }
+    @Override public void refreshStoreFiles() throws IOException {
+      throw new IOException();
+    }
+  }
+}

@@ -1,0 +1,71 @@
+/** 
+ * This is a minimal test to ensure renormalization takes place
+ */
+public class BasicRenormalizationIT extends MlNativeAutodetectIntegTestCase {
+  @After public void tearDownData() throws Exception {
+    cleanUp();
+  }
+  public void testDefaultRenormalization() throws Exception {
+    String jobId="basic-renormalization-it-test-default-renormalization-job";
+    createAndRunJob(jobId,null);
+    GetRecordsAction.Request getRecordsRequest=new GetRecordsAction.Request(jobId);
+    getRecordsRequest.setRecordScore(10.0);
+    List<AnomalyRecord> records=getRecords(getRecordsRequest);
+    assertThat(records.size(),equalTo(2));
+    AnomalyRecord laterRecord=records.get(0);
+    assertThat(laterRecord.getActual().get(0),equalTo(100.0));
+    AnomalyRecord earlierRecord=records.get(1);
+    assertThat(earlierRecord.getActual().get(0),equalTo(10.0));
+    assertThat(laterRecord.getRecordScore(),greaterThan(earlierRecord.getRecordScore()));
+    assertThat(earlierRecord.getInitialRecordScore(),greaterThan(earlierRecord.getRecordScore()));
+    assertBusy(() -> {
+      GetJobsStatsAction.Response.JobStats jobStats=getJobStats(jobId).get(0);
+      ModelSizeStats modelSizeStats=jobStats.getModelSizeStats();
+      Job updatedJob=getJob(jobId).get(0);
+      assertThat(updatedJob.getEstablishedModelMemory(),equalTo(modelSizeStats.getModelBytes()));
+    }
+);
+  }
+  public void testRenormalizationDisabled() throws Exception {
+    String jobId="basic-renormalization-it-test-renormalization-disabled-job";
+    createAndRunJob(jobId,0L);
+    List<AnomalyRecord> records=getRecords(jobId);
+    for (    AnomalyRecord record : records) {
+      assertThat(record.getInitialRecordScore(),equalTo(record.getRecordScore()));
+    }
+  }
+  private void createAndRunJob(  String jobId,  Long renormalizationWindow) throws Exception {
+    TimeValue bucketSpan=TimeValue.timeValueHours(1);
+    long startTime=1491004800000L;
+    Job.Builder job=buildAndRegisterJob(jobId,bucketSpan,renormalizationWindow);
+    openJob(job.getId());
+    postData(job.getId(),generateData(startTime,bucketSpan,50,bucketIndex -> {
+      if (bucketIndex == 35) {
+        return 10;
+      }
+ else       if (bucketIndex == 45) {
+        return 100;
+      }
+ else {
+        return 1;
+      }
+    }
+).stream().collect(Collectors.joining()));
+    closeJob(job.getId());
+  }
+  private Job.Builder buildAndRegisterJob(  String jobId,  TimeValue bucketSpan,  Long renormalizationWindow) throws Exception {
+    Detector.Builder detector=new Detector.Builder("count",null);
+    AnalysisConfig.Builder analysisConfig=new AnalysisConfig.Builder(Arrays.asList(detector.build()));
+    analysisConfig.setBucketSpan(bucketSpan);
+    Job.Builder job=new Job.Builder(jobId);
+    job.setAnalysisConfig(analysisConfig);
+    DataDescription.Builder dataDescription=new DataDescription.Builder();
+    job.setDataDescription(dataDescription);
+    if (renormalizationWindow != null) {
+      job.setRenormalizationWindowDays(renormalizationWindow);
+    }
+    registerJob(job);
+    putJob(job);
+    return job;
+  }
+}

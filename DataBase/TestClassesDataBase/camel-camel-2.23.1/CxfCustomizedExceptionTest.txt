@@ -1,0 +1,90 @@
+public class CxfCustomizedExceptionTest extends CamelTestSupport {
+  protected static final String SERVICE_CLASS="serviceClass=org.apache.camel.component.cxf.HelloService";
+  private static final String EXCEPTION_MESSAGE="This is an exception test message";
+  private static final String DETAIL_TEXT="This is a detail text node";
+  private static final SoapFault SOAP_FAULT;
+static {
+    SOAP_FAULT=new SoapFault(EXCEPTION_MESSAGE,Fault.FAULT_CODE_CLIENT);
+    Element detail=SOAP_FAULT.getOrCreateDetail();
+    Document doc=detail.getOwnerDocument();
+    Text tn=doc.createTextNode(DETAIL_TEXT);
+    detail.appendChild(tn);
+  }
+  protected String routerAddress="http://localhost:" + CXFTestSupport.getPort1() + "/"+ getClass().getSimpleName()+ "/router";
+  protected String routerEndpointURI="cxf://" + routerAddress + "?"+ SERVICE_CLASS;
+  protected String serviceURI="cxf://" + routerAddress + "?"+ SERVICE_CLASS;
+  private Bus bus;
+  @Override public boolean isCreateCamelContextPerClass(){
+    return true;
+  }
+  @Override @Before public void setUp() throws Exception {
+    bus=BusFactory.getDefaultBus();
+    super.setUp();
+  }
+  @Override @After public void tearDown() throws Exception {
+    super.tearDown();
+  }
+  protected RouteBuilder createRouteBuilder(){
+    return new RouteBuilder(){
+      public void configure(){
+        from("direct:start").onException(SoapFault.class).maximumRedeliveries(0).handled(true).process(new Processor(){
+          public void process(          Exchange exchange) throws Exception {
+            SoapFault fault=exchange.getProperty(Exchange.EXCEPTION_CAUGHT,SoapFault.class);
+            exchange.getOut().setFault(true);
+            exchange.getOut().setBody(fault);
+          }
+        }
+).end().to(serviceURI);
+        from(routerEndpointURI).setFaultBody(constant(SOAP_FAULT));
+      }
+    }
+;
+  }
+  protected CamelContext createCamelContext() throws Exception {
+    return new DefaultCamelContext();
+  }
+  @Test public void testInvokingServiceFromCamel() throws Exception {
+    Object result=template.sendBodyAndHeader("direct:start",ExchangePattern.InOut,"hello world",CxfConstants.OPERATION_NAME,"echo");
+    assertTrue("Exception is not instance of SoapFault",result instanceof SoapFault);
+    assertEquals("Expect to get right detail message",DETAIL_TEXT,((SoapFault)result).getDetail().getTextContent());
+    assertEquals("Expect to get right fault-code","{http://schemas.xmlsoap.org/soap/envelope/}Client",((SoapFault)result).getFaultCode().toString());
+  }
+  @Test public void testInvokingServiceFromCXFClient() throws Exception {
+    ClientProxyFactoryBean proxyFactory=new ClientProxyFactoryBean();
+    ClientFactoryBean clientBean=proxyFactory.getClientFactoryBean();
+    clientBean.setAddress(routerAddress);
+    clientBean.setServiceClass(HelloService.class);
+    clientBean.setBus(bus);
+    HelloService client=(HelloService)proxyFactory.create();
+    try {
+      client.echo("hello world");
+      fail("Expect to get an exception here");
+    }
+ catch (    Exception e) {
+      assertEquals("Expect to get right exception message",EXCEPTION_MESSAGE,e.getMessage());
+      assertTrue("Exception is not instance of SoapFault",e instanceof SoapFault);
+      assertEquals("Expect to get right detail message",DETAIL_TEXT,((SoapFault)e).getDetail().getTextContent());
+      assertEquals("Expect to get right fault-code","{http://schemas.xmlsoap.org/soap/envelope/}Client",((SoapFault)e).getFaultCode().toString());
+    }
+  }
+  @Test public void testInvokingServiceFromHTTPURL() throws Exception {
+    URL url=new URL(routerAddress);
+    URLConnection urlConnection=url.openConnection();
+    urlConnection.setDoInput(true);
+    urlConnection.setDoOutput(true);
+    urlConnection.setUseCaches(false);
+    urlConnection.setRequestProperty("Content-Type","application/xml");
+    OutputStream out=urlConnection.getOutputStream();
+    InputStream is=this.getClass().getResourceAsStream("SimpleSoapRequest.xml");
+    IOHelper.copy(is,out);
+    out.flush();
+    is.close();
+    try {
+      urlConnection.getInputStream();
+      fail("We except an IOException here");
+    }
+ catch (    IOException exception) {
+      assertTrue(exception.getMessage().contains("500"));
+    }
+  }
+}

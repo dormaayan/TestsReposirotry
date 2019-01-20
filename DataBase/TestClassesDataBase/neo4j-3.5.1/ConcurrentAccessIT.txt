@@ -1,0 +1,59 @@
+/** 
+ * Multiple concurrent users should be able to connect simultaneously. We test this with multiple users running load that they roll back, asserting they don't see each others changes.
+ */
+public class ConcurrentAccessIT extends AbstractBoltTransportsTest {
+  @Rule public Neo4jWithSocket server=new Neo4jWithSocket(getClass(),settings -> settings.put(GraphDatabaseSettings.auth_enabled.name(),"false"));
+  @Test public void shouldRunSimpleStatement() throws Throwable {
+    int numWorkers=5;
+    int numRequests=1_000;
+    List<Callable<Void>> workers=createWorkers(numWorkers,numRequests);
+    ExecutorService exec=Executors.newFixedThreadPool(numWorkers);
+    try {
+      for (      Future<Void> f : exec.invokeAll(workers)) {
+        f.get(60,TimeUnit.SECONDS);
+      }
+    }
+  finally {
+      exec.shutdownNow();
+      exec.awaitTermination(30,TimeUnit.SECONDS);
+    }
+  }
+  private List<Callable<Void>> createWorkers(  int numWorkers,  int numRequests) throws Exception {
+    List<Callable<Void>> workers=new LinkedList<>();
+    for (int i=0; i < numWorkers; i++) {
+      workers.add(newWorker(numRequests));
+    }
+    return workers;
+  }
+  private Callable<Void> newWorker(  final int iterationsToRun) throws Exception {
+    return new Callable<Void>(){
+      private final byte[] init=util.chunk(new InitMessage("TestClient",emptyMap()));
+      private final byte[] createAndRollback=util.chunk(new RunMessage("BEGIN"),PullAllMessage.INSTANCE,new RunMessage("CREATE (n)"),PullAllMessage.INSTANCE,new RunMessage("ROLLBACK"),PullAllMessage.INSTANCE);
+      private final byte[] matchAll=util.chunk(new RunMessage("MATCH (n) RETURN n"),PullAllMessage.INSTANCE);
+      @Override public Void call() throws Exception {
+        TransportConnection client=newConnection();
+        client.connect(server.lookupDefaultConnector()).send(util.defaultAcceptedVersions());
+        assertThat(client,util.eventuallyReceivesSelectedProtocolVersion());
+        init(client);
+        for (int i=0; i < iterationsToRun; i++) {
+          createAndRollback(client);
+        }
+        return null;
+      }
+      private void init(      TransportConnection client) throws Exception {
+        client.send(init);
+        assertThat(client,util.eventuallyReceives(msgSuccess()));
+      }
+      private void createAndRollback(      TransportConnection client) throws Exception {
+        client.send(createAndRollback);
+        Matcher<Map<? extends String,?>> entryMatcher=hasEntry(is("fields"),equalTo(emptyList()));
+        Matcher<Map<String,?>> messageMatcher=CoreMatchers.allOf(entryMatcher,hasKey("result_available_after"));
+        assertThat(client,util.eventuallyReceives(msgSuccess(messageMatcher),msgSuccess(),msgSuccess(messageMatcher),msgSuccess(),msgSuccess(messageMatcher),msgSuccess()));
+        client.send(matchAll);
+        Matcher<Map<? extends String,?>> fieldsMatcher=hasEntry(is("fields"),equalTo(singletonList("n")));
+        assertThat(client,util.eventuallyReceives(msgSuccess(CoreMatchers.allOf(fieldsMatcher,hasKey("result_available_after"))),msgSuccess()));
+      }
+    }
+;
+  }
+}

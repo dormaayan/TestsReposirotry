@@ -1,0 +1,128 @@
+/** 
+ * @author Kohsuke Kawaguchi
+ */
+public class NodeProvisionerTest {
+  @Rule public JenkinsRule r=new NodeProvisionerRule(10,100,10);
+  /** 
+ * Latch synchronization primitive that waits for N thread to pass the checkpoint. <p> This is used to make sure we get a set of builds that run long enough.
+ */
+static class Latch {
+    /** 
+ * Initial value 
+ */
+    public final CountDownLatch counter;
+    private final int init;
+    Latch(    int n){
+      this.init=n;
+      this.counter=new CountDownLatch(n);
+    }
+    void block() throws InterruptedException {
+      this.counter.countDown();
+      this.counter.await(60,TimeUnit.SECONDS);
+    }
+    /** 
+ * Creates a builder that blocks until the latch opens.
+ */
+    public Builder createBuilder(){
+      return new Builder(){
+        public boolean perform(        AbstractBuild<?,?> build,        Launcher launcher,        BuildListener listener) throws InterruptedException, IOException {
+          block();
+          return true;
+        }
+      }
+;
+    }
+  }
+  /** 
+ * Scenario: schedule a build and see if one slave is provisioned.
+ */
+  @Test public void autoProvision() throws Exception {
+    try (BulkChange bc=new BulkChange(r.jenkins)){
+      DummyCloudImpl cloud=initHudson(10);
+      FreeStyleProject p=createJob(new SleepBuilder(10));
+      Future<FreeStyleBuild> f=p.scheduleBuild2(0);
+      f.get(30,TimeUnit.SECONDS);
+      assertEquals(1,cloud.numProvisioned);
+    }
+   }
+  /** 
+ * Scenario: we got a lot of jobs all of the sudden, and we need to fire up a few nodes.
+ */
+  @Test public void loadSpike() throws Exception {
+    try (BulkChange bc=new BulkChange(r.jenkins)){
+      DummyCloudImpl cloud=initHudson(0);
+      verifySuccessfulCompletion(buildAll(create5SlowJobs(new Latch(5))));
+      assertEquals(5,cloud.numProvisioned);
+    }
+   }
+  /** 
+ * Scenario: make sure we take advantage of statically configured slaves.
+ */
+  @Test public void baselineSlaveUsage() throws Exception {
+    try (BulkChange bc=new BulkChange(r.jenkins)){
+      DummyCloudImpl cloud=initHudson(0);
+      r.createSlave().toComputer().connect(false).get();
+      r.createSlave().toComputer().connect(false).get();
+      verifySuccessfulCompletion(buildAll(create5SlowJobs(new Latch(5))));
+      assertEquals(3,cloud.numProvisioned);
+    }
+   }
+  /** 
+ * Scenario: loads on one label shouldn't translate to load on another label.
+ */
+  @Test public void labels() throws Exception {
+    try (BulkChange bc=new BulkChange(r.jenkins)){
+      DummyCloudImpl cloud=initHudson(0);
+      Label blue=r.jenkins.getLabel("blue");
+      Label red=r.jenkins.getLabel("red");
+      cloud.label=red;
+      List<FreeStyleProject> redJobs=create5SlowJobs(new Latch(5));
+      for (      FreeStyleProject p : redJobs)       p.setAssignedLabel(red);
+      List<FreeStyleProject> blueJobs=create5SlowJobs(new Latch(5));
+      for (      FreeStyleProject p : blueJobs)       p.setAssignedLabel(blue);
+      List<Future<FreeStyleBuild>> blueBuilds=buildAll(blueJobs);
+      verifySuccessfulCompletion(buildAll(redJobs));
+      assertEquals(5,cloud.numProvisioned);
+      for (      Future<FreeStyleBuild> bb : blueBuilds)       assertFalse(bb.isDone());
+    }
+   }
+  private FreeStyleProject createJob(  Builder builder) throws IOException {
+    FreeStyleProject p=r.createFreeStyleProject();
+    p.setAssignedLabel(null);
+    p.getBuildersList().add(builder);
+    return p;
+  }
+  private DummyCloudImpl initHudson(  int delay) throws IOException {
+    DummyCloudImpl cloud=new DummyCloudImpl(r,delay);
+    r.jenkins.clouds.add(cloud);
+    r.jenkins.setNumExecutors(0);
+    r.jenkins.setNodes(Collections.<Node>emptyList());
+    return cloud;
+  }
+  private List<FreeStyleProject> create5SlowJobs(  Latch l) throws IOException {
+    List<FreeStyleProject> jobs=new ArrayList<FreeStyleProject>();
+    for (int i=0; i < l.init; i++)     jobs.add(createJob(l.createBuilder()));
+    return jobs;
+  }
+  /** 
+ * Builds all the given projects at once.
+ */
+  private List<Future<FreeStyleBuild>> buildAll(  List<FreeStyleProject> jobs){
+    System.out.println("Scheduling builds for " + jobs.size() + " jobs");
+    List<Future<FreeStyleBuild>> builds=new ArrayList<Future<FreeStyleBuild>>();
+    for (    FreeStyleProject job : jobs)     builds.add(job.scheduleBuild2(0));
+    return builds;
+  }
+  private void verifySuccessfulCompletion(  List<Future<FreeStyleBuild>> builds) throws Exception {
+    System.out.println("Waiting for a completion");
+    for (    Future<FreeStyleBuild> f : builds) {
+      try {
+        r.assertBuildStatus(Result.SUCCESS,f.get(90,TimeUnit.SECONDS));
+      }
+ catch (      TimeoutException e) {
+        System.out.println("Build didn't complete in time");
+        throw e;
+      }
+    }
+  }
+}

@@ -1,0 +1,226 @@
+/** 
+ * Cluster-wide testing of a distributed three-phase commit using a 'real' zookeeper cluster
+ */
+@Category({MasterTests.class,MediumTests.class}) public class TestZKProcedure {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestZKProcedure.class);
+  private static final Logger LOG=LoggerFactory.getLogger(TestZKProcedure.class);
+  private static HBaseTestingUtility UTIL=new HBaseTestingUtility();
+  private static final String COORDINATOR_NODE_NAME="coordinator";
+  private static final long KEEP_ALIVE=100;
+  private static final int POOL_SIZE=1;
+  private static final long TIMEOUT=10000;
+  private static final long WAKE_FREQUENCY=500;
+  private static final String opName="op";
+  private static final byte[] data=new byte[]{1,2};
+  private static final VerificationMode once=Mockito.times(1);
+  @BeforeClass public static void setupTest() throws Exception {
+    UTIL.startMiniZKCluster();
+  }
+  @AfterClass public static void cleanupTest() throws Exception {
+    UTIL.shutdownMiniZKCluster();
+  }
+  private static ZKWatcher newZooKeeperWatcher() throws IOException {
+    return new ZKWatcher(UTIL.getConfiguration(),"testing utility",new Abortable(){
+      @Override public void abort(      String why,      Throwable e){
+        throw new RuntimeException("Unexpected abort in distributed three phase commit test:" + why,e);
+      }
+      @Override public boolean isAborted(){
+        return false;
+      }
+    }
+);
+  }
+  @Test public void testEmptyMemberSet() throws Exception {
+    runCommit();
+  }
+  @Test public void testSingleMember() throws Exception {
+    runCommit("one");
+  }
+  @Test public void testMultipleMembers() throws Exception {
+    runCommit("one","two","three","four");
+  }
+  private void runCommit(  String... members) throws Exception {
+    if (members == null) {
+      members=new String[0];
+    }
+    List<String> expected=Arrays.asList(members);
+    ZKWatcher coordZkw=newZooKeeperWatcher();
+    String opDescription="coordination test - " + members.length + " cohort members";
+    ZKProcedureCoordinator coordinatorComms=new ZKProcedureCoordinator(coordZkw,opDescription,COORDINATOR_NODE_NAME);
+    ThreadPoolExecutor pool=ProcedureCoordinator.defaultPool(COORDINATOR_NODE_NAME,POOL_SIZE,KEEP_ALIVE);
+    ProcedureCoordinator coordinator=new ProcedureCoordinator(coordinatorComms,pool){
+      @Override public Procedure createProcedure(      ForeignExceptionDispatcher fed,      String procName,      byte[] procArgs,      List<String> expectedMembers){
+        return Mockito.spy(super.createProcedure(fed,procName,procArgs,expectedMembers));
+      }
+    }
+;
+    SubprocedureFactory subprocFactory=Mockito.mock(SubprocedureFactory.class);
+    List<Pair<ProcedureMember,ZKProcedureMemberRpcs>> procMembers=new ArrayList<>(members.length);
+    for (    String member : members) {
+      ZKWatcher watcher=newZooKeeperWatcher();
+      ZKProcedureMemberRpcs comms=new ZKProcedureMemberRpcs(watcher,opDescription);
+      ThreadPoolExecutor pool2=ProcedureMember.defaultPool(member,1,KEEP_ALIVE);
+      ProcedureMember procMember=new ProcedureMember(comms,pool2,subprocFactory);
+      procMembers.add(new Pair<>(procMember,comms));
+      comms.start(member,procMember);
+    }
+    final List<Subprocedure> subprocs=new ArrayList<>();
+    for (int i=0; i < procMembers.size(); i++) {
+      ForeignExceptionDispatcher cohortMonitor=new ForeignExceptionDispatcher();
+      Subprocedure commit=Mockito.spy(new SubprocedureImpl(procMembers.get(i).getFirst(),opName,cohortMonitor,WAKE_FREQUENCY,TIMEOUT));
+      subprocs.add(commit);
+    }
+    final AtomicInteger i=new AtomicInteger(0);
+    Mockito.when(subprocFactory.buildSubprocedure(Mockito.eq(opName),(byte[])Mockito.argThat(new ArrayEquals(data)))).thenAnswer(new Answer<Subprocedure>(){
+      @Override public Subprocedure answer(      InvocationOnMock invocation) throws Throwable {
+        int index=i.getAndIncrement();
+        LOG.debug("Task size:" + subprocs.size() + ", getting:"+ index);
+        Subprocedure commit=subprocs.get(index);
+        return commit;
+      }
+    }
+);
+    Procedure task=coordinator.startProcedure(new ForeignExceptionDispatcher(),opName,data,expected);
+    waitAndVerifyProc(task,once,once,never(),once,false);
+    verifyCohortSuccessful(expected,subprocFactory,subprocs,once,once,never(),once,false);
+    closeAll(coordinator,coordinatorComms,procMembers);
+  }
+  /** 
+ * Test a distributed commit with multiple cohort members, where one of the cohort members has a timeout exception during the prepare stage.
+ */
+  @Test public void testMultiCohortWithMemberTimeoutDuringPrepare() throws Exception {
+    String opDescription="error injection coordination";
+    String[] cohortMembers=new String[]{"one","two","three"};
+    List<String> expected=Lists.newArrayList(cohortMembers);
+    final int memberErrorIndex=2;
+    final CountDownLatch coordinatorReceivedErrorLatch=new CountDownLatch(1);
+    ZKWatcher coordinatorWatcher=newZooKeeperWatcher();
+    ZKProcedureCoordinator coordinatorController=new ZKProcedureCoordinator(coordinatorWatcher,opDescription,COORDINATOR_NODE_NAME);
+    ThreadPoolExecutor pool=ProcedureCoordinator.defaultPool(COORDINATOR_NODE_NAME,POOL_SIZE,KEEP_ALIVE);
+    ProcedureCoordinator coordinator=spy(new ProcedureCoordinator(coordinatorController,pool));
+    SubprocedureFactory subprocFactory=Mockito.mock(SubprocedureFactory.class);
+    List<Pair<ProcedureMember,ZKProcedureMemberRpcs>> members=new ArrayList<>(expected.size());
+    for (    String member : expected) {
+      ZKWatcher watcher=newZooKeeperWatcher();
+      ZKProcedureMemberRpcs controller=new ZKProcedureMemberRpcs(watcher,opDescription);
+      ThreadPoolExecutor pool2=ProcedureMember.defaultPool(member,1,KEEP_ALIVE);
+      ProcedureMember mem=new ProcedureMember(controller,pool2,subprocFactory);
+      members.add(new Pair<>(mem,controller));
+      controller.start(member,mem);
+    }
+    final List<Subprocedure> cohortTasks=new ArrayList<>();
+    final int[] elem=new int[1];
+    for (int i=0; i < members.size(); i++) {
+      ForeignExceptionDispatcher cohortMonitor=new ForeignExceptionDispatcher();
+      final ProcedureMember comms=members.get(i).getFirst();
+      Subprocedure commit=Mockito.spy(new SubprocedureImpl(comms,opName,cohortMonitor,WAKE_FREQUENCY,TIMEOUT));
+      Mockito.doAnswer(new Answer<Void>(){
+        @Override public Void answer(        InvocationOnMock invocation) throws Throwable {
+          int index=elem[0];
+          if (index == memberErrorIndex) {
+            LOG.debug("Sending error to coordinator");
+            ForeignException remoteCause=new ForeignException("TIMER",new TimeoutException("subprocTimeout",1,2,0));
+            Subprocedure r=((Subprocedure)invocation.getMock());
+            LOG.error("Remote commit failure, not propagating error:" + remoteCause);
+            comms.receiveAbortProcedure(r.getName(),remoteCause);
+            assertTrue(r.isComplete());
+            try {
+              Procedure.waitForLatch(coordinatorReceivedErrorLatch,new ForeignExceptionDispatcher(),WAKE_FREQUENCY,"coordinator received error");
+            }
+ catch (            InterruptedException e) {
+              LOG.debug("Wait for latch interrupted, done:" + (coordinatorReceivedErrorLatch.getCount() == 0));
+              Thread.currentThread().interrupt();
+            }
+          }
+          elem[0]=++index;
+          return null;
+        }
+      }
+).when(commit).acquireBarrier();
+      cohortTasks.add(commit);
+    }
+    final AtomicInteger taskIndex=new AtomicInteger();
+    Mockito.when(subprocFactory.buildSubprocedure(Mockito.eq(opName),(byte[])Mockito.argThat(new ArrayEquals(data)))).thenAnswer(new Answer<Subprocedure>(){
+      @Override public Subprocedure answer(      InvocationOnMock invocation) throws Throwable {
+        int index=taskIndex.getAndIncrement();
+        Subprocedure commit=cohortTasks.get(index);
+        return commit;
+      }
+    }
+);
+    ForeignExceptionDispatcher coordinatorTaskErrorMonitor=Mockito.spy(new ForeignExceptionDispatcher());
+    Procedure coordinatorTask=Mockito.spy(new Procedure(coordinator,coordinatorTaskErrorMonitor,WAKE_FREQUENCY,TIMEOUT,opName,data,expected));
+    when(coordinator.createProcedure(any(),eq(opName),eq(data),anyListOf(String.class))).thenReturn(coordinatorTask);
+    Mockito.doAnswer(new Answer<Void>(){
+      @Override public Void answer(      InvocationOnMock invocation) throws Throwable {
+        invocation.callRealMethod();
+        coordinatorReceivedErrorLatch.countDown();
+        return null;
+      }
+    }
+).when(coordinatorTask).receive(Mockito.any());
+    Procedure task=coordinator.startProcedure(coordinatorTaskErrorMonitor,opName,data,expected);
+    assertEquals("Didn't mock coordinator task",coordinatorTask,task);
+    try {
+      task.waitForCompleted();
+    }
+ catch (    ForeignException fe) {
+    }
+    waitAndVerifyProc(coordinatorTask,once,never(),once,atMost(1),true);
+    verifyCohortSuccessful(expected,subprocFactory,cohortTasks,once,never(),once,once,true);
+    closeAll(coordinator,coordinatorController,members);
+  }
+  /** 
+ * Wait for the coordinator task to complete, and verify all the mocks
+ * @param task to wait on
+ * @throws Exception on unexpected failure
+ */
+  private void waitAndVerifyProc(  Procedure proc,  VerificationMode prepare,  VerificationMode commit,  VerificationMode cleanup,  VerificationMode finish,  boolean opHasError) throws Exception {
+    boolean caughtError=false;
+    try {
+      proc.waitForCompleted();
+    }
+ catch (    ForeignException fe) {
+      caughtError=true;
+    }
+    Mockito.verify(proc,prepare).sendGlobalBarrierStart();
+    Mockito.verify(proc,commit).sendGlobalBarrierReached();
+    Mockito.verify(proc,finish).sendGlobalBarrierComplete();
+    assertEquals("Operation error state was unexpected",opHasError,proc.getErrorMonitor().hasException());
+    assertEquals("Operation error state was unexpected",opHasError,caughtError);
+  }
+  /** 
+ * Wait for the coordinator task to complete, and verify all the mocks
+ * @param task to wait on
+ * @throws Exception on unexpected failure
+ */
+  private void waitAndVerifySubproc(  Subprocedure op,  VerificationMode prepare,  VerificationMode commit,  VerificationMode cleanup,  VerificationMode finish,  boolean opHasError) throws Exception {
+    boolean caughtError=false;
+    try {
+      op.waitForLocallyCompleted();
+    }
+ catch (    ForeignException fe) {
+      caughtError=true;
+    }
+    Mockito.verify(op,prepare).acquireBarrier();
+    Mockito.verify(op,commit).insideBarrier();
+    assertEquals("Operation error state was unexpected",opHasError,op.getErrorCheckable().hasException());
+    assertEquals("Operation error state was unexpected",opHasError,caughtError);
+  }
+  private void verifyCohortSuccessful(  List<String> cohortNames,  SubprocedureFactory subprocFactory,  Iterable<Subprocedure> cohortTasks,  VerificationMode prepare,  VerificationMode commit,  VerificationMode cleanup,  VerificationMode finish,  boolean opHasError) throws Exception {
+    Mockito.verify(subprocFactory,Mockito.times(cohortNames.size())).buildSubprocedure(Mockito.eq(opName),(byte[])Mockito.argThat(new ArrayEquals(data)));
+    int j=0;
+    for (    Subprocedure op : cohortTasks) {
+      LOG.debug("Checking mock:" + (j++));
+      waitAndVerifySubproc(op,prepare,commit,cleanup,finish,opHasError);
+    }
+  }
+  private void closeAll(  ProcedureCoordinator coordinator,  ZKProcedureCoordinator coordinatorController,  List<Pair<ProcedureMember,ZKProcedureMemberRpcs>> cohort) throws IOException {
+    for (    Pair<ProcedureMember,ZKProcedureMemberRpcs> member : cohort) {
+      member.getFirst().close();
+      member.getSecond().close();
+    }
+    coordinator.close();
+    coordinatorController.close();
+  }
+}

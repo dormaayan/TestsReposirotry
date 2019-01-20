@@ -1,0 +1,50 @@
+/** 
+ * HRegion test case that is made of a major compacted HFile (created with three bulk loaded files) and an edit in the memstore. This is for HBASE-10958 "[dataloss] Bulk loading with seqids can prevent some log entries from being replayed"
+ * @throws IOException
+ * @throws IllegalAccessException
+ * @throws NoSuchFieldException
+ * @throws IllegalArgumentException
+ * @throws SecurityException
+ */
+@Test public void testCompactedBulkLoadedFiles() throws IOException, SecurityException, IllegalArgumentException, NoSuchFieldException, IllegalAccessException, InterruptedException {
+  final TableName tableName=TableName.valueOf("testCompactedBulkLoadedFiles");
+  final HRegionInfo hri=createBasic3FamilyHRegionInfo(tableName);
+  final Path basedir=new Path(this.hbaseRootDir,tableName.getNameAsString());
+  deleteDir(basedir);
+  final HTableDescriptor htd=createBasic3FamilyHTD(tableName);
+  HRegion region2=HBaseTestingUtility.createRegionAndWAL(hri,hbaseRootDir,this.conf,htd);
+  HBaseTestingUtility.closeRegionAndWAL(region2);
+  WAL wal=createWAL(this.conf,hbaseRootDir,logName);
+  HRegion region=HRegion.openHRegion(hri,htd,wal,this.conf);
+  byte[] row=tableName.getName();
+  byte[] family=htd.getFamilies().iterator().next().getName();
+  region.put((new Put(row)).addColumn(family,family,family));
+  wal.sync();
+  List<Pair<byte[],String>> hfs=new ArrayList<>(1);
+  for (int i=0; i < 3; i++) {
+    Path f=new Path(basedir,"hfile" + i);
+    HFileTestUtil.createHFile(this.conf,fs,f,family,family,Bytes.toBytes(i + "00"),Bytes.toBytes(i + "50"),10);
+    hfs.add(Pair.newPair(family,f.toString()));
+  }
+  region.bulkLoadHFiles(hfs,true,null);
+  final int rowsInsertedCount=31;
+  assertEquals(rowsInsertedCount,getScannedCount(region.getScanner(new Scan())));
+  region.compact(true);
+  assertEquals(rowsInsertedCount,getScannedCount(region.getScanner(new Scan())));
+  final Configuration newConf=HBaseConfiguration.create(this.conf);
+  User user=HBaseTestingUtility.getDifferentUser(newConf,tableName.getNameAsString());
+  user.runAs(new PrivilegedExceptionAction(){
+    @Override public Object run() throws Exception {
+      runWALSplit(newConf);
+      WAL wal2=createWAL(newConf,hbaseRootDir,logName);
+      HRegion region2=HRegion.openHRegion(newConf,FileSystem.get(newConf),hbaseRootDir,hri,htd,wal2);
+      long seqid2=region2.getOpenSeqNum();
+      assertTrue(seqid2 > -1);
+      assertEquals(rowsInsertedCount,getScannedCount(region2.getScanner(new Scan())));
+      region2.close();
+      wal2.close();
+      return null;
+    }
+  }
+);
+}

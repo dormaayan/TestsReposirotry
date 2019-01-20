@@ -1,0 +1,56 @@
+/** 
+ * Doing request/reply over Netty with async processing.
+ */
+public class NettyAsyncRequestReplyTest extends CamelTestSupport {
+  private int port;
+  @Test public void testNetty() throws Exception {
+    String out=template.requestBody("netty:tcp://localhost:" + port + "?textline=true&sync=true","World",String.class);
+    assertEquals("Bye World",out);
+    String out2=template.requestBody("netty:tcp://localhost:" + port + "?textline=true&sync=true","Camel",String.class);
+    assertEquals("Bye Camel",out2);
+  }
+  @Test public void testConcurrent() throws Exception {
+    int size=1000;
+    ExecutorService executor=Executors.newFixedThreadPool(20);
+    Map<Integer,Future<String>> responses=new HashMap<>();
+    for (int i=0; i < size; i++) {
+      final int index=i;
+      Future<String> out=executor.submit(new Callable<String>(){
+        public String call() throws Exception {
+          String reply=template.requestBody("netty:tcp://localhost:" + port + "?textline=true&sync=true",index,String.class);
+          log.info("Sent {} received {}",index,reply);
+          assertEquals("Bye " + index,reply);
+          return reply;
+        }
+      }
+);
+      responses.put(index,out);
+    }
+    Set<String> unique=new HashSet<>();
+    for (    Future<String> future : responses.values()) {
+      String reply=future.get(120,TimeUnit.SECONDS);
+      assertNotNull("Should get a reply",reply);
+      unique.add(reply);
+    }
+    assertEquals("Should be " + size + " unique responses",size,unique.size());
+    executor.shutdownNow();
+  }
+  @Override protected RouteBuilder createRouteBuilder() throws Exception {
+    return new RouteBuilder(){
+      @Override public void configure() throws Exception {
+        port=AvailablePortFinder.getNextAvailable(8000);
+        from("netty:tcp://localhost:" + port + "?textline=true&sync=true&reuseAddress=true&synchronous=false").to("activemq:queue:foo").log("Writing reply ${body}");
+        from("activemq:queue:foo").transform(simple("Bye ${body}"));
+      }
+    }
+;
+  }
+  @Override protected Context createJndiContext() throws Exception {
+    JndiContext answer=new JndiContext();
+    ConnectionFactory connectionFactory=CamelJmsTestHelper.createConnectionFactory();
+    JmsComponent amq=jmsComponentAutoAcknowledge(connectionFactory);
+    amq.setCamelContext(context);
+    answer.bind("activemq",amq);
+    return answer;
+  }
+}

@@ -1,0 +1,58 @@
+public static class MockNode implements PublishClusterStateAction.IncomingClusterStateListener {
+  public final DiscoveryNode discoveryNode;
+  public final MockTransportService service;
+  public MockPublishAction action;
+  public final ClusterStateListener listener;
+  private final PendingClusterStatesQueue pendingStatesQueue;
+  public volatile ClusterState clusterState;
+  private final Logger logger;
+  public MockNode(  DiscoveryNode discoveryNode,  MockTransportService service,  @Nullable ClusterStateListener listener,  Logger logger){
+    this.discoveryNode=discoveryNode;
+    this.service=service;
+    this.listener=listener;
+    this.logger=logger;
+    this.clusterState=ClusterState.builder(CLUSTER_NAME).nodes(DiscoveryNodes.builder().add(discoveryNode).localNodeId(discoveryNode.getId()).build()).build();
+    this.pendingStatesQueue=new PendingClusterStatesQueue(logger,25);
+  }
+  public MockNode setAsMaster(){
+    this.clusterState=ClusterState.builder(clusterState).nodes(DiscoveryNodes.builder(clusterState.nodes()).masterNodeId(discoveryNode.getId())).build();
+    return this;
+  }
+  public MockNode resetMasterId(){
+    this.clusterState=ClusterState.builder(clusterState).nodes(DiscoveryNodes.builder(clusterState.nodes()).masterNodeId(null)).build();
+    return this;
+  }
+  public void connectTo(  DiscoveryNode node){
+    service.connectToNode(node);
+  }
+  @Override public void onIncomingClusterState(  ClusterState incomingState){
+    ZenDiscovery.validateIncomingState(logger,incomingState,clusterState);
+    pendingStatesQueue.addPending(incomingState);
+  }
+  public void onClusterStateCommitted(  String stateUUID,  ActionListener<Void> processedListener){
+    final ClusterState state=pendingStatesQueue.markAsCommitted(stateUUID,new PendingClusterStatesQueue.StateProcessedListener(){
+      @Override public void onNewClusterStateProcessed(){
+        processedListener.onResponse(null);
+      }
+      @Override public void onNewClusterStateFailed(      Exception e){
+        processedListener.onFailure(e);
+      }
+    }
+);
+    if (state != null) {
+      ClusterState newClusterState=pendingStatesQueue.getNextClusterStateToProcess();
+      logger.debug("[{}] received version [{}], uuid [{}]",discoveryNode.getName(),newClusterState.version(),newClusterState.stateUUID());
+      if (listener != null) {
+        ClusterChangedEvent event=new ClusterChangedEvent("",newClusterState,clusterState);
+        listener.clusterChanged(event);
+      }
+      if (clusterState.nodes().getMasterNode() == null || newClusterState.supersedes(clusterState)) {
+        clusterState=newClusterState;
+      }
+      pendingStatesQueue.markAsProcessed(newClusterState);
+    }
+  }
+  public DiscoveryNodes nodes(){
+    return clusterState.nodes();
+  }
+}

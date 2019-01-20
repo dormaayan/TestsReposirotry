@@ -1,0 +1,116 @@
+public class RecordStorageEngineTest {
+  private final RecordStorageEngineRule storageEngineRule=new RecordStorageEngineRule();
+  private final EphemeralFileSystemRule fsRule=new EphemeralFileSystemRule();
+  private final PageCacheRule pageCacheRule=new PageCacheRule();
+  private final TestDirectory testDirectory=TestDirectory.testDirectory(fsRule);
+  private final DatabaseHealth databaseHealth=mock(DatabaseHealth.class);
+  @Rule public RuleChain ruleChain=RuleChain.outerRule(fsRule).around(pageCacheRule).around(testDirectory).around(storageEngineRule);
+  private static final Function<Optional<StoreType>,StoreType> assertIsPresentAndGet=optional -> {
+    assertTrue("Expected optional to be present",optional.isPresent());
+    return optional.get();
+  }
+;
+  @Test(timeout=30_000) public void shutdownRecordStorageEngineAfterFailedTransaction() throws Throwable {
+    RecordStorageEngine engine=buildRecordStorageEngine();
+    Exception applicationError=executeFailingTransaction(engine);
+    assertNotNull(applicationError);
+  }
+  @Test public void panicOnExceptionDuringCommandsApply(){
+    IllegalStateException failure=new IllegalStateException("Too many open files");
+    RecordStorageEngine engine=storageEngineRule.getWith(fsRule.get(),pageCacheRule.getPageCache(fsRule.get()),testDirectory.databaseLayout()).databaseHealth(databaseHealth).transactionApplierTransformer(facade -> transactionApplierFacadeTransformer(facade,failure)).build();
+    CommandsToApply commandsToApply=mock(CommandsToApply.class);
+    try {
+      engine.apply(commandsToApply,TransactionApplicationMode.INTERNAL);
+      fail("Exception expected");
+    }
+ catch (    Exception exception) {
+      assertSame(failure,Exceptions.rootCause(exception));
+    }
+    verify(databaseHealth).panic(any(Throwable.class));
+  }
+  private static BatchTransactionApplierFacade transactionApplierFacadeTransformer(  BatchTransactionApplierFacade facade,  Exception failure){
+    return new FailingBatchTransactionApplierFacade(failure,facade);
+  }
+  @Test public void databasePanicIsRaisedWhenTxApplicationFails() throws Throwable {
+    RecordStorageEngine engine=buildRecordStorageEngine();
+    Exception applicationError=executeFailingTransaction(engine);
+    ArgumentCaptor<Exception> captor=ArgumentCaptor.forClass(Exception.class);
+    verify(databaseHealth).panic(captor.capture());
+    Throwable exception=captor.getValue();
+    if (exception instanceof KernelException) {
+      assertThat(((KernelException)exception).status(),is(Status.General.UnknownError));
+      exception=exception.getCause();
+    }
+    assertThat(exception,is(applicationError));
+  }
+  @Test(timeout=30_000) public void obtainCountsStoreResetterAfterFailedTransaction() throws Throwable {
+    RecordStorageEngine engine=buildRecordStorageEngine();
+    Exception applicationError=executeFailingTransaction(engine);
+    assertNotNull(applicationError);
+    CountsTracker countsStore=engine.testAccessNeoStores().getCounts();
+    try (CountsAccessor.Updater updater=countsStore.reset(0)){
+      assertNotNull(updater);
+    }
+   }
+  @Test public void mustFlushStoresWithGivenIOLimiter(){
+    IOLimiter limiter=IOLimiter.UNLIMITED;
+    FileSystemAbstraction fs=fsRule.get();
+    AtomicReference<IOLimiter> observedLimiter=new AtomicReference<>();
+    PageCache pageCache=new DelegatingPageCache(pageCacheRule.getPageCache(fs)){
+      @Override public void flushAndForce(      IOLimiter limiter) throws IOException {
+        super.flushAndForce(limiter);
+        observedLimiter.set(limiter);
+      }
+    }
+;
+    RecordStorageEngine engine=storageEngineRule.getWith(fs,pageCache,testDirectory.databaseLayout()).build();
+    engine.flushAndForce(limiter);
+    assertThat(observedLimiter.get(),sameInstance(limiter));
+  }
+  @Test public void shouldListAllStoreFiles(){
+    RecordStorageEngine engine=buildRecordStorageEngine();
+    final Collection<StoreFileMetadata> files=engine.listStorageFiles();
+    Set<File> currentFiles=files.stream().map(StoreFileMetadata::file).collect(Collectors.toSet());
+    DatabaseLayout databaseLayout=testDirectory.databaseLayout();
+    Set<File> allPossibleFiles=databaseLayout.storeFiles();
+    allPossibleFiles.remove(databaseLayout.countStoreB());
+    allPossibleFiles.remove(databaseLayout.labelScanStore());
+    assertEquals(currentFiles,allPossibleFiles);
+  }
+  private RecordStorageEngine buildRecordStorageEngine(){
+    return storageEngineRule.getWith(fsRule.get(),pageCacheRule.getPageCache(fsRule.get()),testDirectory.databaseLayout()).databaseHealth(databaseHealth).build();
+  }
+  private static Exception executeFailingTransaction(  RecordStorageEngine engine) throws IOException {
+    Exception applicationError=new UnderlyingStorageException("No space left on device");
+    TransactionToApply txToApply=newTransactionThatFailsWith(applicationError);
+    try {
+      engine.apply(txToApply,TransactionApplicationMode.INTERNAL);
+      fail("Exception expected");
+    }
+ catch (    Exception e) {
+      assertSame(applicationError,Exceptions.rootCause(e));
+    }
+    return applicationError;
+  }
+  private static TransactionToApply newTransactionThatFailsWith(  Exception error) throws IOException {
+    TransactionRepresentation transaction=mock(TransactionRepresentation.class);
+    when(transaction.additionalHeader()).thenReturn(new byte[0]);
+    doThrow(error).when(transaction).accept(any());
+    long txId=ThreadLocalRandom.current().nextLong(0,1000);
+    TransactionToApply txToApply=new TransactionToApply(transaction);
+    FakeCommitment commitment=new FakeCommitment(txId,mock(TransactionIdStore.class));
+    commitment.setHasExplicitIndexChanges(false);
+    txToApply.commitment(commitment,txId);
+    return txToApply;
+  }
+private static class FailingBatchTransactionApplierFacade extends BatchTransactionApplierFacade {
+    private final Exception failure;
+    FailingBatchTransactionApplierFacade(    Exception failure,    BatchTransactionApplier... appliers){
+      super(appliers);
+      this.failure=failure;
+    }
+    @Override public void close() throws Exception {
+      throw failure;
+    }
+  }
+}

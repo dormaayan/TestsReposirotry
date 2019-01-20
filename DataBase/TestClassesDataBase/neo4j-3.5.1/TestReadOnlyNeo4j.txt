@@ -1,0 +1,79 @@
+public class TestReadOnlyNeo4j {
+  private final EphemeralFileSystemRule fs=new EphemeralFileSystemRule();
+  private final TestDirectory testDirectory=TestDirectory.testDirectory();
+  @Rule public final RuleChain ruleChain=RuleChain.outerRule(fs).around(testDirectory);
+  @Test public void testSimple(){
+    DbRepresentation someData=createSomeData();
+    GraphDatabaseService readGraphDb=new TestGraphDatabaseFactory().setFileSystem(new UncloseableDelegatingFileSystemAbstraction(fs.get())).newImpermanentDatabaseBuilder(testDirectory.databaseDir()).setConfig(GraphDatabaseSettings.read_only,Settings.TRUE).newGraphDatabase();
+    assertEquals(someData,DbRepresentation.of(readGraphDb));
+    try (Transaction tx=readGraphDb.beginTx()){
+      readGraphDb.createNode();
+      tx.success();
+    }
+ catch (    WriteOperationsNotAllowedException e) {
+    }
+    readGraphDb.shutdown();
+  }
+  private DbRepresentation createSomeData(){
+    RelationshipType type=withName("KNOWS");
+    GraphDatabaseService db=new TestGraphDatabaseFactory().setFileSystem(new UncloseableDelegatingFileSystemAbstraction(fs.get())).newImpermanentDatabase(testDirectory.databaseDir());
+    try (Transaction tx=db.beginTx()){
+      Node prevNode=db.createNode();
+      for (int i=0; i < 100; i++) {
+        Node node=db.createNode();
+        Relationship rel=prevNode.createRelationshipTo(node,type);
+        node.setProperty("someKey" + i % 10,i % 15);
+        rel.setProperty("since",System.currentTimeMillis());
+      }
+      tx.success();
+    }
+     DbRepresentation result=DbRepresentation.of(db);
+    db.shutdown();
+    return result;
+  }
+  @Test public void testReadOnlyOperationsAndNoTransaction(){
+    GraphDatabaseService db=new TestGraphDatabaseFactory().setFileSystem(fs.get()).newImpermanentDatabase(testDirectory.databaseDir());
+    Transaction tx=db.beginTx();
+    Node node1=db.createNode();
+    Node node2=db.createNode();
+    Relationship rel=node1.createRelationshipTo(node2,withName("TEST"));
+    node1.setProperty("key1","value1");
+    rel.setProperty("key1","value1");
+    tx.success();
+    tx.close();
+    try {
+      db.createNode();
+      fail("Write operation and no transaction should throw exception");
+    }
+ catch (    NotInTransactionException e) {
+    }
+    try {
+      node1.createRelationshipTo(node2,withName("TEST2"));
+      fail("Write operation and no transaction should throw exception");
+    }
+ catch (    NotInTransactionException e) {
+    }
+    try {
+      node1.setProperty("key1","value2");
+      fail("Write operation and no transaction should throw exception");
+    }
+ catch (    NotInTransactionException e) {
+    }
+    try {
+      rel.removeProperty("key1");
+      fail("Write operation and no transaction should throw exception");
+    }
+ catch (    NotInTransactionException e) {
+    }
+    Transaction transaction=db.beginTx();
+    assertEquals(node1,db.getNodeById(node1.getId()));
+    assertEquals(node2,db.getNodeById(node2.getId()));
+    assertEquals(rel,db.getRelationshipById(rel.getId()));
+    assertThat(node1,inTx(db,hasProperty("key1").withValue("value1")));
+    Relationship loadedRel=node1.getSingleRelationship(withName("TEST"),Direction.OUTGOING);
+    assertEquals(rel,loadedRel);
+    assertThat(loadedRel,inTx(db,hasProperty("key1").withValue("value1")));
+    transaction.close();
+    db.shutdown();
+  }
+}

@@ -1,0 +1,63 @@
+@Test @Ignore("Flaky test") public void testSemaphorePermitsInUse(){
+  final TryableSemaphoreActual sharedSemaphore=new TryableSemaphoreActual(HystrixProperty.Factory.asProperty(3));
+  final TryableSemaphoreActual isolatedSemaphore=new TryableSemaphoreActual(HystrixProperty.Factory.asProperty(1));
+  final TestCircuitBreaker circuitBreaker=new TestCircuitBreaker();
+  final CountDownLatch startLatch=new CountDownLatch((sharedSemaphore.numberOfPermits.get()) * 2 + 1);
+  final CountDownLatch sharedLatch=new CountDownLatch(1);
+  final CountDownLatch isolatedLatch=new CountDownLatch(1);
+  final List<HystrixObservableCommand<Boolean>> commands=new ArrayList<HystrixObservableCommand<Boolean>>();
+  final List<Observable<Boolean>> results=new ArrayList<Observable<Boolean>>();
+  HystrixObservableCommand<Boolean> isolated=new LatchedSemaphoreCommand("ObservableCommand-Isolated",circuitBreaker,isolatedSemaphore,startLatch,isolatedLatch);
+  commands.add(isolated);
+  for (int s=0; s < sharedSemaphore.numberOfPermits.get() * 2; s++) {
+    HystrixObservableCommand<Boolean> shared=new LatchedSemaphoreCommand("ObservableCommand-Shared",circuitBreaker,sharedSemaphore,startLatch,sharedLatch);
+    commands.add(shared);
+    Observable<Boolean> result=shared.toObservable();
+    results.add(result);
+  }
+  Observable<Boolean> isolatedResult=isolated.toObservable();
+  results.add(isolatedResult);
+  assertEquals("before commands start, shared semaphore should be unused",0,sharedSemaphore.getNumberOfPermitsUsed());
+  assertEquals("before commands start, isolated semaphore should be unused",0,isolatedSemaphore.getNumberOfPermitsUsed());
+  final CountDownLatch allTerminal=new CountDownLatch(1);
+  Observable.merge(results).subscribeOn(Schedulers.computation()).subscribe(new Subscriber<Boolean>(){
+    @Override public void onCompleted(){
+      System.out.println(Thread.currentThread().getName() + " OnCompleted");
+      allTerminal.countDown();
+    }
+    @Override public void onError(    Throwable e){
+      System.out.println(Thread.currentThread().getName() + " OnError : " + e);
+      allTerminal.countDown();
+    }
+    @Override public void onNext(    Boolean b){
+      System.out.println(Thread.currentThread().getName() + " OnNext : " + b);
+    }
+  }
+);
+  try {
+    assertTrue(startLatch.await(1000,TimeUnit.MILLISECONDS));
+  }
+ catch (  Throwable ex) {
+    fail(ex.getMessage());
+  }
+  assertEquals("immediately after command start, all shared semaphores should be in-use",sharedSemaphore.numberOfPermits.get().longValue(),sharedSemaphore.getNumberOfPermitsUsed());
+  assertEquals("immediately after command start, isolated semaphore should be in-use",isolatedSemaphore.numberOfPermits.get().longValue(),isolatedSemaphore.getNumberOfPermitsUsed());
+  sharedLatch.countDown();
+  isolatedLatch.countDown();
+  try {
+    assertTrue(allTerminal.await(1000,TimeUnit.MILLISECONDS));
+  }
+ catch (  Exception e) {
+    e.printStackTrace();
+    fail("failed waiting on commands");
+  }
+  assertEquals("after all threads have finished, no shared semaphores should be in-use",0,sharedSemaphore.getNumberOfPermitsUsed());
+  assertEquals("after all threads have finished, isolated semaphore not in-use",0,isolatedSemaphore.getNumberOfPermitsUsed());
+  int numSemaphoreRejected=0;
+  for (  HystrixObservableCommand<Boolean> cmd : commands) {
+    if (cmd.isResponseSemaphoreRejected()) {
+      numSemaphoreRejected++;
+    }
+  }
+  assertEquals("expected some of shared semaphore commands to get rejected",sharedSemaphore.numberOfPermits.get().longValue(),numSemaphoreRejected);
+}

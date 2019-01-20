@@ -1,0 +1,41 @@
+/** 
+ * Tests that a standby Dispatcher does not interfere with the clean up of a completed job.
+ */
+@Test public void testStandbyDispatcherJobExecution() throws Exception {
+  try (final TestingHighAvailabilityServices haServices1=new TestingHighAvailabilityServices();final TestingHighAvailabilityServices haServices2=new TestingHighAvailabilityServices();final CuratorFramework curatorFramework=ZooKeeperUtils.startCuratorFramework(configuration)){
+    final ZooKeeperSubmittedJobGraphStore submittedJobGraphStore1=ZooKeeperUtils.createSubmittedJobGraphs(curatorFramework,configuration);
+    haServices1.setSubmittedJobGraphStore(submittedJobGraphStore1);
+    final TestingLeaderElectionService leaderElectionService1=new TestingLeaderElectionService();
+    haServices1.setDispatcherLeaderElectionService(leaderElectionService1);
+    final ZooKeeperSubmittedJobGraphStore submittedJobGraphStore2=ZooKeeperUtils.createSubmittedJobGraphs(curatorFramework,configuration);
+    haServices2.setSubmittedJobGraphStore(submittedJobGraphStore2);
+    final TestingLeaderElectionService leaderElectionService2=new TestingLeaderElectionService();
+    haServices2.setDispatcherLeaderElectionService(leaderElectionService2);
+    final CompletableFuture<JobGraph> jobGraphFuture=new CompletableFuture<>();
+    final CompletableFuture<ArchivedExecutionGraph> resultFuture=new CompletableFuture<>();
+    final TestingDispatcher dispatcher1=createDispatcher(haServices1,new TestingJobManagerRunnerFactory(jobGraphFuture,resultFuture,CompletableFuture.completedFuture(null)));
+    final TestingDispatcher dispatcher2=createDispatcher(haServices2,new TestingJobManagerRunnerFactory(new CompletableFuture<>(),new CompletableFuture<>(),CompletableFuture.completedFuture(null)));
+    try {
+      dispatcher1.start();
+      dispatcher2.start();
+      leaderElectionService1.isLeader(UUID.randomUUID()).get();
+      final DispatcherGateway dispatcherGateway1=dispatcher1.getSelfGateway(DispatcherGateway.class);
+      final JobGraph jobGraph=DispatcherHATest.createNonEmptyJobGraph();
+      dispatcherGateway1.submitJob(jobGraph,TIMEOUT).get();
+      final CompletableFuture<JobResult> jobResultFuture=dispatcherGateway1.requestJobResult(jobGraph.getJobID(),TIMEOUT);
+      jobGraphFuture.get();
+      resultFuture.complete(new ArchivedExecutionGraphBuilder().setJobID(jobGraph.getJobID()).setState(JobStatus.FINISHED).build());
+      final JobResult jobResult=jobResultFuture.get();
+      assertThat(jobResult.isSuccess(),is(true));
+      dispatcher1.getJobTerminationFuture(jobGraph.getJobID(),TIMEOUT).get();
+      leaderElectionService1.notLeader();
+      leaderElectionService2.isLeader(UUID.randomUUID()).get();
+      final DispatcherGateway dispatcherGateway2=dispatcher2.getSelfGateway(DispatcherGateway.class);
+      assertThat(dispatcherGateway2.listJobs(TIMEOUT).get(),is(empty()));
+    }
+  finally {
+      RpcUtils.terminateRpcEndpoint(dispatcher1,TIMEOUT);
+      RpcUtils.terminateRpcEndpoint(dispatcher2,TIMEOUT);
+    }
+  }
+ }

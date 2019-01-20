@@ -1,0 +1,72 @@
+public class NonUniqueIndexTest {
+  private static final String LABEL="SomeLabel";
+  private static final String KEY="key";
+  private static final String VALUE="value";
+  @Rule public PageCacheAndDependenciesRule resources=new PageCacheAndDependenciesRule().with(new DefaultFileSystemRule());
+  @Test public void concurrentIndexPopulationAndInsertsShouldNotProduceDuplicates() throws Exception {
+    Config config=Config.defaults();
+    GraphDatabaseService db=newEmbeddedGraphDatabaseWithSlowJobScheduler(config);
+    try {
+      try (Transaction tx=db.beginTx()){
+        db.schema().indexFor(label(LABEL)).on(KEY).create();
+        tx.success();
+      }
+       Node node;
+      try (Transaction tx=db.beginTx()){
+        node=db.createNode(label(LABEL));
+        node.setProperty(KEY,VALUE);
+        tx.success();
+      }
+       try (Transaction tx=db.beginTx()){
+        db.schema().awaitIndexesOnline(1,MINUTES);
+        tx.success();
+      }
+       try (Transaction tx=db.beginTx()){
+        KernelTransaction ktx=((GraphDatabaseAPI)db).getDependencyResolver().resolveDependency(ThreadToStatementContextBridge.class).getKernelTransactionBoundToThisThread(true);
+        IndexReference index=ktx.schemaRead().index(ktx.tokenRead().nodeLabel(LABEL),ktx.tokenRead().propertyKey(KEY));
+        NodeValueIndexCursor cursor=ktx.cursors().allocateNodeValueIndexCursor();
+        ktx.dataRead().nodeIndexSeek(index,cursor,IndexOrder.NONE,false,IndexQuery.exact(1,VALUE));
+        assertTrue(cursor.next());
+        assertEquals(node.getId(),cursor.nodeReference());
+        assertFalse(cursor.next());
+        tx.success();
+      }
+     }
+  finally {
+      db.shutdown();
+    }
+  }
+  private GraphDatabaseService newEmbeddedGraphDatabaseWithSlowJobScheduler(  Config config){
+    GraphDatabaseFactoryState graphDatabaseFactoryState=new GraphDatabaseFactoryState();
+    graphDatabaseFactoryState.setUserLogProvider(NullLogService.getInstance().getUserLogProvider());
+    return new GraphDatabaseFacadeFactory(DatabaseInfo.COMMUNITY,CommunityEditionModule::new){
+      @Override protected PlatformModule createPlatform(      File storeDir,      Config config,      Dependencies dependencies){
+        return new PlatformModule(storeDir,config,databaseInfo,dependencies){
+          @Override protected CentralJobScheduler createJobScheduler(){
+            return newSlowJobScheduler();
+          }
+          @Override protected LogService createLogService(          LogProvider userLogProvider){
+            return NullLogService.getInstance();
+          }
+        }
+;
+      }
+    }
+.newFacade(resources.directory().storeDir(),config,graphDatabaseFactoryState.databaseDependencies());
+  }
+  private static CentralJobScheduler newSlowJobScheduler(){
+    return new CentralJobScheduler(){
+      @Override public JobHandle schedule(      Group group,      Runnable job){
+        return super.schedule(group,slowRunnable(job));
+      }
+    }
+;
+  }
+  private static Runnable slowRunnable(  final Runnable target){
+    return () -> {
+      LockSupport.parkNanos(100_000_000L);
+      target.run();
+    }
+;
+  }
+}

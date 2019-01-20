@@ -1,0 +1,34 @@
+@Test public void testHeartbeatTimeoutWithResourceManager() throws Exception {
+  final String resourceManagerAddress="rm";
+  final ResourceManagerId resourceManagerId=ResourceManagerId.generate();
+  final ResourceID rmResourceId=new ResourceID(resourceManagerAddress);
+  final TestingResourceManagerGateway resourceManagerGateway=new TestingResourceManagerGateway(resourceManagerId,rmResourceId,fastHeartbeatInterval,resourceManagerAddress,"localhost");
+  final CompletableFuture<Tuple3<JobMasterId,ResourceID,JobID>> jobManagerRegistrationFuture=new CompletableFuture<>();
+  final CompletableFuture<JobID> disconnectedJobManagerFuture=new CompletableFuture<>();
+  final CountDownLatch registrationAttempts=new CountDownLatch(2);
+  resourceManagerGateway.setRegisterJobManagerConsumer(tuple -> {
+    jobManagerRegistrationFuture.complete(Tuple3.of(tuple.f0,tuple.f1,tuple.f3));
+    registrationAttempts.countDown();
+  }
+);
+  resourceManagerGateway.setDisconnectJobManagerConsumer(tuple -> disconnectedJobManagerFuture.complete(tuple.f0));
+  rpcService.registerGateway(resourceManagerAddress,resourceManagerGateway);
+  final JobManagerSharedServices jobManagerSharedServices=new TestingJobManagerSharedServicesBuilder().build();
+  final JobMaster jobMaster=createJobMaster(configuration,jobGraph,haServices,jobManagerSharedServices);
+  CompletableFuture<Acknowledge> startFuture=jobMaster.start(jobMasterId,testingTimeout);
+  try {
+    startFuture.get(testingTimeout.toMilliseconds(),TimeUnit.MILLISECONDS);
+    rmLeaderRetrievalService.notifyListener(resourceManagerAddress,resourceManagerId.toUUID());
+    final Tuple3<JobMasterId,ResourceID,JobID> registrationInformation=jobManagerRegistrationFuture.get(testingTimeout.toMilliseconds(),TimeUnit.MILLISECONDS);
+    assertThat(registrationInformation.f0,Matchers.equalTo(jobMasterId));
+    assertThat(registrationInformation.f1,Matchers.equalTo(jmResourceId));
+    assertThat(registrationInformation.f2,Matchers.equalTo(jobGraph.getJobID()));
+    final JobID disconnectedJobManager=disconnectedJobManagerFuture.get(testingTimeout.toMilliseconds(),TimeUnit.MILLISECONDS);
+    assertThat(disconnectedJobManager,Matchers.equalTo(jobGraph.getJobID()));
+    registrationAttempts.await();
+  }
+  finally {
+    jobManagerSharedServices.shutdown();
+    RpcUtils.terminateRpcEndpoint(jobMaster,testingTimeout);
+  }
+}

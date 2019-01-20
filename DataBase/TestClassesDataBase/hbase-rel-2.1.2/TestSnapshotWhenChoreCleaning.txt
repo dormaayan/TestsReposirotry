@@ -1,0 +1,125 @@
+/** 
+ * Test Case for HBASE-21387
+ */
+@Category({LargeTests.class}) public class TestSnapshotWhenChoreCleaning {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestSnapshotWhenChoreCleaning.class);
+  private static final HBaseTestingUtility TEST_UTIL=new HBaseTestingUtility();
+  private static final Configuration CONF=TEST_UTIL.getConfiguration();
+  private static final Logger LOG=LoggerFactory.getLogger(TestSnapshotClientRetries.class);
+  private static final TableName TABLE_NAME=TableName.valueOf("testTable");
+  private static final int MAX_SPLIT_KEYS_NUM=100;
+  private static final byte[] FAMILY=Bytes.toBytes("family");
+  private static final byte[] QUALIFIER=Bytes.toBytes("qualifier");
+  private static final byte[] VALUE=Bytes.toBytes("value");
+  private static Table TABLE;
+  @Rule public TestTableName TEST_TABLE=new TestTableName();
+  @BeforeClass public static void setUp() throws Exception {
+    CONF.setInt("hbase.snapshot.thread.pool.max",1);
+    CONF.setBoolean(SnapshotManager.HBASE_SNAPSHOT_ENABLED,true);
+    TEST_UTIL.startMiniCluster(3);
+    createTable();
+  }
+  private static byte[] integerToBytes(  int i){
+    return Bytes.toBytes(String.format("%06d",i));
+  }
+  private static void createTable() throws IOException {
+    byte[][] splitKeys=new byte[MAX_SPLIT_KEYS_NUM][];
+    for (int i=0; i < splitKeys.length; i++) {
+      splitKeys[i]=integerToBytes(i);
+    }
+    TABLE=TEST_UTIL.createTable(TABLE_NAME,FAMILY,splitKeys);
+  }
+  @AfterClass public static void tearDown() throws Exception {
+    TEST_UTIL.shutdownMiniCluster();
+  }
+  private static void loadDataAndFlush() throws IOException {
+    for (int i=0; i < MAX_SPLIT_KEYS_NUM; i++) {
+      Put put=new Put(integerToBytes(i)).addColumn(FAMILY,QUALIFIER,Bytes.add(VALUE,Bytes.toBytes(i)));
+      TABLE.put(put);
+    }
+    TEST_UTIL.flush(TABLE_NAME);
+  }
+  private static List<Path> listHFileNames(  final FileSystem fs,  final Path tableDir) throws IOException {
+    final List<Path> hfiles=new ArrayList<>();
+    FSVisitor.visitTableStoreFiles(fs,tableDir,(region,family,hfileName) -> {
+      hfiles.add(new Path(new Path(new Path(tableDir,region),family),hfileName));
+    }
+);
+    Collections.sort(hfiles);
+    return hfiles;
+  }
+  private static boolean isAnySnapshots(  FileSystem fs) throws IOException {
+    Path snapshotDir=SnapshotDescriptionUtils.getSnapshotsDir(FSUtils.getRootDir(CONF));
+    FileStatus[] snapFiles=fs.listStatus(snapshotDir);
+    if (snapFiles.length == 0) {
+      return false;
+    }
+    Path firstPath=snapFiles[0].getPath();
+    LOG.info("firstPath in isAnySnapshots: " + firstPath);
+    if (snapFiles.length == 1 && firstPath.getName().equals(".tmp")) {
+      FileStatus[] tmpSnapFiles=fs.listStatus(firstPath);
+      return tmpSnapFiles != null && tmpSnapFiles.length > 0;
+    }
+    return true;
+  }
+  @Test public void testSnapshotWhenSnapshotHFileCleanerRunning() throws Exception {
+    loadDataAndFlush();
+    SnapshotHFileCleaner cleaner=new SnapshotHFileCleaner();
+    cleaner.init(ImmutableMap.of(HMaster.MASTER,TEST_UTIL.getHBaseCluster().getMaster()));
+    cleaner.setConf(CONF);
+    FileSystem fs=FSUtils.getCurrentFileSystem(CONF);
+    List<Path> fileNames=listHFileNames(fs,FSUtils.getTableDir(FSUtils.getRootDir(CONF),TABLE_NAME));
+    List<FileStatus> files=new ArrayList<>();
+    for (    Path fileName : fileNames) {
+      files.add(fs.getFileStatus(fileName));
+    }
+    TEST_UTIL.getAdmin().snapshot("snapshotName_prev",TABLE_NAME);
+    Assert.assertEquals(Lists.newArrayList(cleaner.getDeletableFiles(files)).size(),0);
+    TEST_UTIL.getAdmin().deleteSnapshot("snapshotName_prev");
+    cleaner.getFileCacheForTesting().triggerCacheRefreshForTesting();
+    Assert.assertEquals(Lists.newArrayList(cleaner.getDeletableFiles(files)).size(),100);
+    Runnable snapshotRunnable=() -> {
+      try {
+        for (int k=0; k < 5; k++) {
+          TEST_UTIL.getAdmin().snapshot("snapshotName_" + k,TABLE_NAME);
+        }
+      }
+ catch (      Exception e) {
+        LOG.error("Snapshot failed: ",e);
+      }
+    }
+;
+    final AtomicBoolean success=new AtomicBoolean(true);
+    Runnable cleanerRunnable=() -> {
+      try {
+        while (!isAnySnapshots(fs)) {
+          LOG.info("Not found any snapshot, sleep 100ms");
+          Thread.sleep(100);
+        }
+        for (int k=0; k < 5; k++) {
+          cleaner.getFileCacheForTesting().triggerCacheRefreshForTesting();
+          Iterable<FileStatus> toDeleteFiles=cleaner.getDeletableFiles(files);
+          List<FileStatus> deletableFiles=Lists.newArrayList(toDeleteFiles);
+          LOG.info("Size of deletableFiles is: " + deletableFiles.size());
+          for (int i=0; i < deletableFiles.size(); i++) {
+            LOG.debug("toDeleteFiles[{}] is: {}",i,deletableFiles.get(i));
+          }
+          if (deletableFiles.size() > 0) {
+            success.set(false);
+          }
+        }
+      }
+ catch (      Exception e) {
+        LOG.error("Chore cleaning failed: ",e);
+      }
+    }
+;
+    Thread t1=new Thread(snapshotRunnable);
+    t1.start();
+    Thread t2=new Thread(cleanerRunnable);
+    t2.start();
+    t1.join();
+    t2.join();
+    Assert.assertTrue(success.get());
+  }
+}

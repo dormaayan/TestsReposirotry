@@ -1,0 +1,56 @@
+@Test public void testReversibleKeyValueHeap() throws IOException {
+  FileSystem fs=TEST_UTIL.getTestFileSystem();
+  Path hfilePath=new Path(new Path(TEST_UTIL.getDataTestDir("testReversibleKeyValueHeap"),"regionname"),"familyname");
+  CacheConfig cacheConf=new CacheConfig(TEST_UTIL.getConfiguration());
+  HFileContextBuilder hcBuilder=new HFileContextBuilder();
+  hcBuilder.withBlockSize(2 * 1024);
+  HFileContext hFileContext=hcBuilder.build();
+  StoreFileWriter writer1=new StoreFileWriter.Builder(TEST_UTIL.getConfiguration(),cacheConf,fs).withOutputDir(hfilePath).withFileContext(hFileContext).build();
+  StoreFileWriter writer2=new StoreFileWriter.Builder(TEST_UTIL.getConfiguration(),cacheConf,fs).withOutputDir(hfilePath).withFileContext(hFileContext).build();
+  MemStore memstore=new DefaultMemStore();
+  writeMemstoreAndStoreFiles(memstore,new StoreFileWriter[]{writer1,writer2});
+  HStoreFile sf1=new HStoreFile(fs,writer1.getPath(),TEST_UTIL.getConfiguration(),cacheConf,BloomType.NONE,true);
+  HStoreFile sf2=new HStoreFile(fs,writer2.getPath(),TEST_UTIL.getConfiguration(),cacheConf,BloomType.NONE,true);
+  int startRowNum=ROWSIZE / 2;
+  ReversedKeyValueHeap kvHeap=getReversibleKeyValueHeap(memstore,sf1,sf2,ROWS[startRowNum],MAXMVCC);
+  internalTestSeekAndNextForReversibleKeyValueHeap(kvHeap,startRowNum);
+  startRowNum=ROWSIZE - 1;
+  kvHeap=getReversibleKeyValueHeap(memstore,sf1,sf2,HConstants.EMPTY_START_ROW,MAXMVCC);
+  internalTestSeekAndNextForReversibleKeyValueHeap(kvHeap,startRowNum);
+  for (int readPoint=0; readPoint < MAXMVCC; readPoint++) {
+    LOG.info("Setting read point to " + readPoint);
+    startRowNum=ROWSIZE - 1;
+    kvHeap=getReversibleKeyValueHeap(memstore,sf1,sf2,HConstants.EMPTY_START_ROW,readPoint);
+    for (int i=startRowNum; i >= 0; i--) {
+      if (i - 2 < 0)       break;
+      i=i - 2;
+      kvHeap.seekToPreviousRow(KeyValueUtil.createFirstOnRow(ROWS[i + 1]));
+      Pair<Integer,Integer> nextReadableNum=getNextReadableNumWithBackwardScan(i,0,readPoint);
+      if (nextReadableNum == null)       break;
+      KeyValue expecedKey=makeKV(nextReadableNum.getFirst(),nextReadableNum.getSecond());
+      assertEquals(expecedKey,kvHeap.peek());
+      i=nextReadableNum.getFirst();
+      int qualNum=nextReadableNum.getSecond();
+      if (qualNum + 1 < QUALSIZE) {
+        kvHeap.backwardSeek(makeKV(i,qualNum + 1));
+        nextReadableNum=getNextReadableNumWithBackwardScan(i,qualNum + 1,readPoint);
+        if (nextReadableNum == null)         break;
+        expecedKey=makeKV(nextReadableNum.getFirst(),nextReadableNum.getSecond());
+        assertEquals(expecedKey,kvHeap.peek());
+        i=nextReadableNum.getFirst();
+        qualNum=nextReadableNum.getSecond();
+      }
+      kvHeap.next();
+      if (qualNum + 1 >= QUALSIZE) {
+        nextReadableNum=getNextReadableNumWithBackwardScan(i - 1,0,readPoint);
+      }
+ else {
+        nextReadableNum=getNextReadableNumWithBackwardScan(i,qualNum + 1,readPoint);
+      }
+      if (nextReadableNum == null)       break;
+      expecedKey=makeKV(nextReadableNum.getFirst(),nextReadableNum.getSecond());
+      assertEquals(expecedKey,kvHeap.peek());
+      i=nextReadableNum.getFirst();
+    }
+  }
+}

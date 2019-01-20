@@ -1,0 +1,94 @@
+/** 
+ * Tests the ability to specify favored nodes for a region.
+ */
+@Category({RegionServerTests.class,MediumTests.class}) public class TestRegionFavoredNodes {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestRegionFavoredNodes.class);
+  private static final HBaseTestingUtility TEST_UTIL=new HBaseTestingUtility();
+  private static Table table;
+  private static final TableName TABLE_NAME=TableName.valueOf("table");
+  private static final byte[] COLUMN_FAMILY=Bytes.toBytes("family");
+  private static final int FAVORED_NODES_NUM=3;
+  private static final int REGION_SERVERS=6;
+  private static final int FLUSHES=3;
+  private static Method createWithFavoredNode=null;
+  @BeforeClass public static void setUpBeforeClass() throws Exception {
+    try {
+      createWithFavoredNode=DistributedFileSystem.class.getDeclaredMethod("create",Path.class,FsPermission.class,boolean.class,int.class,short.class,long.class,Progressable.class,InetSocketAddress[].class);
+    }
+ catch (    NoSuchMethodException nm) {
+      return;
+    }
+    TEST_UTIL.startMiniCluster(REGION_SERVERS);
+    table=TEST_UTIL.createMultiRegionTable(TABLE_NAME,COLUMN_FAMILY);
+    TEST_UTIL.waitUntilAllRegionsAssigned(TABLE_NAME);
+  }
+  @AfterClass public static void tearDownAfterClass() throws Exception {
+    if (table != null) {
+      table.close();
+    }
+    if (createWithFavoredNode == null) {
+      return;
+    }
+    TEST_UTIL.shutdownMiniCluster();
+  }
+  @Test public void testFavoredNodes() throws Exception {
+    Assume.assumeTrue(createWithFavoredNode != null);
+    InetSocketAddress[] nodes=new InetSocketAddress[REGION_SERVERS];
+    List<DataNode> datanodes=TEST_UTIL.getDFSCluster().getDataNodes();
+    Method selfAddress;
+    try {
+      selfAddress=DataNode.class.getMethod("getSelfAddr");
+    }
+ catch (    NoSuchMethodException ne) {
+      selfAddress=DataNode.class.getMethod("getXferAddress");
+    }
+    for (int i=0; i < REGION_SERVERS; i++) {
+      nodes[i]=(InetSocketAddress)selfAddress.invoke(datanodes.get(i));
+    }
+    String[] nodeNames=new String[REGION_SERVERS];
+    for (int i=0; i < REGION_SERVERS; i++) {
+      nodeNames[i]=nodes[i].getAddress().getHostAddress() + ":" + nodes[i].getPort();
+    }
+    for (int i=0; i < REGION_SERVERS; i++) {
+      HRegionServer server=TEST_UTIL.getHBaseCluster().getRegionServer(i);
+      List<HRegion> regions=server.getRegions(TABLE_NAME);
+      for (      HRegion region : regions) {
+        List<org.apache.hadoop.hbase.shaded.protobuf.generated.HBaseProtos.ServerName> favoredNodes=new ArrayList<>(3);
+        String encodedRegionName=region.getRegionInfo().getEncodedName();
+        for (int j=0; j < FAVORED_NODES_NUM; j++) {
+          org.apache.hadoop.hbase.shaded.protobuf.generated.HBaseProtos.ServerName.Builder b=org.apache.hadoop.hbase.shaded.protobuf.generated.HBaseProtos.ServerName.newBuilder();
+          b.setHostName(nodes[(i + j) % REGION_SERVERS].getAddress().getHostAddress());
+          b.setPort(nodes[(i + j) % REGION_SERVERS].getPort());
+          b.setStartCode(-1);
+          favoredNodes.add(b.build());
+        }
+        server.updateRegionFavoredNodesMapping(encodedRegionName,favoredNodes);
+      }
+    }
+    for (int i=0; i < FLUSHES; i++) {
+      TEST_UTIL.loadTable(table,COLUMN_FAMILY,false);
+      TEST_UTIL.flush();
+    }
+    for (int i=0; i < REGION_SERVERS; i++) {
+      HRegionServer server=TEST_UTIL.getHBaseCluster().getRegionServer(i);
+      List<HRegion> regions=server.getRegions(TABLE_NAME);
+      for (      HRegion region : regions) {
+        List<String> files=region.getStoreFileList(new byte[][]{COLUMN_FAMILY});
+        for (        String file : files) {
+          FileStatus status=TEST_UTIL.getDFSCluster().getFileSystem().getFileStatus(new Path(new URI(file).getPath()));
+          BlockLocation[] lbks=((DistributedFileSystem)TEST_UTIL.getDFSCluster().getFileSystem()).getFileBlockLocations(status,0,Long.MAX_VALUE);
+          for (          BlockLocation lbk : lbks) {
+            locations:             for (            String info : lbk.getNames()) {
+              for (int j=0; j < FAVORED_NODES_NUM; j++) {
+                if (info.equals(nodeNames[(i + j) % REGION_SERVERS])) {
+                  continue locations;
+                }
+              }
+              fail("Block location " + info + " not a favored node");
+            }
+          }
+        }
+      }
+    }
+  }
+}

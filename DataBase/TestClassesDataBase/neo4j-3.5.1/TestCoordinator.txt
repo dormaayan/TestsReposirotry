@@ -1,0 +1,111 @@
+private class TestCoordinator implements Supplier<ReaderInstruction> {
+  private final Random random;
+  final long minRange=0;
+  final long maxRange=1 << 13;
+  private final int writeBatchSize;
+  private final boolean forwardsSeek;
+  private final double writePercentage;
+  private final AtomicReference<ReaderInstruction> currentReaderInstruction;
+  TreeSet<Long> readersShouldSee;
+  private final AtomicBoolean endSignal;
+  Queue<Long> toRemove=new LinkedList<>();
+  Queue<Long> toAdd=new LinkedList<>();
+  List<UpdateOperation> updatesForNextIteration=new ArrayList<>();
+  TestCoordinator(  Random random,  boolean forwardsSeek,  double writePercentage){
+    this.endSignal=new AtomicBoolean();
+    this.random=random;
+    this.forwardsSeek=forwardsSeek;
+    this.writePercentage=writePercentage;
+    this.writeBatchSize=random.nextInt(990) + 10;
+    currentReaderInstruction=new AtomicReference<>();
+    Comparator<Long> comparator=forwardsSeek ? Comparator.naturalOrder() : Comparator.reverseOrder();
+    readersShouldSee=new TreeSet<>(comparator);
+  }
+  List<Long> shuffleToNewList(  List<Long> sourceList,  Random random){
+    List<Long> shuffledList=new ArrayList<>(sourceList);
+    Collections.shuffle(shuffledList,random);
+    return shuffledList;
+  }
+  void prepare(  GBPTree<KEY,VALUE> index) throws IOException {
+    prepareIndex(index,readersShouldSee,toRemove,toAdd,random);
+    iterationFinished();
+  }
+  void prepareIndex(  GBPTree<KEY,VALUE> index,  TreeSet<Long> dataInIndex,  Queue<Long> toRemove,  Queue<Long> toAdd,  Random random) throws IOException {
+    List<Long> fullRange=LongStream.range(minRange,maxRange).boxed().collect(Collectors.toList());
+    List<Long> rangeOutOfOrder=shuffleToNewList(fullRange,random);
+    try (Writer<KEY,VALUE> writer=index.writer()){
+      for (      Long key : rangeOutOfOrder) {
+        boolean addForRemoval=random.nextDouble() > writePercentage;
+        if (addForRemoval) {
+          writer.put(key(key),value(key));
+          dataInIndex.add(key);
+          toRemove.add(key);
+        }
+ else {
+          toAdd.add(key);
+        }
+      }
+    }
+   }
+  void iterationFinished(){
+    readersShouldSee=new TreeSet<>(readersShouldSee);
+    updateRecentlyInsertedData(readersShouldSee,updatesForNextIteration);
+    updatesForNextIteration=generateUpdatesForNextIteration();
+    updateWithSoonToBeRemovedData(readersShouldSee,updatesForNextIteration);
+    currentReaderInstruction.set(newReaderInstruction(minRange,maxRange,readersShouldSee));
+  }
+  void updateRecentlyInsertedData(  TreeSet<Long> readersShouldSee,  List<UpdateOperation> updateBatch){
+    updateBatch.stream().filter(UpdateOperation::isInsert).forEach(uo -> uo.applyToSet(readersShouldSee));
+  }
+  void updateWithSoonToBeRemovedData(  TreeSet<Long> readersShouldSee,  List<UpdateOperation> updateBatch){
+    updateBatch.stream().filter(uo -> !uo.isInsert()).forEach(uo -> uo.applyToSet(readersShouldSee));
+  }
+  private ReaderInstruction newReaderInstruction(  long minRange,  long maxRange,  TreeSet<Long> readersShouldSee){
+    return forwardsSeek ? new ReaderInstruction(minRange,maxRange,readersShouldSee) : new ReaderInstruction(maxRange - 1,minRange,readersShouldSee);
+  }
+  private List<UpdateOperation> generateUpdatesForNextIteration(){
+    List<UpdateOperation> updateOperations=new ArrayList<>();
+    if (toAdd.isEmpty() && toRemove.isEmpty()) {
+      endSignal.set(true);
+      return updateOperations;
+    }
+    int operationsInIteration=readersShouldSee.size() < 1000 ? 100 : readersShouldSee.size() / 10;
+    int count=0;
+    while (count < operationsInIteration && (!toAdd.isEmpty() || !toRemove.isEmpty())) {
+      UpdateOperation operation;
+      if (toAdd.isEmpty()) {
+        operation=new RemoveOperation(toRemove.poll());
+      }
+ else       if (toRemove.isEmpty()) {
+        operation=new PutOperation(toAdd.poll());
+      }
+ else {
+        boolean remove=random.nextDouble() > writePercentage;
+        if (remove) {
+          operation=new RemoveOperation(toRemove.poll());
+        }
+ else {
+          operation=new PutOperation(toAdd.poll());
+        }
+      }
+      updateOperations.add(operation);
+      count++;
+    }
+    return updateOperations;
+  }
+  Iterable<UpdateOperation> nextToWrite(){
+    return updatesForNextIteration;
+  }
+  @Override public ReaderInstruction get(){
+    return currentReaderInstruction.get();
+  }
+  AtomicBoolean endSignal(){
+    return endSignal;
+  }
+  int writeBatchSize(){
+    return writeBatchSize;
+  }
+  boolean isReallyExpected(  long nextToSee){
+    return readersShouldSee.contains(nextToSee);
+  }
+}

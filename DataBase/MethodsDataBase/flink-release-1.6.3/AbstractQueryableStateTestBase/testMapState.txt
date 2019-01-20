@@ -1,0 +1,58 @@
+/** 
+ * Tests simple map state queryable state instance. Each source emits (subtaskIndex, 0)..(subtaskIndex, numElements) tuples, which are then queried. The map state instance sums the values up. The test succeeds after each subtask index is queried with result n*(n+1)/2.
+ */
+@Test public void testMapState() throws Exception {
+  final Deadline deadline=Deadline.now().plus(TEST_TIMEOUT);
+  final long numElements=1024L;
+  StreamExecutionEnvironment env=StreamExecutionEnvironment.getExecutionEnvironment();
+  env.setStateBackend(stateBackend);
+  env.setParallelism(maxParallelism);
+  env.setRestartStrategy(RestartStrategies.fixedDelayRestart(Integer.MAX_VALUE,1000L));
+  DataStream<Tuple2<Integer,Long>> source=env.addSource(new TestAscendingValueSource(numElements));
+  final MapStateDescriptor<Integer,Tuple2<Integer,Long>> mapStateDescriptor=new MapStateDescriptor<>("timon",BasicTypeInfo.INT_TYPE_INFO,source.getType());
+  mapStateDescriptor.setQueryable("timon-queryable");
+  source.keyBy(new KeySelector<Tuple2<Integer,Long>,Integer>(){
+    private static final long serialVersionUID=8470749712274833552L;
+    @Override public Integer getKey(    Tuple2<Integer,Long> value){
+      return value.f0;
+    }
+  }
+).process(new ProcessFunction<Tuple2<Integer,Long>,Object>(){
+    private static final long serialVersionUID=-805125545438296619L;
+    private transient MapState<Integer,Tuple2<Integer,Long>> mapState;
+    @Override public void open(    Configuration parameters) throws Exception {
+      super.open(parameters);
+      mapState=getRuntimeContext().getMapState(mapStateDescriptor);
+    }
+    @Override public void processElement(    Tuple2<Integer,Long> value,    Context ctx,    Collector<Object> out) throws Exception {
+      Tuple2<Integer,Long> v=mapState.get(value.f0);
+      if (v == null) {
+        v=new Tuple2<>(value.f0,0L);
+      }
+      mapState.put(value.f0,new Tuple2<>(v.f0,v.f1 + value.f1));
+    }
+  }
+);
+  try (AutoCancellableJob autoCancellableJob=new AutoCancellableJob(deadline,clusterClient,env)){
+    final JobID jobId=autoCancellableJob.getJobId();
+    final JobGraph jobGraph=autoCancellableJob.getJobGraph();
+    clusterClient.setDetached(true);
+    clusterClient.submitJob(jobGraph,AbstractQueryableStateTestBase.class.getClassLoader());
+    final long expected=numElements * (numElements + 1L) / 2L;
+    for (int key=0; key < maxParallelism; key++) {
+      boolean success=false;
+      while (deadline.hasTimeLeft() && !success) {
+        CompletableFuture<MapState<Integer,Tuple2<Integer,Long>>> future=getKvState(deadline,client,jobId,"timon-queryable",key,BasicTypeInfo.INT_TYPE_INFO,mapStateDescriptor,false,executor);
+        Tuple2<Integer,Long> value=future.get(deadline.timeLeft().toMillis(),TimeUnit.MILLISECONDS).get(key);
+        if (value != null && value.f0 != null && expected == value.f1) {
+          assertEquals("Key mismatch",key,value.f0.intValue());
+          success=true;
+        }
+ else {
+          Thread.sleep(RETRY_TIMEOUT);
+        }
+      }
+      assertTrue("Did not succeed query",success);
+    }
+  }
+ }

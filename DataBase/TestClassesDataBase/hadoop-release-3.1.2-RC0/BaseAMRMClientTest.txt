@@ -1,0 +1,96 @@
+/** 
+ * Base class for testing AMRMClient.
+ */
+public class BaseAMRMClientTest {
+  protected Configuration conf=null;
+  protected MiniYARNCluster yarnCluster=null;
+  protected YarnClient yarnClient=null;
+  protected List<NodeReport> nodeReports=null;
+  protected ApplicationAttemptId attemptId=null;
+  protected String schedulerName=CapacityScheduler.class.getName();
+  protected boolean autoUpdate=false;
+  protected int nodeCount=3;
+  protected long amExpireMs=4000;
+  protected int rollingIntervalSec=13;
+  protected Resource capability;
+  protected Priority priority;
+  protected Priority priority2;
+  protected String node;
+  protected String rack;
+  protected String[] nodes;
+  protected String[] racks;
+  @Before public void setup() throws Exception {
+    conf=new YarnConfiguration();
+    createClusterAndStartApplication(conf);
+  }
+  protected void createClusterAndStartApplication(  Configuration conf) throws Exception {
+    this.conf=conf;
+    if (autoUpdate) {
+      conf.setBoolean(YarnConfiguration.RM_AUTO_UPDATE_CONTAINERS,true);
+    }
+    conf.set(YarnConfiguration.RM_SCHEDULER,schedulerName);
+    conf.setLong(YarnConfiguration.RM_AMRM_TOKEN_MASTER_KEY_ROLLING_INTERVAL_SECS,rollingIntervalSec);
+    conf.setLong(YarnConfiguration.RM_AM_EXPIRY_INTERVAL_MS,amExpireMs);
+    conf.setInt(YarnConfiguration.RM_NM_HEARTBEAT_INTERVAL_MS,100);
+    conf.setInt(YarnConfiguration.RM_SCHEDULER_MINIMUM_ALLOCATION_MB,512);
+    conf.setLong(YarnConfiguration.NM_LOG_RETAIN_SECONDS,1);
+    conf.setBoolean(YarnConfiguration.OPPORTUNISTIC_CONTAINER_ALLOCATION_ENABLED,true);
+    conf.setInt(YarnConfiguration.NM_OPPORTUNISTIC_CONTAINERS_MAX_QUEUE_LENGTH,10);
+    yarnCluster=new MiniYARNCluster(TestAMRMClient.class.getName(),nodeCount,1,1);
+    yarnCluster.init(conf);
+    yarnCluster.start();
+    yarnClient=YarnClient.createYarnClient();
+    yarnClient.init(conf);
+    yarnClient.start();
+    assertTrue("All node managers did not connect to the RM within the " + "allotted 5-second timeout",yarnCluster.waitForNodeManagersToConnect(5000L));
+    nodeReports=yarnClient.getNodeReports(NodeState.RUNNING);
+    assertEquals("Not all node managers were reported running",nodeCount,nodeReports.size());
+    priority=Priority.newInstance(1);
+    priority2=Priority.newInstance(2);
+    capability=Resource.newInstance(1024,1);
+    node=nodeReports.get(0).getNodeId().getHost();
+    rack=nodeReports.get(0).getRackName();
+    nodes=new String[]{node};
+    racks=new String[]{rack};
+    ApplicationSubmissionContext appContext=yarnClient.createApplication().getApplicationSubmissionContext();
+    ApplicationId appId=appContext.getApplicationId();
+    appContext.setApplicationName("Test");
+    Priority pri=Records.newRecord(Priority.class);
+    pri.setPriority(0);
+    appContext.setPriority(pri);
+    appContext.setQueue("default");
+    ContainerLaunchContext amContainer=BuilderUtils.newContainerLaunchContext(Collections.<String,LocalResource>emptyMap(),new HashMap<String,String>(),Arrays.asList("sleep","100"),new HashMap<String,ByteBuffer>(),null,new HashMap<ApplicationAccessType,String>());
+    appContext.setAMContainerSpec(amContainer);
+    appContext.setResource(Resource.newInstance(1024,1));
+    SubmitApplicationRequest appRequest=Records.newRecord(SubmitApplicationRequest.class);
+    appRequest.setApplicationSubmissionContext(appContext);
+    yarnClient.submitApplication(appContext);
+    RMAppAttempt appAttempt=null;
+    while (true) {
+      ApplicationReport appReport=yarnClient.getApplicationReport(appId);
+      if (appReport.getYarnApplicationState() == YarnApplicationState.ACCEPTED) {
+        attemptId=appReport.getCurrentApplicationAttemptId();
+        appAttempt=yarnCluster.getResourceManager().getRMContext().getRMApps().get(attemptId.getApplicationId()).getCurrentAppAttempt();
+        while (true) {
+          if (appAttempt.getAppAttemptState() == RMAppAttemptState.LAUNCHED) {
+            break;
+          }
+        }
+        break;
+      }
+    }
+    UserGroupInformation.setLoginUser(UserGroupInformation.createRemoteUser(UserGroupInformation.getCurrentUser().getUserName()));
+    UserGroupInformation.getCurrentUser().addToken(appAttempt.getAMRMToken());
+    appAttempt.getAMRMToken().setService(ClientRMProxy.getAMRMTokenService(conf));
+  }
+  @After public void teardown() throws YarnException, IOException {
+    yarnClient.killApplication(attemptId.getApplicationId());
+    attemptId=null;
+    if (yarnClient != null && yarnClient.getServiceState() == Service.STATE.STARTED) {
+      yarnClient.stop();
+    }
+    if (yarnCluster != null && yarnCluster.getServiceState() == Service.STATE.STARTED) {
+      yarnCluster.stop();
+    }
+  }
+}

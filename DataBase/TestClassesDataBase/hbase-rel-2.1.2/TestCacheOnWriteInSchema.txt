@@ -1,0 +1,163 @@
+/** 
+ * Tests  {@link HFile} cache-on-write functionality for data blocks, non-rootindex blocks, and Bloom filter blocks, as specified by the column family.
+ */
+@RunWith(Parameterized.class) @Category({RegionServerTests.class,MediumTests.class}) public class TestCacheOnWriteInSchema {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestCacheOnWriteInSchema.class);
+  private static final Logger LOG=LoggerFactory.getLogger(TestCacheOnWriteInSchema.class);
+  @Rule public TestName name=new TestName();
+  private static final HBaseTestingUtility TEST_UTIL=HBaseTestingUtility.createLocalHTU();
+  private static final String DIR=TEST_UTIL.getDataTestDir("TestCacheOnWriteInSchema").toString();
+  private static byte[] table;
+  private static byte[] family=Bytes.toBytes("family");
+  private static final int NUM_KV=25000;
+  private static final Random rand=new Random(12983177L);
+  /** 
+ * The number of valid key types possible in a store file 
+ */
+  private static final int NUM_VALID_KEY_TYPES=KeyValue.Type.values().length - 2;
+  private static enum CacheOnWriteType {  DATA_BLOCKS(BlockType.DATA,BlockType.ENCODED_DATA),   BLOOM_BLOCKS(BlockType.BLOOM_CHUNK),   INDEX_BLOCKS(BlockType.LEAF_INDEX,BlockType.INTERMEDIATE_INDEX);   private final BlockType blockType1;
+  private final BlockType blockType2;
+  private CacheOnWriteType(  BlockType blockType){
+    this(blockType,blockType);
+  }
+  private CacheOnWriteType(  BlockType blockType1,  BlockType blockType2){
+    this.blockType1=blockType1;
+    this.blockType2=blockType2;
+  }
+  public boolean shouldBeCached(  BlockType blockType){
+    return blockType == blockType1 || blockType == blockType2;
+  }
+  public ColumnFamilyDescriptorBuilder modifyFamilySchema(  ColumnFamilyDescriptorBuilder builder){
+switch (this) {
+case DATA_BLOCKS:
+      builder.setCacheDataOnWrite(true);
+    break;
+case BLOOM_BLOCKS:
+  builder.setCacheBloomsOnWrite(true);
+break;
+case INDEX_BLOCKS:
+builder.setCacheIndexesOnWrite(true);
+break;
+}
+return builder;
+}
+}
+private final CacheOnWriteType cowType;
+private Configuration conf;
+private final String testDescription;
+private HRegion region;
+private HStore store;
+private WALFactory walFactory;
+private FileSystem fs;
+public TestCacheOnWriteInSchema(CacheOnWriteType cowType){
+this.cowType=cowType;
+testDescription="[cacheOnWrite=" + cowType + "]";
+System.out.println(testDescription);
+}
+@Parameters public static Collection<Object[]> getParameters(){
+List<Object[]> cowTypes=new ArrayList<>();
+for (CacheOnWriteType cowType : CacheOnWriteType.values()) {
+cowTypes.add(new Object[]{cowType});
+}
+return cowTypes;
+}
+@Before public void setUp() throws IOException {
+table=Bytes.toBytes(name.getMethodName().replaceAll("[\\[\\]]","_"));
+conf=TEST_UTIL.getConfiguration();
+conf.setInt(HFile.FORMAT_VERSION_KEY,HFile.MAX_FORMAT_VERSION);
+conf.setBoolean(CacheConfig.CACHE_BLOCKS_ON_WRITE_KEY,false);
+conf.setBoolean(CacheConfig.CACHE_INDEX_BLOCKS_ON_WRITE_KEY,false);
+conf.setBoolean(CacheConfig.CACHE_BLOOM_BLOCKS_ON_WRITE_KEY,false);
+CacheConfig.instantiateBlockCache(conf);
+fs=HFileSystem.get(conf);
+ColumnFamilyDescriptor hcd=cowType.modifyFamilySchema(ColumnFamilyDescriptorBuilder.newBuilder(family).setBloomFilterType(BloomType.ROWCOL)).build();
+TableDescriptor htd=TableDescriptorBuilder.newBuilder(TableName.valueOf(table)).setColumnFamily(hcd).build();
+String id=TestCacheOnWriteInSchema.class.getName();
+Path logdir=new Path(FSUtils.getRootDir(conf),AbstractFSWALProvider.getWALDirectoryName(id));
+fs.delete(logdir,true);
+RegionInfo info=RegionInfoBuilder.newBuilder(htd.getTableName()).build();
+walFactory=new WALFactory(conf,id);
+region=TEST_UTIL.createLocalHRegion(info,htd,walFactory.getWAL(info));
+store=new HStore(region,hcd,conf);
+}
+@After public void tearDown() throws IOException {
+IOException ex=null;
+try {
+region.close();
+}
+ catch (IOException e) {
+LOG.warn("Caught Exception",e);
+ex=e;
+}
+try {
+walFactory.close();
+}
+ catch (IOException e) {
+LOG.warn("Caught Exception",e);
+ex=e;
+}
+try {
+fs.delete(new Path(DIR),true);
+}
+ catch (IOException e) {
+LOG.error("Could not delete " + DIR,e);
+ex=e;
+}
+if (ex != null) {
+throw ex;
+}
+}
+@Test public void testCacheOnWriteInSchema() throws IOException {
+StoreFileWriter writer=store.createWriterInTmp(Integer.MAX_VALUE,HFile.DEFAULT_COMPRESSION_ALGORITHM,false,true,false,false);
+writeStoreFile(writer);
+writer.close();
+readStoreFile(writer.getPath());
+}
+private void readStoreFile(Path path) throws IOException {
+CacheConfig cacheConf=store.getCacheConfig();
+BlockCache cache=cacheConf.getBlockCache();
+HStoreFile sf=new HStoreFile(fs,path,conf,cacheConf,BloomType.ROWCOL,true);
+sf.initReader();
+HFile.Reader reader=sf.getReader().getHFileReader();
+try {
+HFileScanner scanner=reader.getScanner(false,false);
+assertTrue(testDescription,scanner.seekTo());
+long offset=0;
+while (offset < reader.getTrailer().getLoadOnOpenDataOffset()) {
+HFileBlock block=reader.readBlock(offset,-1,false,true,false,true,null,DataBlockEncoding.NONE);
+BlockCacheKey blockCacheKey=new BlockCacheKey(reader.getName(),offset);
+boolean isCached=cache.getBlock(blockCacheKey,true,false,true) != null;
+boolean shouldBeCached=cowType.shouldBeCached(block.getBlockType());
+if (shouldBeCached != isCached) {
+throw new AssertionError("shouldBeCached: " + shouldBeCached + "\n"+ "isCached: "+ isCached+ "\n"+ "Test description: "+ testDescription+ "\n"+ "block: "+ block+ "\n"+ "blockCacheKey: "+ blockCacheKey);
+}
+offset+=block.getOnDiskSizeWithHeader();
+}
+}
+  finally {
+reader.close();
+}
+}
+private static KeyValue.Type generateKeyType(Random rand){
+if (rand.nextBoolean()) {
+return KeyValue.Type.Put;
+}
+ else {
+KeyValue.Type keyType=KeyValue.Type.values()[1 + rand.nextInt(NUM_VALID_KEY_TYPES)];
+if (keyType == KeyValue.Type.Minimum || keyType == KeyValue.Type.Maximum) {
+throw new RuntimeException("Generated an invalid key type: " + keyType + ". "+ "Probably the layout of KeyValue.Type has changed.");
+}
+return keyType;
+}
+}
+private void writeStoreFile(StoreFileWriter writer) throws IOException {
+final int rowLen=32;
+for (int i=0; i < NUM_KV; ++i) {
+byte[] k=RandomKeyValueUtil.randomOrderedKey(rand,i);
+byte[] v=RandomKeyValueUtil.randomValue(rand);
+int cfLen=rand.nextInt(k.length - rowLen + 1);
+KeyValue kv=new KeyValue(k,0,rowLen,k,rowLen,cfLen,k,rowLen + cfLen,k.length - rowLen - cfLen,rand.nextLong(),generateKeyType(rand),v,0,v.length);
+writer.append(kv);
+}
+}
+}

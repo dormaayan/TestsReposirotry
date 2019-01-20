@@ -1,0 +1,82 @@
+/** 
+ * Traversing a relationship chain has no consistency guarantees that there will be no change between starting the traversal and continuing through it. Therefore relationships might get deleted right when, or before, traversing there. The previous behaviour was to be aware of that and simply abort the chain traversal. Given the fact that relationship ids will not be reused within the same database session the behaviour has been changed to continue through such unused relationships, reading its pointers, until arriving at either  {@code -1} or a used relationship.
+ */
+public class RelationshipChainPointerChasingTest {
+  private static final int THRESHOLD=10;
+  @Rule public final DatabaseRule db=new ImpermanentDatabaseRule().withSetting(GraphDatabaseSettings.dense_node_threshold,String.valueOf(THRESHOLD));
+  @Test public void shouldChaseTheLivingRelationships() throws Exception {
+    int numberOfRelationships=THRESHOLD / 2;
+    Node node;
+    try (Transaction tx=db.beginTx()){
+      node=db.createNode();
+      for (int i=0; i < numberOfRelationships; i++) {
+        node.createRelationshipTo(db.createNode(),TEST);
+      }
+      tx.success();
+    }
+     Relationship[] relationships;
+    try (Transaction tx=db.beginTx()){
+      relationships=asArray(Relationship.class,node.getRelationships());
+      tx.success();
+    }
+     try (Transaction tx=db.beginTx()){
+      Iterator<Relationship> iterator=node.getRelationships().iterator();
+      deleteRelationshipsInSeparateThread(relationships[1],relationships[2]);
+      assertNext(relationships[0],iterator);
+      assertNext(relationships[3],iterator);
+      assertNext(relationships[4],iterator);
+      assertFalse(iterator.hasNext());
+      tx.success();
+    }
+   }
+  @Test public void shouldChaseTheLivingRelationshipGroups() throws Exception {
+    Node node;
+    Relationship relationshipInTheMiddle;
+    Relationship relationshipInTheEnd;
+    try (Transaction tx=db.beginTx()){
+      node=db.createNode();
+      for (int i=0; i < THRESHOLD; i++) {
+        node.createRelationshipTo(db.createNode(),TEST);
+      }
+      relationshipInTheMiddle=node.createRelationshipTo(db.createNode(),TEST2);
+      relationshipInTheEnd=node.createRelationshipTo(db.createNode(),TEST_TRAVERSAL);
+      tx.success();
+    }
+     try (Transaction tx=db.beginTx()){
+      Iterator<Relationship> relationships=node.getRelationships().iterator();
+      for (int i=0; i < THRESHOLD / 2; i++) {
+        assertTrue(relationships.next().isType(TEST));
+      }
+      deleteRelationshipsInSeparateThread(relationshipInTheMiddle);
+      for (int i=0; i < THRESHOLD / 2; i++) {
+        assertTrue(relationships.next().isType(TEST));
+      }
+      assertNext(relationshipInTheEnd,relationships);
+      assertFalse(relationships.hasNext());
+      tx.success();
+    }
+   }
+  private void assertNext(  Relationship expected,  Iterator<Relationship> iterator){
+    assertTrue("Expected there to be more relationships",iterator.hasNext());
+    assertEquals("Unexpected next relationship",expected,iterator.next());
+  }
+  private void deleteRelationshipsInSeparateThread(  final Relationship... relationships) throws InterruptedException {
+    executeTransactionInSeparateThread(() -> {
+      for (      Relationship relationship : relationships) {
+        relationship.delete();
+      }
+    }
+);
+  }
+  private void executeTransactionInSeparateThread(  final Runnable actionInsideTransaction) throws InterruptedException {
+    Thread thread=new Thread(() -> {
+      try (Transaction tx=db.beginTx()){
+        actionInsideTransaction.run();
+        tx.success();
+      }
+     }
+);
+    thread.start();
+    thread.join();
+  }
+}

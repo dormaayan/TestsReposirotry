@@ -1,0 +1,82 @@
+/** 
+ * Testcase for HBASE-20066
+ */
+@Category({RegionServerTests.class,LargeTests.class}) public class TestSequenceIdMonotonicallyIncreasing {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestSequenceIdMonotonicallyIncreasing.class);
+  private static final HBaseTestingUtility UTIL=new HBaseTestingUtility();
+  private static final TableName NAME=TableName.valueOf("test");
+  private static final byte[] CF=Bytes.toBytes("cf");
+  private static final byte[] CQ=Bytes.toBytes("cq");
+  @BeforeClass public static void setUpBeforeClass() throws Exception {
+    UTIL.startMiniCluster(2);
+  }
+  @AfterClass public static void tearDownAfterClass() throws Exception {
+    UTIL.shutdownMiniCluster();
+  }
+  @After public void tearDown() throws IOException {
+    Admin admin=UTIL.getAdmin();
+    if (admin.tableExists(NAME)) {
+      admin.disableTable(NAME);
+      admin.deleteTable(NAME);
+    }
+  }
+  private Table createTable(  boolean multiRegions) throws IOException {
+    if (multiRegions) {
+      return UTIL.createTable(NAME,CF,new byte[][]{Bytes.toBytes(1)});
+    }
+ else {
+      return UTIL.createTable(NAME,CF);
+    }
+  }
+  private long getMaxSeqId(  HRegionServer rs,  RegionInfo region) throws IOException {
+    Path walFile=((AbstractFSWAL<?>)rs.getWAL(null)).getCurrentFileName();
+    long maxSeqId=-1L;
+    try (WAL.Reader reader=WALFactory.createReader(UTIL.getTestFileSystem(),walFile,UTIL.getConfiguration())){
+      for (; ; ) {
+        WAL.Entry entry=reader.next();
+        if (entry == null) {
+          break;
+        }
+        if (Bytes.equals(region.getEncodedNameAsBytes(),entry.getKey().getEncodedRegionName())) {
+          maxSeqId=Math.max(maxSeqId,entry.getKey().getSequenceId());
+        }
+      }
+    }
+     return maxSeqId;
+  }
+  @Test public void testSplit() throws IOException, InterruptedException, ExecutionException, TimeoutException {
+    try (Table table=createTable(false)){
+      table.put(new Put(Bytes.toBytes(0)).addColumn(CF,CQ,Bytes.toBytes(0)));
+      table.put(new Put(Bytes.toBytes(1)).addColumn(CF,CQ,Bytes.toBytes(0)));
+    }
+     UTIL.flush(NAME);
+    HRegionServer rs=UTIL.getRSForFirstRegionInTable(NAME);
+    RegionInfo region=UTIL.getMiniHBaseCluster().getRegions(NAME).get(0).getRegionInfo();
+    UTIL.getAdmin().splitRegionAsync(region.getRegionName(),Bytes.toBytes(1)).get(1,TimeUnit.MINUTES);
+    long maxSeqId=getMaxSeqId(rs,region);
+    RegionLocator locator=UTIL.getConnection().getRegionLocator(NAME);
+    HRegionLocation locA=locator.getRegionLocation(Bytes.toBytes(0),true);
+    HRegionLocation locB=locator.getRegionLocation(Bytes.toBytes(1),true);
+    assertEquals(maxSeqId + 1,locA.getSeqNum());
+    assertEquals(maxSeqId + 1,locB.getSeqNum());
+  }
+  @Test public void testMerge() throws IOException, InterruptedException, ExecutionException, TimeoutException {
+    try (Table table=createTable(true)){
+      table.put(new Put(Bytes.toBytes(0)).addColumn(CF,CQ,Bytes.toBytes(0)));
+      table.put(new Put(Bytes.toBytes(1)).addColumn(CF,CQ,Bytes.toBytes(0)));
+      table.put(new Put(Bytes.toBytes(2)).addColumn(CF,CQ,Bytes.toBytes(0)));
+    }
+     UTIL.flush(NAME);
+    MiniHBaseCluster cluster=UTIL.getMiniHBaseCluster();
+    List<HRegion> regions=cluster.getRegions(NAME);
+    HRegion regionA=regions.get(0);
+    HRegion regionB=regions.get(1);
+    HRegionServer rsA=cluster.getRegionServer(cluster.getServerWith(regionA.getRegionInfo().getRegionName()));
+    HRegionServer rsB=cluster.getRegionServer(cluster.getServerWith(regionB.getRegionInfo().getRegionName()));
+    UTIL.getAdmin().mergeRegionsAsync(regionA.getRegionInfo().getRegionName(),regionB.getRegionInfo().getRegionName(),false).get(1,TimeUnit.MINUTES);
+    long maxSeqIdA=getMaxSeqId(rsA,regionA.getRegionInfo());
+    long maxSeqIdB=getMaxSeqId(rsB,regionB.getRegionInfo());
+    HRegionLocation loc=UTIL.getConnection().getRegionLocator(NAME).getRegionLocation(Bytes.toBytes(0),true);
+    assertEquals(Math.max(maxSeqIdA,maxSeqIdB) + 1,loc.getSeqNum());
+  }
+}

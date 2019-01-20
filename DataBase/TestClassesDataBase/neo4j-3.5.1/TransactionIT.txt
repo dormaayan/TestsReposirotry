@@ -1,0 +1,256 @@
+public class TransactionIT {
+  private static final String USER_AGENT="TransactionIT/0.0";
+  private static final Pattern BOOKMARK_PATTERN=Pattern.compile("neo4j:bookmark:v1:tx[0-9]+");
+  private static final BoltChannel BOLT_CHANNEL=BoltTestUtil.newTestBoltChannel();
+  @Rule public SessionRule env=new SessionRule();
+  @Rule public SuppressOutput suppressOutput=SuppressOutput.suppressAll();
+  @Test public void shouldHandleBeginCommit() throws Throwable {
+    BoltResponseRecorder recorder=new BoltResponseRecorder();
+    BoltStateMachine machine=env.newMachine(BOLT_CHANNEL);
+    machine.process(new InitMessage(USER_AGENT,emptyMap()),nullResponseHandler());
+    machine.process(new RunMessage("BEGIN",EMPTY_MAP),recorder);
+    machine.process(DiscardAllMessage.INSTANCE,nullResponseHandler());
+    machine.process(new RunMessage("CREATE (n:InTx)",EMPTY_MAP),recorder);
+    machine.process(DiscardAllMessage.INSTANCE,nullResponseHandler());
+    machine.process(new RunMessage("COMMIT",EMPTY_MAP),recorder);
+    machine.process(DiscardAllMessage.INSTANCE,nullResponseHandler());
+    assertThat(recorder.nextResponse(),succeeded());
+    assertThat(recorder.nextResponse(),succeeded());
+    assertThat(recorder.nextResponse(),succeeded());
+  }
+  @Test public void shouldHandleBeginRollback() throws Throwable {
+    BoltResponseRecorder recorder=new BoltResponseRecorder();
+    BoltStateMachine machine=env.newMachine(BOLT_CHANNEL);
+    machine.process(new InitMessage(USER_AGENT,emptyMap()),nullResponseHandler());
+    machine.process(new RunMessage("BEGIN",EMPTY_MAP),recorder);
+    machine.process(DiscardAllMessage.INSTANCE,nullResponseHandler());
+    machine.process(new RunMessage("CREATE (n:InTx)",EMPTY_MAP),recorder);
+    machine.process(DiscardAllMessage.INSTANCE,nullResponseHandler());
+    machine.process(new RunMessage("ROLLBACK",EMPTY_MAP),recorder);
+    machine.process(DiscardAllMessage.INSTANCE,nullResponseHandler());
+    assertThat(recorder.nextResponse(),succeeded());
+    assertThat(recorder.nextResponse(),succeeded());
+    assertThat(recorder.nextResponse(),succeeded());
+  }
+  @Test public void shouldNotFailWhenOutOfOrderRollbackInAutoCommitMode() throws Throwable {
+    BoltResponseRecorder runRecorder=new BoltResponseRecorder();
+    BoltResponseRecorder pullAllRecorder=new BoltResponseRecorder();
+    BoltStateMachine machine=env.newMachine(BOLT_CHANNEL);
+    machine.process(new InitMessage(USER_AGENT,emptyMap()),nullResponseHandler());
+    machine.process(new RunMessage("ROLLBACK",EMPTY_MAP),runRecorder);
+    machine.process(PullAllMessage.INSTANCE,pullAllRecorder);
+    assertThat(runRecorder.nextResponse(),succeeded());
+    assertThat(pullAllRecorder.nextResponse(),succeeded());
+  }
+  @Test public void shouldReceiveBookmarkOnCommitAndDiscardAll() throws Throwable {
+    BoltResponseRecorder recorder=new BoltResponseRecorder();
+    BoltStateMachine machine=env.newMachine(BOLT_CHANNEL);
+    machine.process(new InitMessage(USER_AGENT,emptyMap()),nullResponseHandler());
+    machine.process(new RunMessage("BEGIN",EMPTY_MAP),recorder);
+    machine.process(DiscardAllMessage.INSTANCE,recorder);
+    machine.process(new RunMessage("CREATE (a:Person)",EMPTY_MAP),recorder);
+    machine.process(DiscardAllMessage.INSTANCE,recorder);
+    machine.process(new RunMessage("COMMIT",EMPTY_MAP),recorder);
+    machine.process(DiscardAllMessage.INSTANCE,recorder);
+    assertThat(recorder.nextResponse(),succeeded());
+    assertThat(recorder.nextResponse(),succeeded());
+    assertThat(recorder.nextResponse(),succeeded());
+    assertThat(recorder.nextResponse(),succeeded());
+    assertThat(recorder.nextResponse(),succeeded());
+    assertThat(recorder.nextResponse(),succeededWithMetadata("bookmark",BOOKMARK_PATTERN));
+  }
+  @Test public void shouldReceiveBookmarkOnCommitAndPullAll() throws Throwable {
+    BoltResponseRecorder recorder=new BoltResponseRecorder();
+    BoltStateMachine machine=env.newMachine(BOLT_CHANNEL);
+    machine.process(new InitMessage(USER_AGENT,emptyMap()),nullResponseHandler());
+    machine.process(new RunMessage("BEGIN",EMPTY_MAP),recorder);
+    machine.process(DiscardAllMessage.INSTANCE,recorder);
+    machine.process(new RunMessage("CREATE (a:Person)",EMPTY_MAP),recorder);
+    machine.process(DiscardAllMessage.INSTANCE,recorder);
+    machine.process(new RunMessage("COMMIT",EMPTY_MAP),recorder);
+    machine.process(PullAllMessage.INSTANCE,recorder);
+    assertThat(recorder.nextResponse(),succeeded());
+    assertThat(recorder.nextResponse(),succeeded());
+    assertThat(recorder.nextResponse(),succeeded());
+    assertThat(recorder.nextResponse(),succeeded());
+    assertThat(recorder.nextResponse(),succeeded());
+    assertThat(recorder.nextResponse(),succeededWithMetadata("bookmark",BOOKMARK_PATTERN));
+  }
+  @Test public void shouldReadYourOwnWrites() throws Exception {
+    try (Transaction tx=env.graph().beginTx()){
+      Node node=env.graph().createNode(Label.label("A"));
+      node.setProperty("prop","one");
+      tx.success();
+    }
+     BinaryLatch latch=new BinaryLatch();
+    long dbVersion=env.lastClosedTxId();
+    Thread thread=new Thread(() -> {
+      try (BoltStateMachine machine=env.newMachine(BOLT_CHANNEL)){
+        machine.process(new InitMessage(USER_AGENT,emptyMap()),nullResponseHandler());
+        latch.await();
+        machine.process(new RunMessage("MATCH (n:A) SET n.prop = 'two'",EMPTY_MAP),nullResponseHandler());
+        machine.process(PullAllMessage.INSTANCE,nullResponseHandler());
+      }
+ catch (      BoltConnectionFatality connectionFatality) {
+        throw new RuntimeException(connectionFatality);
+      }
+    }
+);
+    thread.start();
+    long dbVersionAfterWrite=dbVersion + 1;
+    try (BoltStateMachine machine=env.newMachine(BOLT_CHANNEL)){
+      BoltResponseRecorder recorder=new BoltResponseRecorder();
+      machine.process(new InitMessage(USER_AGENT,emptyMap()),nullResponseHandler());
+      latch.release();
+      final String bookmark="neo4j:bookmark:v1:tx" + dbVersionAfterWrite;
+      machine.process(new RunMessage("BEGIN",ValueUtils.asMapValue(singletonMap("bookmark",bookmark))),nullResponseHandler());
+      machine.process(PullAllMessage.INSTANCE,recorder);
+      machine.process(new RunMessage("MATCH (n:A) RETURN n.prop",EMPTY_MAP),nullResponseHandler());
+      machine.process(PullAllMessage.INSTANCE,recorder);
+      machine.process(new RunMessage("COMMIT",EMPTY_MAP),nullResponseHandler());
+      machine.process(PullAllMessage.INSTANCE,recorder);
+      assertThat(recorder.nextResponse(),succeeded());
+      assertThat(recorder.nextResponse(),succeededWithRecord("two"));
+      assertThat(recorder.nextResponse(),succeededWithMetadata("bookmark",BOOKMARK_PATTERN));
+    }
+     thread.join();
+  }
+  @Test public void shouldTerminateQueriesEvenIfUsingPeriodicCommit() throws Exception {
+    final DoubleLatch latch=new DoubleLatch(3,true);
+    final Barrier.Control barrier=new Barrier.Control();
+    Server server=createHttpServer(latch,barrier,20,30);
+    server.start();
+    int localPort=getLocalPort(server);
+    final BoltStateMachine[] machine={null};
+    Thread thread=new Thread(() -> {
+      try (BoltStateMachine stateMachine=env.newMachine(BOLT_CHANNEL)){
+        machine[0]=stateMachine;
+        stateMachine.process(new InitMessage(USER_AGENT,emptyMap()),nullResponseHandler());
+        String query=format("USING PERIODIC COMMIT 10 LOAD CSV FROM 'http://localhost:%d' AS line " + "CREATE (n:A {id: line[0], square: line[1]}) " + "WITH count(*) as number "+ "CREATE (n:ShouldNotExist)",localPort);
+        try {
+          latch.start();
+          stateMachine.process(new RunMessage(query,EMPTY_MAP),nullResponseHandler());
+          stateMachine.process(PullAllMessage.INSTANCE,nullResponseHandler());
+        }
+  finally {
+          latch.finish();
+        }
+      }
+ catch (      BoltConnectionFatality connectionFatality) {
+        throw new RuntimeException(connectionFatality);
+      }
+    }
+);
+    thread.setName("query runner");
+    thread.start();
+    latch.startAndWaitForAllToStart();
+    Thread.sleep(1000);
+    machine[0].process(ResetMessage.INSTANCE,nullResponseHandler());
+    barrier.release();
+    latch.finishAndWaitForAllToFinish();
+    try (Transaction ignored=env.graph().beginTx()){
+      assertFalse("Query was not terminated in time - nodes were created!",env.graph().findNodes(Label.label("ShouldNotExist")).hasNext());
+    }
+   }
+  @Test public void shouldInterpretEmptyStatementAsReuseLastStatementInAutocommitTransaction() throws Throwable {
+    final BoltStateMachine machine=env.newMachine(BOLT_CHANNEL);
+    machine.process(new InitMessage(USER_AGENT,emptyMap()),nullResponseHandler());
+    BoltResponseRecorder recorder=new BoltResponseRecorder();
+    machine.process(new RunMessage("RETURN 1",EMPTY_MAP),nullResponseHandler());
+    machine.process(PullAllMessage.INSTANCE,recorder);
+    machine.process(new RunMessage("",EMPTY_MAP),nullResponseHandler());
+    machine.process(PullAllMessage.INSTANCE,recorder);
+    assertThat(recorder.nextResponse(),succeededWithRecord(1L));
+    assertThat(recorder.nextResponse(),succeededWithRecord(1L));
+  }
+  @Test public void shouldInterpretEmptyStatementAsReuseLastStatementInExplicitTransaction() throws Throwable {
+    final BoltStateMachine machine=env.newMachine(BOLT_CHANNEL);
+    machine.process(new InitMessage(USER_AGENT,emptyMap()),nullResponseHandler());
+    BoltResponseRecorder recorder=new BoltResponseRecorder();
+    machine.process(new RunMessage("BEGIN",EMPTY_MAP),nullResponseHandler());
+    machine.process(DiscardAllMessage.INSTANCE,nullResponseHandler());
+    machine.process(new RunMessage("RETURN 1",EMPTY_MAP),nullResponseHandler());
+    machine.process(PullAllMessage.INSTANCE,recorder);
+    machine.process(new RunMessage("",EMPTY_MAP),nullResponseHandler());
+    machine.process(PullAllMessage.INSTANCE,recorder);
+    machine.process(new RunMessage("COMMIT",EMPTY_MAP),nullResponseHandler());
+    machine.process(DiscardAllMessage.INSTANCE,nullResponseHandler());
+    assertThat(recorder.nextResponse(),succeededWithRecord(1L));
+    assertThat(recorder.nextResponse(),succeededWithRecord(1L));
+  }
+  @Test public void beginShouldNotOverwriteLastStatement() throws Throwable {
+    final BoltStateMachine machine=env.newMachine(BOLT_CHANNEL);
+    machine.process(new InitMessage(USER_AGENT,emptyMap()),nullResponseHandler());
+    BoltResponseRecorder recorder=new BoltResponseRecorder();
+    machine.process(new RunMessage("RETURN 1",EMPTY_MAP),nullResponseHandler());
+    machine.process(PullAllMessage.INSTANCE,recorder);
+    machine.process(new RunMessage("BEGIN",EMPTY_MAP),nullResponseHandler());
+    machine.process(DiscardAllMessage.INSTANCE,nullResponseHandler());
+    machine.process(new RunMessage("",EMPTY_MAP),nullResponseHandler());
+    machine.process(PullAllMessage.INSTANCE,recorder);
+    machine.process(new RunMessage("COMMIT",EMPTY_MAP),nullResponseHandler());
+    machine.process(DiscardAllMessage.INSTANCE,nullResponseHandler());
+    assertThat(recorder.nextResponse(),succeededWithRecord(1L));
+    assertThat(recorder.nextResponse(),succeededWithRecord(1L));
+  }
+  @Test public void shouldCloseAutoCommitTransactionAndRespondToNextStatementWhenRunFails() throws Throwable {
+    final BoltStateMachine machine=env.newMachine(BOLT_CHANNEL);
+    machine.process(new InitMessage(USER_AGENT,emptyMap()),nullResponseHandler());
+    BoltResponseRecorder recorder=new BoltResponseRecorder();
+    machine.process(new RunMessage("INVALID QUERY",EMPTY_MAP),recorder);
+    machine.process(PullAllMessage.INSTANCE,recorder);
+    machine.process(AckFailureMessage.INSTANCE,recorder);
+    machine.process(new RunMessage("RETURN 2",EMPTY_MAP),recorder);
+    machine.process(PullAllMessage.INSTANCE,recorder);
+    assertThat(recorder.nextResponse(),failedWithStatus(Status.Statement.SyntaxError));
+    assertThat(recorder.nextResponse(),wasIgnored());
+    assertThat(recorder.nextResponse(),succeeded());
+    assertThat(recorder.nextResponse(),succeeded());
+    assertThat(recorder.nextResponse(),succeededWithRecord(2L));
+    assertEquals(0,recorder.responseCount());
+  }
+  @Test public void shouldCloseAutoCommitTransactionAndRespondToNextStatementWhenStreamingFails() throws Throwable {
+    final BoltStateMachine machine=env.newMachine(BOLT_CHANNEL);
+    machine.process(new InitMessage(USER_AGENT,emptyMap()),nullResponseHandler());
+    BoltResponseRecorder recorder=new BoltResponseRecorder();
+    machine.process(new RunMessage("UNWIND [1, 0] AS x RETURN 1 / x",EMPTY_MAP),recorder);
+    machine.process(PullAllMessage.INSTANCE,recorder);
+    machine.process(AckFailureMessage.INSTANCE,recorder);
+    machine.process(new RunMessage("RETURN 2",EMPTY_MAP),recorder);
+    machine.process(PullAllMessage.INSTANCE,recorder);
+    assertThat(recorder.nextResponse(),succeeded());
+    assertThat(recorder.nextResponse(),allOf(containsRecord(1L),failedWithStatus(Status.Statement.ArithmeticError)));
+    assertThat(recorder.nextResponse(),succeeded());
+    assertThat(recorder.nextResponse(),succeeded());
+    assertThat(recorder.nextResponse(),succeededWithRecord(2L));
+    assertEquals(0,recorder.responseCount());
+  }
+  public static Server createHttpServer(  DoubleLatch latch,  Barrier.Control innerBarrier,  int firstBatchSize,  int otherBatchSize){
+    Server server=new Server(0);
+    server.setHandler(new AbstractHandler(){
+      @Override public void handle(      String target,      Request baseRequest,      HttpServletRequest request,      HttpServletResponse response) throws IOException {
+        response.setContentType("text/plain; charset=utf-8");
+        response.setStatus(HttpServletResponse.SC_OK);
+        PrintWriter out=response.getWriter();
+        writeBatch(out,firstBatchSize);
+        out.flush();
+        latch.start();
+        innerBarrier.reached();
+        latch.finish();
+        writeBatch(out,otherBatchSize);
+        baseRequest.setHandled(true);
+      }
+      private void writeBatch(      PrintWriter out,      int batchSize){
+        for (int i=0; i < batchSize; i++) {
+          out.write(format("%d %d\n",i,i * i));
+          i++;
+        }
+      }
+    }
+);
+    return server;
+  }
+  private int getLocalPort(  Server server){
+    return ((ServerConnector)(server.getConnectors()[0])).getLocalPort();
+  }
+}

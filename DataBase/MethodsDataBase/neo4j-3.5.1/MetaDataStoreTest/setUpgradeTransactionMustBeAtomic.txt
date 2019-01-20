@@ -1,0 +1,42 @@
+@Test public void setUpgradeTransactionMustBeAtomic() throws Throwable {
+  try (MetaDataStore store=newMetaDataStore()){
+    PagedFile pf=store.pagedFile;
+    store.setUpgradeTransaction(0,0,0);
+    AtomicLong writeCount=new AtomicLong();
+    AtomicLong fileReadCount=new AtomicLong();
+    AtomicLong apiReadCount=new AtomicLong();
+    int upperLimit=10_000;
+    int lowerLimit=100;
+    long endTime=currentTimeMillis() + SECONDS.toMillis(10);
+    Race race=new Race();
+    race.withEndCondition(() -> writeCount.get() >= upperLimit && fileReadCount.get() >= upperLimit && apiReadCount.get() >= upperLimit);
+    race.withEndCondition(() -> writeCount.get() >= lowerLimit && fileReadCount.get() >= lowerLimit && apiReadCount.get() >= lowerLimit && currentTimeMillis() >= endTime);
+    race.addContestants(3,() -> {
+      long count=writeCount.incrementAndGet();
+      store.setUpgradeTransaction(count,count,count);
+    }
+);
+    race.addContestants(3,throwing(() -> {
+      try (PageCursor cursor=pf.io(0,PagedFile.PF_SHARED_READ_LOCK)){
+        assertTrue(cursor.next());
+        long id;
+        long checksum;
+        do {
+          id=store.getRecordValue(cursor,MetaDataStore.Position.UPGRADE_TRANSACTION_ID);
+          checksum=store.getRecordValue(cursor,MetaDataStore.Position.UPGRADE_TRANSACTION_CHECKSUM);
+        }
+ while (cursor.shouldRetry());
+        assertIdEqualsChecksum(id,checksum,"file");
+        fileReadCount.incrementAndGet();
+      }
+     }
+));
+    race.addContestants(3,() -> {
+      TransactionId transaction=store.getUpgradeTransaction();
+      assertIdEqualsChecksum(transaction.transactionId(),transaction.checksum(),"API");
+      apiReadCount.incrementAndGet();
+    }
+);
+    race.go();
+  }
+ }

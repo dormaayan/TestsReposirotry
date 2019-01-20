@@ -1,0 +1,73 @@
+/** 
+ * Tests the retry logic in startFile. We release the lock while generating an EDEK, so tricky things can happen in the intervening time.
+ */
+@Test public void testStartFileRetry() throws Exception {
+  final Path zone1=new Path("/zone1");
+  final Path file=new Path(zone1,"file1");
+  fsWrapper.mkdir(zone1,FsPermission.getDirDefault(),true);
+  ExecutorService executor=Executors.newSingleThreadExecutor();
+  executor.submit(new InjectFaultTask(){
+    @Override public void doCleanup() throws Exception {
+      assertEquals("Expected no startFile key generation",-1,injector.generateCount);
+      fsWrapper.delete(file,false);
+    }
+  }
+).get();
+  dfsAdmin.createEncryptionZone(zone1,TEST_KEY,NO_TRASH);
+  executor.submit(new InjectFaultTask(){
+    @Override public void doFault() throws Exception {
+      fsWrapper.delete(zone1,true);
+    }
+    @Override public void doCleanup() throws Exception {
+      assertEquals("Expected no startFile retries",1,injector.generateCount);
+      fsWrapper.delete(file,false);
+    }
+  }
+).get();
+  fsWrapper.mkdir(zone1,FsPermission.getDirDefault(),true);
+  final String otherKey="other_key";
+  DFSTestUtil.createKey(otherKey,cluster,conf);
+  dfsAdmin.createEncryptionZone(zone1,TEST_KEY,NO_TRASH);
+  executor.submit(new InjectFaultTask(){
+    @Override public void doFault() throws Exception {
+      fsWrapper.delete(zone1,true);
+      fsWrapper.mkdir(zone1,FsPermission.getDirDefault(),true);
+      dfsAdmin.createEncryptionZone(zone1,otherKey,NO_TRASH);
+    }
+    @Override public void doCleanup() throws Exception {
+      assertEquals("Expected a startFile retry",2,injector.generateCount);
+      fsWrapper.delete(zone1,true);
+    }
+  }
+).get();
+  fsWrapper.mkdir(zone1,FsPermission.getDirDefault(),true);
+  final String anotherKey="another_key";
+  DFSTestUtil.createKey(anotherKey,cluster,conf);
+  dfsAdmin.createEncryptionZone(zone1,anotherKey,NO_TRASH);
+  String keyToUse=otherKey;
+  MyInjector injector=new MyInjector();
+  EncryptionFaultInjector.instance=injector;
+  Future<?> future=executor.submit(new CreateFileTask(fsWrapper,file));
+  for (int i=0; i < DFSOutputStream.CREATE_RETRY_COUNT + 1; i++) {
+    injector.ready.await();
+    fsWrapper.delete(zone1,true);
+    fsWrapper.mkdir(zone1,FsPermission.getDirDefault(),true);
+    dfsAdmin.createEncryptionZone(zone1,keyToUse,NO_TRASH);
+    if (keyToUse == otherKey) {
+      keyToUse=anotherKey;
+    }
+ else {
+      keyToUse=otherKey;
+    }
+    injector.wait.countDown();
+    injector=new MyInjector();
+    EncryptionFaultInjector.instance=injector;
+  }
+  try {
+    future.get();
+    fail("Expected exception from too many retries");
+  }
+ catch (  ExecutionException e) {
+    assertExceptionContains("Too many retries because of encryption zone operations",e.getCause());
+  }
+}

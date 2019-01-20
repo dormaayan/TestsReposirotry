@@ -1,0 +1,93 @@
+/** 
+ * Test partitioned staging committer's logic for putting data in the right place.
+ */
+public class TestStagingPartitionedFileListing extends TaskCommitterTest<PartitionedStagingCommitter> {
+  @Override PartitionedStagingCommitter newJobCommitter() throws IOException {
+    return new PartitionedStagingCommitter(OUTPUT_PATH,createTaskAttemptForJob());
+  }
+  @Override PartitionedStagingCommitter newTaskCommitter() throws IOException {
+    return new PartitionedStagingCommitter(OUTPUT_PATH,getTAC());
+  }
+  private FileSystem attemptFS;
+  private Path attemptPath;
+  @After public void cleanupAttempt(){
+    cleanup("teardown",attemptFS,attemptPath);
+  }
+  @Test public void testTaskOutputListing() throws Exception {
+    PartitionedStagingCommitter committer=newTaskCommitter();
+    attemptPath=committer.getTaskAttemptPath(getTAC());
+    attemptFS=attemptPath.getFileSystem(getTAC().getConfiguration());
+    attemptFS.delete(attemptPath,true);
+    try {
+      List<String> expectedFiles=Lists.newArrayList();
+      for (      String dateint : Arrays.asList("20161115","20161116")) {
+        for (        String hour : Arrays.asList("13","14")) {
+          String relative="dateint=" + dateint + "/hour="+ hour+ "/"+ UUID.randomUUID().toString()+ ".parquet";
+          expectedFiles.add(relative);
+          attemptFS.create(new Path(attemptPath,relative)).close();
+        }
+      }
+      List<String> actualFiles=committer.getTaskOutput(getTAC()).stream().map(stat -> Paths.getRelativePath(attemptPath,stat.getPath())).collect(Collectors.toList());
+      Collections.sort(expectedFiles);
+      Collections.sort(actualFiles);
+      assertEquals("File sets should match",expectedFiles,actualFiles);
+    }
+  finally {
+      deleteQuietly(attemptFS,attemptPath,true);
+    }
+  }
+  @Test public void testTaskOutputListingWithHiddenFiles() throws Exception {
+    PartitionedStagingCommitter committer=newTaskCommitter();
+    attemptPath=committer.getTaskAttemptPath(getTAC());
+    attemptFS=attemptPath.getFileSystem(getTAC().getConfiguration());
+    attemptFS.delete(attemptPath,true);
+    try {
+      List<String> expectedFiles=Lists.newArrayList();
+      for (      String dateint : Arrays.asList("20161115","20161116")) {
+        String metadata="dateint=" + dateint + "/"+ "_metadata";
+        attemptFS.create(new Path(attemptPath,metadata)).close();
+        for (        String hour : Arrays.asList("13","14")) {
+          String relative="dateint=" + dateint + "/hour="+ hour+ "/"+ UUID.randomUUID().toString()+ ".parquet";
+          expectedFiles.add(relative);
+          attemptFS.create(new Path(attemptPath,relative)).close();
+          String partial="dateint=" + dateint + "/hour="+ hour+ "/."+ UUID.randomUUID().toString()+ ".partial";
+          attemptFS.create(new Path(attemptPath,partial)).close();
+        }
+      }
+      List<String> actualFiles=committer.getTaskOutput(getTAC()).stream().map(stat -> Paths.getRelativePath(attemptPath,stat.getPath())).collect(Collectors.toList());
+      Collections.sort(expectedFiles);
+      Collections.sort(actualFiles);
+      assertEquals("File sets should match",expectedFiles,actualFiles);
+    }
+  finally {
+      deleteQuietly(attemptFS,attemptPath,true);
+    }
+  }
+  @Test public void testPartitionsResolution() throws Throwable {
+    File tempDir=getTempDir();
+    File partitionsDir=new File(tempDir,"partitions");
+    attemptPath=new Path(partitionsDir.toURI());
+    attemptFS=FileSystem.getLocal(getJob().getConfiguration());
+    deleteQuietly(attemptFS,attemptPath,true);
+    attemptFS.mkdirs(attemptPath);
+    assertTrue(Paths.getPartitions(attemptPath,new ArrayList<>(0)).isEmpty());
+    String oct2017="year=2017/month=10";
+    Path octLog=new Path(attemptPath,oct2017 + "/log-2017-10-04.txt");
+    touch(attemptFS,octLog);
+    assertThat(listPartitions(attemptFS,attemptPath),hasItem(oct2017));
+    Path rootFile=new Path(attemptPath,"root.txt");
+    touch(attemptFS,rootFile);
+    assertThat(listPartitions(attemptFS,attemptPath),allOf(hasItem(oct2017),hasItem(StagingCommitterConstants.TABLE_ROOT)));
+  }
+  /** 
+ * List files in a filesystem using  {@code listFiles()}, then get all the partitions.
+ * @param fs filesystem
+ * @param base base of tree
+ * @return a list of partitions
+ * @throws IOException failure
+ */
+  private Set<String> listPartitions(  FileSystem fs,  Path base) throws IOException {
+    List<FileStatus> statusList=mapLocatedFiles(fs.listFiles(base,true),s -> (FileStatus)s);
+    return Paths.getPartitions(base,statusList);
+  }
+}

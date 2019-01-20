@@ -1,0 +1,35 @@
+@Test(timeout=30_000) public void begin__execute__rollback_concurrently() throws Exception {
+  final Response begin=http.POST("db/data/transaction");
+  assertThat(begin.status(),equalTo(201));
+  assertHasTxLocation(begin);
+  Label sharedLockLabel=Label.label("sharedLock");
+  http.POST("db/data/transaction/commit",quotedJson("{ 'statements': [ { 'statement': 'CREATE (n:" + sharedLockLabel + ")' } ] }"));
+  CountDownLatch nodeLockLatch=new CountDownLatch(1);
+  CountDownLatch nodeReleaseLatch=new CountDownLatch(1);
+  Future<?> lockerFuture=executors.submit(() -> lockNodeWithLabel(sharedLockLabel,nodeLockLatch,nodeReleaseLatch));
+  nodeLockLatch.await();
+  final String executeResource=begin.location();
+  final String statement="MATCH (n:" + sharedLockLabel + ") DELETE n RETURN count(n)";
+  final Future<Response> executeFuture=executors.submit(() -> {
+    HTTP.Builder requestBuilder=HTTP.withBaseUri(server().baseUri());
+    Response response=requestBuilder.POST(executeResource,quotedJson("{ 'statements': [ { 'statement': '" + statement + "' } ] }"));
+    assertThat(response.status(),equalTo(200));
+    return response;
+  }
+);
+  final Future<Response> interruptFuture=executors.submit(() -> {
+    waitForStatementExecution(statement);
+    Response response=http.DELETE(executeResource);
+    assertThat(response.toString(),response.status(),equalTo(200));
+    nodeReleaseLatch.countDown();
+    return response;
+  }
+);
+  interruptFuture.get();
+  lockerFuture.get();
+  Response execute=executeFuture.get();
+  assertThat(execute,hasErrors(Status.Statement.ExecutionFailed));
+  Response execute2=http.POST(executeResource,quotedJson("{ 'statements': [ { 'statement': 'CREATE (n)' } ] }"));
+  assertThat(execute2.status(),equalTo(404));
+  assertThat(execute2,hasErrors(Status.Transaction.TransactionNotFound));
+}

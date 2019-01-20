@@ -1,0 +1,281 @@
+@RunWith(Parameterized.class) public class LogTailScannerTest {
+  private final EphemeralFileSystemRule fsRule=new EphemeralFileSystemRule();
+  private final PageCacheRule pageCacheRule=new PageCacheRule();
+  private final TestDirectory testDirectory=TestDirectory.testDirectory(fsRule);
+  @Rule public final RuleChain ruleChain=RuleChain.outerRule(fsRule).around(testDirectory).around(pageCacheRule);
+  private final LogEntryReader<ReadableClosablePositionAwareChannel> reader=new VersionAwareLogEntryReader<>();
+  private LogTailScanner tailScanner;
+  private final Monitors monitors=new Monitors();
+  private LogFiles logFiles;
+  private final int startLogVersion;
+  private final int endLogVersion;
+  private final LogEntryVersion latestLogEntryVersion=LogEntryVersion.CURRENT;
+  private LogVersionRepository logVersionRepository;
+  public LogTailScannerTest(  Integer startLogVersion,  Integer endLogVersion){
+    this.startLogVersion=startLogVersion;
+    this.endLogVersion=endLogVersion;
+  }
+  @Parameterized.Parameters(name="{0},{1}") public static Collection<Object[]> params(){
+    return Arrays.asList(new Object[]{1,2},new Object[]{42,43});
+  }
+  @Before public void setUp() throws IOException {
+    logVersionRepository=new SimpleLogVersionRepository();
+    logFiles=LogFilesBuilder.activeFilesBuilder(testDirectory.databaseLayout(),fsRule,pageCacheRule.getPageCache(fsRule)).withLogVersionRepository(logVersionRepository).build();
+    tailScanner=new LogTailScanner(logFiles,reader,monitors);
+  }
+  @Test public void noLogFilesFound(){
+    setupLogFiles();
+    LogTailInformation logTailInformation=tailScanner.getTailInformation();
+    assertLatestCheckPoint(false,false,NO_TRANSACTION_ID,-1,logTailInformation);
+  }
+  @Test public void oneLogFileNoCheckPoints(){
+    setupLogFiles(logFile());
+    LogTailInformation logTailInformation=tailScanner.getTailInformation();
+    assertLatestCheckPoint(false,true,NO_TRANSACTION_ID,endLogVersion,logTailInformation);
+  }
+  @Test public void oneLogFileNoCheckPointsOneStart(){
+    long txId=10;
+    setupLogFiles(logFile(start(),commit(txId)));
+    LogTailInformation logTailInformation=tailScanner.getTailInformation();
+    assertLatestCheckPoint(false,true,txId,endLogVersion,logTailInformation);
+  }
+  @Test public void twoLogFilesNoCheckPoints(){
+    setupLogFiles(logFile(),logFile());
+    LogTailInformation logTailInformation=tailScanner.getTailInformation();
+    assertLatestCheckPoint(false,true,NO_TRANSACTION_ID,startLogVersion,logTailInformation);
+  }
+  @Test public void twoLogFilesNoCheckPointsOneStart(){
+    long txId=21;
+    setupLogFiles(logFile(),logFile(start(),commit(txId)));
+    LogTailInformation logTailInformation=tailScanner.getTailInformation();
+    assertLatestCheckPoint(false,true,txId,startLogVersion,logTailInformation);
+  }
+  @Test public void twoLogFilesNoCheckPointsOneStartWithoutCommit(){
+    setupLogFiles(logFile(),logFile(start()));
+    LogTailInformation logTailInformation=tailScanner.getTailInformation();
+    assertLatestCheckPoint(false,true,NO_TRANSACTION_ID,startLogVersion,logTailInformation);
+  }
+  @Test public void twoLogFilesNoCheckPointsTwoCommits(){
+    long txId=21;
+    setupLogFiles(logFile(),logFile(start(),commit(txId),start(),commit(txId + 1)));
+    LogTailInformation logTailInformation=tailScanner.getTailInformation();
+    assertLatestCheckPoint(false,true,txId,startLogVersion,logTailInformation);
+  }
+  @Test public void twoLogFilesCheckPointTargetsPrevious(){
+    long txId=6;
+    PositionEntry position=position();
+    setupLogFiles(logFile(start(),commit(txId - 1),position),logFile(start(),commit(txId)),logFile(checkPoint(position)));
+    LogTailInformation logTailInformation=tailScanner.getTailInformation();
+    assertLatestCheckPoint(true,true,txId,endLogVersion,logTailInformation);
+  }
+  @Test public void twoLogFilesStartAndCommitInDifferentFiles(){
+    long txId=6;
+    setupLogFiles(logFile(start()),logFile(commit(txId)));
+    LogTailInformation logTailInformation=tailScanner.getTailInformation();
+    assertLatestCheckPoint(false,true,6,startLogVersion,logTailInformation);
+  }
+  @Test public void latestLogFileContainingACheckPointOnly(){
+    setupLogFiles(logFile(checkPoint()));
+    LogTailInformation logTailInformation=tailScanner.getTailInformation();
+    assertLatestCheckPoint(true,false,NO_TRANSACTION_ID,endLogVersion,logTailInformation);
+  }
+  @Test public void latestLogFileContainingACheckPointAndAStartBefore(){
+    setupLogFiles(logFile(start(),checkPoint()));
+    LogTailInformation logTailInformation=tailScanner.getTailInformation();
+    assertLatestCheckPoint(true,false,NO_TRANSACTION_ID,endLogVersion,logTailInformation);
+  }
+  @Test public void bigFileLatestCheckpointFindsStartAfter() throws Throwable {
+    long firstTxAfterCheckpoint=Integer.MAX_VALUE + 4L;
+    LogTailScanner tailScanner=new FirstTxIdConfigurableTailScanner(firstTxAfterCheckpoint,logFiles,reader,monitors);
+    LogEntryStart startEntry=new LogEntryStart(1,2,3L,4L,new byte[]{5,6},new LogPosition(endLogVersion,Integer.MAX_VALUE + 17L));
+    CheckPoint checkPoint=new CheckPoint(new LogPosition(endLogVersion,16L));
+    LogTailInformation logTailInformation=tailScanner.checkpointTailInformation(endLogVersion,startEntry,endLogVersion,latestLogEntryVersion,checkPoint,false);
+    assertLatestCheckPoint(true,true,firstTxAfterCheckpoint,endLogVersion,logTailInformation);
+  }
+  @Test public void twoLogFilesSecondIsCorruptedBeforeCommit() throws IOException {
+    setupLogFiles(logFile(checkPoint()),logFile(start(),commit(2)));
+    File highestLogFile=logFiles.getHighestLogFile();
+    fsRule.truncate(highestLogFile,fsRule.getFileSize(highestLogFile) - 3);
+    LogTailInformation logTailInformation=tailScanner.getTailInformation();
+    assertLatestCheckPoint(true,true,NO_TRANSACTION_ID,startLogVersion,logTailInformation);
+  }
+  @Test public void twoLogFilesSecondIsCorruptedBeforeAfterCommit() throws IOException {
+    int firstTxId=2;
+    setupLogFiles(logFile(checkPoint()),logFile(start(),commit(firstTxId),start(),commit(3)));
+    File highestLogFile=logFiles.getHighestLogFile();
+    fsRule.truncate(highestLogFile,fsRule.getFileSize(highestLogFile) - 3);
+    LogTailInformation logTailInformation=tailScanner.getTailInformation();
+    assertLatestCheckPoint(true,true,firstTxId,startLogVersion,logTailInformation);
+  }
+  @Test public void latestLogFileContainingACheckPointAndAStartAfter(){
+    long txId=35;
+    StartEntry start=start();
+    setupLogFiles(logFile(start,commit(txId),checkPoint(start)));
+    LogTailInformation logTailInformation=tailScanner.getTailInformation();
+    assertLatestCheckPoint(true,true,txId,endLogVersion,logTailInformation);
+  }
+  @Test public void latestLogFileContainingACheckPointAndAStartWithoutCommitAfter(){
+    StartEntry start=start();
+    setupLogFiles(logFile(start,checkPoint(start)));
+    LogTailInformation logTailInformation=tailScanner.getTailInformation();
+    assertLatestCheckPoint(true,true,NO_TRANSACTION_ID,endLogVersion,logTailInformation);
+  }
+  @Test public void latestLogFileContainingMultipleCheckPointsOneStartInBetween(){
+    setupLogFiles(logFile(checkPoint(),start(),checkPoint()));
+    LogTailInformation logTailInformation=tailScanner.getTailInformation();
+    assertLatestCheckPoint(true,false,NO_TRANSACTION_ID,endLogVersion,logTailInformation);
+  }
+  @Test public void latestLogFileContainingMultipleCheckPointsOneStartAfterBoth(){
+    long txId=11;
+    setupLogFiles(logFile(checkPoint(),checkPoint(),start(),commit(txId)));
+    LogTailInformation logTailInformation=tailScanner.getTailInformation();
+    assertLatestCheckPoint(true,true,txId,endLogVersion,logTailInformation);
+  }
+  @Test public void olderLogFileContainingACheckPointAndNewerFileContainingAStart(){
+    long txId=11;
+    StartEntry start=start();
+    setupLogFiles(logFile(checkPoint()),logFile(start,commit(txId)));
+    LogTailInformation logTailInformation=tailScanner.getTailInformation();
+    assertLatestCheckPoint(true,true,txId,startLogVersion,logTailInformation);
+  }
+  @Test public void olderLogFileContainingACheckPointAndNewerFileIsEmpty(){
+    StartEntry start=start();
+    setupLogFiles(logFile(start,checkPoint()),logFile());
+    LogTailInformation logTailInformation=tailScanner.getTailInformation();
+    assertLatestCheckPoint(true,true,NO_TRANSACTION_ID,startLogVersion,logTailInformation);
+  }
+  @Test public void olderLogFileContainingAStartAndNewerFileContainingACheckPointPointingToAPreviousPositionThanStart(){
+    long txId=123;
+    StartEntry start=start();
+    setupLogFiles(logFile(start,commit(txId)),logFile(checkPoint(start)));
+    LogTailInformation logTailInformation=tailScanner.getTailInformation();
+    assertLatestCheckPoint(true,true,txId,endLogVersion,logTailInformation);
+  }
+  @Test public void olderLogFileContainingAStartAndNewerFileContainingACheckPointPointingToAPreviousPositionThanStartWithoutCommit(){
+    StartEntry start=start();
+    setupLogFiles(logFile(start),logFile(checkPoint(start)));
+    LogTailInformation logTailInformation=tailScanner.getTailInformation();
+    assertLatestCheckPoint(true,false,NO_TRANSACTION_ID,endLogVersion,logTailInformation);
+  }
+  @Test public void olderLogFileContainingAStartAndNewerFileContainingACheckPointPointingToALaterPositionThanStart(){
+    PositionEntry position=position();
+    setupLogFiles(logFile(start(),commit(3),position),logFile(checkPoint(position)));
+    LogTailInformation logTailInformation=tailScanner.getTailInformation();
+    assertLatestCheckPoint(true,false,NO_TRANSACTION_ID,endLogVersion,logTailInformation);
+  }
+  @Test public void latestLogEmptyStartEntryBeforeAndAfterCheckPointInTheLastButOneLog(){
+    long txId=432;
+    setupLogFiles(logFile(start(),checkPoint(),start(),commit(txId)),logFile());
+    LogTailInformation logTailInformation=tailScanner.getTailInformation();
+    assertLatestCheckPoint(true,true,txId,startLogVersion,logTailInformation);
+  }
+  private void setupLogFiles(  LogCreator... logFiles){
+    Map<Entry,LogPosition> positions=new HashMap<>();
+    long version=endLogVersion - logFiles.length;
+    for (    LogCreator logFile : logFiles) {
+      logFile.create(++version,positions);
+    }
+  }
+  private LogCreator logFile(  Entry... entries){
+    return (logVersion,positions) -> {
+      try {
+        AtomicLong lastTxId=new AtomicLong();
+        logVersionRepository.setCurrentLogVersion(logVersion);
+        LifeSupport logFileLife=new LifeSupport();
+        logFileLife.start();
+        logFileLife.add(logFiles);
+        LogFile logFile=logFiles.getLogFile();
+        try {
+          FlushablePositionAwareChannel writeChannel=logFile.getWriter();
+          LogPositionMarker positionMarker=new LogPositionMarker();
+          LogEntryWriter writer=new LogEntryWriter(writeChannel);
+          for (          Entry entry : entries) {
+            LogPosition currentPosition=writeChannel.getCurrentPosition(positionMarker).newPosition();
+            positions.put(entry,currentPosition);
+            if (entry instanceof StartEntry) {
+              writer.writeStartEntry(0,0,0,0,new byte[0]);
+            }
+ else             if (entry instanceof CommitEntry) {
+              CommitEntry commitEntry=(CommitEntry)entry;
+              writer.writeCommitEntry(commitEntry.txId,0);
+              lastTxId.set(commitEntry.txId);
+            }
+ else             if (entry instanceof CheckPointEntry) {
+              CheckPointEntry checkPointEntry=(CheckPointEntry)entry;
+              Entry target=checkPointEntry.withPositionOfEntry;
+              LogPosition logPosition=target != null ? positions.get(target) : currentPosition;
+              assert logPosition != null : "No registered log position for " + target;
+              writer.writeCheckPointEntry(logPosition);
+            }
+ else             if (entry instanceof PositionEntry) {
+            }
+ else {
+              throw new IllegalArgumentException("Unknown entry " + entry);
+            }
+          }
+        }
+  finally {
+          logFileLife.shutdown();
+        }
+      }
+ catch (      IOException e) {
+        throw new UncheckedIOException(e);
+      }
+    }
+;
+  }
+interface LogCreator {
+    void create(    long version,    Map<Entry,LogPosition> positions);
+  }
+interface Entry {
+  }
+  private static StartEntry start(){
+    return new StartEntry();
+  }
+  private static CommitEntry commit(  long txId){
+    return new CommitEntry(txId);
+  }
+  private static CheckPointEntry checkPoint(){
+    return checkPoint(null);
+  }
+  private static CheckPointEntry checkPoint(  Entry forEntry){
+    return new CheckPointEntry(forEntry);
+  }
+  private static PositionEntry position(){
+    return new PositionEntry();
+  }
+private static class StartEntry implements Entry {
+  }
+private static class CommitEntry implements Entry {
+    final long txId;
+    CommitEntry(    long txId){
+      this.txId=txId;
+    }
+  }
+private static class CheckPointEntry implements Entry {
+    final Entry withPositionOfEntry;
+    CheckPointEntry(    Entry withPositionOfEntry){
+      this.withPositionOfEntry=withPositionOfEntry;
+    }
+  }
+private static class PositionEntry implements Entry {
+  }
+  private void assertLatestCheckPoint(  boolean hasCheckPointEntry,  boolean commitsAfterLastCheckPoint,  long firstTxIdAfterLastCheckPoint,  long logVersion,  LogTailInformation logTailInformation){
+    assertEquals(hasCheckPointEntry,logTailInformation.lastCheckPoint != null);
+    assertEquals(commitsAfterLastCheckPoint,logTailInformation.commitsAfterLastCheckpoint());
+    if (commitsAfterLastCheckPoint) {
+      assertEquals(firstTxIdAfterLastCheckPoint,logTailInformation.firstTxIdAfterLastCheckPoint);
+    }
+    assertEquals(logVersion,logTailInformation.oldestLogVersionFound);
+  }
+private static class FirstTxIdConfigurableTailScanner extends LogTailScanner {
+    private final long txId;
+    FirstTxIdConfigurableTailScanner(    long txId,    LogFiles logFiles,    LogEntryReader<ReadableClosablePositionAwareChannel> logEntryReader,    Monitors monitors){
+      super(logFiles,logEntryReader,monitors);
+      this.txId=txId;
+    }
+    @Override protected ExtractedTransactionRecord extractFirstTxIdAfterPosition(    LogPosition initialPosition,    long maxLogVersion){
+      return new ExtractedTransactionRecord(txId);
+    }
+  }
+}

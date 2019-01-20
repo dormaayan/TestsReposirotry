@@ -1,0 +1,150 @@
+public class TestLegacyMetrics {
+  private static final String scopeName="foo";
+  private static final long periodMs=50L;
+  private static LegacyMetrics metrics;
+  @Before public void before() throws Exception {
+    MetricsFactory.close();
+    HiveConf conf=new HiveConf();
+    conf.setVar(HiveConf.ConfVars.HIVE_METRICS_CLASS,LegacyMetrics.class.getCanonicalName());
+    MetricsFactory.init(conf);
+    metrics=(LegacyMetrics)MetricsFactory.getInstance();
+  }
+  @After public void after() throws Exception {
+    MetricsFactory.close();
+  }
+  @Test public void testMetricsMBean() throws Exception {
+    MBeanServer mbs=ManagementFactory.getPlatformMBeanServer();
+    final ObjectName oname=new ObjectName("org.apache.hadoop.hive.common.metrics:type=MetricsMBean");
+    MBeanInfo mBeanInfo=mbs.getMBeanInfo(oname);
+    assertEquals(MetricsMBeanImpl.class.getName(),mBeanInfo.getClassName());
+    MBeanOperationInfo[] oops=mBeanInfo.getOperations();
+    boolean resetFound=false;
+    for (    MBeanOperationInfo op : oops) {
+      if ("reset".equals(op.getName())) {
+        resetFound=true;
+        break;
+      }
+    }
+    assertTrue(resetFound);
+    Attribute attr=new Attribute("fooMetric",Long.valueOf(-77));
+    mbs.setAttribute(oname,attr);
+    mBeanInfo=mbs.getMBeanInfo(oname);
+    MBeanAttributeInfo[] attrinuteInfos=mBeanInfo.getAttributes();
+    assertEquals(1,attrinuteInfos.length);
+    boolean attrFound=false;
+    for (    MBeanAttributeInfo info : attrinuteInfos) {
+      if ("fooMetric".equals(info.getName())) {
+        assertEquals("java.lang.Long",info.getType());
+        assertTrue(info.isReadable());
+        assertTrue(info.isWritable());
+        assertFalse(info.isIs());
+        attrFound=true;
+        break;
+      }
+    }
+    assertTrue(attrFound);
+    Object v=mbs.getAttribute(oname,"fooMetric");
+    assertEquals(Long.valueOf(-77),v);
+    Object result=mbs.invoke(oname,"reset",new Object[0],new String[0]);
+    assertNull(result);
+    v=mbs.getAttribute(oname,"fooMetric");
+    assertEquals(Long.valueOf(0),v);
+  }
+  @Test public void testScopeSingleThread() throws Exception {
+    metrics.startStoredScope(scopeName);
+    final LegacyMetrics.LegacyMetricsScope fooScope=(LegacyMetrics.LegacyMetricsScope)metrics.getStoredScope(scopeName);
+    Long num=fooScope.getNumCounter();
+    assertNull(num);
+    Long time=fooScope.getTimeCounter();
+    assertNull(time);
+    assertSame(fooScope,metrics.getStoredScope(scopeName));
+    Thread.sleep(periodMs + 1);
+    metrics.endStoredScope(scopeName);
+    assertEquals(Long.valueOf(1),fooScope.getNumCounter());
+    final long t1=fooScope.getTimeCounter().longValue();
+    assertTrue(t1 > periodMs);
+    assertSame(fooScope,metrics.getStoredScope(scopeName));
+    metrics.startStoredScope(scopeName);
+    assertEquals(Long.valueOf(1),fooScope.getNumCounter());
+    assertEquals(t1,fooScope.getTimeCounter().longValue());
+    assertSame(fooScope,metrics.getStoredScope(scopeName));
+    Thread.sleep(periodMs + 1);
+    fooScope.reopen();
+    assertEquals(Long.valueOf(2),fooScope.getNumCounter());
+    assertTrue(fooScope.getTimeCounter().longValue() > 2 * periodMs);
+    Thread.sleep(periodMs + 1);
+    fooScope.close();
+    assertEquals(Long.valueOf(3),fooScope.getNumCounter());
+    assertTrue(fooScope.getTimeCounter().longValue() > 3 * periodMs);
+    Double avgT=(Double)metrics.get("foo.avg_t");
+    assertTrue(avgT.doubleValue() > periodMs);
+  }
+  @Test public void testScopeConcurrency() throws Exception {
+    metrics.startStoredScope(scopeName);
+    LegacyMetrics.LegacyMetricsScope fooScope=(LegacyMetrics.LegacyMetricsScope)metrics.getStoredScope(scopeName);
+    final int threads=10;
+    ExecutorService executorService=Executors.newFixedThreadPool(threads);
+    for (int i=0; i < threads; i++) {
+      final int n=i;
+      executorService.submit(new Callable<Void>(){
+        @Override public Void call() throws Exception {
+          testScopeImpl(n);
+          return null;
+        }
+      }
+);
+    }
+    executorService.shutdown();
+    assertTrue(executorService.awaitTermination(periodMs * 3 * threads,TimeUnit.MILLISECONDS));
+    fooScope=(LegacyMetrics.LegacyMetricsScope)metrics.getStoredScope(scopeName);
+    assertEquals(Long.valueOf(3 * threads),fooScope.getNumCounter());
+    assertTrue(fooScope.getTimeCounter().longValue() > 3 * periodMs * threads);
+    Double avgT=(Double)metrics.get("foo.avg_t");
+    assertTrue(avgT.doubleValue() > periodMs);
+    metrics.endStoredScope(scopeName);
+  }
+  @Test public void testScopeIncorrectOpenOrder() throws Exception {
+    metrics.startStoredScope(scopeName);
+    LegacyMetrics.LegacyMetricsScope fooScope=(LegacyMetrics.LegacyMetricsScope)metrics.getStoredScope(scopeName);
+    assertEquals(null,fooScope.getNumCounter());
+    fooScope.close();
+    assertEquals(Long.valueOf(1),fooScope.getNumCounter());
+    for (int i=0; i < 10; i++) {
+      fooScope.open();
+      fooScope.close();
+    }
+    assertEquals(Long.valueOf(11),fooScope.getNumCounter());
+    for (int i=0; i < 10; i++) {
+      fooScope.open();
+    }
+    for (int i=0; i < 10; i++) {
+      fooScope.close();
+    }
+    assertEquals(Long.valueOf(12),fooScope.getNumCounter());
+  }
+  void testScopeImpl(  int n) throws Exception {
+    metrics.startStoredScope(scopeName);
+    final LegacyMetrics.LegacyMetricsScope fooScope=(LegacyMetrics.LegacyMetricsScope)metrics.getStoredScope(scopeName);
+    assertSame(fooScope,metrics.getStoredScope(scopeName));
+    Thread.sleep(periodMs + 1);
+    metrics.endStoredScope(scopeName);
+    assertTrue(fooScope.getNumCounter().longValue() >= 1);
+    final long t1=fooScope.getTimeCounter().longValue();
+    assertTrue(t1 > periodMs);
+    assertSame(fooScope,metrics.getStoredScope(scopeName));
+    metrics.startStoredScope(scopeName);
+    assertTrue(fooScope.getNumCounter().longValue() >= 1);
+    assertTrue(fooScope.getTimeCounter().longValue() >= t1);
+    assertSame(fooScope,metrics.getStoredScope(scopeName));
+    Thread.sleep(periodMs + 1);
+    fooScope.reopen();
+    assertTrue(fooScope.getNumCounter().longValue() >= 2);
+    assertTrue(fooScope.getTimeCounter().longValue() > 2 * periodMs);
+    Thread.sleep(periodMs + 1);
+    fooScope.close();
+    assertTrue(fooScope.getNumCounter().longValue() >= 3);
+    assertTrue(fooScope.getTimeCounter().longValue() > 3 * periodMs);
+    Double avgT=(Double)metrics.get("foo.avg_t");
+    assertTrue(avgT.doubleValue() > periodMs);
+  }
+}

@@ -1,0 +1,50 @@
+@Test public void testCanSplitJustAfterASplit() throws Exception {
+  LOG.info("Starting testCanSplitJustAfterASplit");
+  byte[] fam=Bytes.toBytes("cf_split");
+  TableName tableName=TableName.valueOf("CanSplitTable");
+  Table source=TEST_UTIL.getConnection().getTable(tableName);
+  Admin admin=TEST_UTIL.getAdmin();
+  Map<String,StoreFileReader> scanner=Maps.newHashMap();
+  try {
+    TableDescriptor htd=TableDescriptorBuilder.newBuilder(tableName).setColumnFamily(ColumnFamilyDescriptorBuilder.of(fam)).build();
+    admin.createTable(htd);
+    TEST_UTIL.loadTable(source,fam);
+    List<HRegion> regions=TEST_UTIL.getHBaseCluster().getRegions(tableName);
+    regions.get(0).forceSplit(null);
+    admin.split(tableName);
+    while (regions.size() <= 1) {
+      regions=TEST_UTIL.getHBaseCluster().getRegions(tableName);
+      regions.stream().forEach(r -> r.getStores().get(0).getStorefiles().stream().filter(s -> s.isReference() && !scanner.containsKey(r.getRegionInfo().getEncodedName())).forEach(sf -> {
+        StoreFileReader reader=((HStoreFile)sf).getReader();
+        reader.getStoreFileScanner(true,false,false,0,0,false);
+        scanner.put(r.getRegionInfo().getEncodedName(),reader);
+        LOG.info("Got reference to file = " + sf.getPath() + ",for region = "+ r.getRegionInfo().getEncodedName());
+      }
+));
+    }
+    Assert.assertTrue("Regions did not split properly",regions.size() > 1);
+    Assert.assertTrue("Could not get reference any of the store file",scanner.size() > 1);
+    RetryCounter retrier=new RetryCounter(30,1,TimeUnit.SECONDS);
+    while (CompactionState.NONE != admin.getCompactionState(tableName) && retrier.shouldRetry()) {
+      retrier.sleepUntilNextRetry();
+    }
+    Assert.assertEquals("Compaction did not complete in 30 secs",CompactionState.NONE,admin.getCompactionState(tableName));
+    regions.stream().filter(region -> scanner.containsKey(region.getRegionInfo().getEncodedName())).forEach(r -> Assert.assertTrue("Contains an open file reference which can be split",!r.getStores().get(0).canSplit()));
+  }
+  finally {
+    scanner.values().stream().forEach(s -> {
+      try {
+        s.close(true);
+      }
+ catch (      IOException ioe) {
+        LOG.error("Failed while closing store file",ioe);
+      }
+    }
+);
+    scanner.clear();
+    if (source != null) {
+      source.close();
+    }
+    TEST_UTIL.deleteTableIfAny(tableName);
+  }
+}

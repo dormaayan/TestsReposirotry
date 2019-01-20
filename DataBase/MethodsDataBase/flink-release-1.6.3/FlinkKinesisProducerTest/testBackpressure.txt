@@ -1,0 +1,48 @@
+/** 
+ * Test ensuring that the producer blocks if the queue limit is exceeded, until the queue length drops below the limit; we set a timeout because the test will not finish if the logic is broken.
+ */
+@Test(timeout=10000) public void testBackpressure() throws Throwable {
+  final DummyFlinkKinesisProducer<String> producer=new DummyFlinkKinesisProducer<>(new SimpleStringSchema());
+  producer.setQueueLimit(1);
+  OneInputStreamOperatorTestHarness<String,Object> testHarness=new OneInputStreamOperatorTestHarness<>(new StreamSink<>(producer));
+  testHarness.open();
+  UserRecordResult result=mock(UserRecordResult.class);
+  when(result.isSuccessful()).thenReturn(true);
+  CheckedThread msg1=new CheckedThread(){
+    @Override public void go() throws Exception {
+      testHarness.processElement(new StreamRecord<>("msg-1"));
+    }
+  }
+;
+  msg1.start();
+  msg1.trySync(100);
+  assertFalse("Flush triggered before reaching queue limit",msg1.isAlive());
+  producer.getPendingRecordFutures().get(0).set(result);
+  CheckedThread msg2=new CheckedThread(){
+    @Override public void go() throws Exception {
+      testHarness.processElement(new StreamRecord<>("msg-2"));
+    }
+  }
+;
+  msg2.start();
+  msg2.trySync(100);
+  assertFalse("Flush triggered before reaching queue limit",msg2.isAlive());
+  CheckedThread moreElementsThread=new CheckedThread(){
+    @Override public void go() throws Exception {
+      testHarness.processElement(new StreamRecord<>("msg-3"));
+      testHarness.processElement(new StreamRecord<>("msg-4"));
+    }
+  }
+;
+  moreElementsThread.start();
+  moreElementsThread.trySync(100);
+  assertTrue("Producer should still block, but doesn't",moreElementsThread.isAlive());
+  producer.getPendingRecordFutures().get(1).set(result);
+  moreElementsThread.trySync(100);
+  assertTrue("Producer should still block, but doesn't",moreElementsThread.isAlive());
+  producer.getPendingRecordFutures().get(2).set(result);
+  moreElementsThread.trySync(100);
+  assertFalse("Prodcuer still blocks although the queue is flushed",moreElementsThread.isAlive());
+  producer.getPendingRecordFutures().get(3).set(result);
+  testHarness.close();
+}

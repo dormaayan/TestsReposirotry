@@ -1,0 +1,64 @@
+@Category({SecurityTests.class,MediumTests.class}) public class TestVisibilityLabelsWithSLGStack {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestVisibilityLabelsWithSLGStack.class);
+  public static final String CONFIDENTIAL="confidential";
+  private static final String SECRET="secret";
+  public static final HBaseTestingUtility TEST_UTIL=new HBaseTestingUtility();
+  private static final byte[] ROW_1=Bytes.toBytes("row1");
+  private final static byte[] CF=Bytes.toBytes("f");
+  private final static byte[] Q1=Bytes.toBytes("q1");
+  private final static byte[] Q2=Bytes.toBytes("q2");
+  private final static byte[] value=Bytes.toBytes("value");
+  public static Configuration conf;
+  @Rule public final TestName TEST_NAME=new TestName();
+  public static User SUPERUSER;
+  @BeforeClass public static void setupBeforeClass() throws Exception {
+    conf=TEST_UTIL.getConfiguration();
+    VisibilityTestUtil.enableVisiblityLabels(conf);
+    String classes=SimpleScanLabelGenerator.class.getCanonicalName() + " , " + LabelFilteringScanLabelGenerator.class.getCanonicalName();
+    conf.setStrings(VisibilityUtils.VISIBILITY_LABEL_GENERATOR_CLASS,classes);
+    conf.set("hbase.superuser","admin");
+    TEST_UTIL.startMiniCluster(1);
+    SUPERUSER=User.createUserForTesting(conf,"admin",new String[]{"supergroup"});
+    TEST_UTIL.waitTableEnabled(LABELS_TABLE_NAME.getName(),50000);
+    addLabels();
+  }
+  @Test public void testWithSAGStack() throws Exception {
+    TableName tableName=TableName.valueOf(TEST_NAME.getMethodName());
+    try (Table table=TEST_UTIL.createTable(tableName,CF)){
+      Put put=new Put(ROW_1);
+      put.addColumn(CF,Q1,HConstants.LATEST_TIMESTAMP,value);
+      put.setCellVisibility(new CellVisibility(SECRET));
+      table.put(put);
+      put=new Put(ROW_1);
+      put.addColumn(CF,Q2,HConstants.LATEST_TIMESTAMP,value);
+      put.setCellVisibility(new CellVisibility(CONFIDENTIAL));
+      table.put(put);
+      LabelFilteringScanLabelGenerator.labelToFilter=CONFIDENTIAL;
+      Scan s=new Scan();
+      s.setAuthorizations(new Authorizations(SECRET,CONFIDENTIAL));
+      ResultScanner scanner=table.getScanner(s);
+      Result next=scanner.next();
+      assertNotNull(next.getColumnLatestCell(CF,Q1));
+      assertNull(next.getColumnLatestCell(CF,Q2));
+    }
+   }
+  private static void addLabels() throws Exception {
+    PrivilegedExceptionAction<VisibilityLabelsResponse> action=new PrivilegedExceptionAction<VisibilityLabelsResponse>(){
+      @Override public VisibilityLabelsResponse run() throws Exception {
+        String[] labels={SECRET,CONFIDENTIAL};
+        try (Connection conn=ConnectionFactory.createConnection(conf)){
+          VisibilityClient.addLabels(conn,labels);
+        }
+ catch (        Throwable t) {
+          throw new IOException(t);
+        }
+        return null;
+      }
+    }
+;
+    SUPERUSER.runAs(action);
+  }
+  @AfterClass public static void tearDownAfterClass() throws Exception {
+    TEST_UTIL.shutdownMiniCluster();
+  }
+}

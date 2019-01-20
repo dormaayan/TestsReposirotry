@@ -1,0 +1,37 @@
+@Test public void shouldTerminateQueriesEvenIfUsingPeriodicCommit() throws Exception {
+  final DoubleLatch latch=new DoubleLatch(3,true);
+  final Barrier.Control barrier=new Barrier.Control();
+  Server server=createHttpServer(latch,barrier,20,30);
+  server.start();
+  int localPort=getLocalPort(server);
+  final BoltStateMachine[] machine={null};
+  Thread thread=new Thread(() -> {
+    try (BoltStateMachine stateMachine=env.newMachine(BOLT_CHANNEL)){
+      machine[0]=stateMachine;
+      stateMachine.process(new InitMessage(USER_AGENT,emptyMap()),nullResponseHandler());
+      String query=format("USING PERIODIC COMMIT 10 LOAD CSV FROM 'http://localhost:%d' AS line " + "CREATE (n:A {id: line[0], square: line[1]}) " + "WITH count(*) as number "+ "CREATE (n:ShouldNotExist)",localPort);
+      try {
+        latch.start();
+        stateMachine.process(new RunMessage(query,EMPTY_MAP),nullResponseHandler());
+        stateMachine.process(PullAllMessage.INSTANCE,nullResponseHandler());
+      }
+  finally {
+        latch.finish();
+      }
+    }
+ catch (    BoltConnectionFatality connectionFatality) {
+      throw new RuntimeException(connectionFatality);
+    }
+  }
+);
+  thread.setName("query runner");
+  thread.start();
+  latch.startAndWaitForAllToStart();
+  Thread.sleep(1000);
+  machine[0].process(ResetMessage.INSTANCE,nullResponseHandler());
+  barrier.release();
+  latch.finishAndWaitForAllToFinish();
+  try (Transaction ignored=env.graph().beginTx()){
+    assertFalse("Query was not terminated in time - nodes were created!",env.graph().findNodes(Label.label("ShouldNotExist")).hasNext());
+  }
+ }

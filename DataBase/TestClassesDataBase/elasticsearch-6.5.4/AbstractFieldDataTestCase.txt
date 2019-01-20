@@ -1,0 +1,111 @@
+public abstract class AbstractFieldDataTestCase extends ESSingleNodeTestCase {
+  protected IndexService indexService;
+  protected MapperService mapperService;
+  protected IndexWriter writer;
+  protected List<LeafReaderContext> readerContexts=null;
+  protected DirectoryReader topLevelReader=null;
+  protected IndicesFieldDataCache indicesFieldDataCache;
+  protected QueryShardContext shardContext;
+  protected abstract String getFieldDataType();
+  protected boolean hasDocValues(){
+    return false;
+  }
+  public <IFD extends IndexFieldData<?>>IFD getForField(  String fieldName){
+    return getForField(getFieldDataType(),fieldName,hasDocValues());
+  }
+  public <IFD extends IndexFieldData<?>>IFD getForField(  String type,  String fieldName){
+    return getForField(type,fieldName,hasDocValues());
+  }
+  @Override protected Collection<Class<? extends Plugin>> getPlugins(){
+    return pluginList(InternalSettingsPlugin.class);
+  }
+  public <IFD extends IndexFieldData<?>>IFD getForField(  String type,  String fieldName,  boolean docValues){
+    final MappedFieldType fieldType;
+    final BuilderContext context=new BuilderContext(indexService.getIndexSettings().getSettings(),new ContentPath(1));
+    if (type.equals("string")) {
+      if (docValues) {
+        fieldType=new KeywordFieldMapper.Builder(fieldName).build(context).fieldType();
+      }
+ else {
+        fieldType=new TextFieldMapper.Builder(fieldName).fielddata(true).build(context).fieldType();
+      }
+    }
+ else     if (type.equals("float")) {
+      fieldType=new NumberFieldMapper.Builder(fieldName,NumberFieldMapper.NumberType.FLOAT).docValues(docValues).build(context).fieldType();
+    }
+ else     if (type.equals("double")) {
+      fieldType=new NumberFieldMapper.Builder(fieldName,NumberFieldMapper.NumberType.DOUBLE).docValues(docValues).build(context).fieldType();
+    }
+ else     if (type.equals("long")) {
+      fieldType=new NumberFieldMapper.Builder(fieldName,NumberFieldMapper.NumberType.LONG).docValues(docValues).build(context).fieldType();
+    }
+ else     if (type.equals("int")) {
+      fieldType=new NumberFieldMapper.Builder(fieldName,NumberFieldMapper.NumberType.INTEGER).docValues(docValues).build(context).fieldType();
+    }
+ else     if (type.equals("short")) {
+      fieldType=new NumberFieldMapper.Builder(fieldName,NumberFieldMapper.NumberType.SHORT).docValues(docValues).build(context).fieldType();
+    }
+ else     if (type.equals("byte")) {
+      fieldType=new NumberFieldMapper.Builder(fieldName,NumberFieldMapper.NumberType.BYTE).docValues(docValues).build(context).fieldType();
+    }
+ else     if (type.equals("geo_point")) {
+      fieldType=new GeoPointFieldMapper.Builder(fieldName).docValues(docValues).build(context).fieldType();
+    }
+ else     if (type.equals("_parent")) {
+      fieldType=new ParentFieldMapper.Builder("_type").type(fieldName).build(context).fieldType();
+    }
+ else     if (type.equals("binary")) {
+      fieldType=new BinaryFieldMapper.Builder(fieldName).docValues(docValues).build(context).fieldType();
+    }
+ else {
+      throw new UnsupportedOperationException(type);
+    }
+    return shardContext.getForField(fieldType);
+  }
+  @Before public void setup() throws Exception {
+    indexService=createIndex("test",Settings.builder().build());
+    mapperService=indexService.mapperService();
+    indicesFieldDataCache=getInstanceFromNode(IndicesService.class).getIndicesFieldDataCache();
+    writer=new IndexWriter(new RAMDirectory(),new IndexWriterConfig(new StandardAnalyzer()).setMergePolicy(new LogByteSizeMergePolicy()));
+    shardContext=indexService.newQueryShardContext(0,null,() -> 0,null);
+  }
+  protected final List<LeafReaderContext> refreshReader() throws Exception {
+    if (readerContexts != null && topLevelReader != null) {
+      topLevelReader.close();
+    }
+    topLevelReader=ElasticsearchDirectoryReader.wrap(DirectoryReader.open(writer),new ShardId("foo","_na_",1));
+    readerContexts=topLevelReader.leaves();
+    return readerContexts;
+  }
+  @Override @After public void tearDown() throws Exception {
+    super.tearDown();
+    if (topLevelReader != null) {
+      topLevelReader.close();
+    }
+    writer.close();
+    shardContext=null;
+  }
+  protected Nested createNested(  IndexSearcher searcher,  Query parentFilter,  Query childFilter) throws IOException {
+    BitsetFilterCache s=indexService.cache().bitsetFilterCache();
+    return new Nested(s.getBitSetProducer(parentFilter),childFilter,null);
+  }
+  public void testEmpty() throws Exception {
+    Document d=new Document();
+    d.add(new StringField("field","value",Field.Store.NO));
+    writer.addDocument(d);
+    refreshReader();
+    IndexFieldData fieldData=getForField("non_existing_field");
+    int max=randomInt(7);
+    for (    LeafReaderContext readerContext : readerContexts) {
+      AtomicFieldData previous=null;
+      for (int i=0; i < max; i++) {
+        AtomicFieldData current=fieldData.load(readerContext);
+        assertThat(current.ramBytesUsed(),equalTo(0L));
+        if (previous != null) {
+          assertThat(current,not(sameInstance(previous)));
+        }
+        previous=current;
+      }
+    }
+  }
+}

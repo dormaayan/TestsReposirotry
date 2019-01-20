@@ -1,0 +1,81 @@
+public class FailoverCuratorLeaderRoutePolicyTest extends ZooKeeperTestSupport {
+  public static final String ZNODE="/curatorleader";
+  public static final String BASE_ZNODE="/someapp";
+  private static final Logger LOG=LoggerFactory.getLogger(FailoverCuratorLeaderRoutePolicyTest.class);
+  protected CamelContext createCamelContext() throws Exception {
+    disableJMX();
+    return super.createCamelContext();
+  }
+  @Test public void masterSlaveScenarioContolledByPolicy() throws Exception {
+    ZookeeperPolicyEnforcedContext master=createEnforcedContext("master");
+    ZookeeperPolicyEnforcedContext slave=createEnforcedContext("slave");
+    Thread.sleep(5000);
+    master.sendMessageToEnforcedRoute("message for master",1);
+    slave.sendMessageToEnforcedRoute("message for slave",0);
+    master.shutdown();
+    slave.sendMessageToEnforcedRoute("second message for slave",1);
+    slave.shutdown();
+  }
+  @Test public void ensureRoutesDoNotStartBeforeElection() throws Exception {
+    DefaultCamelContext context=new DefaultCamelContext();
+    context.addRoutes(new RouteBuilder(){
+      @Override public void configure() throws Exception {
+        CuratorLeaderRoutePolicy policy=new CuratorLeaderRoutePolicy("zookeeper:localhost:" + getServerPort() + BASE_ZNODE+ ZNODE+ 2);
+        from("timer://foo?fixedRate=true&period=5").routePolicy(policy).id("single_route").autoStartup(true).to("mock:controlled");
+      }
+    }
+);
+    context.start();
+    assertThat(context.getRouteStatus("single_route").isStarted(),is(false));
+    assertThat(context.getRouteStatus("single_route").isStarting(),is(false));
+    context.shutdown();
+  }
+private static class ZookeeperPolicyEnforcedContext {
+    private CamelContext controlledContext;
+    private ProducerTemplate template;
+    private MockEndpoint mock;
+    private String routename;
+    ZookeeperPolicyEnforcedContext(    String name) throws Exception {
+      controlledContext=new DefaultCamelContext();
+      routename=name;
+      template=controlledContext.createProducerTemplate();
+      mock=controlledContext.getEndpoint("mock:controlled",MockEndpoint.class);
+      controlledContext.addRoutes(new FailoverRoute(name));
+      controlledContext.start();
+    }
+    public void sendMessageToEnforcedRoute(    String message,    int expected) throws InterruptedException {
+      mock.expectedMessageCount(expected);
+      try {
+        template.sendBody("vm:" + routename,ExchangePattern.InOut,message);
+      }
+ catch (      Exception e) {
+        if (expected > 0) {
+          LOG.error(e.getMessage(),e);
+          fail("Expected messages...");
+        }
+      }
+      mock.await(2,TimeUnit.SECONDS);
+      mock.assertIsSatisfied(2000);
+    }
+    public void shutdown() throws Exception {
+      LoggerFactory.getLogger(getClass()).debug("stopping");
+      controlledContext.stop();
+      LoggerFactory.getLogger(getClass()).debug("stopped");
+    }
+  }
+  private ZookeeperPolicyEnforcedContext createEnforcedContext(  String name) throws Exception, InterruptedException {
+    ZookeeperPolicyEnforcedContext context=new ZookeeperPolicyEnforcedContext(name);
+    delay(1000);
+    return context;
+  }
+public static class FailoverRoute extends RouteBuilder {
+    private String routename;
+    public FailoverRoute(    String routename){
+      this.routename=routename;
+    }
+    public void configure() throws Exception {
+      CuratorLeaderRoutePolicy policy=new CuratorLeaderRoutePolicy("zookeeper:localhost:" + getServerPort() + BASE_ZNODE+ ZNODE);
+      from("vm:" + routename).routePolicy(policy).id(routename).to("mock:controlled");
+    }
+  }
+}

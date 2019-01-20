@@ -1,0 +1,68 @@
+@Test(timeout=60000) public void testRemoveVolumeBeingWritten() throws Exception {
+  final ExtendedBlock eb=new ExtendedBlock(BLOCK_POOL_IDS[0],0);
+  final CountDownLatch startFinalizeLatch=new CountDownLatch(1);
+  final CountDownLatch blockReportReceivedLatch=new CountDownLatch(1);
+  final CountDownLatch volRemoveStartedLatch=new CountDownLatch(1);
+  final CountDownLatch volRemoveCompletedLatch=new CountDownLatch(1);
+class BlockReportThread extends Thread {
+    public void run(){
+      try {
+        volRemoveStartedLatch.await();
+      }
+ catch (      Exception e) {
+        LOG.info("Unexpected exception when waiting for vol removal:",e);
+      }
+      LOG.info("Getting block report");
+      dataset.getBlockReports(eb.getBlockPoolId());
+      LOG.info("Successfully received block report");
+      blockReportReceivedLatch.countDown();
+    }
+  }
+class ResponderThread extends Thread {
+    public void run(){
+      try (ReplicaHandler replica=dataset.createRbw(StorageType.DEFAULT,null,eb,false)){
+        LOG.info("CreateRbw finished");
+        startFinalizeLatch.countDown();
+        try {
+          Thread.sleep(1000);
+        }
+ catch (        InterruptedException ie) {
+          LOG.info("Ignoring ",ie);
+        }
+        blockReportReceivedLatch.await();
+        dataset.finalizeBlock(eb,false);
+        LOG.info("FinalizeBlock finished");
+      }
+ catch (      Exception e) {
+        LOG.warn("Exception caught. This should not affect the test",e);
+      }
+    }
+  }
+class VolRemoveThread extends Thread {
+    public void run(){
+      Set<StorageLocation> volumesToRemove=new HashSet<>();
+      try {
+        volumesToRemove.add(dataset.getVolume(eb).getStorageLocation());
+      }
+ catch (      Exception e) {
+        LOG.info("Problem preparing volumes to remove: ",e);
+        Assert.fail("Exception in remove volume thread, check log for " + "details.");
+      }
+      LOG.info("Removing volume " + volumesToRemove);
+      dataset.removeVolumes(volumesToRemove,true);
+      volRemoveCompletedLatch.countDown();
+      LOG.info("Removed volume " + volumesToRemove);
+    }
+  }
+  ResponderThread responderThread=new ResponderThread();
+  responderThread.start();
+  startFinalizeLatch.await();
+  final BlockReportThread blockReportThread=new BlockReportThread();
+  blockReportThread.start();
+  VolRemoveThread volRemoveThread=new VolRemoveThread();
+  volRemoveThread.start();
+  Thread.sleep(2000);
+  volRemoveStartedLatch.countDown();
+  blockReportReceivedLatch.await();
+  volRemoveCompletedLatch.await();
+}

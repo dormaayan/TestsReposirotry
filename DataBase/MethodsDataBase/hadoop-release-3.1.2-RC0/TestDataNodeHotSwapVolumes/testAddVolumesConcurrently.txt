@@ -1,0 +1,78 @@
+@Test(timeout=180000) public void testAddVolumesConcurrently() throws IOException, InterruptedException, TimeoutException, ReconfigurationException {
+  startDFSCluster(1,1,10);
+  int numVolumes=cluster.getStoragesPerDatanode();
+  String blockPoolId=cluster.getNamesystem().getBlockPoolId();
+  Path testFile=new Path("/test");
+  int initialBlockCount=numVolumes * 2;
+  createFile(testFile,initialBlockCount);
+  DataNode dn=cluster.getDataNodes().get(0);
+  final FsDatasetSpi<? extends FsVolumeSpi> data=dn.data;
+  dn.data=Mockito.spy(data);
+  final int newVolumeCount=40;
+  List<Thread> addVolumeDelayedThreads=new ArrayList<>();
+  AtomicBoolean addVolumeError=new AtomicBoolean(false);
+  AtomicBoolean listStorageError=new AtomicBoolean(false);
+  CountDownLatch addVolumeCompletionLatch=new CountDownLatch(newVolumeCount);
+  final Thread listStorageThread=new Thread(new Runnable(){
+    @Override public void run(){
+      while (addVolumeCompletionLatch.getCount() != newVolumeCount) {
+        int i=0;
+        while (i++ < 1000) {
+          try {
+            dn.getStorage().listStorageDirectories();
+          }
+ catch (          Exception e) {
+            listStorageError.set(true);
+            LOG.error("Error listing storage: " + e);
+          }
+        }
+      }
+    }
+  }
+);
+  listStorageThread.start();
+  doAnswer(new Answer<Object>(){
+    @Override public Object answer(    InvocationOnMock invocationOnMock) throws Throwable {
+      final Random r=new Random();
+      Thread addVolThread=new Thread(new Runnable(){
+        @Override public void run(){
+          try {
+            r.setSeed(Time.now());
+            if (r.nextInt(10) > 4) {
+              int s=r.nextInt(10) + 1;
+              Thread.sleep(s * 100);
+            }
+            invocationOnMock.callRealMethod();
+          }
+ catch (          Throwable throwable) {
+            addVolumeError.set(true);
+            LOG.error("Error adding volume: " + throwable);
+          }
+ finally {
+            addVolumeCompletionLatch.countDown();
+          }
+        }
+      }
+);
+      addVolumeDelayedThreads.add(addVolThread);
+      addVolThread.start();
+      return null;
+    }
+  }
+).when(dn.data).addVolume(any(StorageLocation.class),any(List.class));
+  addVolumes(newVolumeCount,addVolumeCompletionLatch);
+  numVolumes+=newVolumeCount;
+  for (  Thread t : addVolumeDelayedThreads) {
+    t.join();
+  }
+  listStorageThread.join();
+  Assert.assertEquals("Error adding volumes!",false,addVolumeError.get());
+  Assert.assertEquals("Error listing storage!",false,listStorageError.get());
+  int additionalBlockCount=9;
+  int totalBlockCount=initialBlockCount + additionalBlockCount;
+  DFSTestUtil.appendFile(cluster.getFileSystem(),testFile,BLOCK_SIZE * additionalBlockCount);
+  verifyFileLength(cluster.getFileSystem(),testFile,totalBlockCount);
+  List<Map<DatanodeStorage,BlockListAsLongs>> blockReports=cluster.getAllBlockReports(blockPoolId);
+  assertEquals(1,blockReports.size());
+  assertEquals(numVolumes,blockReports.get(0).size());
+}

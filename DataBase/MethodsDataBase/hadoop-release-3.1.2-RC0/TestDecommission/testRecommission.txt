@@ -1,0 +1,60 @@
+/** 
+ * Test that over-replicated blocks are deleted on recommission.
+ */
+@Test(timeout=120000) public void testRecommission() throws Exception {
+  final int numDatanodes=6;
+  try {
+    LOG.info("Starting test testRecommission");
+    startCluster(1,numDatanodes);
+    final Path file1=new Path("testDecommission.dat");
+    final int replicas=numDatanodes - 1;
+    ArrayList<DatanodeInfo> decommissionedNodes=Lists.newArrayList();
+    final FileSystem fileSys=getCluster().getFileSystem();
+    writeFile(fileSys,file1,replicas);
+    BlockLocation loc=fileSys.getFileBlockLocations(file1,0,1)[0];
+    assertEquals("Unexpected number of replicas from getFileBlockLocations",replicas,loc.getHosts().length);
+    final String toDecomHost=loc.getNames()[0];
+    String toDecomUuid=null;
+    for (    DataNode d : getCluster().getDataNodes()) {
+      if (d.getDatanodeId().getXferAddr().equals(toDecomHost)) {
+        toDecomUuid=d.getDatanodeId().getDatanodeUuid();
+        break;
+      }
+    }
+    assertNotNull("Could not find a dn with the block!",toDecomUuid);
+    final DatanodeInfo decomNode=takeNodeOutofService(0,toDecomUuid,0,decommissionedNodes,AdminStates.DECOMMISSIONED);
+    decommissionedNodes.add(decomNode);
+    final BlockManager blockManager=getCluster().getNamesystem().getBlockManager();
+    final DatanodeManager datanodeManager=blockManager.getDatanodeManager();
+    BlockManagerTestUtil.recheckDecommissionState(datanodeManager);
+    DFSClient client=getDfsClient(0);
+    assertEquals("All datanodes must be alive",numDatanodes,client.datanodeReport(DatanodeReportType.LIVE).length);
+    final ExtendedBlock b=DFSTestUtil.getFirstBlock(fileSys,file1);
+    final String uuid=toDecomUuid;
+    GenericTestUtils.waitFor(new Supplier<Boolean>(){
+      @Override public Boolean get(){
+        BlockInfo info=blockManager.getStoredBlock(b.getLocalBlock());
+        int count=0;
+        StringBuilder sb=new StringBuilder("Replica locations: ");
+        for (int i=0; i < info.numNodes(); i++) {
+          DatanodeDescriptor dn=info.getDatanode(i);
+          sb.append(dn + ", ");
+          if (!dn.getDatanodeUuid().equals(uuid)) {
+            count++;
+          }
+        }
+        LOG.info(sb.toString());
+        LOG.info("Count: " + count);
+        return count == replicas;
+      }
+    }
+,500,30000);
+    putNodeInService(0,decomNode);
+    BlockManagerTestUtil.recheckDecommissionState(datanodeManager);
+    DFSTestUtil.waitForReplication(getCluster(),b,1,replicas,0);
+    cleanupFile(fileSys,file1);
+  }
+  finally {
+    shutdownCluster();
+  }
+}

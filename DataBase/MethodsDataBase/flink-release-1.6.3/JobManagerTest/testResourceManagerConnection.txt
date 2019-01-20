@@ -1,0 +1,52 @@
+/** 
+ * This tests makes sure that triggering a reconnection from the ResourceManager will stop after a new ResourceManager has connected. Furthermore it makes sure that there is not endless loop of reconnection commands (see FLINK-6341).
+ */
+@Test public void testResourceManagerConnection() throws TimeoutException, InterruptedException {
+  FiniteDuration testTimeout=new FiniteDuration(30L,TimeUnit.SECONDS);
+  final long reconnectionInterval=200L;
+  final Configuration configuration=new Configuration();
+  configuration.setLong(JobManagerOptions.RESOURCE_MANAGER_RECONNECT_INTERVAL,reconnectionInterval);
+  final ActorSystem actorSystem=AkkaUtils.createLocalActorSystem(configuration);
+  try {
+    final ActorGateway jmGateway=TestingUtils.createJobManager(actorSystem,TestingUtils.defaultExecutor(),TestingUtils.defaultExecutor(),configuration,highAvailabilityServices);
+    final TestProbe probe=TestProbe.apply(actorSystem);
+    final AkkaActorGateway rmGateway=new AkkaActorGateway(probe.ref(),HighAvailabilityServices.DEFAULT_LEADER_ID);
+    Future<?> leaderFuture=jmGateway.ask(TestingJobManagerMessages.getNotifyWhenLeader(),testTimeout);
+    Await.ready(leaderFuture,testTimeout);
+    jmGateway.tell(new RegisterResourceManager(probe.ref()),rmGateway);
+    LeaderSessionMessage leaderSessionMessage=probe.expectMsgClass(LeaderSessionMessage.class);
+    assertEquals(jmGateway.leaderSessionID(),leaderSessionMessage.leaderSessionID());
+    assertTrue(leaderSessionMessage.message() instanceof RegisterResourceManagerSuccessful);
+    jmGateway.tell(new RegistrationMessages.RegisterTaskManager(ResourceID.generate(),mock(TaskManagerLocation.class),new HardwareDescription(1,1L,1L,1L),1));
+    leaderSessionMessage=probe.expectMsgClass(LeaderSessionMessage.class);
+    assertTrue(leaderSessionMessage.message() instanceof NotifyResourceStarted);
+    probe.lastSender().tell(new Status.Failure(new Exception("Test exception")),ActorRef.noSender());
+    Deadline reconnectionDeadline=new FiniteDuration(5L * reconnectionInterval,TimeUnit.MILLISECONDS).fromNow();
+    boolean registered=false;
+    while (reconnectionDeadline.hasTimeLeft()) {
+      try {
+        leaderSessionMessage=probe.expectMsgClass(reconnectionDeadline.timeLeft(),LeaderSessionMessage.class);
+      }
+ catch (      AssertionError ignored) {
+        continue;
+      }
+      if (leaderSessionMessage.message() instanceof TriggerRegistrationAtJobManager) {
+        if (registered) {
+          fail("A successful registration should not be followed by another TriggerRegistrationAtJobManager message.");
+        }
+        jmGateway.tell(new RegisterResourceManager(probe.ref()),rmGateway);
+      }
+ else       if (leaderSessionMessage.message() instanceof RegisterResourceManagerSuccessful) {
+        registered=true;
+      }
+ else {
+        fail("Received unknown message: " + leaderSessionMessage.message() + '.');
+      }
+    }
+    assertTrue(registered);
+  }
+  finally {
+    actorSystem.shutdown();
+    actorSystem.awaitTermination();
+  }
+}

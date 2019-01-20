@@ -1,0 +1,125 @@
+/** 
+ * This class tests the scenario where a store refresh happens due to a file not found during scan, after a compaction but before the compacted files are archived. At this state we test for a split and compaction
+ */
+@Category(MediumTests.class) public class TestCompactionFileNotFound {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestCompactionFileNotFound.class);
+  private static final Logger LOG=LoggerFactory.getLogger(TestCompactionFileNotFound.class);
+  private static final HBaseTestingUtility util=new HBaseTestingUtility();
+  private static final TableName TEST_TABLE=TableName.valueOf("test");
+  private static final byte[] TEST_FAMILY=Bytes.toBytes("f1");
+  private static final byte[] ROW_A=Bytes.toBytes("aaa");
+  private static final byte[] ROW_B=Bytes.toBytes("bbb");
+  private static final byte[] ROW_C=Bytes.toBytes("ccc");
+  private static final byte[] qualifierCol1=Bytes.toBytes("col1");
+  private static final byte[] bytes1=Bytes.toBytes(1);
+  private static final byte[] bytes2=Bytes.toBytes(2);
+  private static final byte[] bytes3=Bytes.toBytes(3);
+  private Table table;
+  @BeforeClass public static void setupBeforeClass() throws Exception {
+    Configuration conf=util.getConfiguration();
+    conf.setInt("hbase.hfile.compaction.discharger.interval",Integer.MAX_VALUE);
+    util.startMiniCluster(3);
+  }
+  @AfterClass public static void tearDownAfterClass() throws Exception {
+    util.shutdownMiniCluster();
+  }
+  @After public void after() throws Exception {
+    try {
+      if (table != null) {
+        table.close();
+      }
+    }
+  finally {
+      util.deleteTable(TEST_TABLE);
+    }
+  }
+  @Test public void testSplitAfterRefresh() throws Exception {
+    Admin admin=util.getAdmin();
+    table=util.createTable(TEST_TABLE,TEST_FAMILY);
+    try {
+      Put puta=new Put(ROW_A);
+      puta.addColumn(TEST_FAMILY,qualifierCol1,bytes1);
+      table.put(puta);
+      admin.flush(TEST_TABLE);
+      Put putb=new Put(ROW_B);
+      putb.addColumn(TEST_FAMILY,qualifierCol1,bytes2);
+      table.put(putb);
+      admin.flush(TEST_TABLE);
+      Put putc=new Put(ROW_C);
+      putc.addColumn(TEST_FAMILY,qualifierCol1,bytes3);
+      table.put(putc);
+      admin.flush(TEST_TABLE);
+      admin.compact(TEST_TABLE);
+      while (admin.getCompactionState(TEST_TABLE) != CompactionState.NONE) {
+        Thread.sleep(1000);
+      }
+      table.put(putb);
+      HRegion hr1=(HRegion)util.getRSForFirstRegionInTable(TEST_TABLE).getRegionByEncodedName(admin.getTableRegions(TEST_TABLE).get(0).getEncodedName());
+      hr1.refreshStoreFiles(true);
+      int numRegionsBeforeSplit=admin.getTableRegions(TEST_TABLE).size();
+      admin.splitRegion(admin.getTableRegions(TEST_TABLE).get(0).getEncodedNameAsBytes(),ROW_C);
+      util.waitFor(20000,new Waiter.Predicate<Exception>(){
+        @Override public boolean evaluate() throws Exception {
+          int numRegionsAfterSplit=0;
+          List<RegionServerThread> rst=util.getMiniHBaseCluster().getLiveRegionServerThreads();
+          for (          RegionServerThread t : rst) {
+            numRegionsAfterSplit+=t.getRegionServer().getRegions(TEST_TABLE).size();
+          }
+          return (numRegionsAfterSplit == numRegionsBeforeSplit + 1 && admin.isTableAvailable(TEST_TABLE));
+        }
+      }
+);
+      assertEquals(3,util.getMiniHBaseCluster().getLiveRegionServerThreads().size());
+    }
+  finally {
+      if (admin != null) {
+        admin.close();
+      }
+    }
+  }
+  @Test public void testCompactionAfterRefresh() throws Exception {
+    Admin admin=util.getAdmin();
+    table=util.createTable(TEST_TABLE,TEST_FAMILY);
+    try {
+      Put puta=new Put(ROW_A);
+      puta.addColumn(TEST_FAMILY,qualifierCol1,bytes1);
+      table.put(puta);
+      admin.flush(TEST_TABLE);
+      Put putb=new Put(ROW_B);
+      putb.addColumn(TEST_FAMILY,qualifierCol1,bytes2);
+      table.put(putb);
+      admin.flush(TEST_TABLE);
+      Put putc=new Put(ROW_C);
+      putc.addColumn(TEST_FAMILY,qualifierCol1,bytes3);
+      table.put(putc);
+      admin.flush(TEST_TABLE);
+      admin.compact(TEST_TABLE);
+      while (admin.getCompactionState(TEST_TABLE) != CompactionState.NONE) {
+        Thread.sleep(1000);
+      }
+      table.put(putb);
+      HRegion hr1=(HRegion)util.getRSForFirstRegionInTable(TEST_TABLE).getRegionByEncodedName(admin.getTableRegions(TEST_TABLE).get(0).getEncodedName());
+      hr1.refreshStoreFiles(true);
+      for (      HStore store : hr1.getStores()) {
+        store.closeAndArchiveCompactedFiles();
+      }
+      try {
+        hr1.compact(false);
+      }
+ catch (      IOException e) {
+        LOG.error("Got an exception during compaction",e);
+        if (e instanceof FileNotFoundException) {
+          Assert.fail("Got a FNFE during compaction");
+        }
+ else {
+          Assert.fail();
+        }
+      }
+    }
+  finally {
+      if (admin != null) {
+        admin.close();
+      }
+    }
+  }
+}

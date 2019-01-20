@@ -1,0 +1,118 @@
+/** 
+ * Tests around replay of recovered.edits content.
+ */
+@Category({MediumTests.class}) public class TestRecoveredEdits {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestRecoveredEdits.class);
+  private static final HBaseTestingUtility TEST_UTIL=new HBaseTestingUtility();
+  private static final Logger LOG=LoggerFactory.getLogger(TestRecoveredEdits.class);
+  @Rule public TestName testName=new TestName();
+  /** 
+ * HBASE-12782 ITBLL fails for me if generator does anything but 5M per maptask. Create a region. Close it. Then copy into place a file to replay, one that is bigger than configured flush size so we bring on lots of flushes.  Then reopen and confirm all edits made it in.
+ * @throws IOException
+ */
+  @Test public void testReplayWorksThoughLotsOfFlushing() throws IOException {
+    CacheConfig.instantiateBlockCache(TEST_UTIL.getConfiguration());
+    for (    MemoryCompactionPolicy policy : MemoryCompactionPolicy.values()) {
+      testReplayWorksWithMemoryCompactionPolicy(policy);
+    }
+  }
+  private void testReplayWorksWithMemoryCompactionPolicy(  MemoryCompactionPolicy policy) throws IOException {
+    Configuration conf=new Configuration(TEST_UTIL.getConfiguration());
+    conf.setInt(HConstants.HREGION_MEMSTORE_FLUSH_SIZE,1024 * 1024);
+    conf.set(CompactingMemStore.COMPACTING_MEMSTORE_TYPE_KEY,String.valueOf(policy));
+    final String encodedRegionName="4823016d8fca70b25503ee07f4c6d79f";
+    HTableDescriptor htd=new HTableDescriptor(TableName.valueOf(testName.getMethodName()));
+    final String columnFamily="meta";
+    byte[][] columnFamilyAsByteArray=new byte[][]{Bytes.toBytes(columnFamily)};
+    htd.addFamily(new HColumnDescriptor(columnFamily));
+    HRegionInfo hri=new HRegionInfo(htd.getTableName()){
+      @Override public synchronized String getEncodedName(){
+        return encodedRegionName;
+      }
+      private byte[] encodedRegionNameAsBytes=null;
+      @Override public synchronized byte[] getEncodedNameAsBytes(){
+        if (encodedRegionNameAsBytes == null) {
+          this.encodedRegionNameAsBytes=Bytes.toBytes(getEncodedName());
+        }
+        return this.encodedRegionNameAsBytes;
+      }
+    }
+;
+    Path hbaseRootDir=TEST_UTIL.getDataTestDir();
+    ChunkCreator.initialize(MemStoreLABImpl.CHUNK_SIZE_DEFAULT,false,0,0,0,null);
+    FileSystem fs=FileSystem.get(TEST_UTIL.getConfiguration());
+    Path tableDir=FSUtils.getTableDir(hbaseRootDir,htd.getTableName());
+    HRegionFileSystem hrfs=new HRegionFileSystem(TEST_UTIL.getConfiguration(),fs,tableDir,hri);
+    if (fs.exists(hrfs.getRegionDir())) {
+      LOG.info("Region directory already exists. Deleting.");
+      fs.delete(hrfs.getRegionDir(),true);
+    }
+    HRegion region=HRegion.createHRegion(hri,hbaseRootDir,conf,htd,null);
+    assertEquals(encodedRegionName,region.getRegionInfo().getEncodedName());
+    List<String> storeFiles=region.getStoreFileList(columnFamilyAsByteArray);
+    assertTrue(storeFiles.isEmpty());
+    region.close();
+    Path regionDir=region.getRegionDir(hbaseRootDir,hri);
+    Path recoveredEditsDir=WALSplitter.getRegionDirRecoveredEditsDir(regionDir);
+    Path recoveredEditsFile=new Path(System.getProperty("test.build.classes","target/test-classes"),"0000000000000016310");
+    Path destination=new Path(recoveredEditsDir,recoveredEditsFile.getName());
+    fs.copyToLocalFile(recoveredEditsFile,destination);
+    assertTrue(fs.exists(destination));
+    region=HRegion.openHRegion(region,null);
+    assertEquals(encodedRegionName,region.getRegionInfo().getEncodedName());
+    storeFiles=region.getStoreFileList(columnFamilyAsByteArray);
+    if (policy == MemoryCompactionPolicy.EAGER || policy == MemoryCompactionPolicy.ADAPTIVE) {
+      assertTrue("Files count=" + storeFiles.size(),storeFiles.size() >= 1);
+    }
+ else {
+      assertTrue("Files count=" + storeFiles.size(),storeFiles.size() > 10);
+    }
+    int count=verifyAllEditsMadeItIn(fs,conf,recoveredEditsFile,region);
+    LOG.info("Checked " + count + " edits made it in");
+  }
+  /** 
+ * @param fs
+ * @param conf
+ * @param edits
+ * @param region
+ * @return Return how many edits seen.
+ * @throws IOException
+ */
+  private int verifyAllEditsMadeItIn(  final FileSystem fs,  final Configuration conf,  final Path edits,  final HRegion region) throws IOException {
+    int count=0;
+    WAL.Reader reader=null;
+    try {
+      reader=WALFactory.createReader(fs,edits,conf);
+      WAL.Entry entry;
+      while ((entry=reader.next()) != null) {
+        WALKey key=entry.getKey();
+        WALEdit val=entry.getEdit();
+        count++;
+        if (!Bytes.equals(key.getEncodedRegionName(),region.getRegionInfo().getEncodedNameAsBytes())) {
+          continue;
+        }
+        Cell previous=null;
+        for (        Cell cell : val.getCells()) {
+          if (CellUtil.matchingFamily(cell,WALEdit.METAFAMILY))           continue;
+          if (previous != null && CellComparatorImpl.COMPARATOR.compareRows(previous,cell) == 0)           continue;
+          previous=cell;
+          Get g=new Get(CellUtil.cloneRow(cell));
+          Result r=region.get(g);
+          boolean found=false;
+          for (CellScanner scanner=r.cellScanner(); scanner.advance(); ) {
+            Cell current=scanner.current();
+            if (PrivateCellUtil.compareKeyIgnoresMvcc(CellComparatorImpl.COMPARATOR,cell,current) == 0) {
+              found=true;
+              break;
+            }
+          }
+          assertTrue("Failed to find " + cell,found);
+        }
+      }
+    }
+  finally {
+      if (reader != null)       reader.close();
+    }
+    return count;
+  }
+}

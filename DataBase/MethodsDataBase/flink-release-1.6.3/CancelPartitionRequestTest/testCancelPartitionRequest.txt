@@ -1,0 +1,33 @@
+/** 
+ * Verifies that requests for non-existing (failed/cancelled) input channels are properly cancelled. The receiver receives data, but there is no input channel to receive the data. This should cancel the request.
+ */
+@Test public void testCancelPartitionRequest() throws Exception {
+  NettyServerAndClient serverAndClient=null;
+  try {
+    TestPooledBufferProvider outboundBuffers=new TestPooledBufferProvider(16);
+    ResultPartitionManager partitions=mock(ResultPartitionManager.class);
+    ResultPartitionID pid=new ResultPartitionID();
+    CountDownLatch sync=new CountDownLatch(1);
+    final ResultSubpartitionView view=spy(new InfiniteSubpartitionView(outboundBuffers,sync));
+    when(partitions.createSubpartitionView(eq(pid),eq(0),any(BufferAvailabilityListener.class))).thenAnswer(new Answer<ResultSubpartitionView>(){
+      @Override public ResultSubpartitionView answer(      InvocationOnMock invocationOnMock) throws Throwable {
+        BufferAvailabilityListener listener=(BufferAvailabilityListener)invocationOnMock.getArguments()[2];
+        listener.notifyDataAvailable();
+        return view;
+      }
+    }
+);
+    NettyProtocol protocol=new NettyProtocol(partitions,mock(TaskEventDispatcher.class),true);
+    serverAndClient=initServerAndClient(protocol);
+    Channel ch=connect(serverAndClient);
+    ch.writeAndFlush(new PartitionRequest(pid,0,new InputChannelID(),Integer.MAX_VALUE)).await();
+    if (!sync.await(TestingUtils.TESTING_DURATION().toMillis(),TimeUnit.MILLISECONDS)) {
+      fail("Timed out after waiting for " + TestingUtils.TESTING_DURATION().toMillis() + " ms to be notified about cancelled partition.");
+    }
+    verify(view,times(1)).releaseAllResources();
+    verify(view,times(0)).notifySubpartitionConsumed();
+  }
+  finally {
+    shutdown(serverAndClient);
+  }
+}

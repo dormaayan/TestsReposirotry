@@ -1,0 +1,43 @@
+@Test public void transactionClosedMustBeAtomic() throws Throwable {
+  try (MetaDataStore store=newMetaDataStore()){
+    PagedFile pf=store.pagedFile;
+    int initialValue=2;
+    store.transactionClosed(initialValue,initialValue,initialValue);
+    AtomicLong writeCount=new AtomicLong();
+    AtomicLong fileReadCount=new AtomicLong();
+    AtomicLong apiReadCount=new AtomicLong();
+    int upperLimit=10_000;
+    int lowerLimit=100;
+    long endTime=currentTimeMillis() + SECONDS.toMillis(10);
+    Race race=new Race();
+    race.withEndCondition(() -> writeCount.get() >= upperLimit && fileReadCount.get() >= upperLimit && apiReadCount.get() >= upperLimit);
+    race.withEndCondition(() -> writeCount.get() >= lowerLimit && fileReadCount.get() >= lowerLimit && apiReadCount.get() >= lowerLimit && currentTimeMillis() >= endTime);
+    race.addContestants(3,() -> {
+      long count=writeCount.incrementAndGet();
+      store.transactionCommitted(count,count,count);
+    }
+);
+    race.addContestants(3,throwing(() -> {
+      try (PageCursor cursor=pf.io(0,PagedFile.PF_SHARED_READ_LOCK)){
+        assertTrue(cursor.next());
+        long logVersion;
+        long byteOffset;
+        do {
+          logVersion=store.getRecordValue(cursor,MetaDataStore.Position.LAST_CLOSED_TRANSACTION_LOG_VERSION);
+          byteOffset=store.getRecordValue(cursor,MetaDataStore.Position.LAST_CLOSED_TRANSACTION_LOG_BYTE_OFFSET);
+        }
+ while (cursor.shouldRetry());
+        assertLogVersionEqualsByteOffset(logVersion,byteOffset,"file");
+        fileReadCount.incrementAndGet();
+      }
+     }
+));
+    race.addContestants(3,() -> {
+      long[] transaction=store.getLastClosedTransaction();
+      assertLogVersionEqualsByteOffset(transaction[0],transaction[1],"API");
+      apiReadCount.incrementAndGet();
+    }
+);
+    race.go();
+  }
+ }

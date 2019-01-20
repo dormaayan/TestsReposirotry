@@ -1,0 +1,42 @@
+/** 
+ * Tests the consumption of multiple subpartitions via local input channels. <p>Multiple producer tasks produce pipelined partitions, which are consumed by multiple tasks via local input channels.
+ */
+@Test public void testConcurrentConsumeMultiplePartitions() throws Exception {
+  final int parallelism=32;
+  final int producerBufferPoolSize=parallelism + 1;
+  final int numberOfBuffersPerChannel=1024;
+  checkArgument(parallelism >= 1);
+  checkArgument(producerBufferPoolSize >= parallelism);
+  checkArgument(numberOfBuffersPerChannel >= 1);
+  final ExecutorService executor=Executors.newFixedThreadPool(2 * parallelism);
+  final NetworkBufferPool networkBuffers=new NetworkBufferPool((parallelism * producerBufferPoolSize) + (parallelism * parallelism),TestBufferFactory.BUFFER_SIZE);
+  final ResultPartitionConsumableNotifier partitionConsumableNotifier=new NoOpResultPartitionConsumableNotifier();
+  final TaskActions taskActions=mock(TaskActions.class);
+  final IOManager ioManager=mock(IOManager.class);
+  final JobID jobId=new JobID();
+  final ResultPartitionManager partitionManager=new ResultPartitionManager();
+  final ResultPartitionID[] partitionIds=new ResultPartitionID[parallelism];
+  final TestPartitionProducer[] partitionProducers=new TestPartitionProducer[parallelism];
+  for (int i=0; i < parallelism; i++) {
+    partitionIds[i]=new ResultPartitionID();
+    final ResultPartition partition=new ResultPartition("Test Name",taskActions,jobId,partitionIds[i],ResultPartitionType.PIPELINED,parallelism,parallelism,partitionManager,partitionConsumableNotifier,ioManager,true);
+    partition.registerBufferPool(networkBuffers.createBufferPool(producerBufferPoolSize,producerBufferPoolSize));
+    partitionProducers[i]=new TestPartitionProducer(partition,false,new TestPartitionProducerBufferSource(parallelism,partition.getBufferProvider(),numberOfBuffersPerChannel));
+    partitionManager.registerResultPartition(partition);
+  }
+  try {
+    List<Future<?>> results=Lists.newArrayListWithCapacity(parallelism + 1);
+    for (int i=0; i < parallelism; i++) {
+      results.add(executor.submit(partitionProducers[i]));
+    }
+    for (int i=0; i < parallelism; i++) {
+      results.add(executor.submit(new TestLocalInputChannelConsumer(i,parallelism,numberOfBuffersPerChannel,networkBuffers.createBufferPool(parallelism,parallelism),partitionManager,new TaskEventDispatcher(),partitionIds)));
+    }
+    waitForAll(60_000L,results);
+  }
+  finally {
+    networkBuffers.destroyAllBufferPools();
+    networkBuffers.destroy();
+    executor.shutdown();
+  }
+}

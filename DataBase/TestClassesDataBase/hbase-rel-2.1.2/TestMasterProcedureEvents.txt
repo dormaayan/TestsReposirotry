@@ -1,0 +1,66 @@
+@Category({MasterTests.class,MediumTests.class}) public class TestMasterProcedureEvents {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestMasterProcedureEvents.class);
+  private static final Logger LOG=LoggerFactory.getLogger(TestCreateTableProcedure.class);
+  protected static final HBaseTestingUtility UTIL=new HBaseTestingUtility();
+  @Rule public TestName name=new TestName();
+  private static void setupConf(  Configuration conf){
+    conf.setInt(MasterProcedureConstants.MASTER_PROCEDURE_THREADS,1);
+    conf.setInt(MasterProcedureConstants.MASTER_URGENT_PROCEDURE_THREADS,0);
+    conf.setBoolean(WALProcedureStore.USE_HSYNC_CONF_KEY,false);
+  }
+  @BeforeClass public static void setupCluster() throws Exception {
+    setupConf(UTIL.getConfiguration());
+    UTIL.startMiniCluster(2);
+    UTIL.waitUntilNoRegionsInTransition();
+  }
+  @AfterClass public static void cleanupTest() throws Exception {
+    try {
+      UTIL.shutdownMiniCluster();
+    }
+ catch (    Exception e) {
+      LOG.warn("failure shutting down cluster",e);
+    }
+  }
+  @After public void tearDown() throws Exception {
+    for (    TableDescriptor htd : UTIL.getAdmin().listTableDescriptors()) {
+      LOG.info("Tear down, remove table=" + htd.getTableName());
+      UTIL.deleteTable(htd.getTableName());
+    }
+  }
+  @Test public void testMasterInitializedEvent() throws Exception {
+    final TableName tableName=TableName.valueOf(name.getMethodName());
+    HMaster master=UTIL.getMiniHBaseCluster().getMaster();
+    ProcedureExecutor<MasterProcedureEnv> procExec=master.getMasterProcedureExecutor();
+    RegionInfo hri=RegionInfoBuilder.newBuilder(tableName).build();
+    TableDescriptor htd=TableDescriptorBuilder.newBuilder(tableName).setColumnFamily(ColumnFamilyDescriptorBuilder.of("f")).build();
+    while (!master.isInitialized()) {
+      Thread.sleep(250);
+    }
+    master.setInitialized(false);
+    testProcedureEventWaitWake(master,master.getInitializedEvent(),new CreateTableProcedure(procExec.getEnvironment(),htd,new RegionInfo[]{hri}));
+  }
+  private void testProcedureEventWaitWake(  final HMaster master,  final ProcedureEvent<?> event,  final Procedure<MasterProcedureEnv> proc) throws Exception {
+    final ProcedureExecutor<MasterProcedureEnv> procExec=master.getMasterProcedureExecutor();
+    final MasterProcedureScheduler procSched=procExec.getEnvironment().getProcedureScheduler();
+    final long startPollCalls=procSched.getPollCalls();
+    final long startNullPollCalls=procSched.getNullPollCalls();
+    LOG.debug("checking " + event);
+    assertEquals(false,event.isReady());
+    assertEquals(0,event.getSuspendedProcedures().size());
+    LOG.debug("submit " + proc);
+    long procId=procExec.submitProcedure(proc);
+    LOG.debug("wait procedure suspended on " + event);
+    while (event.getSuspendedProcedures().size() < 1)     Thread.sleep(25);
+    LOG.debug("checking " + event + " size="+ event.getSuspendedProcedures().size());
+    assertEquals(false,event.isReady());
+    assertEquals(1,event.getSuspendedProcedures().size());
+    LOG.debug("wake " + event);
+    event.wake(procSched);
+    assertEquals(true,event.isReady());
+    LOG.debug("waiting " + proc);
+    ProcedureTestingUtility.waitProcedure(procExec,procId);
+    assertEquals(true,event.isReady());
+    assertEquals(0,event.getSuspendedProcedures().size());
+    LOG.debug("completed execution of " + proc + " pollCalls="+ (procSched.getPollCalls() - startPollCalls)+ " nullPollCalls="+ (procSched.getNullPollCalls() - startNullPollCalls));
+  }
+}

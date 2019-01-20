@@ -1,0 +1,38 @@
+@Test public void testAggregatingState() throws Exception {
+  final Deadline deadline=Deadline.now().plus(TEST_TIMEOUT);
+  final long numElements=1024L;
+  StreamExecutionEnvironment env=StreamExecutionEnvironment.getExecutionEnvironment();
+  env.setStateBackend(stateBackend);
+  env.setParallelism(maxParallelism);
+  env.setRestartStrategy(RestartStrategies.fixedDelayRestart(Integer.MAX_VALUE,1000L));
+  DataStream<Tuple2<Integer,Long>> source=env.addSource(new TestAscendingValueSource(numElements));
+  final AggregatingStateDescriptor<Tuple2<Integer,Long>,String,String> aggrStateDescriptor=new AggregatingStateDescriptor<>("aggregates",new SumAggr(),String.class);
+  aggrStateDescriptor.setQueryable("aggr-queryable");
+  source.keyBy(new KeySelector<Tuple2<Integer,Long>,Integer>(){
+    private static final long serialVersionUID=8470749712274833552L;
+    @Override public Integer getKey(    Tuple2<Integer,Long> value){
+      return value.f0;
+    }
+  }
+).transform("TestAggregatingOperator",BasicTypeInfo.STRING_TYPE_INFO,new AggregatingTestOperator(aggrStateDescriptor));
+  try (AutoCancellableJob autoCancellableJob=new AutoCancellableJob(deadline,clusterClient,env)){
+    final JobID jobId=autoCancellableJob.getJobId();
+    final JobGraph jobGraph=autoCancellableJob.getJobGraph();
+    clusterClient.setDetached(true);
+    clusterClient.submitJob(jobGraph,AbstractQueryableStateTestBase.class.getClassLoader());
+    for (int key=0; key < maxParallelism; key++) {
+      boolean success=false;
+      while (deadline.hasTimeLeft() && !success) {
+        CompletableFuture<AggregatingState<Tuple2<Integer,Long>,String>> future=getKvState(deadline,client,jobId,"aggr-queryable",key,BasicTypeInfo.INT_TYPE_INFO,aggrStateDescriptor,false,executor);
+        String value=future.get(deadline.timeLeft().toMillis(),TimeUnit.MILLISECONDS).get();
+        if (Long.parseLong(value) == numElements * (numElements + 1L) / 2L) {
+          success=true;
+        }
+ else {
+          Thread.sleep(RETRY_TIMEOUT);
+        }
+      }
+      assertTrue("Did not succeed query",success);
+    }
+  }
+ }

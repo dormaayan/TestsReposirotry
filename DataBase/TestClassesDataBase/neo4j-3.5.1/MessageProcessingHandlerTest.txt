@@ -1,0 +1,54 @@
+public class MessageProcessingHandlerTest {
+  @Test public void shouldCallHaltOnUnexpectedFailures() throws Exception {
+    BoltResponseMessageWriter msgWriter=newResponseHandlerMock();
+    doThrow(new RuntimeException("Something went horribly wrong")).when(msgWriter).write(any(SuccessMessage.class));
+    BoltConnection connection=mock(BoltConnection.class);
+    MessageProcessingHandler handler=new MessageProcessingHandler(msgWriter,connection,mock(Log.class));
+    handler.onFinish();
+    verify(connection).stop();
+  }
+  @Test public void shouldLogOriginalErrorWhenOutputIsClosed() throws Exception {
+    testLoggingOfOriginalErrorWhenOutputIsClosed(Neo4jError.from(new RuntimeException("Non-fatal error")));
+  }
+  @Test public void shouldLogOriginalFatalErrorWhenOutputIsClosed() throws Exception {
+    testLoggingOfOriginalErrorWhenOutputIsClosed(Neo4jError.fatalFrom(new RuntimeException("Fatal error")));
+  }
+  @Test public void shouldLogWriteErrorAndOriginalErrorWhenUnknownFailure() throws Exception {
+    testLoggingOfWriteErrorAndOriginalErrorWhenUnknownFailure(Neo4jError.from(new RuntimeException("Non-fatal error")));
+  }
+  @Test public void shouldLogWriteErrorAndOriginalFatalErrorWhenUnknownFailure() throws Exception {
+    testLoggingOfWriteErrorAndOriginalErrorWhenUnknownFailure(Neo4jError.fatalFrom(new RuntimeException("Fatal error")));
+  }
+  @Test public void shouldLogShortWarningOnClientDisconnectMidwayThroughQuery() throws Exception {
+    PackOutputClosedException outputClosed=new PackOutputClosedException("Output closed","<client>");
+    Neo4jError txTerminated=Neo4jError.from(new TransactionTerminatedException(Status.Transaction.Terminated));
+    AssertableLogProvider logProvider=emulateFailureWritingError(txTerminated,outputClosed);
+    logProvider.assertExactly(inLog("Test").warn(equalTo("Client %s disconnected while query was running. Session has been cleaned up. " + "This can be caused by temporary network problems, but if you see this often, ensure your " + "applications are properly waiting for operations to complete before exiting."),equalTo("<client>")));
+  }
+  private static void testLoggingOfOriginalErrorWhenOutputIsClosed(  Neo4jError original) throws Exception {
+    PackOutputClosedException outputClosed=new PackOutputClosedException("Output closed","<client>");
+    AssertableLogProvider logProvider=emulateFailureWritingError(original,outputClosed);
+    logProvider.assertExactly(inLog("Test").warn(startsWith("Unable to send error back to the client"),equalTo(original.cause())));
+  }
+  private static void testLoggingOfWriteErrorAndOriginalErrorWhenUnknownFailure(  Neo4jError original) throws Exception {
+    RuntimeException outputError=new RuntimeException("Output failed");
+    AssertableLogProvider logProvider=emulateFailureWritingError(original,outputError);
+    logProvider.assertExactly(inLog("Test").error(startsWith("Unable to send error back to the client"),both(equalTo(outputError)).and(hasSuppressed(original.cause()))));
+  }
+  private static AssertableLogProvider emulateFailureWritingError(  Neo4jError error,  Throwable errorDuringWrite) throws Exception {
+    AssertableLogProvider logProvider=new AssertableLogProvider();
+    BoltResponseMessageWriter responseHandler=newResponseHandlerMock(error.isFatal(),errorDuringWrite);
+    MessageProcessingHandler handler=new MessageProcessingHandler(responseHandler,mock(BoltConnection.class),logProvider.getLog("Test"));
+    handler.markFailed(error);
+    handler.onFinish();
+    return logProvider;
+  }
+  private static BoltResponseMessageWriter newResponseHandlerMock(  boolean fatalError,  Throwable error) throws Exception {
+    BoltResponseMessageWriter handler=newResponseHandlerMock();
+    doThrow(error).when(handler).write(any(FailureMessage.class));
+    return handler;
+  }
+  @SuppressWarnings("unchecked") private static BoltResponseMessageWriter newResponseHandlerMock(){
+    return mock(BoltResponseMessageWriter.class);
+  }
+}

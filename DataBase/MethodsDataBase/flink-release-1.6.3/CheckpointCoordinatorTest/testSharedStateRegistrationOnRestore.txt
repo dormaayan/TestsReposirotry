@@ -1,0 +1,102 @@
+@Test public void testSharedStateRegistrationOnRestore() throws Exception {
+  final JobID jid=new JobID();
+  final long timestamp=System.currentTimeMillis();
+  final JobVertexID jobVertexID1=new JobVertexID();
+  int parallelism1=2;
+  int maxParallelism1=4;
+  final ExecutionJobVertex jobVertex1=mockExecutionJobVertex(jobVertexID1,parallelism1,maxParallelism1);
+  List<ExecutionVertex> allExecutionVertices=new ArrayList<>(parallelism1);
+  allExecutionVertices.addAll(Arrays.asList(jobVertex1.getTaskVertices()));
+  ExecutionVertex[] arrayExecutionVertices=allExecutionVertices.toArray(new ExecutionVertex[allExecutionVertices.size()]);
+  RecoverableCompletedCheckpointStore store=new RecoverableCompletedCheckpointStore(10);
+  final List<SharedStateRegistry> createdSharedStateRegistries=new ArrayList<>(2);
+  CheckpointCoordinator coord=new CheckpointCoordinator(jid,600000,600000,0,Integer.MAX_VALUE,CheckpointRetentionPolicy.NEVER_RETAIN_AFTER_TERMINATION,arrayExecutionVertices,arrayExecutionVertices,arrayExecutionVertices,new StandaloneCheckpointIDCounter(),store,new MemoryStateBackend(),Executors.directExecutor(),deleteExecutor -> {
+    SharedStateRegistry instance=new SharedStateRegistry(deleteExecutor);
+    createdSharedStateRegistries.add(instance);
+    return instance;
+  }
+);
+  final int numCheckpoints=3;
+  List<KeyGroupRange> keyGroupPartitions1=StateAssignmentOperation.createKeyGroupPartitions(maxParallelism1,parallelism1);
+  for (int i=0; i < numCheckpoints; ++i) {
+    performIncrementalCheckpoint(jid,coord,jobVertex1,keyGroupPartitions1,timestamp + i,i);
+  }
+  List<CompletedCheckpoint> completedCheckpoints=coord.getSuccessfulCheckpoints();
+  assertEquals(numCheckpoints,completedCheckpoints.size());
+  int sharedHandleCount=0;
+  List<Map<StateHandleID,StreamStateHandle>> sharedHandlesByCheckpoint=new ArrayList<>(numCheckpoints);
+  for (int i=0; i < numCheckpoints; ++i) {
+    sharedHandlesByCheckpoint.add(new HashMap<>(2));
+  }
+  int cp=0;
+  for (  CompletedCheckpoint completedCheckpoint : completedCheckpoints) {
+    for (    OperatorState taskState : completedCheckpoint.getOperatorStates().values()) {
+      for (      OperatorSubtaskState subtaskState : taskState.getStates()) {
+        for (        KeyedStateHandle keyedStateHandle : subtaskState.getManagedKeyedState()) {
+          verify(keyedStateHandle,times(1)).registerSharedStates(createdSharedStateRegistries.get(0));
+          IncrementalKeyedStateHandle incrementalKeyedStateHandle=(IncrementalKeyedStateHandle)keyedStateHandle;
+          sharedHandlesByCheckpoint.get(cp).putAll(incrementalKeyedStateHandle.getSharedState());
+          for (          StreamStateHandle streamStateHandle : incrementalKeyedStateHandle.getSharedState().values()) {
+            assertTrue(!(streamStateHandle instanceof PlaceholderStreamStateHandle));
+            verify(streamStateHandle,never()).discardState();
+            ++sharedHandleCount;
+          }
+          for (          StreamStateHandle streamStateHandle : incrementalKeyedStateHandle.getPrivateState().values()) {
+            verify(streamStateHandle,never()).discardState();
+          }
+          verify(incrementalKeyedStateHandle.getMetaStateHandle(),never()).discardState();
+        }
+        verify(subtaskState,never()).discardState();
+      }
+    }
+    ++cp;
+  }
+  assertEquals(10,sharedHandleCount);
+  store.removeOldestCheckpoint();
+  for (  Map<StateHandleID,StreamStateHandle> cpList : sharedHandlesByCheckpoint) {
+    for (    StreamStateHandle streamStateHandle : cpList.values()) {
+      verify(streamStateHandle,never()).discardState();
+    }
+  }
+  store.shutdown(JobStatus.SUSPENDED);
+  Map<JobVertexID,ExecutionJobVertex> tasks=new HashMap<>();
+  tasks.put(jobVertexID1,jobVertex1);
+  coord.restoreLatestCheckpointedState(tasks,true,false);
+  cp=0;
+  for (  CompletedCheckpoint completedCheckpoint : completedCheckpoints) {
+    for (    OperatorState taskState : completedCheckpoint.getOperatorStates().values()) {
+      for (      OperatorSubtaskState subtaskState : taskState.getStates()) {
+        for (        KeyedStateHandle keyedStateHandle : subtaskState.getManagedKeyedState()) {
+          VerificationMode verificationMode;
+          if (cp > 0) {
+            verificationMode=times(1);
+          }
+ else {
+            verificationMode=never();
+          }
+          verify(keyedStateHandle,verificationMode).registerSharedStates(createdSharedStateRegistries.get(1));
+        }
+      }
+    }
+    ++cp;
+  }
+  store.removeOldestCheckpoint();
+  for (  Map<StateHandleID,StreamStateHandle> cpList : sharedHandlesByCheckpoint) {
+    for (    Map.Entry<StateHandleID,StreamStateHandle> entry : cpList.entrySet()) {
+      String key=entry.getKey().getKeyString();
+      int belongToCP=Integer.parseInt(String.valueOf(key.charAt(key.length() - 1)));
+      if (belongToCP == 0) {
+        verify(entry.getValue(),times(1)).discardState();
+      }
+ else {
+        verify(entry.getValue(),never()).discardState();
+      }
+    }
+  }
+  store.removeOldestCheckpoint();
+  for (  Map<StateHandleID,StreamStateHandle> cpList : sharedHandlesByCheckpoint) {
+    for (    StreamStateHandle streamStateHandle : cpList.values()) {
+      verify(streamStateHandle,times(1)).discardState();
+    }
+  }
+}

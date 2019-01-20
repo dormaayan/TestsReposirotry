@@ -1,0 +1,68 @@
+/** 
+ * Test case for https://issues.apache.org/jira/browse/HBASE-16721
+ */
+@Test public void testUnflushedSeqIdTracking() throws IOException, InterruptedException {
+  final String name=this.name.getMethodName();
+  final byte[] b=Bytes.toBytes("b");
+  final AtomicBoolean startHoldingForAppend=new AtomicBoolean(false);
+  final CountDownLatch holdAppend=new CountDownLatch(1);
+  final CountDownLatch flushFinished=new CountDownLatch(1);
+  final CountDownLatch putFinished=new CountDownLatch(1);
+  try (FSHLog log=new FSHLog(FS,FSUtils.getRootDir(CONF),name,HConstants.HREGION_OLDLOGDIR_NAME,CONF,null,true,null,null)){
+    log.registerWALActionsListener(new WALActionsListener(){
+      @Override public void visitLogEntryBeforeWrite(      WALKey logKey,      WALEdit logEdit) throws IOException {
+        if (startHoldingForAppend.get()) {
+          try {
+            holdAppend.await();
+          }
+ catch (          InterruptedException e) {
+            LOG.error(e.toString(),e);
+          }
+        }
+      }
+    }
+);
+    TableDescriptor htd=TableDescriptorBuilder.newBuilder(TableName.valueOf(this.name.getMethodName())).setColumnFamily(ColumnFamilyDescriptorBuilder.of(b)).build();
+    RegionInfo hri=RegionInfoBuilder.newBuilder(htd.getTableName()).build();
+    ChunkCreator.initialize(MemStoreLABImpl.CHUNK_SIZE_DEFAULT,false,0,0,0,null);
+    final HRegion region=TEST_UTIL.createLocalHRegion(hri,htd,log);
+    ExecutorService exec=Executors.newFixedThreadPool(2);
+    region.put(new Put(b).addColumn(b,b,b));
+    startHoldingForAppend.set(true);
+    exec.submit(new Runnable(){
+      @Override public void run(){
+        try {
+          region.put(new Put(b).addColumn(b,b,b));
+          putFinished.countDown();
+        }
+ catch (        IOException e) {
+          LOG.error(e.toString(),e);
+        }
+      }
+    }
+);
+    Threads.sleep(3000);
+    exec.submit(new Runnable(){
+      @Override public void run(){
+        try {
+          HRegion.FlushResult flushResult=region.flush(true);
+          LOG.info("Flush result:" + flushResult.getResult());
+          LOG.info("Flush succeeded:" + flushResult.isFlushSucceeded());
+          flushFinished.countDown();
+        }
+ catch (        IOException e) {
+          LOG.error(e.toString(),e);
+        }
+      }
+    }
+);
+    Threads.sleep(3000);
+    holdAppend.countDown();
+    putFinished.await();
+    flushFinished.await();
+    assertEquals("Region did not flush?",1,region.getStoreFileList(new byte[][]{b}).size());
+    long seqId=log.getEarliestMemStoreSeqNum(hri.getEncodedNameAsBytes());
+    assertEquals("Found seqId for the region which is already flushed",HConstants.NO_SEQNUM,seqId);
+    region.close();
+  }
+ }

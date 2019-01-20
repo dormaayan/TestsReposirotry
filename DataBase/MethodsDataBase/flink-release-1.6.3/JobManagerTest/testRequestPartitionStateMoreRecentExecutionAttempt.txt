@@ -1,0 +1,63 @@
+/** 
+ * Tests the JobManager response when the execution is not registered with the ExecutionGraph anymore and a new execution attempt is available.
+ */
+@Test public void testRequestPartitionStateMoreRecentExecutionAttempt() throws Exception {
+  new JavaTestKit(system){
+{
+      new Within(duration("15 seconds")){
+        @Override protected void run(){
+          TestingCluster cluster=null;
+          try {
+            cluster=startTestingCluster(4,1,DEFAULT_AKKA_ASK_TIMEOUT());
+            final IntermediateDataSetID rid=new IntermediateDataSetID();
+            final JobVertex sender=new JobVertex("Sender");
+            sender.setParallelism(1);
+            sender.setInvokableClass(NoOpInvokable.class);
+            sender.createAndAddResultDataSet(rid,PIPELINED);
+            final JobVertex sender2=new JobVertex("Blocking Sender");
+            sender2.setParallelism(1);
+            sender2.setInvokableClass(BlockingNoOpInvokable.class);
+            sender2.createAndAddResultDataSet(new IntermediateDataSetID(),PIPELINED);
+            final JobGraph jobGraph=new JobGraph("Fast finishing producer test job",sender,sender2);
+            final JobID jid=jobGraph.getJobID();
+            final ActorGateway jobManagerGateway=cluster.getLeaderGateway(TestingUtils.TESTING_DURATION());
+            final ActorGateway testActorGateway=new AkkaActorGateway(getTestActor(),HighAvailabilityServices.DEFAULT_LEADER_ID);
+            jobManagerGateway.tell(new SubmitJob(jobGraph,ListeningBehaviour.EXECUTION_RESULT),testActorGateway);
+            expectMsgClass(JobSubmitSuccess.class);
+            jobManagerGateway.tell(new WaitForAllVerticesToBeRunningOrFinished(jid),testActorGateway);
+            expectMsgClass(TestingJobManagerMessages.AllVerticesRunning.class);
+            Future<Object> egFuture=jobManagerGateway.ask(new RequestExecutionGraph(jobGraph.getJobID()),remaining());
+            ExecutionGraphFound egFound=(ExecutionGraphFound)Await.result(egFuture,remaining());
+            ExecutionGraph eg=(ExecutionGraph)egFound.executionGraph();
+            ExecutionVertex vertex=eg.getJobVertex(sender.getID()).getTaskVertices()[0];
+            while (vertex.getExecutionState() != ExecutionState.FINISHED) {
+              Thread.sleep(1);
+            }
+            IntermediateResultPartition partition=vertex.getProducedPartitions().values().iterator().next();
+            ResultPartitionID partitionId=new ResultPartitionID(partition.getPartitionId(),vertex.getCurrentExecutionAttempt().getAttemptId());
+            vertex.resetForNewExecution(System.currentTimeMillis(),1L);
+            Object request=new RequestPartitionProducerState(jid,rid,partitionId);
+            Future<?> producerStateFuture=jobManagerGateway.ask(request,getRemainingTime());
+            try {
+              Await.result(producerStateFuture,getRemainingTime());
+              fail("Did not fail with expected Exception");
+            }
+ catch (            PartitionProducerDisposedException ignored) {
+            }
+          }
+ catch (          Exception e) {
+            e.printStackTrace();
+            fail(e.getMessage());
+          }
+ finally {
+            if (cluster != null) {
+              cluster.stop();
+            }
+          }
+        }
+      }
+;
+    }
+  }
+;
+}

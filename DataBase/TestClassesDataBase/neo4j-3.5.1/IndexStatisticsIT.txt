@@ -1,0 +1,91 @@
+public class IndexStatisticsIT {
+  private static final Label ALIEN=label("Alien");
+  private static final String SPECIMEN="specimen";
+  @Rule public final EphemeralFileSystemRule fsRule=new EphemeralFileSystemRule();
+  private final AssertableLogProvider logProvider=new AssertableLogProvider();
+  private GraphDatabaseService db;
+  private EphemeralFileSystemAbstraction fileSystem;
+  @Before public void before(){
+    fileSystem=fsRule.get();
+    startDb();
+  }
+  @After public void after(){
+    try {
+      db.shutdown();
+    }
+  finally {
+      db=null;
+    }
+  }
+  @Test public void shouldRecoverIndexCountsBySamplingThemOnStartup(){
+    createAliens();
+    awaitIndexOnline(indexAliensBySpecimen());
+    IndexDescriptor index=TestIndexDescriptorFactory.forLabel(labelId(ALIEN),pkId(SPECIMEN));
+    SchemaStorage storage=new SchemaStorage(neoStores().getSchemaStore());
+    long indexId=storage.indexGetForSchema(index).getId();
+    resetIndexCounts(indexId);
+    restart();
+    CountsTracker tracker=neoStores().getCounts();
+    assertEqualRegisters("Unexpected updates and size for the index",newDoubleLongRegister(0,32),tracker.indexUpdatesAndSize(indexId,newDoubleLongRegister()));
+    assertEqualRegisters("Unexpected sampling result",newDoubleLongRegister(16,32),tracker.indexSample(indexId,newDoubleLongRegister()));
+    assertLogExistsForRecoveryOn(":Alien(specimen)");
+  }
+  private void assertEqualRegisters(  String message,  DoubleLongRegister expected,  DoubleLongRegister actual){
+    assertEquals(message + " (first part of register)",expected.readFirst(),actual.readFirst());
+    assertEquals(message + " (second part of register)",expected.readSecond(),actual.readSecond());
+  }
+  private void assertLogExistsForRecoveryOn(  String labelAndProperty){
+    logProvider.assertAtLeastOnce(inLog(IndexSamplingController.class).debug("Recovering index sampling for index %s",labelAndProperty));
+  }
+  private int labelId(  Label alien){
+    try (Transaction ignore=db.beginTx()){
+      return ktx().tokenRead().nodeLabel(alien.name());
+    }
+   }
+  private int pkId(  String propertyName){
+    try (Transaction ignore=db.beginTx()){
+      return ktx().tokenRead().propertyKey(propertyName);
+    }
+   }
+  private KernelTransaction ktx(){
+    return ((GraphDatabaseAPI)db).getDependencyResolver().resolveDependency(ThreadToStatementContextBridge.class).getKernelTransactionBoundToThisThread(true);
+  }
+  private void createAliens(){
+    try (Transaction tx=db.beginTx()){
+      for (int i=0; i < 32; i++) {
+        Node alien=db.createNode(ALIEN);
+        alien.setProperty(SPECIMEN,i / 2);
+      }
+      tx.success();
+    }
+   }
+  private void awaitIndexOnline(  IndexDefinition definition){
+    try (Transaction tx=db.beginTx()){
+      db.schema().awaitIndexOnline(definition,10,TimeUnit.SECONDS);
+      tx.success();
+    }
+   }
+  private IndexDefinition indexAliensBySpecimen(){
+    try (Transaction tx=db.beginTx()){
+      IndexDefinition definition=db.schema().indexFor(ALIEN).on(SPECIMEN).create();
+      tx.success();
+      return definition;
+    }
+   }
+  private void resetIndexCounts(  long indexId){
+    try (CountsAccessor.IndexStatsUpdater updater=neoStores().getCounts().updateIndexCounts()){
+      updater.replaceIndexSample(indexId,0,0);
+      updater.replaceIndexUpdateAndSize(indexId,0,0);
+    }
+   }
+  private NeoStores neoStores(){
+    return ((GraphDatabaseAPI)db).getDependencyResolver().resolveDependency(RecordStorageEngine.class).testAccessNeoStores();
+  }
+  private void startDb(){
+    db=new TestGraphDatabaseFactory().setInternalLogProvider(logProvider).setFileSystem(new UncloseableDelegatingFileSystemAbstraction(fileSystem)).newImpermanentDatabaseBuilder().setConfig(index_background_sampling_enabled,"false").newGraphDatabase();
+  }
+  void restart(){
+    db.shutdown();
+    startDb();
+  }
+}

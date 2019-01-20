@@ -1,0 +1,46 @@
+@Test void retryMustResetCursorOffset() throws Exception {
+  configureStandardPageCache();
+  final PagedFile pagedFile=map(file("a"),filePageSize);
+  final AtomicReference<Exception> caughtWriterException=new AtomicReference<>();
+  final CountDownLatch startLatch=new CountDownLatch(1);
+  final byte expectedByte=(byte)13;
+  try (PageCursor cursor=pagedFile.io(0,PF_SHARED_WRITE_LOCK)){
+    if (cursor.next()) {
+      cursor.putByte(expectedByte);
+    }
+  }
+   AtomicBoolean end=new AtomicBoolean(false);
+  Runnable writer=() -> {
+    while (!end.get()) {
+      try (PageCursor cursor=pagedFile.io(0,PF_SHARED_WRITE_LOCK)){
+        if (cursor.next()) {
+          cursor.setOffset(recordSize);
+          cursor.putByte((byte)14);
+        }
+        startLatch.countDown();
+      }
+ catch (      IOException e) {
+        caughtWriterException.set(e);
+        throw new RuntimeException(e);
+      }
+    }
+  }
+;
+  Future<?> writerFuture=executor.submit(writer);
+  startLatch.await();
+  long timeout=currentTimeMillis() + SHORT_TIMEOUT_MILLIS;
+  int i=0;
+  for (; i < 1000 && currentTimeMillis() < timeout; i++) {
+    try (PageCursor cursor=pagedFile.io(0,PF_SHARED_READ_LOCK)){
+      assertTrue(cursor.next());
+      do {
+        assertThat(cursor.getByte(),is(expectedByte));
+      }
+ while (cursor.shouldRetry() && currentTimeMillis() < timeout);
+    }
+   }
+  end.set(true);
+  writerFuture.get();
+  assertTrue(i > 1);
+  pagedFile.close();
+}

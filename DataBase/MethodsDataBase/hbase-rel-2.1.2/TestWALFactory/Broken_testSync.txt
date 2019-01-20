@@ -1,0 +1,90 @@
+/** 
+ * Test new HDFS-265 sync.
+ * @throws Exception
+ */
+@Test public void Broken_testSync() throws Exception {
+  TableName tableName=TableName.valueOf(currentTest.getMethodName());
+  MultiVersionConcurrencyControl mvcc=new MultiVersionConcurrencyControl(1);
+  Path p=new Path(dir,currentTest.getMethodName() + ".fsdos");
+  FSDataOutputStream out=fs.create(p);
+  out.write(tableName.getName());
+  Method syncMethod=null;
+  try {
+    syncMethod=out.getClass().getMethod("hflush",new Class<?>[]{});
+  }
+ catch (  NoSuchMethodException e) {
+    try {
+      syncMethod=out.getClass().getMethod("sync",new Class<?>[]{});
+    }
+ catch (    NoSuchMethodException ex) {
+      fail("This version of Hadoop supports neither Syncable.sync() " + "nor Syncable.hflush().");
+    }
+  }
+  syncMethod.invoke(out,new Object[]{});
+  FSDataInputStream in=fs.open(p);
+  assertTrue(in.available() > 0);
+  byte[] buffer=new byte[1024];
+  int read=in.read(buffer);
+  assertEquals(tableName.getName().length,read);
+  out.close();
+  in.close();
+  final int total=20;
+  WAL.Reader reader=null;
+  try {
+    RegionInfo info=RegionInfoBuilder.newBuilder(tableName).build();
+    NavigableMap<byte[],Integer> scopes=new TreeMap<>(Bytes.BYTES_COMPARATOR);
+    scopes.put(tableName.getName(),0);
+    final WAL wal=wals.getWAL(info);
+    for (int i=0; i < total; i++) {
+      WALEdit kvs=new WALEdit();
+      kvs.add(new KeyValue(Bytes.toBytes(i),tableName.getName(),tableName.getName()));
+      wal.append(info,new WALKeyImpl(info.getEncodedNameAsBytes(),tableName,System.currentTimeMillis(),mvcc,scopes),kvs,true);
+    }
+    wal.sync();
+    Path walPath=AbstractFSWALProvider.getCurrentFileName(wal);
+    reader=wals.createReader(fs,walPath);
+    int count=0;
+    WAL.Entry entry=new WAL.Entry();
+    while ((entry=reader.next(entry)) != null)     count++;
+    assertEquals(total,count);
+    reader.close();
+    for (int i=0; i < total; i++) {
+      WALEdit kvs=new WALEdit();
+      kvs.add(new KeyValue(Bytes.toBytes(i),tableName.getName(),tableName.getName()));
+      wal.append(info,new WALKeyImpl(info.getEncodedNameAsBytes(),tableName,System.currentTimeMillis(),mvcc,scopes),kvs,true);
+    }
+    wal.sync();
+    reader=wals.createReader(fs,walPath);
+    count=0;
+    while ((entry=reader.next(entry)) != null)     count++;
+    assertTrue(count >= total);
+    reader.close();
+    wal.sync();
+    reader=wals.createReader(fs,walPath);
+    count=0;
+    while ((entry=reader.next(entry)) != null)     count++;
+    assertEquals(total * 2,count);
+    reader.close();
+    final byte[] value=new byte[1025 * 1024];
+    for (int i=0; i < total; i++) {
+      WALEdit kvs=new WALEdit();
+      kvs.add(new KeyValue(Bytes.toBytes(i),tableName.getName(),value));
+      wal.append(info,new WALKeyImpl(info.getEncodedNameAsBytes(),tableName,System.currentTimeMillis(),mvcc,scopes),kvs,true);
+    }
+    wal.sync();
+    reader=wals.createReader(fs,walPath);
+    count=0;
+    while ((entry=reader.next(entry)) != null)     count++;
+    assertEquals(total * 3,count);
+    reader.close();
+    wal.shutdown();
+    reader=wals.createReader(fs,walPath);
+    count=0;
+    while ((entry=reader.next(entry)) != null)     count++;
+    assertEquals(total * 3,count);
+    reader.close();
+  }
+  finally {
+    if (reader != null)     reader.close();
+  }
+}

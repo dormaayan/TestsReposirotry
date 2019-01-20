@@ -1,0 +1,47 @@
+/** 
+ * Test that a file which is open for write is overwritten by another client. Regression test for HDFS-3755.
+ */
+@Test public void testOverwriteOpenForWrite() throws Exception {
+  Configuration conf=new HdfsConfiguration();
+  SimulatedFSDataset.setFactory(conf);
+  conf.setBoolean(DFSConfigKeys.DFS_PERMISSIONS_ENABLED_KEY,false);
+  final MiniDFSCluster cluster=new MiniDFSCluster.Builder(conf).build();
+  FileSystem fs=cluster.getFileSystem();
+  UserGroupInformation otherUgi=UserGroupInformation.createUserForTesting("testuser",new String[]{"testgroup"});
+  FileSystem fs2=otherUgi.doAs(new PrivilegedExceptionAction<FileSystem>(){
+    @Override public FileSystem run() throws Exception {
+      return FileSystem.get(cluster.getConfiguration(0));
+    }
+  }
+);
+  String metricsName=RPC_DETAILED_METRICS + cluster.getNameNodePort();
+  try {
+    Path p=new Path("/testfile");
+    FSDataOutputStream stm1=fs.create(p);
+    stm1.write(1);
+    assertCounter("CreateNumOps",1L,getMetrics(metricsName));
+    try {
+      fs2.create(p,false);
+      fail("Did not throw!");
+    }
+ catch (    IOException abce) {
+      GenericTestUtils.assertExceptionContains("Failed to CREATE_FILE",abce);
+    }
+    assertCounter("AlreadyBeingCreatedExceptionNumOps",1L,getMetrics(metricsName));
+    FSDataOutputStream stm2=fs2.create(p,true);
+    stm2.write(2);
+    stm2.close();
+    try {
+      stm1.close();
+      fail("Should have exception closing stm1 since it was deleted");
+    }
+ catch (    IOException ioe) {
+      GenericTestUtils.assertExceptionContains("File does not exist",ioe);
+    }
+  }
+  finally {
+    IOUtils.closeStream(fs);
+    IOUtils.closeStream(fs2);
+    cluster.shutdown();
+  }
+}

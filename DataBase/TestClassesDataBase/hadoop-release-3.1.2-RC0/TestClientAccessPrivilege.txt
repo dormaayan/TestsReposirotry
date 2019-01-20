@@ -1,0 +1,47 @@
+public class TestClientAccessPrivilege {
+  static MiniDFSCluster cluster=null;
+  static NfsConfiguration config=new NfsConfiguration();
+  static DistributedFileSystem hdfs;
+  static NameNode nn;
+  static String testdir="/tmp";
+  static SecurityHandler securityHandler;
+  @BeforeClass public static void setup() throws Exception {
+    String currentUser=System.getProperty("user.name");
+    config.set(DefaultImpersonationProvider.getTestProvider().getProxySuperuserGroupConfKey(currentUser),"*");
+    config.set(DefaultImpersonationProvider.getTestProvider().getProxySuperuserIpConfKey(currentUser),"*");
+    ProxyUsers.refreshSuperUserGroupsConfiguration(config);
+    cluster=new MiniDFSCluster.Builder(config).numDataNodes(1).build();
+    cluster.waitActive();
+    hdfs=cluster.getFileSystem();
+    nn=cluster.getNameNode();
+    config.setInt("nfs3.mountd.port",0);
+    config.setInt("nfs3.server.port",0);
+    securityHandler=Mockito.mock(SecurityHandler.class);
+    Mockito.when(securityHandler.getUser()).thenReturn(System.getProperty("user.name"));
+  }
+  @AfterClass public static void shutdown() throws Exception {
+    if (cluster != null) {
+      cluster.shutdown();
+    }
+  }
+  @Before public void createFiles() throws IllegalArgumentException, IOException {
+    hdfs.delete(new Path(testdir),true);
+    hdfs.mkdirs(new Path(testdir));
+    DFSTestUtil.createFile(hdfs,new Path(testdir + "/f1"),0,(short)1,0);
+  }
+  @Test(timeout=60000) public void testClientAccessPrivilegeForRemove() throws Exception {
+    config.set("dfs.nfs.exports.allowed.hosts","* ro");
+    Nfs3 nfs=new Nfs3(config);
+    nfs.startServiceInternal(false);
+    RpcProgramNfs3 nfsd=(RpcProgramNfs3)nfs.getRpcProgram();
+    HdfsFileStatus status=nn.getRpcServer().getFileInfo(testdir);
+    long dirId=status.getFileId();
+    int namenodeId=Nfs3Utils.getNamenodeId(config);
+    XDR xdr_req=new XDR();
+    FileHandle handle=new FileHandle(dirId,namenodeId);
+    handle.serialize(xdr_req);
+    xdr_req.writeString("f1");
+    REMOVE3Response response=nfsd.remove(xdr_req.asReadOnlyWrap(),securityHandler,new InetSocketAddress("localhost",1234));
+    assertEquals("Incorrect return code",Nfs3Status.NFS3ERR_ACCES,response.getStatus());
+  }
+}

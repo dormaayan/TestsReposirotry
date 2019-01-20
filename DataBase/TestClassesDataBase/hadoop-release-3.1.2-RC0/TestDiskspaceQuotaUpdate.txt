@@ -1,0 +1,326 @@
+public class TestDiskspaceQuotaUpdate {
+  private static final int BLOCKSIZE=1024;
+  private static final short REPLICATION=4;
+  static final long seed=0L;
+  private static final Path BASE_DIR=new Path("/TestQuotaUpdate");
+  private static Configuration conf;
+  private static MiniDFSCluster cluster;
+  @BeforeClass public static void setUp() throws Exception {
+    conf=new Configuration();
+    conf.setLong(DFSConfigKeys.DFS_BLOCK_SIZE_KEY,BLOCKSIZE);
+    cluster=new MiniDFSCluster.Builder(conf).numDataNodes(REPLICATION).build();
+    cluster.waitActive();
+  }
+  @Before public void resetCluster() throws Exception {
+    if (!cluster.isClusterUp()) {
+      cluster.shutdown();
+      cluster=new MiniDFSCluster.Builder(conf).numDataNodes(REPLICATION).build();
+      cluster.waitActive();
+    }
+  }
+  @AfterClass public static void tearDown() throws Exception {
+    if (cluster != null) {
+      cluster.shutdown();
+      cluster=null;
+    }
+  }
+  private Path getParent(  String testName){
+    return new Path(BASE_DIR,testName);
+  }
+  private FSDirectory getFSDirectory(){
+    return cluster.getNamesystem().getFSDirectory();
+  }
+  private DistributedFileSystem getDFS() throws IOException {
+    return cluster.getFileSystem();
+  }
+  /** 
+ * Test if the quota can be correctly updated for create file
+ */
+  @Test(timeout=60000) public void testQuotaUpdateWithFileCreate() throws Exception {
+    final Path foo=new Path(getParent(GenericTestUtils.getMethodName()),"foo");
+    Path createdFile=new Path(foo,"created_file.data");
+    getDFS().mkdirs(foo);
+    getDFS().setQuota(foo,Long.MAX_VALUE - 1,Long.MAX_VALUE - 1);
+    long fileLen=BLOCKSIZE * 2 + BLOCKSIZE / 2;
+    DFSTestUtil.createFile(getDFS(),createdFile,BLOCKSIZE / 16,fileLen,BLOCKSIZE,REPLICATION,seed);
+    INode fnode=getFSDirectory().getINode4Write(foo.toString());
+    assertTrue(fnode.isDirectory());
+    assertTrue(fnode.isQuotaSet());
+    QuotaCounts cnt=fnode.asDirectory().getDirectoryWithQuotaFeature().getSpaceConsumed();
+    assertEquals(2,cnt.getNameSpace());
+    assertEquals(fileLen * REPLICATION,cnt.getStorageSpace());
+  }
+  /** 
+ * Test if the quota can be correctly updated for append
+ */
+  @Test(timeout=60000) public void testUpdateQuotaForAppend() throws Exception {
+    final Path foo=new Path(getParent(GenericTestUtils.getMethodName()),"foo");
+    final Path bar=new Path(foo,"bar");
+    long currentFileLen=BLOCKSIZE;
+    DFSTestUtil.createFile(getDFS(),bar,currentFileLen,REPLICATION,seed);
+    getDFS().setQuota(foo,Long.MAX_VALUE - 1,Long.MAX_VALUE - 1);
+    DFSTestUtil.appendFile(getDFS(),bar,BLOCKSIZE / 2);
+    currentFileLen+=(BLOCKSIZE / 2);
+    INodeDirectory fooNode=getFSDirectory().getINode4Write(foo.toString()).asDirectory();
+    assertTrue(fooNode.isQuotaSet());
+    QuotaCounts quota=fooNode.getDirectoryWithQuotaFeature().getSpaceConsumed();
+    long ns=quota.getNameSpace();
+    long ds=quota.getStorageSpace();
+    assertEquals(2,ns);
+    assertEquals(currentFileLen * REPLICATION,ds);
+    ContentSummary c=getDFS().getContentSummary(foo);
+    assertEquals(c.getSpaceConsumed(),ds);
+    DFSTestUtil.appendFile(getDFS(),bar,BLOCKSIZE);
+    currentFileLen+=BLOCKSIZE;
+    quota=fooNode.getDirectoryWithQuotaFeature().getSpaceConsumed();
+    ns=quota.getNameSpace();
+    ds=quota.getStorageSpace();
+    assertEquals(2,ns);
+    assertEquals(currentFileLen * REPLICATION,ds);
+    c=getDFS().getContentSummary(foo);
+    assertEquals(c.getSpaceConsumed(),ds);
+    DFSTestUtil.appendFile(getDFS(),bar,BLOCKSIZE * 3 + BLOCKSIZE / 8);
+    currentFileLen+=(BLOCKSIZE * 3 + BLOCKSIZE / 8);
+    quota=fooNode.getDirectoryWithQuotaFeature().getSpaceConsumed();
+    ns=quota.getNameSpace();
+    ds=quota.getStorageSpace();
+    assertEquals(2,ns);
+    assertEquals(currentFileLen * REPLICATION,ds);
+    c=getDFS().getContentSummary(foo);
+    assertEquals(c.getSpaceConsumed(),ds);
+  }
+  /** 
+ * Test if the quota can be correctly updated when file length is updated through fsync
+ */
+  @Test(timeout=60000) public void testUpdateQuotaForFSync() throws Exception {
+    final Path foo=new Path(getParent(GenericTestUtils.getMethodName()),"foo");
+    final Path bar=new Path(foo,"bar");
+    DFSTestUtil.createFile(getDFS(),bar,BLOCKSIZE,REPLICATION,0L);
+    getDFS().setQuota(foo,Long.MAX_VALUE - 1,Long.MAX_VALUE - 1);
+    FSDataOutputStream out=getDFS().append(bar);
+    out.write(new byte[BLOCKSIZE / 4]);
+    ((DFSOutputStream)out.getWrappedStream()).hsync(EnumSet.of(HdfsDataOutputStream.SyncFlag.UPDATE_LENGTH));
+    INodeDirectory fooNode=getFSDirectory().getINode4Write(foo.toString()).asDirectory();
+    QuotaCounts quota=fooNode.getDirectoryWithQuotaFeature().getSpaceConsumed();
+    long ns=quota.getNameSpace();
+    long ds=quota.getStorageSpace();
+    assertEquals(2,ns);
+    assertEquals(BLOCKSIZE * 2 * REPLICATION,ds);
+    out.write(new byte[BLOCKSIZE / 4]);
+    out.close();
+    fooNode=getFSDirectory().getINode4Write(foo.toString()).asDirectory();
+    quota=fooNode.getDirectoryWithQuotaFeature().getSpaceConsumed();
+    ns=quota.getNameSpace();
+    ds=quota.getStorageSpace();
+    assertEquals(2,ns);
+    assertEquals((BLOCKSIZE + BLOCKSIZE / 2) * REPLICATION,ds);
+    DFSTestUtil.appendFile(getDFS(),bar,BLOCKSIZE);
+    quota=fooNode.getDirectoryWithQuotaFeature().getSpaceConsumed();
+    ns=quota.getNameSpace();
+    ds=quota.getStorageSpace();
+    assertEquals(2,ns);
+    assertEquals((BLOCKSIZE * 2 + BLOCKSIZE / 2) * REPLICATION,ds);
+  }
+  /** 
+ * Test append over storage quota does not mark file as UC or create lease
+ */
+  @Test(timeout=60000) public void testAppendOverStorageQuota() throws Exception {
+    final Path dir=getParent(GenericTestUtils.getMethodName());
+    final Path file=new Path(dir,"file");
+    getDFS().mkdirs(dir);
+    DFSTestUtil.createFile(getDFS(),file,BLOCKSIZE / 2,REPLICATION,seed);
+    getDFS().setQuota(dir,Long.MAX_VALUE - 1,1);
+    final INodeDirectory dirNode=getFSDirectory().getINode4Write(dir.toString()).asDirectory();
+    final long spaceUsed=dirNode.getDirectoryWithQuotaFeature().getSpaceConsumed().getStorageSpace();
+    try {
+      DFSTestUtil.appendFile(getDFS(),file,BLOCKSIZE);
+      Assert.fail("append didn't fail");
+    }
+ catch (    DSQuotaExceededException e) {
+    }
+    LeaseManager lm=cluster.getNamesystem().getLeaseManager();
+    INodeFile inode=getFSDirectory().getINode(file.toString()).asFile();
+    Assert.assertNotNull(inode);
+    Assert.assertFalse("should not be UC",inode.isUnderConstruction());
+    Assert.assertNull("should not have a lease",lm.getLease(inode));
+    final long newSpaceUsed=dirNode.getDirectoryWithQuotaFeature().getSpaceConsumed().getStorageSpace();
+    assertEquals(spaceUsed,newSpaceUsed);
+    getDFS().recoverLease(file);
+    cluster.restartNameNode(true);
+  }
+  /** 
+ * Test append over a specific type of storage quota does not mark file as UC or create a lease
+ */
+  @Test(timeout=60000) public void testAppendOverTypeQuota() throws Exception {
+    final Path dir=getParent(GenericTestUtils.getMethodName());
+    final Path file=new Path(dir,"file");
+    getDFS().mkdirs(dir);
+    getDFS().setStoragePolicy(dir,HdfsConstants.ONESSD_STORAGE_POLICY_NAME);
+    DFSTestUtil.createFile(getDFS(),file,BLOCKSIZE / 2,REPLICATION,seed);
+    getDFS().setQuotaByStorageType(dir,StorageType.SSD,1L);
+    final INodeDirectory dirNode=getFSDirectory().getINode4Write(dir.toString()).asDirectory();
+    final long spaceUsed=dirNode.getDirectoryWithQuotaFeature().getSpaceConsumed().getStorageSpace();
+    try {
+      DFSTestUtil.appendFile(getDFS(),file,BLOCKSIZE);
+      Assert.fail("append didn't fail");
+    }
+ catch (    QuotaByStorageTypeExceededException e) {
+    }
+    LeaseManager lm=cluster.getNamesystem().getLeaseManager();
+    INodeFile inode=getFSDirectory().getINode(file.toString()).asFile();
+    Assert.assertNotNull(inode);
+    Assert.assertFalse("should not be UC",inode.isUnderConstruction());
+    Assert.assertNull("should not have a lease",lm.getLease(inode));
+    final long newSpaceUsed=dirNode.getDirectoryWithQuotaFeature().getSpaceConsumed().getStorageSpace();
+    assertEquals(spaceUsed,newSpaceUsed);
+    getDFS().recoverLease(file);
+    cluster.restartNameNode(true);
+  }
+  /** 
+ * Test truncate over quota does not mark file as UC or create a lease
+ */
+  @Test(timeout=60000) public void testTruncateOverQuota() throws Exception {
+    final Path dir=getParent(GenericTestUtils.getMethodName());
+    final Path file=new Path(dir,"file");
+    getDFS().mkdirs(dir);
+    DFSTestUtil.createFile(getDFS(),file,BLOCKSIZE / 2,REPLICATION,seed);
+    getDFS().setQuota(dir,Long.MAX_VALUE - 1,1);
+    final INodeDirectory dirNode=getFSDirectory().getINode4Write(dir.toString()).asDirectory();
+    final long spaceUsed=dirNode.getDirectoryWithQuotaFeature().getSpaceConsumed().getStorageSpace();
+    try {
+      getDFS().truncate(file,BLOCKSIZE / 2 - 1);
+      Assert.fail("truncate didn't fail");
+    }
+ catch (    RemoteException e) {
+      assertTrue(e.getClassName().contains("DSQuotaExceededException"));
+    }
+    LeaseManager lm=cluster.getNamesystem().getLeaseManager();
+    INodeFile inode=getFSDirectory().getINode(file.toString()).asFile();
+    Assert.assertNotNull(inode);
+    Assert.assertFalse("should not be UC",inode.isUnderConstruction());
+    Assert.assertNull("should not have a lease",lm.getLease(inode));
+    final long newSpaceUsed=dirNode.getDirectoryWithQuotaFeature().getSpaceConsumed().getStorageSpace();
+    assertEquals(spaceUsed,newSpaceUsed);
+    getDFS().recoverLease(file);
+    cluster.restartNameNode(true);
+  }
+  /** 
+ * Check whether the quota is initialized correctly.
+ */
+  @Test public void testQuotaInitialization() throws Exception {
+    final int size=500;
+    Path testDir=new Path(getParent(GenericTestUtils.getMethodName()),"testDir");
+    long expectedSize=3 * BLOCKSIZE + BLOCKSIZE / 2;
+    getDFS().mkdirs(testDir);
+    getDFS().setQuota(testDir,size * 4,expectedSize * size * 2);
+    Path[] testDirs=new Path[size];
+    for (int i=0; i < size; i++) {
+      testDirs[i]=new Path(testDir,"sub" + i);
+      getDFS().mkdirs(testDirs[i]);
+      getDFS().setQuota(testDirs[i],100,1000000);
+      DFSTestUtil.createFile(getDFS(),new Path(testDirs[i],"a"),expectedSize,(short)1,1L);
+    }
+    INodeDirectory root=getFSDirectory().getRoot();
+    HashMap<String,Long> nsMap=new HashMap<String,Long>();
+    HashMap<String,Long> dsMap=new HashMap<String,Long>();
+    scanDirsWithQuota(root,nsMap,dsMap,false);
+    getFSDirectory().updateCountForQuota(1);
+    scanDirsWithQuota(root,nsMap,dsMap,true);
+    getFSDirectory().updateCountForQuota(2);
+    scanDirsWithQuota(root,nsMap,dsMap,true);
+    getFSDirectory().updateCountForQuota(4);
+    scanDirsWithQuota(root,nsMap,dsMap,true);
+  }
+  private void scanDirsWithQuota(  INodeDirectory dir,  HashMap<String,Long> nsMap,  HashMap<String,Long> dsMap,  boolean verify){
+    if (dir.isQuotaSet()) {
+      QuotaCounts q=dir.getDirectoryWithQuotaFeature().getSpaceConsumed();
+      String name=dir.getFullPathName();
+      if (verify) {
+        assertEquals(nsMap.get(name).longValue(),q.getNameSpace());
+        assertEquals(dsMap.get(name).longValue(),q.getStorageSpace());
+      }
+ else {
+        nsMap.put(name,Long.valueOf(q.getNameSpace()));
+        dsMap.put(name,Long.valueOf(q.getStorageSpace()));
+      }
+    }
+    for (    INode child : dir.getChildrenList(Snapshot.CURRENT_STATE_ID)) {
+      if (child instanceof INodeDirectory) {
+        scanDirsWithQuota((INodeDirectory)child,nsMap,dsMap,verify);
+      }
+    }
+  }
+  /** 
+ * Test that the cached quota stays correct between the COMMIT and COMPLETE block steps, even if the replication factor is changed during this time.
+ */
+  @Test(timeout=60000) public void testQuotaIssuesWhileCommitting() throws Exception {
+    List<MiniDFSCluster.DataNodeProperties> dnprops=new ArrayList<>();
+    try {
+      for (int i=REPLICATION - 1; i > 0; i--) {
+        dnprops.add(cluster.stopDataNode(i));
+      }
+      DatanodeProtocolClientSideTranslatorPB nnSpy=InternalDataNodeTestUtils.spyOnBposToNN(cluster.getDataNodes().get(0),cluster.getNameNode());
+      testQuotaIssuesWhileCommittingHelper(nnSpy,(short)1,(short)4);
+      testQuotaIssuesWhileCommittingHelper(nnSpy,(short)4,(short)1);
+      testQuotaIssuesWhileCommittingHelper(nnSpy,(short)1,(short)1);
+    }
+  finally {
+      for (      MiniDFSCluster.DataNodeProperties dnprop : dnprops) {
+        cluster.restartDataNode(dnprop);
+      }
+      cluster.waitActive();
+    }
+  }
+  private void testQuotaIssuesWhileCommittingHelper(  DatanodeProtocolClientSideTranslatorPB nnSpy,  final short initialReplication,  final short finalReplication) throws Exception {
+    final String logStmt="BUG: Inconsistent storagespace for directory";
+    final Path dir=new Path(getParent(GenericTestUtils.getMethodName()),String.format("%d-%d",initialReplication,finalReplication));
+    final Path file=new Path(dir,"testfile");
+    LogCapturer logs=LogCapturer.captureLogs(NameNode.LOG);
+    Mockito.doAnswer(new Answer<Object>(){
+      @Override public Object answer(      InvocationOnMock invocation) throws Throwable {
+        if (finalReplication != initialReplication) {
+          getDFS().setReplication(file,finalReplication);
+        }
+        getDFS().getContentSummary(dir);
+        invocation.callRealMethod();
+        return null;
+      }
+    }
+).when(nnSpy).blockReceivedAndDeleted(Mockito.<DatanodeRegistration>anyObject(),Mockito.anyString(),Mockito.<StorageReceivedDeletedBlocks[]>anyObject());
+    getDFS().mkdirs(dir);
+    getDFS().setQuota(dir,Long.MAX_VALUE - 1,Long.MAX_VALUE - 1);
+    DFSTestUtil.createFile(getDFS(),file,BLOCKSIZE / 2,initialReplication,1L);
+    getDFS().getContentSummary(dir);
+    assertFalse(logs.getOutput().contains(logStmt));
+  }
+  /** 
+ * Test that the cached quota remains correct when the block has been written to but not yet committed, even if the replication factor is updated during this time.
+ */
+  private void testQuotaIssuesBeforeCommitting(  short initialReplication,  short finalReplication) throws Exception {
+    final String logStmt="BUG: Inconsistent storagespace for directory";
+    final Path dir=new Path(getParent(GenericTestUtils.getMethodName()),String.format("%d-%d",initialReplication,finalReplication));
+    final Path file=new Path(dir,"testfile");
+    LogCapturer logs=LogCapturer.captureLogs(NameNode.LOG);
+    getDFS().mkdirs(dir);
+    getDFS().setQuota(dir,Long.MAX_VALUE - 1,Long.MAX_VALUE - 1);
+    FSDataOutputStream out=TestFileCreation.createFile(getDFS(),file,initialReplication);
+    TestFileCreation.writeFile(out,BLOCKSIZE / 2);
+    out.hflush();
+    getDFS().getContentSummary(dir);
+    if (finalReplication != initialReplication) {
+      getDFS().setReplication(file,finalReplication);
+    }
+    out.close();
+    getDFS().getContentSummary(dir);
+    assertFalse(logs.getOutput().contains(logStmt));
+  }
+  @Test(timeout=60000) public void testCachedComputedSizesAgreeBeforeCommitting() throws Exception {
+    testQuotaIssuesBeforeCommitting((short)1,(short)1);
+  }
+  @Test(timeout=60000) public void testDecreaseReplicationBeforeCommitting() throws Exception {
+    testQuotaIssuesBeforeCommitting((short)4,(short)1);
+  }
+  @Test(timeout=60000) public void testIncreaseReplicationBeforeCommitting() throws Exception {
+    testQuotaIssuesBeforeCommitting((short)1,(short)4);
+  }
+}

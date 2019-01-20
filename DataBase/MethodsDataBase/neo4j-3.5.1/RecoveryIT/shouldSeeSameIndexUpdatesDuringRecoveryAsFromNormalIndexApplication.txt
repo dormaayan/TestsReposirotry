@@ -1,0 +1,37 @@
+@Test public void shouldSeeSameIndexUpdatesDuringRecoveryAsFromNormalIndexApplication() throws Exception {
+  File storeDir=directory.absolutePath();
+  EphemeralFileSystemAbstraction fs=new EphemeralFileSystemAbstraction();
+  UpdateCapturingIndexProvider updateCapturingIndexProvider=new UpdateCapturingIndexProvider(IndexProvider.EMPTY,new HashMap<>());
+  GraphDatabaseAPI db=startDatabase(storeDir,fs,updateCapturingIndexProvider);
+  Label label=TestLabels.LABEL_ONE;
+  String key1="key1";
+  String key2="key2";
+  try (Transaction tx=db.beginTx()){
+    db.schema().indexFor(label).on(key1).create();
+    db.schema().indexFor(label).on(key1).on(key2).create();
+    tx.success();
+  }
+   try (Transaction tx=db.beginTx()){
+    db.schema().awaitIndexesOnline(10,SECONDS);
+    tx.success();
+  }
+   checkPoint(db);
+  produceRandomNodePropertyAndLabelUpdates(db,random.intBetween(20,40),label,key1,key2);
+  checkPoint(db);
+  Map<Long,Collection<IndexEntryUpdate<?>>> updatesAtLastCheckPoint=updateCapturingIndexProvider.snapshot();
+  produceRandomNodePropertyAndLabelUpdates(db,random.intBetween(40,100),label,key1,key2);
+  flush(db);
+  EphemeralFileSystemAbstraction crashedFs=fs.snapshot();
+  Map<Long,Collection<IndexEntryUpdate<?>>> updatesAtCrash=updateCapturingIndexProvider.snapshot();
+  UpdateCapturingIndexProvider recoveredUpdateCapturingIndexProvider=new UpdateCapturingIndexProvider(IndexProvider.EMPTY,updatesAtLastCheckPoint);
+  long lastCommittedTxIdBeforeRecovered=lastCommittedTxId(db);
+  db.shutdown();
+  fs.close();
+  db=startDatabase(storeDir,crashedFs,recoveredUpdateCapturingIndexProvider);
+  long lastCommittedTxIdAfterRecovered=lastCommittedTxId(db);
+  Map<Long,Collection<IndexEntryUpdate<?>>> updatesAfterRecovery=recoveredUpdateCapturingIndexProvider.snapshot();
+  assertEquals(lastCommittedTxIdBeforeRecovered,lastCommittedTxIdAfterRecovered);
+  assertSameUpdates(updatesAtCrash,updatesAfterRecovery);
+  db.shutdown();
+  crashedFs.close();
+}

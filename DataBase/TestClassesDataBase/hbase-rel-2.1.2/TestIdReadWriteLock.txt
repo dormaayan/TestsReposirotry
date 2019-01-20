@@ -1,0 +1,75 @@
+@RunWith(Parameterized.class) @Category({MiscTests.class,MediumTests.class}) public class TestIdReadWriteLock {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestIdReadWriteLock.class);
+  private static final Logger LOG=LoggerFactory.getLogger(TestIdReadWriteLock.class);
+  private static final int NUM_IDS=16;
+  private static final int NUM_THREADS=128;
+  private static final int NUM_SECONDS=15;
+  @Parameterized.Parameter public IdReadWriteLock<Long> idLock;
+  @Parameterized.Parameters public static Iterable<Object[]> data(){
+    return Arrays.asList(new Object[][]{{new IdReadWriteLock<Long>(ReferenceType.WEAK)},{new IdReadWriteLock<Long>(ReferenceType.SOFT)}});
+  }
+  private Map<Long,String> idOwner=new ConcurrentHashMap<>();
+private class IdLockTestThread implements Callable<Boolean> {
+    private String clientId;
+    public IdLockTestThread(    String clientId){
+      this.clientId=clientId;
+    }
+    @Override public Boolean call() throws Exception {
+      Thread.currentThread().setName(clientId);
+      Random rand=new Random();
+      long endTime=System.currentTimeMillis() + NUM_SECONDS * 1000;
+      while (System.currentTimeMillis() < endTime) {
+        long id=rand.nextInt(NUM_IDS);
+        boolean readLock=rand.nextBoolean();
+        ReentrantReadWriteLock readWriteLock=idLock.getLock(id);
+        Lock lock=readLock ? readWriteLock.readLock() : readWriteLock.writeLock();
+        try {
+          lock.lock();
+          int sleepMs=1 + rand.nextInt(4);
+          String owner=idOwner.get(id);
+          if (owner != null && LOG.isDebugEnabled()) {
+            LOG.debug((readLock ? "Read" : "Write") + "lock of Id " + id+ " already taken by "+ owner+ ", we are "+ clientId);
+          }
+          idOwner.put(id,clientId);
+          Thread.sleep(sleepMs);
+          idOwner.remove(id);
+        }
+  finally {
+          lock.unlock();
+          if (LOG.isDebugEnabled()) {
+            LOG.debug("Release " + (readLock ? "Read" : "Write") + " lock of Id"+ id+ ", we are "+ clientId);
+          }
+        }
+      }
+      return true;
+    }
+  }
+  @Test public void testMultipleClients() throws Exception {
+    ExecutorService exec=Executors.newFixedThreadPool(NUM_THREADS);
+    try {
+      ExecutorCompletionService<Boolean> ecs=new ExecutorCompletionService<>(exec);
+      for (int i=0; i < NUM_THREADS; ++i)       ecs.submit(new IdLockTestThread("client_" + i));
+      for (int i=0; i < NUM_THREADS; ++i) {
+        Future<Boolean> result=ecs.take();
+        assertTrue(result.get());
+      }
+      int entryPoolSize=idLock.purgeAndGetEntryPoolSize();
+      LOG.debug("Size of entry pool after gc and purge: " + entryPoolSize);
+      ReferenceType refType=idLock.getReferenceType();
+switch (refType) {
+case WEAK:
+        assertEquals(0,entryPoolSize);
+      break;
+case SOFT:
+    assertEquals(NUM_IDS,entryPoolSize);
+  break;
+default :
+break;
+}
+}
+  finally {
+exec.shutdown();
+exec.awaitTermination(5000,TimeUnit.MILLISECONDS);
+}
+}
+}

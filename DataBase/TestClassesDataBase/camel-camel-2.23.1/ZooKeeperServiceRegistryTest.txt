@@ -1,0 +1,63 @@
+public class ZooKeeperServiceRegistryTest {
+  private static final Logger LOGGER=LoggerFactory.getLogger(ZooKeeperServiceRegistryTest.class);
+  private static final String SERVICE_PATH="/camel";
+  private static final String SERVICE_ID=UUID.randomUUID().toString();
+  private static final String SERVICE_NAME="my-service";
+  private static final String SERVICE_HOST="localhost";
+  private static final int SERVICE_PORT=SocketUtils.findAvailableTcpPort();
+  @Rule public final TestName testName=new TestName();
+  @Rule public final TemporaryFolder temporaryFolder=new TemporaryFolder();
+  @Test public void testServiceRegistry() throws Exception {
+    final int zkPort=AvailablePortFinder.getNextAvailable();
+    final File zkDir=temporaryFolder.newFolder();
+    final TestingServer zkServer=new TestingServer(zkPort,zkDir);
+    zkServer.start();
+    final ZooKeeperTestClient zkClient=new ZooKeeperTestClient("localhost:" + zkPort);
+    zkClient.start();
+    try {
+      new ApplicationContextRunner().withUserConfiguration(TestConfiguration.class).withPropertyValues("debug=false","spring.main.banner-mode=OFF","spring.application.name=" + UUID.randomUUID().toString(),"camel.component.zookeeper.service-registry.enabled=true","camel.component.zookeeper.service-registry.nodes=localhost:" + zkPort,"camel.component.zookeeper.service-registry.id=" + UUID.randomUUID().toString(),"camel.component.zookeeper.service-registry.base-path=" + SERVICE_PATH,"camel.component.zookeeper.service-registry.service-host=localhost").run(context -> {
+        assertThat(context).hasSingleBean(CamelContext.class);
+        assertThat(context).hasSingleBean(ServiceRegistry.class);
+        final CamelContext camelContext=context.getBean(CamelContext.class);
+        final ServiceRegistry serviceRegistry=camelContext.hasService(ServiceRegistry.class);
+        assertThat(serviceRegistry).isNotNull();
+        serviceRegistry.register(DefaultServiceDefinition.builder().withHost(SERVICE_HOST).withPort(SERVICE_PORT).withName(SERVICE_NAME).withId(SERVICE_ID).build());
+        final Collection<ServiceInstance<ZooKeeperServiceRegistry.MetaData>> services=zkClient.discovery().queryForInstances(SERVICE_NAME);
+        assertThat(services).hasSize(1);
+        assertThat(services).first().hasFieldOrPropertyWithValue("id",SERVICE_ID);
+        assertThat(services).first().hasFieldOrPropertyWithValue("name",SERVICE_NAME);
+        assertThat(services).first().hasFieldOrPropertyWithValue("address",SERVICE_HOST);
+        assertThat(services).first().hasFieldOrPropertyWithValue("port",SERVICE_PORT);
+      }
+);
+    }
+  finally {
+      zkClient.stop();
+      zkServer.stop();
+    }
+  }
+@EnableAutoConfiguration @Configuration public static class TestConfiguration {
+  }
+public static class ZooKeeperTestClient {
+    private final CuratorFramework curator;
+    private final ServiceDiscovery<ZooKeeperServiceRegistry.MetaData> discovery;
+    public ZooKeeperTestClient(    String nodes){
+      curator=CuratorFrameworkFactory.builder().connectString(nodes).retryPolicy(new ExponentialBackoffRetry(1000,3)).build();
+      discovery=ServiceDiscoveryBuilder.builder(ZooKeeperServiceRegistry.MetaData.class).client(curator).basePath(SERVICE_PATH).serializer(new JsonInstanceSerializer<>(ZooKeeperServiceRegistry.MetaData.class)).build();
+    }
+    public CuratorFramework curator(){
+      return curator;
+    }
+    public ServiceDiscovery<ZooKeeperServiceRegistry.MetaData> discovery(){
+      return discovery;
+    }
+    public void start() throws Exception {
+      curator.start();
+      discovery.start();
+    }
+    public void stop() throws Exception {
+      CloseableUtils.closeQuietly(discovery);
+      CloseableUtils.closeQuietly(curator);
+    }
+  }
+}

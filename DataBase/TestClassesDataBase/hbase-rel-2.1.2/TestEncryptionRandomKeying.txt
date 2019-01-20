@@ -1,0 +1,64 @@
+@Category({RegionServerTests.class,MediumTests.class}) public class TestEncryptionRandomKeying {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestEncryptionRandomKeying.class);
+  private static final HBaseTestingUtility TEST_UTIL=new HBaseTestingUtility();
+  private static Configuration conf=TEST_UTIL.getConfiguration();
+  private static HTableDescriptor htd;
+  private static List<Path> findStorefilePaths(  TableName tableName) throws Exception {
+    List<Path> paths=new ArrayList<>();
+    for (    Region region : TEST_UTIL.getRSForFirstRegionInTable(tableName).getRegions(htd.getTableName())) {
+      for (      HStore store : ((HRegion)region).getStores()) {
+        for (        HStoreFile storefile : store.getStorefiles()) {
+          paths.add(storefile.getPath());
+        }
+      }
+    }
+    return paths;
+  }
+  private static byte[] extractHFileKey(  Path path) throws Exception {
+    HFile.Reader reader=HFile.createReader(TEST_UTIL.getTestFileSystem(),path,new CacheConfig(conf),true,conf);
+    try {
+      reader.loadFileInfo();
+      Encryption.Context cryptoContext=reader.getFileContext().getEncryptionContext();
+      assertNotNull("Reader has a null crypto context",cryptoContext);
+      Key key=cryptoContext.getKey();
+      if (key == null) {
+        return null;
+      }
+      return key.getEncoded();
+    }
+  finally {
+      reader.close();
+    }
+  }
+  @BeforeClass public static void setUp() throws Exception {
+    conf.setInt("hfile.format.version",3);
+    conf.set(HConstants.CRYPTO_KEYPROVIDER_CONF_KEY,KeyProviderForTesting.class.getName());
+    conf.set(HConstants.CRYPTO_MASTERKEY_NAME_CONF_KEY,"hbase");
+    htd=new HTableDescriptor(TableName.valueOf("default","TestEncryptionRandomKeying"));
+    HColumnDescriptor hcd=new HColumnDescriptor("cf");
+    String algorithm=conf.get(HConstants.CRYPTO_KEY_ALGORITHM_CONF_KEY,HConstants.CIPHER_AES);
+    hcd.setEncryptionType(algorithm);
+    htd.addFamily(hcd);
+    TEST_UTIL.startMiniCluster(1);
+    TEST_UTIL.getAdmin().createTable(htd);
+    TEST_UTIL.waitTableAvailable(htd.getTableName(),5000);
+    Table table=TEST_UTIL.getConnection().getTable(htd.getTableName());
+    try {
+      table.put(new Put(Bytes.toBytes("testrow")).addColumn(hcd.getName(),Bytes.toBytes("q"),Bytes.toBytes("value")));
+    }
+  finally {
+      table.close();
+    }
+    TEST_UTIL.getAdmin().flush(htd.getTableName());
+  }
+  @AfterClass public static void tearDown() throws Exception {
+    TEST_UTIL.shutdownMiniCluster();
+  }
+  @Test public void testRandomKeying() throws Exception {
+    final List<Path> initialPaths=findStorefilePaths(htd.getTableName());
+    assertTrue(initialPaths.size() > 0);
+    for (    Path path : initialPaths) {
+      assertNotNull("Store file " + path + " is not encrypted",extractHFileKey(path));
+    }
+  }
+}

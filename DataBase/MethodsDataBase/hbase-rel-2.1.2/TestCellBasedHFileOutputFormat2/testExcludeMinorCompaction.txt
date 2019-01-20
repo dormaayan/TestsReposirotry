@@ -1,0 +1,54 @@
+@Ignore("Goes zombie too frequently; needs work. See HBASE-14563") @Test public void testExcludeMinorCompaction() throws Exception {
+  Configuration conf=util.getConfiguration();
+  conf.setInt("hbase.hstore.compaction.min",2);
+  generateRandomStartKeys(5);
+  util.startMiniCluster();
+  try (Connection conn=ConnectionFactory.createConnection(conf);Admin admin=conn.getAdmin()){
+    Path testDir=util.getDataTestDirOnTestFS("testExcludeMinorCompaction");
+    final FileSystem fs=util.getDFSCluster().getFileSystem();
+    Table table=util.createTable(TABLE_NAMES[0],FAMILIES);
+    assertEquals("Should start with empty table",0,util.countRows(table));
+    final Path storePath=new Path(FSUtils.getTableDir(FSUtils.getRootDir(conf),TABLE_NAMES[0]),new Path(admin.getTableRegions(TABLE_NAMES[0]).get(0).getEncodedName(),Bytes.toString(FAMILIES[0])));
+    assertEquals(0,fs.listStatus(storePath).length);
+    Put p=new Put(Bytes.toBytes("test"));
+    p.addColumn(FAMILIES[0],Bytes.toBytes("1"),Bytes.toBytes("1"));
+    table.put(p);
+    admin.flush(TABLE_NAMES[0]);
+    assertEquals(1,util.countRows(table));
+    quickPoll(new Callable<Boolean>(){
+      @Override public Boolean call() throws Exception {
+        return fs.listStatus(storePath).length == 1;
+      }
+    }
+,5000);
+    conf.setBoolean("hbase.mapreduce.hfileoutputformat.compaction.exclude",true);
+    RegionLocator regionLocator=conn.getRegionLocator(TABLE_NAMES[0]);
+    runIncrementalPELoad(conf,Arrays.asList(new HFileOutputFormat2.TableInfo(table.getTableDescriptor(),regionLocator)),testDir,false);
+    new LoadIncrementalHFiles(conf).doBulkLoad(testDir,admin,table,regionLocator);
+    int expectedRows=NMapInputFormat.getNumMapTasks(conf) * ROWSPERSPLIT;
+    assertEquals("LoadIncrementalHFiles should put expected data in table",expectedRows + 1,util.countRows(table));
+    assertEquals(2,fs.listStatus(storePath).length);
+    admin.compact(TABLE_NAMES[0]);
+    try {
+      quickPoll(new Callable<Boolean>(){
+        @Override public Boolean call() throws Exception {
+          return fs.listStatus(storePath).length == 1;
+        }
+      }
+,5000);
+      throw new IOException("SF# = " + fs.listStatus(storePath).length);
+    }
+ catch (    AssertionError ae) {
+    }
+    admin.majorCompact(TABLE_NAMES[0]);
+    quickPoll(new Callable<Boolean>(){
+      @Override public Boolean call() throws Exception {
+        return fs.listStatus(storePath).length == 1;
+      }
+    }
+,5000);
+  }
+  finally {
+    util.shutdownMiniCluster();
+  }
+}

@@ -1,0 +1,77 @@
+@Test public void shouldRecoverExistingData() throws Exception {
+  File file=logFiles.getLogFileForVersion(logVersion);
+  writeSomeData(file,pair -> {
+    LogEntryWriter writer=pair.first();
+    Consumer<LogPositionMarker> consumer=pair.other();
+    LogPositionMarker marker=new LogPositionMarker();
+    consumer.accept(marker);
+    LogPosition lastCommittedTxPosition=marker.newPosition();
+    writer.writeStartEntry(0,1,2L,3L,new byte[0]);
+    lastCommittedTxStartEntry=new LogEntryStart(0,1,2L,3L,new byte[0],lastCommittedTxPosition);
+    writer.writeCommitEntry(4L,5L);
+    lastCommittedTxCommitEntry=new LogEntryCommit(4L,5L);
+    writer.writeCheckPointEntry(lastCommittedTxPosition);
+    expectedCheckPointEntry=new CheckPoint(lastCommittedTxPosition);
+    consumer.accept(marker);
+    writer.writeStartEntry(0,1,6L,4L,new byte[0]);
+    expectedStartEntry=new LogEntryStart(0,1,6L,4L,new byte[0],marker.newPosition());
+    writer.writeCommitEntry(5L,7L);
+    expectedCommitEntry=new LogEntryCommit(5L,7L);
+    return true;
+  }
+);
+  LifeSupport life=new LifeSupport();
+  RecoveryMonitor monitor=mock(RecoveryMonitor.class);
+  final AtomicBoolean recoveryRequired=new AtomicBoolean();
+  try {
+    StorageEngine storageEngine=mock(StorageEngine.class);
+    final LogEntryReader<ReadableClosablePositionAwareChannel> reader=new VersionAwareLogEntryReader<>();
+    LogTailScanner tailScanner=getTailScanner(logFiles,reader);
+    TransactionMetadataCache metadataCache=new TransactionMetadataCache();
+    LogicalTransactionStore txStore=new PhysicalLogicalTransactionStore(logFiles,metadataCache,reader,monitors,false);
+    CorruptedLogsTruncator logPruner=new CorruptedLogsTruncator(storeDir,logFiles,fileSystemRule.get());
+    life.add(new Recovery(new DefaultRecoveryService(storageEngine,tailScanner,transactionIdStore,txStore,versionRepository,NO_MONITOR){
+      private int nr;
+      @Override public void startRecovery(){
+        recoveryRequired.set(true);
+      }
+      @Override public RecoveryApplier getRecoveryApplier(      TransactionApplicationMode mode) throws Exception {
+        RecoveryApplier actual=super.getRecoveryApplier(mode);
+        if (mode == TransactionApplicationMode.REVERSE_RECOVERY) {
+          return actual;
+        }
+        return new RecoveryApplier(){
+          @Override public void close() throws Exception {
+            actual.close();
+          }
+          @Override public boolean visit(          CommittedTransactionRepresentation tx) throws Exception {
+            actual.visit(tx);
+switch (nr++) {
+case 0:
+              assertEquals(lastCommittedTxStartEntry,tx.getStartEntry());
+            assertEquals(lastCommittedTxCommitEntry,tx.getCommitEntry());
+          break;
+case 1:
+        assertEquals(expectedStartEntry,tx.getStartEntry());
+      assertEquals(expectedCommitEntry,tx.getCommitEntry());
+    break;
+default :
+  fail("Too many recovered transactions");
+}
+return false;
+}
+}
+;
+}
+}
+,logPruner,monitor,SilentProgressReporter.INSTANCE,false));
+life.start();
+InOrder order=inOrder(monitor);
+order.verify(monitor,times(1)).recoveryRequired(any(LogPosition.class));
+order.verify(monitor,times(1)).recoveryCompleted(2);
+assertTrue(recoveryRequired.get());
+}
+  finally {
+life.shutdown();
+}
+}

@@ -1,0 +1,188 @@
+public class IndexSamplingJobTrackerTest {
+  private final IndexSamplingConfig config=mock(IndexSamplingConfig.class);
+  long indexId11;
+  long indexId12=1;
+  long indexId22=2;
+  @Test public void shouldNotRunASampleJobWhichIsAlreadyRunning() throws Throwable {
+    when(config.jobLimit()).thenReturn(2);
+    JobScheduler jobScheduler=createInitialisedScheduler();
+    IndexSamplingJobTracker jobTracker=new IndexSamplingJobTracker(config,jobScheduler);
+    final DoubleLatch latch=new DoubleLatch();
+    final AtomicInteger count=new AtomicInteger(0);
+    assertTrue(jobTracker.canExecuteMoreSamplingJobs());
+    IndexSamplingJob job=new IndexSamplingJob(){
+      @Override public void run(){
+        count.incrementAndGet();
+        latch.waitForAllToStart();
+        latch.finish();
+      }
+      @Override public long indexId(){
+        return indexId12;
+      }
+    }
+;
+    jobTracker.scheduleSamplingJob(job);
+    jobTracker.scheduleSamplingJob(job);
+    latch.startAndWaitForAllToStart();
+    latch.waitForAllToFinish();
+    assertEquals(1,count.get());
+  }
+  @Test public void shouldNotAcceptMoreJobsThanAllowed() throws Throwable {
+    when(config.jobLimit()).thenReturn(1);
+    JobScheduler jobScheduler=createInitialisedScheduler();
+    final IndexSamplingJobTracker jobTracker=new IndexSamplingJobTracker(config,jobScheduler);
+    final DoubleLatch latch=new DoubleLatch();
+    final DoubleLatch waitingLatch=new DoubleLatch();
+    assertTrue(jobTracker.canExecuteMoreSamplingJobs());
+    jobTracker.scheduleSamplingJob(new IndexSamplingJob(){
+      @Override public void run(){
+        latch.startAndWaitForAllToStart();
+        latch.waitForAllToFinish();
+      }
+      @Override public long indexId(){
+        return indexId12;
+      }
+    }
+);
+    latch.waitForAllToStart();
+    assertFalse(jobTracker.canExecuteMoreSamplingJobs());
+    final AtomicBoolean waiting=new AtomicBoolean(false);
+    new Thread(() -> {
+      waiting.set(true);
+      waitingLatch.startAndWaitForAllToStart();
+      jobTracker.waitUntilCanExecuteMoreSamplingJobs();
+      waiting.set(false);
+      waitingLatch.finish();
+    }
+).start();
+    waitingLatch.waitForAllToStart();
+    assertTrue(waiting.get());
+    latch.finish();
+    waitingLatch.waitForAllToFinish();
+    assertFalse(waiting.get());
+    while (!jobTracker.canExecuteMoreSamplingJobs()) {
+      Thread.yield();
+    }
+  }
+  @Test(timeout=5_000) public void shouldAcceptNewJobWhenRunningJobFinishes() throws Throwable {
+    when(config.jobLimit()).thenReturn(1);
+    JobScheduler jobScheduler=createInitialisedScheduler();
+    final IndexSamplingJobTracker jobTracker=new IndexSamplingJobTracker(config,jobScheduler);
+    final DoubleLatch latch=new DoubleLatch();
+    final AtomicBoolean lastJobExecuted=new AtomicBoolean();
+    jobTracker.scheduleSamplingJob(new IndexSamplingJob(){
+      @Override public long indexId(){
+        return indexId11;
+      }
+      @Override public void run(){
+        latch.waitForAllToStart();
+      }
+    }
+);
+    Executors.newSingleThreadExecutor().execute(() -> {
+      jobTracker.waitUntilCanExecuteMoreSamplingJobs();
+      jobTracker.scheduleSamplingJob(new IndexSamplingJob(){
+        @Override public long indexId(){
+          return indexId22;
+        }
+        @Override public void run(){
+          lastJobExecuted.set(true);
+          latch.finish();
+        }
+      }
+);
+    }
+);
+    assertFalse(jobTracker.canExecuteMoreSamplingJobs());
+    latch.startAndWaitForAllToStart();
+    latch.waitForAllToFinish();
+    assertTrue(lastJobExecuted.get());
+  }
+  @Test(timeout=5_000) public void shouldDoNothingWhenUsedAfterBeingStopped(){
+    JobScheduler scheduler=mock(JobScheduler.class);
+    IndexSamplingJobTracker jobTracker=new IndexSamplingJobTracker(config,scheduler);
+    jobTracker.stopAndAwaitAllJobs();
+    jobTracker.scheduleSamplingJob(mock(IndexSamplingJob.class));
+    verifyZeroInteractions(scheduler);
+  }
+  @Test(timeout=5_000) public void shouldNotAllowNewJobsAfterBeingStopped(){
+    IndexSamplingJobTracker jobTracker=new IndexSamplingJobTracker(config,mock(JobScheduler.class));
+    jobTracker.stopAndAwaitAllJobs();
+    assertFalse(jobTracker.canExecuteMoreSamplingJobs());
+  }
+  @Test(timeout=5_000) public void shouldStopAndWaitForAllJobsToFinish() throws Throwable {
+    when(config.jobLimit()).thenReturn(2);
+    JobScheduler jobScheduler=createInitialisedScheduler();
+    final IndexSamplingJobTracker jobTracker=new IndexSamplingJobTracker(config,jobScheduler);
+    final CountDownLatch latch1=new CountDownLatch(1);
+    final CountDownLatch latch2=new CountDownLatch(1);
+    WaitingIndexSamplingJob job1=new WaitingIndexSamplingJob(indexId11,latch1);
+    WaitingIndexSamplingJob job2=new WaitingIndexSamplingJob(indexId22,latch1);
+    jobTracker.scheduleSamplingJob(job1);
+    jobTracker.scheduleSamplingJob(job2);
+    Future<?> stopping=Executors.newSingleThreadExecutor().submit(() -> {
+      latch2.countDown();
+      jobTracker.stopAndAwaitAllJobs();
+    }
+);
+    latch2.await();
+    assertFalse(stopping.isDone());
+    latch1.countDown();
+    stopping.get(10,SECONDS);
+    assertTrue(stopping.isDone());
+    assertNull(stopping.get());
+    assertTrue(job1.executed);
+    assertTrue(job2.executed);
+  }
+  @Test(timeout=5_000) public void shouldWaitForAllJobsToFinish() throws Throwable {
+    when(config.jobLimit()).thenReturn(2);
+    JobScheduler jobScheduler=createInitialisedScheduler();
+    final IndexSamplingJobTracker jobTracker=new IndexSamplingJobTracker(config,jobScheduler);
+    final CountDownLatch latch1=new CountDownLatch(1);
+    final CountDownLatch latch2=new CountDownLatch(1);
+    WaitingIndexSamplingJob job1=new WaitingIndexSamplingJob(indexId11,latch1);
+    WaitingIndexSamplingJob job2=new WaitingIndexSamplingJob(indexId22,latch1);
+    jobTracker.scheduleSamplingJob(job1);
+    jobTracker.scheduleSamplingJob(job2);
+    Future<?> stopping=Executors.newSingleThreadExecutor().submit(() -> {
+      latch2.countDown();
+      try {
+        jobTracker.awaitAllJobs(10,TimeUnit.SECONDS);
+      }
+ catch (      InterruptedException e) {
+        throw new RuntimeException(e);
+      }
+    }
+);
+    latch2.await();
+    assertFalse(stopping.isDone());
+    latch1.countDown();
+    stopping.get(10,SECONDS);
+    assertTrue(stopping.isDone());
+    assertNull(stopping.get());
+    assertTrue(job1.executed);
+    assertTrue(job2.executed);
+  }
+private static class WaitingIndexSamplingJob implements IndexSamplingJob {
+    final long indexId;
+    final CountDownLatch latch;
+    volatile boolean executed;
+    WaitingIndexSamplingJob(    long indexId,    CountDownLatch latch){
+      this.indexId=indexId;
+      this.latch=latch;
+    }
+    @Override public long indexId(){
+      return indexId;
+    }
+    @Override public void run(){
+      try {
+        latch.await();
+        executed=true;
+      }
+ catch (      InterruptedException e) {
+        Thread.currentThread().interrupt();
+        throw new RuntimeException(e);
+      }
+    }
+  }
+}

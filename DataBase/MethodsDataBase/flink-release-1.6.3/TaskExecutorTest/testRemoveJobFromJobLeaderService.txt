@@ -1,0 +1,42 @@
+/** 
+ * Tests that a job is removed from the JobLeaderService once a TaskExecutor has no more slots assigned to this job. <p>See FLINK-8504
+ */
+@Test public void testRemoveJobFromJobLeaderService() throws Exception {
+  final TaskSlotTable taskSlotTable=new TaskSlotTable(Collections.singleton(ResourceProfile.UNKNOWN),timerService);
+  TaskExecutorLocalStateStoresManager localStateStoresManager=new TaskExecutorLocalStateStoresManager(false,new File[]{tmp.newFolder()},Executors.directExecutor());
+  final TaskManagerServices taskManagerServices=new TaskManagerServicesBuilder().setTaskManagerLocation(taskManagerLocation).setTaskSlotTable(taskSlotTable).setTaskStateManager(localStateStoresManager).build();
+  final TaskExecutor taskExecutor=new TaskExecutor(rpc,taskManagerConfiguration,haServices,taskManagerServices,new HeartbeatServices(1000L,1000L),UnregisteredMetricGroups.createUnregisteredTaskManagerMetricGroup(),dummyBlobCacheService,testingFatalErrorHandler);
+  try {
+    final TestingResourceManagerGateway resourceManagerGateway=new TestingResourceManagerGateway();
+    final CompletableFuture<Void> initialSlotReport=new CompletableFuture<>();
+    resourceManagerGateway.setSendSlotReportFunction(resourceIDInstanceIDSlotReportTuple3 -> {
+      initialSlotReport.complete(null);
+      return CompletableFuture.completedFuture(Acknowledge.get());
+    }
+);
+    final ResourceManagerId resourceManagerId=resourceManagerGateway.getFencingToken();
+    rpc.registerGateway(resourceManagerGateway.getAddress(),resourceManagerGateway);
+    resourceManagerLeaderRetriever.notifyListener(resourceManagerGateway.getAddress(),resourceManagerId.toUUID());
+    final CompletableFuture<LeaderRetrievalListener> startFuture=new CompletableFuture<>();
+    final CompletableFuture<Void> stopFuture=new CompletableFuture<>();
+    final StartStopNotifyingLeaderRetrievalService jobMasterLeaderRetriever=new StartStopNotifyingLeaderRetrievalService(startFuture,stopFuture);
+    haServices.setJobMasterLeaderRetriever(jobId,jobMasterLeaderRetriever);
+    taskExecutor.start();
+    final TaskExecutorGateway taskExecutorGateway=taskExecutor.getSelfGateway(TaskExecutorGateway.class);
+    final SlotID slotId=new SlotID(taskManagerLocation.getResourceID(),0);
+    final AllocationID allocationId=new AllocationID();
+    assertThat(startFuture.isDone(),is(false));
+    final JobLeaderService jobLeaderService=taskManagerServices.getJobLeaderService();
+    assertThat(jobLeaderService.containsJob(jobId),is(false));
+    initialSlotReport.get();
+    taskExecutorGateway.requestSlot(slotId,jobId,allocationId,"foobar",resourceManagerId,timeout).get();
+    startFuture.get();
+    assertThat(jobLeaderService.containsJob(jobId),is(true));
+    taskExecutorGateway.freeSlot(allocationId,new FlinkException("Test exception"),timeout).get();
+    stopFuture.get();
+    assertThat(jobLeaderService.containsJob(jobId),is(false));
+  }
+  finally {
+    RpcUtils.terminateRpcEndpoint(taskExecutor,timeout);
+  }
+}

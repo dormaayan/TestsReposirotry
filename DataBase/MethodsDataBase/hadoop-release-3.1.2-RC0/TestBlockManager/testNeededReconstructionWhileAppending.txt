@@ -1,0 +1,43 @@
+@Test(timeout=60000) public void testNeededReconstructionWhileAppending() throws IOException {
+  Configuration conf=new HdfsConfiguration();
+  String src="/test-file";
+  Path file=new Path(src);
+  MiniDFSCluster cluster=new MiniDFSCluster.Builder(conf).build();
+  try {
+    cluster.waitActive();
+    BlockManager bm=cluster.getNamesystem().getBlockManager();
+    FileSystem fs=cluster.getFileSystem();
+    NamenodeProtocols namenode=cluster.getNameNodeRpc();
+    DFSOutputStream out=null;
+    try {
+      out=(DFSOutputStream)(fs.create(file).getWrappedStream());
+      out.write(1);
+      out.hflush();
+      out.close();
+      FSDataInputStream in=null;
+      ExtendedBlock oldBlock=null;
+      try {
+        in=fs.open(file);
+        oldBlock=DFSTestUtil.getAllBlocks(in).get(0).getBlock();
+      }
+  finally {
+        IOUtils.closeStream(in);
+      }
+      String clientName=((DistributedFileSystem)fs).getClient().getClientName();
+      namenode.append(src,clientName,new EnumSetWritable<>(EnumSet.of(CreateFlag.APPEND)));
+      LocatedBlock newLocatedBlock=namenode.updateBlockForPipeline(oldBlock,clientName);
+      ExtendedBlock newBlock=new ExtendedBlock(oldBlock.getBlockPoolId(),oldBlock.getBlockId(),oldBlock.getNumBytes(),newLocatedBlock.getBlock().getGenerationStamp());
+      namenode.updatePipeline(clientName,oldBlock,newBlock,newLocatedBlock.getLocations(),newLocatedBlock.getStorageIDs());
+      BlockInfo bi=bm.getStoredBlock(newBlock.getLocalBlock());
+      assertFalse(bm.isNeededReconstruction(bi,bm.countNodes(bi,cluster.getNamesystem().isInStartupSafeMode())));
+    }
+  finally {
+      IOUtils.closeStream(out);
+    }
+  }
+  finally {
+    if (cluster != null) {
+      cluster.shutdown();
+    }
+  }
+}

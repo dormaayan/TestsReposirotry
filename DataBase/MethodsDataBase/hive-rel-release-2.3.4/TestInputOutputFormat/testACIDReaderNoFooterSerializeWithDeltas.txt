@@ -1,0 +1,54 @@
+@Test public void testACIDReaderNoFooterSerializeWithDeltas() throws Exception {
+  MockFileSystem fs=new MockFileSystem(conf);
+  MockPath mockPath=new MockPath(fs,"mock:///mocktable7");
+  conf.set("hive.transactional.table.scan","true");
+  conf.set(IOConstants.SCHEMA_EVOLUTION_COLUMNS,MyRow.getColumnNamesProperty());
+  conf.set(IOConstants.SCHEMA_EVOLUTION_COLUMNS_TYPES,MyRow.getColumnTypesProperty());
+  conf.set("hive.orc.splits.include.file.footer","false");
+  conf.set("mapred.input.dir",mockPath.toString());
+  conf.set("fs.defaultFS","mock:///");
+  conf.set("fs.mock.impl",MockFileSystem.class.getName());
+  StructObjectInspector inspector;
+synchronized (TestOrcFile.class) {
+    inspector=(StructObjectInspector)ObjectInspectorFactory.getReflectionObjectInspector(MyRow.class,ObjectInspectorFactory.ObjectInspectorOptions.JAVA);
+  }
+  Writer writer=OrcFile.createWriter(new Path(mockPath + "/0_0"),OrcFile.writerOptions(conf).blockPadding(false).bufferSize(1024).inspector(inspector));
+  for (int i=0; i < 10; ++i) {
+    writer.addRow(new MyRow(i,2 * i));
+  }
+  writer.close();
+  writer=OrcFile.createWriter(new Path(new Path(mockPath + "/delta_001_002") + "/0_1"),OrcFile.writerOptions(conf).blockPadding(false).bufferSize(1024).inspector(inspector));
+  for (int i=0; i < 10; ++i) {
+    writer.addRow(new MyRow(i,2 * i));
+  }
+  writer.close();
+  OrcInputFormat orcInputFormat=new OrcInputFormat();
+  InputSplit[] splits=orcInputFormat.getSplits(conf,2);
+  assertEquals(1,splits.length);
+  int readOpsBefore=-1;
+  for (  FileSystem.Statistics statistics : FileSystem.getAllStatistics()) {
+    if (statistics.getScheme().equalsIgnoreCase("mock")) {
+      readOpsBefore=statistics.getReadOps();
+    }
+  }
+  assertTrue("MockFS has stats. Read ops not expected to be -1",readOpsBefore != -1);
+  for (  InputSplit split : splits) {
+    assertTrue("OrcSplit is expected",split instanceof OrcSplit);
+    assertTrue(split.toString().contains("start=3"));
+    assertTrue(split.toString().contains("hasFooter=false"));
+    assertTrue(split.toString().contains("hasBase=true"));
+    assertTrue(split.toString().contains("deltas=[{ minTxnId: 1 maxTxnId: 2 stmtIds: [] }]]"));
+    if (split instanceof OrcSplit) {
+      assertFalse("No footer serialize test for ACID reader, hasFooter is not expected in" + " orc splits.",((OrcSplit)split).hasFooter());
+    }
+    orcInputFormat.getRecordReader(split,conf,Reporter.NULL);
+  }
+  int readOpsDelta=-1;
+  for (  FileSystem.Statistics statistics : FileSystem.getAllStatistics()) {
+    if (statistics.getScheme().equalsIgnoreCase("mock")) {
+      readOpsDelta=statistics.getReadOps() - readOpsBefore;
+    }
+  }
+  assertEquals(4,readOpsDelta);
+  conf.set("fs.defaultFS","file:///");
+}

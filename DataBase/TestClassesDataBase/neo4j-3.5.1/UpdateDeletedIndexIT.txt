@@ -1,0 +1,78 @@
+public class UpdateDeletedIndexIT {
+  private static final TestLabels LABEL=TestLabels.LABEL_ONE;
+  private static final String KEY="key";
+  private static final int NODES=100;
+  @Rule public final DatabaseRule db=new ImpermanentDatabaseRule();
+  @Test public void shouldHandleUpdateRemovalOfLabelConcurrentlyWithIndexDrop() throws Throwable {
+    shouldHandleIndexDropConcurrentlyWithOperation(nodeId -> db.getNodeById(nodeId).removeLabel(LABEL));
+  }
+  @Test public void shouldHandleDeleteNodeConcurrentlyWithIndexDrop() throws Throwable {
+    shouldHandleIndexDropConcurrentlyWithOperation(nodeId -> db.getNodeById(nodeId).delete());
+  }
+  @Test public void shouldHandleRemovePropertyConcurrentlyWithIndexDrop() throws Throwable {
+    shouldHandleIndexDropConcurrentlyWithOperation(nodeId -> db.getNodeById(nodeId).removeProperty(KEY));
+  }
+  @Test public void shouldHandleNodeDetachDeleteConcurrentlyWithIndexDrop() throws Throwable {
+    shouldHandleIndexDropConcurrentlyWithOperation(nodeId -> {
+      ThreadToStatementContextBridge txBridge=db.getDependencyResolver().resolveDependency(ThreadToStatementContextBridge.class);
+      txBridge.getKernelTransactionBoundToThisThread(true).dataWrite().nodeDetachDelete(nodeId);
+    }
+);
+  }
+  private void shouldHandleIndexDropConcurrentlyWithOperation(  NodeOperation operation) throws Throwable {
+    long[] nodes=createNodes();
+    IndexDefinition indexDefinition=createIndex();
+    Race race=new Race();
+    race.addContestant(() -> {
+      try (Transaction tx=db.beginTx()){
+        indexDefinition.drop();
+        tx.success();
+      }
+     }
+,1);
+    for (int i=0; i < NODES; i++) {
+      final long nodeId=nodes[i];
+      race.addContestant(throwing(() -> {
+        try (Transaction tx=db.beginTx()){
+          operation.run(nodeId);
+          tx.success();
+        }
+       }
+));
+    }
+    race.go();
+  }
+  private long[] createNodes(){
+    long[] nodes=new long[NODES];
+    try (Transaction tx=db.beginTx()){
+      for (int i=0; i < NODES; i++) {
+        Node node=db.createNode(LABEL);
+        node.setProperty(KEY,i);
+        nodes[i]=node.getId();
+      }
+      tx.success();
+    }
+     return nodes;
+  }
+  private IndexDefinition createIndex(){
+    try (Transaction tx=db.beginTx()){
+      for (int i=0; i < NODES; i++) {
+        db.createNode(LABEL).setProperty(KEY,i);
+      }
+      tx.success();
+    }
+     IndexDefinition indexDefinition;
+    try (Transaction tx=db.beginTx()){
+      indexDefinition=db.schema().indexFor(LABEL).on(KEY).create();
+      tx.success();
+    }
+     try (Transaction tx=db.beginTx()){
+      db.schema().awaitIndexesOnline(10,TimeUnit.SECONDS);
+      tx.success();
+    }
+     return indexDefinition;
+  }
+private interface NodeOperation {
+    void run(    long nodeId) throws Exception ;
+  }
+}

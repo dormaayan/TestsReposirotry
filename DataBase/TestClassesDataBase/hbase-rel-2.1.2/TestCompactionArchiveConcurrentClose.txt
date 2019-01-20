@@ -1,0 +1,110 @@
+/** 
+ * Tests a race condition between archiving of compacted files in CompactedHFilesDischarger chore and HRegion.close();
+ */
+@Category({RegionServerTests.class,MediumTests.class}) public class TestCompactionArchiveConcurrentClose {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestCompactionArchiveConcurrentClose.class);
+  public HBaseTestingUtility testUtil;
+  private Path testDir;
+  private AtomicBoolean archived=new AtomicBoolean();
+  @Rule public TestName name=new TestName();
+  @Before public void setup() throws Exception {
+    testUtil=HBaseTestingUtility.createLocalHTU();
+    testDir=testUtil.getDataTestDir("TestStoreFileRefresherChore");
+    FSUtils.setRootDir(testUtil.getConfiguration(),testDir);
+  }
+  @After public void tearDown() throws Exception {
+    testUtil.cleanupTestDir();
+  }
+  @Test public void testStoreCloseAndDischargeRunningInParallel() throws Exception {
+    byte[] fam=Bytes.toBytes("f");
+    byte[] col=Bytes.toBytes("c");
+    byte[] val=Bytes.toBytes("val");
+    TableName tableName=TableName.valueOf(name.getMethodName());
+    TableDescriptor htd=TableDescriptorBuilder.newBuilder(tableName).setColumnFamily(ColumnFamilyDescriptorBuilder.of(fam)).build();
+    RegionInfo info=RegionInfoBuilder.newBuilder(tableName).build();
+    HRegion region=initHRegion(htd,info);
+    RegionServerServices rss=mock(RegionServerServices.class);
+    List<HRegion> regions=new ArrayList<>();
+    regions.add(region);
+    Mockito.doReturn(regions).when(rss).getRegions();
+    CompactedHFilesDischarger cleaner=new CompactedHFilesDischarger(1000,(Stoppable)null,rss,false);
+    int batchSize=10;
+    int fileCount=10;
+    for (int f=0; f < fileCount; f++) {
+      int start=f * batchSize;
+      for (int i=start; i < start + batchSize; i++) {
+        Put p=new Put(Bytes.toBytes("row" + i));
+        p.addColumn(fam,col,val);
+        region.put(p);
+      }
+      region.flush(true);
+    }
+    HStore store=region.getStore(fam);
+    assertEquals(fileCount,store.getStorefilesCount());
+    Collection<HStoreFile> storefiles=store.getStorefiles();
+    for (    HStoreFile file : storefiles) {
+      assertFalse(file.isCompactedAway());
+    }
+    region.compact(true);
+    Thread cleanerThread=new Thread(){
+      @Override public void run(){
+        cleaner.chore();
+      }
+    }
+;
+    cleanerThread.start();
+synchronized (archived) {
+      if (!archived.get()) {
+        archived.wait();
+      }
+    }
+    final AtomicReference<Exception> closeException=new AtomicReference<>();
+    Thread closeThread=new Thread(){
+      @Override public void run(){
+        try {
+          ((HRegion)region).close();
+        }
+ catch (        IOException e) {
+          closeException.set(e);
+        }
+      }
+    }
+;
+    closeThread.start();
+    closeThread.join();
+    cleanerThread.join();
+    if (closeException.get() != null) {
+      throw closeException.get();
+    }
+  }
+  private HRegion initHRegion(  TableDescriptor htd,  RegionInfo info) throws IOException {
+    Configuration conf=testUtil.getConfiguration();
+    Path tableDir=FSUtils.getTableDir(testDir,htd.getTableName());
+    HRegionFileSystem fs=new WaitingHRegionFileSystem(conf,tableDir.getFileSystem(conf),tableDir,info);
+    ChunkCreator.initialize(MemStoreLABImpl.CHUNK_SIZE_DEFAULT,false,0,0,0,null);
+    final Configuration walConf=new Configuration(conf);
+    FSUtils.setRootDir(walConf,tableDir);
+    final WALFactory wals=new WALFactory(walConf,"log_" + info.getEncodedName());
+    HRegion region=new HRegion(fs,wals.getWAL(info),conf,htd,null);
+    region.initialize();
+    return region;
+  }
+private class WaitingHRegionFileSystem extends HRegionFileSystem {
+    public WaitingHRegionFileSystem(    final Configuration conf,    final FileSystem fs,    final Path tableDir,    final RegionInfo regionInfo){
+      super(conf,fs,tableDir,regionInfo);
+    }
+    @Override public void removeStoreFiles(    String familyName,    Collection<HStoreFile> storeFiles) throws IOException {
+      super.removeStoreFiles(familyName,storeFiles);
+      archived.set(true);
+synchronized (archived) {
+        archived.notifyAll();
+      }
+      try {
+        Thread.sleep(100);
+      }
+ catch (      InterruptedException ie) {
+        throw new InterruptedIOException("Interrupted waiting for latch");
+      }
+    }
+  }
+}

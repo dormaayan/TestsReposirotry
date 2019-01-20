@@ -1,0 +1,110 @@
+/** 
+ * Tests for running  {@link RollingSinkSecuredITCase} which is an extension of {@link RollingSink} in secure environmentNote: only executed for Hadoop version > 3.x.x.
+ */
+public class RollingSinkSecuredITCase extends RollingSinkITCase {
+  protected static final Logger LOG=LoggerFactory.getLogger(RollingSinkSecuredITCase.class);
+  /** 
+ * Skips all tests if the Hadoop version doesn't match. We can't run this test class until HDFS-9213 is fixed which allows a secure DataNode to bind to non-privileged ports for testing. For now, we skip this test class until Hadoop version 3.x.x.
+ */
+  private static void skipIfHadoopVersionIsNotAppropriate(){
+    String hadoopVersionString=VersionInfo.getVersion();
+    String[] split=hadoopVersionString.split("\\.");
+    if (split.length != 3) {
+      throw new IllegalStateException("Hadoop version was not of format 'X.X.X': " + hadoopVersionString);
+    }
+    Assume.assumeTrue(Integer.parseInt(split[0]) >= 3);
+  }
+  @BeforeClass public static void setup() throws Exception {
+    skipIfHadoopVersionIsNotAppropriate();
+    LOG.info("starting secure cluster environment for testing");
+    dataDir=tempFolder.newFolder();
+    conf.set(MiniDFSCluster.HDFS_MINIDFS_BASEDIR,dataDir.getAbsolutePath());
+    SecureTestEnvironment.prepare(tempFolder);
+    populateSecureConfigurations();
+    Configuration flinkConfig=new Configuration();
+    flinkConfig.setString(SecurityOptions.KERBEROS_LOGIN_KEYTAB,SecureTestEnvironment.getTestKeytab());
+    flinkConfig.setString(SecurityOptions.KERBEROS_LOGIN_PRINCIPAL,SecureTestEnvironment.getHadoopServicePrincipal());
+    SecurityConfiguration ctx=new SecurityConfiguration(flinkConfig,Collections.singletonList(securityConfig -> new HadoopModule(securityConfig,conf)));
+    try {
+      TestingSecurityContext.install(ctx,SecureTestEnvironment.getClientSecurityConfigurationMap());
+    }
+ catch (    Exception e) {
+      throw new RuntimeException("Exception occurred while setting up secure test context. Reason: {}",e);
+    }
+    File hdfsSiteXML=new File(dataDir.getAbsolutePath() + "/hdfs-site.xml");
+    FileWriter writer=new FileWriter(hdfsSiteXML);
+    conf.writeXml(writer);
+    writer.flush();
+    writer.close();
+    Map<String,String> map=new HashMap<String,String>(System.getenv());
+    map.put("HADOOP_CONF_DIR",hdfsSiteXML.getParentFile().getAbsolutePath());
+    TestBaseUtils.setEnv(map);
+    MiniDFSCluster.Builder builder=new MiniDFSCluster.Builder(conf);
+    builder.checkDataNodeAddrConfig(true);
+    builder.checkDataNodeHostConfig(true);
+    hdfsCluster=builder.build();
+    dfs=hdfsCluster.getFileSystem();
+    hdfsURI="hdfs://" + NetUtils.hostAndPortToUrlString(hdfsCluster.getURI().getHost(),hdfsCluster.getNameNodePort()) + "/";
+    Configuration configuration=startSecureFlinkClusterWithRecoveryModeEnabled();
+    miniClusterResource=new MiniClusterResource(new MiniClusterResourceConfiguration.Builder().setConfiguration(configuration).setNumberTaskManagers(1).setNumberSlotsPerTaskManager(4).build());
+    miniClusterResource.before();
+  }
+  @AfterClass public static void teardown() throws Exception {
+    LOG.info("tearing down secure cluster environment");
+    if (hdfsCluster != null) {
+      hdfsCluster.shutdown();
+    }
+    if (miniClusterResource != null) {
+      miniClusterResource.after();
+      miniClusterResource=null;
+    }
+    SecureTestEnvironment.cleanup();
+  }
+  private static void populateSecureConfigurations(){
+    String dataTransferProtection="authentication";
+    SecurityUtil.setAuthenticationMethod(UserGroupInformation.AuthenticationMethod.KERBEROS,conf);
+    conf.set(DFS_NAMENODE_USER_NAME_KEY,SecureTestEnvironment.getHadoopServicePrincipal());
+    conf.set(DFS_NAMENODE_KEYTAB_FILE_KEY,SecureTestEnvironment.getTestKeytab());
+    conf.set(DFS_DATANODE_USER_NAME_KEY,SecureTestEnvironment.getHadoopServicePrincipal());
+    conf.set(DFS_DATANODE_KEYTAB_FILE_KEY,SecureTestEnvironment.getTestKeytab());
+    conf.set(DFS_WEB_AUTHENTICATION_KERBEROS_PRINCIPAL_KEY,SecureTestEnvironment.getHadoopServicePrincipal());
+    conf.setBoolean(DFS_BLOCK_ACCESS_TOKEN_ENABLE_KEY,true);
+    conf.set("dfs.data.transfer.protection",dataTransferProtection);
+    conf.set(DFS_HTTP_POLICY_KEY,HttpConfig.Policy.HTTP_ONLY.name());
+    conf.set(DFS_ENCRYPT_DATA_TRANSFER_KEY,"false");
+    conf.setInt("dfs.datanode.socket.write.timeout",0);
+    conf.set(DFS_DATANODE_ADDRESS_KEY,"localhost:1002");
+    conf.set(DFS_DATANODE_HOST_NAME_KEY,"localhost");
+    conf.set(DFS_DATANODE_HTTP_ADDRESS_KEY,"localhost:1003");
+  }
+  private static Configuration startSecureFlinkClusterWithRecoveryModeEnabled(){
+    try {
+      LOG.info("Starting Flink and ZK in secure mode");
+      dfs.mkdirs(new Path("/flink/checkpoints"));
+      dfs.mkdirs(new Path("/flink/recovery"));
+      final Configuration result=new Configuration();
+      result.setBoolean(ConfigConstants.LOCAL_START_WEBSERVER,false);
+      result.setInteger(ConfigConstants.LOCAL_NUMBER_JOB_MANAGER,3);
+      result.setString(HighAvailabilityOptions.HA_MODE,"zookeeper");
+      result.setString(CheckpointingOptions.STATE_BACKEND,"filesystem");
+      result.setString(HighAvailabilityOptions.HA_ZOOKEEPER_CHECKPOINTS_PATH,hdfsURI + "/flink/checkpoints");
+      result.setString(HighAvailabilityOptions.HA_STORAGE_PATH,hdfsURI + "/flink/recovery");
+      result.setString("state.backend.fs.checkpointdir",hdfsURI + "/flink/checkpoints");
+      SecureTestEnvironment.populateFlinkSecureConfigurations(result);
+      return result;
+    }
+ catch (    Exception e) {
+      throw new RuntimeException(e);
+    }
+  }
+  @Override public void testNonRollingSequenceFileWithoutCompressionWriter() throws Exception {
+  }
+  @Override public void testNonRollingSequenceFileWithCompressionWriter() throws Exception {
+  }
+  @Override public void testNonRollingAvroKeyValueWithoutCompressionWriter() throws Exception {
+  }
+  @Override public void testNonRollingAvroKeyValueWithCompressionWriter() throws Exception {
+  }
+  @Override public void testDateTimeRollingStringWriter() throws Exception {
+  }
+}

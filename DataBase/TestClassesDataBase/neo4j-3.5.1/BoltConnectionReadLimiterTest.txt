@@ -1,0 +1,137 @@
+public class BoltConnectionReadLimiterTest {
+  private static final Job job=machine -> machine.process(new InitMessage("INIT",emptyMap()),nullResponseHandler());
+  private BoltConnection connection;
+  private EmbeddedChannel channel;
+  private Log log;
+  @Before public void setup(){
+    channel=new EmbeddedChannel();
+    log=mock(Log.class);
+    connection=mock(BoltConnection.class);
+    when(connection.id()).thenReturn(channel.id().asLongText());
+    when(connection.channel()).thenReturn(channel);
+  }
+  @After public void cleanup(){
+    channel.finishAndReleaseAll();
+  }
+  @Test public void shouldNotDisableAutoReadBelowHighWatermark(){
+    BoltConnectionReadLimiter limiter=newLimiter(1,2);
+    assertTrue(channel.config().isAutoRead());
+    limiter.enqueued(connection,job);
+    assertTrue(channel.config().isAutoRead());
+    verify(log,never()).warn(anyString(),any(),any());
+  }
+  @Test public void shouldDisableAutoReadWhenAtHighWatermark(){
+    BoltConnectionReadLimiter limiter=newLimiter(1,2);
+    assertTrue(channel.config().isAutoRead());
+    limiter.enqueued(connection,job);
+    limiter.enqueued(connection,job);
+    limiter.enqueued(connection,job);
+    assertFalse(channel.config().isAutoRead());
+    verify(log).warn(contains("disabled"),eq(channel.remoteAddress()),eq(3));
+  }
+  @Test public void shouldDisableAutoReadOnlyOnceWhenAboveHighWatermark(){
+    BoltConnectionReadLimiter limiter=newLimiter(1,2);
+    assertTrue(channel.config().isAutoRead());
+    limiter.enqueued(connection,job);
+    limiter.enqueued(connection,job);
+    limiter.enqueued(connection,job);
+    limiter.enqueued(connection,job);
+    limiter.enqueued(connection,job);
+    assertFalse(channel.config().isAutoRead());
+    verify(log,times(1)).warn(contains("disabled"),eq(channel.remoteAddress()),eq(3));
+  }
+  @Test public void shouldEnableAutoReadWhenAtLowWatermark(){
+    BoltConnectionReadLimiter limiter=newLimiter(1,2);
+    assertTrue(channel.config().isAutoRead());
+    limiter.enqueued(connection,job);
+    limiter.enqueued(connection,job);
+    limiter.enqueued(connection,job);
+    limiter.drained(connection,Arrays.asList(job,job));
+    assertTrue(channel.config().isAutoRead());
+    verify(log,times(1)).warn(contains("disabled"),eq(channel.remoteAddress()),eq(3));
+    verify(log,times(1)).warn(contains("enabled"),eq(channel.remoteAddress()),eq(1));
+  }
+  @Test public void shouldEnableAutoReadOnlyOnceWhenBelowLowWatermark(){
+    BoltConnectionReadLimiter limiter=newLimiter(1,2);
+    assertTrue(channel.config().isAutoRead());
+    limiter.enqueued(connection,job);
+    limiter.enqueued(connection,job);
+    limiter.enqueued(connection,job);
+    limiter.drained(connection,Arrays.asList(job,job,job));
+    assertTrue(channel.config().isAutoRead());
+    verify(log,times(1)).warn(contains("disabled"),eq(channel.remoteAddress()),eq(3));
+    verify(log,times(1)).warn(contains("enabled"),eq(channel.remoteAddress()),eq(1));
+  }
+  @Test public void shouldDisableAndEnableAutoRead(){
+    int lowWatermark=3;
+    int highWatermark=5;
+    BoltConnectionReadLimiter limiter=newLimiter(lowWatermark,highWatermark);
+    assertTrue(channel.config().isAutoRead());
+    for (int i=0; i < highWatermark + 1; i++) {
+      limiter.enqueued(connection,job);
+    }
+    assertFalse(channel.config().isAutoRead());
+    limiter.drained(connection,singleton(job));
+    assertFalse(channel.config().isAutoRead());
+    limiter.drained(connection,singleton(job));
+    assertFalse(channel.config().isAutoRead());
+    limiter.drained(connection,singleton(job));
+    assertTrue(channel.config().isAutoRead());
+    for (int i=0; i < 3; i++) {
+      limiter.enqueued(connection,job);
+    }
+    assertFalse(channel.config().isAutoRead());
+    limiter.drained(connection,Arrays.asList(job,job,job,job,job,job));
+    assertTrue(channel.config().isAutoRead());
+  }
+  @Test public void shouldNotAcceptNegativeLowWatermark(){
+    try {
+      newLimiter(-1,5);
+      fail("exception expected");
+    }
+ catch (    IllegalArgumentException exc) {
+      assertThat(exc.getMessage(),startsWith("invalid lowWatermark value"));
+    }
+  }
+  @Test public void shouldNotAcceptLowWatermarkEqualToHighWatermark(){
+    try {
+      newLimiter(5,5);
+      fail("exception expected");
+    }
+ catch (    IllegalArgumentException exc) {
+      assertThat(exc.getMessage(),startsWith("invalid lowWatermark value"));
+    }
+  }
+  @Test public void shouldNotAcceptLowWatermarkLargerThanHighWatermark(){
+    try {
+      newLimiter(6,5);
+      fail("exception expected");
+    }
+ catch (    IllegalArgumentException exc) {
+      assertThat(exc.getMessage(),startsWith("invalid lowWatermark value"));
+    }
+  }
+  @Test public void shouldNotAcceptZeroHighWatermark(){
+    try {
+      newLimiter(1,0);
+      fail("exception expected");
+    }
+ catch (    IllegalArgumentException exc) {
+      assertThat(exc.getMessage(),startsWith("invalid highWatermark value"));
+    }
+  }
+  @Test public void shouldNotAcceptNegativeHighWatermark(){
+    try {
+      newLimiter(1,-1);
+      fail("exception expected");
+    }
+ catch (    IllegalArgumentException exc) {
+      assertThat(exc.getMessage(),startsWith("invalid highWatermark value"));
+    }
+  }
+  private BoltConnectionReadLimiter newLimiter(  int low,  int high){
+    LogService logService=mock(LogService.class);
+    when(logService.getInternalLog(BoltConnectionReadLimiter.class)).thenReturn(log);
+    return new BoltConnectionReadLimiter(logService,low,high);
+  }
+}

@@ -1,0 +1,51 @@
+@Test(timeout=300000) public void testRenamingStorageIds() throws Exception {
+  Configuration conf=new HdfsConfiguration();
+  conf.setInt(DFSConfigKeys.DFS_DATANODE_FAILED_VOLUMES_TOLERATED_KEY,0);
+  final MiniDFSCluster cluster=new MiniDFSCluster.Builder(conf).numDataNodes(1).storagesPerDatanode(1).build();
+  GenericTestUtils.setLogLevel(BlockManager.LOG,Level.ALL);
+  try {
+    cluster.waitActive();
+    final Path TEST_PATH=new Path("/foo1");
+    DistributedFileSystem fs=cluster.getFileSystem();
+    DFSTestUtil.createFile(fs,TEST_PATH,1,(short)1,0xdeadbeef);
+    DataNode dn=cluster.getDataNodes().get(0);
+    FsVolumeReferences volumeRefs=dn.getFSDataset().getFsVolumeReferences();
+    final String newStorageId=DatanodeStorage.generateUuid();
+    try {
+      File currentDir=new File(new File(volumeRefs.get(0).getStorageLocation().getUri()),"current");
+      File versionFile=new File(currentDir,"VERSION");
+      rewriteVersionFile(versionFile,newStorageId);
+    }
+  finally {
+      volumeRefs.close();
+    }
+    final ExtendedBlock block=DFSTestUtil.getFirstBlock(fs,TEST_PATH);
+    cluster.restartDataNodes();
+    GenericTestUtils.waitFor(new Supplier<Boolean>(){
+      @Override public Boolean get(){
+        cluster.getNamesystem().writeLock();
+        try {
+          Iterator<DatanodeStorageInfo> storageInfoIter=cluster.getNamesystem().getBlockManager().getStorages(block.getLocalBlock()).iterator();
+          if (!storageInfoIter.hasNext()) {
+            LOG.info("Expected to find a storage for " + block.getBlockName() + ", but nothing was found.  "+ "Continuing to wait.");
+            return false;
+          }
+          DatanodeStorageInfo info=storageInfoIter.next();
+          if (!newStorageId.equals(info.getStorageID())) {
+            LOG.info("Expected " + block.getBlockName() + " to "+ "be in storage id "+ newStorageId+ ", but it "+ "was in "+ info.getStorageID()+ ".  Continuing "+ "to wait.");
+            return false;
+          }
+          LOG.info("Successfully found " + block.getBlockName() + " in "+ "be in storage id "+ newStorageId);
+        }
+  finally {
+          cluster.getNamesystem().writeUnlock();
+        }
+        return true;
+      }
+    }
+,20,100000);
+  }
+  finally {
+    cluster.shutdown();
+  }
+}

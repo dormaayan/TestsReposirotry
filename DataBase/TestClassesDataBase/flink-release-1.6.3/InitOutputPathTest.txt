@@ -1,0 +1,144 @@
+/** 
+ * A test validating that the initialization of local output paths is properly synchronized.
+ */
+@RunWith(PowerMockRunner.class) @PrepareForTest(LocalFileSystem.class) public class InitOutputPathTest {
+  @Rule public final TemporaryFolder tempDir=new TemporaryFolder();
+  /** 
+ * This test validates that this test case makes sense - that the error can be produced in the absence of synchronization, if the threads make progress in a certain way, here enforced by latches.
+ */
+  @Test public void testErrorOccursUnSynchronized() throws Exception {
+    Field lock=FileSystem.class.getDeclaredField("OUTPUT_DIRECTORY_INIT_LOCK");
+    lock.setAccessible(true);
+    lock.set(null,new NoOpLock());
+    try {
+      runTest(true);
+      fail("should fail with an exception");
+    }
+ catch (    FileNotFoundException e) {
+    }
+ finally {
+      lock.set(null,new ReentrantLock(true));
+    }
+  }
+  @Test public void testProperSynchronized() throws Exception {
+    runTest(false);
+  }
+  private void runTest(  final boolean useAwaits) throws Exception {
+    final File tempFile=tempDir.newFile();
+    final Path path1=new Path(tempFile.getAbsolutePath(),"1");
+    final Path path2=new Path(tempFile.getAbsolutePath(),"2");
+    final OneShotLatch deleteAwaitLatch1=new OneShotLatch();
+    final OneShotLatch deleteAwaitLatch2=new OneShotLatch();
+    final OneShotLatch mkdirsAwaitLatch1=new OneShotLatch();
+    final OneShotLatch mkdirsAwaitLatch2=new OneShotLatch();
+    final OneShotLatch deleteTriggerLatch1=new OneShotLatch();
+    final OneShotLatch deletetriggerLatch2=new OneShotLatch();
+    final OneShotLatch mkdirsTriggerLatch1=new OneShotLatch();
+    final OneShotLatch mkdirsTriggerLatch2=new OneShotLatch();
+    final OneShotLatch createAwaitLatch=new OneShotLatch();
+    final OneShotLatch createTriggerLatch=new OneShotLatch();
+    whenNew(LocalDataOutputStream.class).withAnyArguments().thenAnswer(new Answer<LocalDataOutputStream>(){
+      @Override public LocalDataOutputStream answer(      InvocationOnMock invocation) throws Throwable {
+        createAwaitLatch.trigger();
+        createTriggerLatch.await();
+        final File file=(File)invocation.getArguments()[0];
+        return new LocalDataOutputStream(file);
+      }
+    }
+);
+    final LocalFileSystem fs1=new SyncedFileSystem(deleteAwaitLatch1,mkdirsAwaitLatch1,deleteTriggerLatch1,mkdirsTriggerLatch1);
+    final LocalFileSystem fs2=new SyncedFileSystem(deleteAwaitLatch2,mkdirsAwaitLatch2,deletetriggerLatch2,mkdirsTriggerLatch2);
+    FileCreator thread1=new FileCreator(fs1,path1);
+    FileCreator thread2=new FileCreator(fs2,path2);
+    thread1.start();
+    thread2.start();
+    if (useAwaits) {
+      deleteAwaitLatch1.await();
+      deleteAwaitLatch2.await();
+    }
+ else {
+      Thread.sleep(5);
+    }
+    mkdirsTriggerLatch1.trigger();
+    deleteTriggerLatch1.trigger();
+    if (useAwaits) {
+      createAwaitLatch.await();
+    }
+ else {
+      Thread.sleep(100);
+    }
+    deletetriggerLatch2.trigger();
+    if (useAwaits) {
+      mkdirsAwaitLatch2.await();
+    }
+ else {
+      Thread.sleep(5);
+    }
+    createTriggerLatch.trigger();
+    if (useAwaits) {
+      thread1.sync();
+    }
+ else {
+      Thread.sleep(5);
+    }
+    mkdirsTriggerLatch2.trigger();
+    thread1.sync();
+    thread2.sync();
+  }
+private static class FileCreator extends CheckedThread {
+    private final FileSystem fs;
+    private final Path path;
+    FileCreator(    FileSystem fs,    Path path){
+      this.fs=fs;
+      this.path=path;
+    }
+    @Override public void go() throws Exception {
+      fs.initOutPathLocalFS(path.getParent(),WriteMode.OVERWRITE,true);
+      try (FSDataOutputStream out=fs.create(path,WriteMode.OVERWRITE)){
+        out.write(11);
+      }
+     }
+  }
+private static class SyncedFileSystem extends LocalFileSystem {
+    private final OneShotLatch deleteTriggerLatch;
+    private final OneShotLatch mkdirsTriggerLatch;
+    private final OneShotLatch deleteAwaitLatch;
+    private final OneShotLatch mkdirsAwaitLatch;
+    SyncedFileSystem(    OneShotLatch deleteTriggerLatch,    OneShotLatch mkdirsTriggerLatch,    OneShotLatch deleteAwaitLatch,    OneShotLatch mkdirsAwaitLatch){
+      this.deleteTriggerLatch=deleteTriggerLatch;
+      this.mkdirsTriggerLatch=mkdirsTriggerLatch;
+      this.deleteAwaitLatch=deleteAwaitLatch;
+      this.mkdirsAwaitLatch=mkdirsAwaitLatch;
+    }
+    @Override public boolean delete(    Path f,    boolean recursive) throws IOException {
+      deleteTriggerLatch.trigger();
+      try {
+        deleteAwaitLatch.await();
+      }
+ catch (      InterruptedException e) {
+        Thread.currentThread().interrupt();
+        throw new IOException("interrupted");
+      }
+      return super.delete(f,recursive);
+    }
+    @Override public boolean mkdirs(    Path f) throws IOException {
+      mkdirsTriggerLatch.trigger();
+      try {
+        mkdirsAwaitLatch.await();
+      }
+ catch (      InterruptedException e) {
+        Thread.currentThread().interrupt();
+        throw new IOException("interrupted");
+      }
+      return super.mkdirs(f);
+    }
+  }
+@SuppressWarnings("serial") private static final class NoOpLock extends ReentrantLock {
+    @Override public void lock(){
+    }
+    @Override public void lockInterruptibly(){
+    }
+    @Override public void unlock(){
+    }
+  }
+}

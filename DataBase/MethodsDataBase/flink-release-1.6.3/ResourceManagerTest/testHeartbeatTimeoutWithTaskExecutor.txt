@@ -1,0 +1,47 @@
+@Test public void testHeartbeatTimeoutWithTaskExecutor() throws Exception {
+  final int dataPort=1234;
+  final HardwareDescription hardwareDescription=new HardwareDescription(1,2L,3L,4L);
+  final String taskManagerAddress="tm";
+  final ResourceID taskManagerResourceID=new ResourceID(taskManagerAddress);
+  final ResourceID resourceManagerResourceID=ResourceID.generate();
+  final TaskExecutorGateway taskExecutorGateway=mock(TaskExecutorGateway.class);
+  final TestingRpcService rpcService=new TestingRpcService();
+  rpcService.registerGateway(taskManagerAddress,taskExecutorGateway);
+  final ResourceManagerConfiguration resourceManagerConfiguration=new ResourceManagerConfiguration(Time.seconds(5L),Time.seconds(5L));
+  final TestingLeaderElectionService rmLeaderElectionService=new TestingLeaderElectionService();
+  final TestingHighAvailabilityServices highAvailabilityServices=new TestingHighAvailabilityServices();
+  highAvailabilityServices.setResourceManagerLeaderElectionService(rmLeaderElectionService);
+  final long heartbeatInterval=1L;
+  final long heartbeatTimeout=5L;
+  final ScheduledExecutor scheduledExecutor=mock(ScheduledExecutor.class);
+  final HeartbeatServices heartbeatServices=new TestingHeartbeatServices(heartbeatInterval,heartbeatTimeout,scheduledExecutor);
+  final MetricRegistryImpl metricRegistry=mock(MetricRegistryImpl.class);
+  final JobLeaderIdService jobLeaderIdService=mock(JobLeaderIdService.class);
+  final TestingFatalErrorHandler testingFatalErrorHandler=new TestingFatalErrorHandler();
+  final SlotManager slotManager=new SlotManager(rpcService.getScheduledExecutor(),TestingUtils.infiniteTime(),TestingUtils.infiniteTime(),TestingUtils.infiniteTime());
+  try {
+    final StandaloneResourceManager resourceManager=new StandaloneResourceManager(rpcService,FlinkResourceManager.RESOURCE_MANAGER_NAME,resourceManagerResourceID,resourceManagerConfiguration,highAvailabilityServices,heartbeatServices,slotManager,metricRegistry,jobLeaderIdService,new ClusterInformation("localhost",1234),testingFatalErrorHandler,UnregisteredMetricGroups.createUnregisteredJobManagerMetricGroup());
+    resourceManager.start();
+    final ResourceManagerGateway rmGateway=resourceManager.getSelfGateway(ResourceManagerGateway.class);
+    final UUID rmLeaderSessionId=UUID.randomUUID();
+    rmLeaderElectionService.isLeader(rmLeaderSessionId).get(timeout.toMilliseconds(),TimeUnit.MILLISECONDS);
+    CompletableFuture<RegistrationResponse> successfulFuture=rmGateway.registerTaskExecutor(taskManagerAddress,taskManagerResourceID,dataPort,hardwareDescription,timeout);
+    RegistrationResponse response=successfulFuture.get(timeout.toMilliseconds(),TimeUnit.MILLISECONDS);
+    assertTrue(response instanceof TaskExecutorRegistrationSuccess);
+    ArgumentCaptor<Runnable> heartbeatRunnableCaptor=ArgumentCaptor.forClass(Runnable.class);
+    verify(scheduledExecutor,times(2)).scheduleAtFixedRate(heartbeatRunnableCaptor.capture(),eq(0L),eq(heartbeatInterval),eq(TimeUnit.MILLISECONDS));
+    List<Runnable> heartbeatRunnable=heartbeatRunnableCaptor.getAllValues();
+    ArgumentCaptor<Runnable> timeoutRunnableCaptor=ArgumentCaptor.forClass(Runnable.class);
+    verify(scheduledExecutor).schedule(timeoutRunnableCaptor.capture(),eq(heartbeatTimeout),eq(TimeUnit.MILLISECONDS));
+    Runnable timeoutRunnable=timeoutRunnableCaptor.getValue();
+    for (    Runnable runnable : heartbeatRunnable) {
+      runnable.run();
+    }
+    verify(taskExecutorGateway,times(1)).heartbeatFromResourceManager(eq(resourceManagerResourceID));
+    timeoutRunnable.run();
+    verify(taskExecutorGateway,Mockito.timeout(timeout.toMilliseconds())).disconnectResourceManager(any(TimeoutException.class));
+  }
+  finally {
+    RpcUtils.terminateRpcService(rpcService,timeout);
+  }
+}

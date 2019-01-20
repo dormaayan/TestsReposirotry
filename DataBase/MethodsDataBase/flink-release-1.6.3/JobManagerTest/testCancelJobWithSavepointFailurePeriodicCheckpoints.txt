@@ -1,0 +1,35 @@
+/** 
+ * Tests that a failed savepoint does not cancel the job and new checkpoints are triggered after the failed cancel-with-savepoint.
+ */
+@Test public void testCancelJobWithSavepointFailurePeriodicCheckpoints() throws Exception {
+  File savepointTarget=tmpFolder.newFolder();
+  JobVertex sourceVertex=new JobVertex("Source");
+  sourceVertex.setInvokableClass(FailOnSavepointSourceTask.class);
+  sourceVertex.setParallelism(1);
+  JobGraph jobGraph=new JobGraph("TestingJob",sourceVertex);
+  CheckpointCoordinatorConfiguration coordConfig=new CheckpointCoordinatorConfiguration(50,3600000,0,Integer.MAX_VALUE,CheckpointRetentionPolicy.NEVER_RETAIN_AFTER_TERMINATION,true);
+  JobCheckpointingSettings snapshottingSettings=new JobCheckpointingSettings(Collections.singletonList(sourceVertex.getID()),Collections.singletonList(sourceVertex.getID()),Collections.singletonList(sourceVertex.getID()),coordConfig,null);
+  jobGraph.setSnapshotSettings(snapshottingSettings);
+  final TestingCluster testingCluster=new TestingCluster(new Configuration(),highAvailabilityServices,true,false);
+  try {
+    testingCluster.start(true);
+    FiniteDuration askTimeout=new FiniteDuration(30,TimeUnit.SECONDS);
+    ActorGateway jobManager=testingCluster.getLeaderGateway(askTimeout);
+    testingCluster.submitJobDetached(jobGraph);
+    Future<Object> allTasksAlive=jobManager.ask(new WaitForAllVerticesToBeRunning(jobGraph.getJobID()),askTimeout);
+    Await.ready(allTasksAlive,askTimeout);
+    Future<Object> cancellationFuture=jobManager.ask(new CancelJobWithSavepoint(jobGraph.getJobID(),savepointTarget.getAbsolutePath()),askTimeout);
+    Object cancellationResponse=Await.result(cancellationFuture,askTimeout);
+    if (cancellationResponse instanceof CancellationFailure) {
+      if (!FailOnSavepointSourceTask.CHECKPOINT_AFTER_SAVEPOINT_LATCH.await(30,TimeUnit.SECONDS)) {
+        fail("No checkpoint was triggered after failed savepoint within expected duration");
+      }
+    }
+ else {
+      fail("Unexpected cancellation response from JobManager: " + cancellationResponse);
+    }
+  }
+  finally {
+    testingCluster.stop();
+  }
+}

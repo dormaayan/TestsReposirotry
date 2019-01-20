@@ -1,0 +1,33 @@
+@Test public void testRestartWithEagerSchedulingAndSlotSharing() throws Exception {
+  assertTrue("test assumptions violated",((ThreadPoolExecutor)executor).getCorePoolSize() > 1);
+  SimpleAckingTaskManagerGateway taskManagerGateway=new SimpleAckingTaskManagerGateway();
+  final int parallelism=20;
+  final Scheduler scheduler=createSchedulerWithInstances(parallelism,taskManagerGateway);
+  final SlotSharingGroup sharingGroup=new SlotSharingGroup();
+  final JobVertex source=new JobVertex("source");
+  source.setInvokableClass(NoOpInvokable.class);
+  source.setParallelism(parallelism);
+  source.setSlotSharingGroup(sharingGroup);
+  final JobVertex sink=new JobVertex("sink");
+  sink.setInvokableClass(NoOpInvokable.class);
+  sink.setParallelism(parallelism);
+  sink.setSlotSharingGroup(sharingGroup);
+  sink.connectNewDataSetAsInput(source,DistributionPattern.POINTWISE,ResultPartitionType.PIPELINED_BOUNDED);
+  final ExecutionGraph eg=ExecutionGraphTestUtils.createExecutionGraph(new JobID(),scheduler,new FixedDelayRestartStrategy(Integer.MAX_VALUE,0),executor,source,sink);
+  WaitForTasks waitForTasks=new WaitForTasks(parallelism * 2);
+  taskManagerGateway.setSubmitConsumer(waitForTasks);
+  eg.setScheduleMode(ScheduleMode.EAGER);
+  eg.scheduleForExecution();
+  waitForTasks.getFuture().get(1000,TimeUnit.MILLISECONDS);
+  switchToRunning(eg);
+  eg.getAllExecutionVertices().iterator().next().getCurrentExecutionAttempt().fail(new Exception("intended test failure"));
+  assertEquals(JobStatus.FAILING,eg.getState());
+  WaitForTasks waitForTasksAfterRestart=new WaitForTasks(parallelism * 2);
+  taskManagerGateway.setSubmitConsumer(waitForTasksAfterRestart);
+  completeCancellingForAllVertices(eg);
+  waitUntilJobStatus(eg,JobStatus.RUNNING,1000);
+  waitForTasksAfterRestart.getFuture().get(1000,TimeUnit.MILLISECONDS);
+  switchToRunning(eg);
+  finishAllVertices(eg);
+  waitUntilJobStatus(eg,JobStatus.FINISHED,1000);
+}

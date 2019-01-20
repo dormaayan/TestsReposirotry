@@ -1,0 +1,43 @@
+@Test public void testExceptionThrownFromOnExceptionAndHandledWithDeadLetterChannel() throws Exception {
+  RETRY.set(0);
+  ON_EXCEPTION_RETRY.set(0);
+  context.addRoutes(new RouteBuilder(){
+    @Override public void configure() throws Exception {
+      deadLetterChannel("mock:error").redeliveryDelay(0).maximumRedeliveries(3);
+      onException(IOException.class).redeliveryDelay(0).maximumRedeliveries(3).handled(true).to("mock:b").process(new Processor(){
+        @Override public void process(        Exchange exchange) throws Exception {
+          ON_EXCEPTION_RETRY.incrementAndGet();
+          throw new IOException("Some other IOException");
+        }
+      }
+).to("mock:c");
+      from("direct:start").to("direct:intermediate").to("mock:result");
+      from("direct:intermediate").to("mock:a").process(new Processor(){
+        @Override public void process(        Exchange exchange) throws Exception {
+          RETRY.incrementAndGet();
+          throw new IOException("IO error");
+        }
+      }
+).to("mock:end");
+    }
+  }
+);
+  context.start();
+  getMockEndpoint("mock:a").expectedMessageCount(1);
+  getMockEndpoint("mock:b").expectedMessageCount(1);
+  getMockEndpoint("mock:c").expectedMessageCount(0);
+  getMockEndpoint("mock:result").expectedMessageCount(0);
+  getMockEndpoint("mock:end").expectedMessageCount(0);
+  getMockEndpoint("mock:error").expectedMessageCount(0);
+  try {
+    template.sendBody("direct:start","Hello World");
+    fail("Should have thrown an exception");
+  }
+ catch (  CamelExecutionException e) {
+    IOException cause=assertIsInstanceOf(IOException.class,e.getCause());
+    assertEquals("Some other IOException",cause.getMessage());
+  }
+  assertMockEndpointsSatisfied();
+  assertEquals("Should try 4 times (1 first, 3 retry)",4,RETRY.get());
+  assertEquals("Should only invoke onException once",1,ON_EXCEPTION_RETRY.get());
+}

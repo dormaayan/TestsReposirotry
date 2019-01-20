@@ -1,0 +1,108 @@
+public abstract class NativeIndexTestUtil<KEY extends NativeIndexKey<KEY>,VALUE extends NativeIndexValue> {
+  static final long NON_EXISTENT_ENTITY_ID=1_000_000_000;
+  final DefaultFileSystemRule fs=new DefaultFileSystemRule();
+  private final TestDirectory directory=TestDirectory.testDirectory(getClass(),fs.get());
+  private final PageCacheRule pageCacheRule=new PageCacheRule(config().withAccessChecks(true));
+  protected final RandomRule random=new RandomRule();
+  @Rule public final RuleChain rules=outerRule(random).around(fs).around(directory).around(pageCacheRule);
+  StoreIndexDescriptor indexDescriptor;
+  ValueCreatorUtil<KEY,VALUE> valueCreatorUtil;
+  IndexLayout<KEY,VALUE> layout;
+  IndexDirectoryStructure indexDirectoryStructure;
+  private File indexFile;
+  PageCache pageCache;
+  IndexProvider.Monitor monitor=IndexProvider.Monitor.EMPTY;
+  @Before public void setup() throws IOException {
+    valueCreatorUtil=createValueCreatorUtil();
+    indexDescriptor=valueCreatorUtil.indexDescriptor();
+    layout=createLayout();
+    indexDirectoryStructure=directoriesByProvider(directory.directory("root")).forProvider(indexDescriptor.providerDescriptor());
+    indexFile=indexDirectoryStructure.directoryForIndex(indexDescriptor.getId());
+    fs.mkdirs(indexFile.getParentFile());
+    pageCache=pageCacheRule.getPageCache(fs);
+  }
+  public File getIndexFile(){
+    return indexFile;
+  }
+  abstract ValueCreatorUtil<KEY,VALUE> createValueCreatorUtil();
+  abstract IndexLayout<KEY,VALUE> createLayout();
+  private void copyValue(  VALUE value,  VALUE intoValue){
+    valueCreatorUtil.copyValue(value,intoValue);
+  }
+  void verifyUpdates(  IndexEntryUpdate<IndexDescriptor>[] updates) throws IOException {
+    Hit<KEY,VALUE>[] expectedHits=convertToHits(updates,layout);
+    List<Hit<KEY,VALUE>> actualHits=new ArrayList<>();
+    try (GBPTree<KEY,VALUE> tree=getTree();RawCursor<Hit<KEY,VALUE>,IOException> scan=scan(tree)){
+      while (scan.next()) {
+        actualHits.add(deepCopy(scan.get()));
+      }
+    }
+     Comparator<Hit<KEY,VALUE>> hitComparator=(h1,h2) -> {
+      int keyCompare=layout.compare(h1.key(),h2.key());
+      if (keyCompare == 0) {
+        return valueCreatorUtil.compareIndexedPropertyValue(h1.key(),h2.key());
+      }
+ else {
+        return keyCompare;
+      }
+    }
+;
+    assertSameHits(expectedHits,actualHits.toArray(new Hit[0]),hitComparator);
+  }
+  GBPTree<KEY,VALUE> getTree(){
+    return new GBPTree<>(pageCache,getIndexFile(),layout,0,GBPTree.NO_MONITOR,NO_HEADER_READER,NO_HEADER_WRITER,RecoveryCleanupWorkCollector.immediate());
+  }
+  private RawCursor<Hit<KEY,VALUE>,IOException> scan(  GBPTree<KEY,VALUE> tree) throws IOException {
+    KEY lowest=layout.newKey();
+    lowest.initialize(Long.MIN_VALUE);
+    lowest.initValueAsLowest(0,ValueGroup.UNKNOWN);
+    KEY highest=layout.newKey();
+    highest.initialize(Long.MAX_VALUE);
+    highest.initValueAsHighest(0,ValueGroup.UNKNOWN);
+    return tree.seek(lowest,highest);
+  }
+  private void assertSameHits(  Hit<KEY,VALUE>[] expectedHits,  Hit<KEY,VALUE>[] actualHits,  Comparator<Hit<KEY,VALUE>> comparator){
+    Arrays.sort(expectedHits,comparator);
+    Arrays.sort(actualHits,comparator);
+    assertEquals(format("Array length differ%nExpected:%d, Actual:%d",expectedHits.length,actualHits.length),expectedHits.length,actualHits.length);
+    for (int i=0; i < expectedHits.length; i++) {
+      Hit<KEY,VALUE> expected=expectedHits[i];
+      Hit<KEY,VALUE> actual=actualHits[i];
+      assertEquals("Hits differ on item number " + i + ". Expected "+ expected+ " but was "+ actual,0,comparator.compare(expected,actual));
+    }
+  }
+  private Hit<KEY,VALUE> deepCopy(  Hit<KEY,VALUE> from){
+    KEY intoKey=layout.newKey();
+    VALUE intoValue=layout.newValue();
+    layout.copyKey(from.key(),intoKey);
+    copyValue(from.value(),intoValue);
+    return new SimpleHit<>(intoKey,intoValue);
+  }
+  private Hit<KEY,VALUE>[] convertToHits(  IndexEntryUpdate<IndexDescriptor>[] updates,  Layout<KEY,VALUE> layout){
+    List<Hit<KEY,VALUE>> hits=new ArrayList<>(updates.length);
+    for (    IndexEntryUpdate<IndexDescriptor> u : updates) {
+      KEY key=layout.newKey();
+      key.initialize(u.getEntityId());
+      for (int i=0; i < u.values().length; i++) {
+        key.initFromValue(i,u.values()[i],NEUTRAL);
+      }
+      VALUE value=layout.newValue();
+      value.from(u.values());
+      hits.add(hit(key,value));
+    }
+    return hits.toArray(new Hit[0]);
+  }
+  private Hit<KEY,VALUE> hit(  final KEY key,  final VALUE value){
+    return new SimpleHit<>(key,value);
+  }
+  void assertFilePresent(){
+    assertTrue(fs.fileExists(getIndexFile()));
+  }
+  void assertFileNotPresent(){
+    assertFalse(fs.fileExists(getIndexFile()));
+  }
+  void setSeed(  long seed){
+    random.setSeed(seed);
+    random.reset();
+  }
+}

@@ -1,0 +1,37 @@
+@Test public void testColumnFamilyAdditionTwiceWithNonce() throws Exception {
+  final TableName tableName=TableName.valueOf(name.getMethodName());
+  final String cf2="cf2";
+  final String cf3="cf3";
+  final ProcedureExecutor<MasterProcedureEnv> procExec=getMasterProcedureExecutor();
+  RegionInfo[] regions=MasterProcedureTestingUtility.createTable(procExec,tableName,null,"cf1",cf3);
+  ProcedureTestingUtility.setKillAndToggleBeforeStoreUpdate(procExec,true);
+  TableDescriptor td=UTIL.getAdmin().getDescriptor(tableName);
+  TableDescriptor newTd=TableDescriptorBuilder.newBuilder(td).setCompactionEnabled(!td.isCompactionEnabled()).setColumnFamily(ColumnFamilyDescriptorBuilder.of(cf2)).build();
+  PerClientRandomNonceGenerator nonceGenerator=PerClientRandomNonceGenerator.get();
+  long nonceGroup=nonceGenerator.getNonceGroup();
+  long newNonce=nonceGenerator.newNonce();
+  NonceKey nonceKey=new NonceKey(nonceGroup,newNonce);
+  procExec.registerNonce(nonceKey);
+  final long procId=procExec.submitProcedure(new ModifyTableProcedure(procExec.getEnvironment(),newTd),nonceKey);
+  MasterProcedureTestingUtility.testRecoveryAndDoubleExecution(procExec,procId,new StepHook(){
+    @Override public boolean execute(    int step) throws IOException {
+      if (step == 3) {
+        return procId == UTIL.getHBaseCluster().getMaster().addColumn(tableName,ColumnFamilyDescriptorBuilder.newBuilder(Bytes.toBytes(cf2)).build(),nonceGroup,newNonce);
+      }
+      return true;
+    }
+  }
+);
+  try {
+    UTIL.getHBaseCluster().getMaster().addColumn(tableName,ColumnFamilyDescriptorBuilder.newBuilder(Bytes.toBytes(cf2)).build(),nonceGroup,nonceGenerator.newNonce());
+    Assert.fail();
+  }
+ catch (  InvalidFamilyOperationException e) {
+  }
+  TableDescriptor currentHtd=UTIL.getAdmin().getDescriptor(tableName);
+  assertEquals(!td.isCompactionEnabled(),currentHtd.isCompactionEnabled());
+  assertEquals(3,currentHtd.getColumnFamilyCount());
+  assertTrue(currentHtd.hasColumnFamily(Bytes.toBytes(cf2)));
+  assertTrue(currentHtd.hasColumnFamily(Bytes.toBytes(cf3)));
+  MasterProcedureTestingUtility.validateTableCreation(UTIL.getHBaseCluster().getMaster(),tableName,regions,"cf1",cf2,cf3);
+}

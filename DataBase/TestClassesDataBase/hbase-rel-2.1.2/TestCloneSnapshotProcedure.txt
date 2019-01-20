@@ -1,0 +1,79 @@
+@Category({MasterTests.class,MediumTests.class}) public class TestCloneSnapshotProcedure extends TestTableDDLProcedureBase {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestCloneSnapshotProcedure.class);
+  private static final Logger LOG=LoggerFactory.getLogger(TestCloneSnapshotProcedure.class);
+  protected final byte[] CF=Bytes.toBytes("cf1");
+  private static SnapshotProtos.SnapshotDescription snapshot=null;
+  @After @Override public void tearDown() throws Exception {
+    super.tearDown();
+    SnapshotTestingUtils.deleteAllSnapshots(UTIL.getAdmin());
+    snapshot=null;
+  }
+  private SnapshotProtos.SnapshotDescription getSnapshot() throws Exception {
+    if (snapshot == null) {
+      final TableName snapshotTableName=TableName.valueOf("testCloneSnapshot");
+      long tid=System.currentTimeMillis();
+      final byte[] snapshotName=Bytes.toBytes("snapshot-" + tid);
+      Admin admin=UTIL.getAdmin();
+      SnapshotTestingUtils.createTable(UTIL,snapshotTableName,getNumReplicas(),CF);
+      SnapshotTestingUtils.loadData(UTIL,snapshotTableName,500,CF);
+      admin.disableTable(snapshotTableName);
+      admin.snapshot(snapshotName,snapshotTableName);
+      admin.enableTable(snapshotTableName);
+      List<SnapshotDescription> snapshotList=admin.listSnapshots();
+      snapshot=ProtobufUtil.createHBaseProtosSnapshotDesc(snapshotList.get(0));
+    }
+    return snapshot;
+  }
+  private int getNumReplicas(){
+    return 1;
+  }
+  public static HTableDescriptor createHTableDescriptor(  final TableName tableName,  final byte[]... family){
+    HTableDescriptor htd=new HTableDescriptor(tableName);
+    for (int i=0; i < family.length; ++i) {
+      htd.addFamily(new HColumnDescriptor(family[i]));
+    }
+    return htd;
+  }
+  @Test public void testCloneSnapshot() throws Exception {
+    final ProcedureExecutor<MasterProcedureEnv> procExec=getMasterProcedureExecutor();
+    final TableName clonedTableName=TableName.valueOf("testCloneSnapshot2");
+    final HTableDescriptor htd=createHTableDescriptor(clonedTableName,CF);
+    SnapshotProtos.SnapshotDescription snapshotDesc=getSnapshot();
+    long procId=ProcedureTestingUtility.submitAndWait(procExec,new CloneSnapshotProcedure(procExec.getEnvironment(),htd,snapshotDesc));
+    ProcedureTestingUtility.assertProcNotFailed(procExec.getResult(procId));
+    MasterProcedureTestingUtility.validateTableIsEnabled(UTIL.getHBaseCluster().getMaster(),clonedTableName);
+  }
+  @Test public void testCloneSnapshotToSameTable() throws Exception {
+    SnapshotProtos.SnapshotDescription snapshotDesc=getSnapshot();
+    final ProcedureExecutor<MasterProcedureEnv> procExec=getMasterProcedureExecutor();
+    final TableName clonedTableName=TableName.valueOf(snapshotDesc.getTable());
+    final HTableDescriptor htd=createHTableDescriptor(clonedTableName,CF);
+    long procId=ProcedureTestingUtility.submitAndWait(procExec,new CloneSnapshotProcedure(procExec.getEnvironment(),htd,snapshotDesc));
+    Procedure<?> result=procExec.getResult(procId);
+    assertTrue(result.isFailed());
+    LOG.debug("Clone snapshot failed with exception: " + result.getException());
+    assertTrue(ProcedureTestingUtility.getExceptionCause(result) instanceof TableExistsException);
+  }
+  @Test public void testRecoveryAndDoubleExecution() throws Exception {
+    final ProcedureExecutor<MasterProcedureEnv> procExec=getMasterProcedureExecutor();
+    final TableName clonedTableName=TableName.valueOf("testRecoveryAndDoubleExecution");
+    final HTableDescriptor htd=createHTableDescriptor(clonedTableName,CF);
+    SnapshotProtos.SnapshotDescription snapshotDesc=getSnapshot();
+    ProcedureTestingUtility.setKillAndToggleBeforeStoreUpdate(procExec,true);
+    long procId=procExec.submitProcedure(new CloneSnapshotProcedure(procExec.getEnvironment(),htd,snapshotDesc));
+    MasterProcedureTestingUtility.testRecoveryAndDoubleExecution(procExec,procId);
+    MasterProcedureTestingUtility.validateTableIsEnabled(UTIL.getHBaseCluster().getMaster(),clonedTableName);
+  }
+  @Test public void testRollbackAndDoubleExecution() throws Exception {
+    final ProcedureExecutor<MasterProcedureEnv> procExec=getMasterProcedureExecutor();
+    final TableName clonedTableName=TableName.valueOf("testRollbackAndDoubleExecution");
+    final HTableDescriptor htd=createHTableDescriptor(clonedTableName,CF);
+    SnapshotProtos.SnapshotDescription snapshotDesc=getSnapshot();
+    ProcedureTestingUtility.waitNoProcedureRunning(procExec);
+    ProcedureTestingUtility.setKillAndToggleBeforeStoreUpdate(procExec,true);
+    long procId=procExec.submitProcedure(new CloneSnapshotProcedure(procExec.getEnvironment(),htd,snapshotDesc));
+    int lastStep=2;
+    MasterProcedureTestingUtility.testRollbackAndDoubleExecution(procExec,procId,lastStep);
+    MasterProcedureTestingUtility.validateTableDeletion(UTIL.getHBaseCluster().getMaster(),clonedTableName);
+  }
+}

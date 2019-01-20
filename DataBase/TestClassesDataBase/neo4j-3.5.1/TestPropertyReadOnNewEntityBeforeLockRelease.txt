@@ -1,0 +1,92 @@
+public class TestPropertyReadOnNewEntityBeforeLockRelease {
+  private static final String INDEX_NAME="nodes";
+  private static final int MAX_READER_DELAY_MS=10;
+  @ClassRule public static final DatabaseRule db=new ImpermanentDatabaseRule();
+  @Rule public final RepeatRule repeat=new RepeatRule();
+  @BeforeClass public static void initializeIndex(){
+    try (Transaction tx=db.beginTx()){
+      Node node=db.createNode();
+      db.index().forNodes(INDEX_NAME).add(node,"foo","bar");
+      tx.success();
+    }
+   }
+  @Test @Repeat(times=100) public void shouldBeAbleToReadPropertiesFromNewNodeReturnedFromIndex() throws Exception {
+    String propertyKey=UUID.randomUUID().toString();
+    String propertyValue=UUID.randomUUID().toString();
+    AtomicBoolean start=new AtomicBoolean(false);
+    int readerDelay=ThreadLocalRandom.current().nextInt(MAX_READER_DELAY_MS);
+    Writer writer=new Writer(db,propertyKey,propertyValue,start);
+    Reader reader=new Reader(db,propertyKey,propertyValue,start,readerDelay);
+    ExecutorService executor=Executors.newFixedThreadPool(2);
+    Future<?> readResult;
+    Future<?> writeResult;
+    try {
+      writeResult=executor.submit(writer);
+      readResult=executor.submit(reader);
+      start.set(true);
+    }
+  finally {
+      executor.shutdown();
+      executor.awaitTermination(20,TimeUnit.SECONDS);
+    }
+    assertNull(writeResult.get());
+    assertNull(readResult.get());
+  }
+private static class Writer implements Runnable {
+    final GraphDatabaseService db;
+    final String propertyKey;
+    final String propertyValue;
+    final AtomicBoolean start;
+    Writer(    GraphDatabaseService db,    String propertyKey,    String propertyValue,    AtomicBoolean start){
+      this.db=db;
+      this.propertyKey=propertyKey;
+      this.propertyValue=propertyValue;
+      this.start=start;
+    }
+    @Override public void run(){
+      while (!start.get()) {
+      }
+      try (Transaction tx=db.beginTx()){
+        Node node=db.createNode();
+        node.setProperty(propertyKey,propertyValue);
+        db.index().forNodes(INDEX_NAME).add(node,propertyKey,propertyValue);
+        tx.success();
+      }
+     }
+  }
+private static class Reader implements Runnable {
+    final GraphDatabaseService db;
+    final String propertyKey;
+    final String propertyValue;
+    final AtomicBoolean start;
+    private final int delay;
+    Reader(    GraphDatabaseService db,    String propertyKey,    String propertyValue,    AtomicBoolean start,    int delay){
+      this.db=db;
+      this.propertyKey=propertyKey;
+      this.propertyValue=propertyValue;
+      this.start=start;
+      this.delay=delay;
+    }
+    @Override public void run(){
+      while (!start.get()) {
+      }
+      sleep();
+      try (Transaction tx=db.beginTx()){
+        Node node=db.index().forNodes(INDEX_NAME).get(propertyKey,propertyValue).getSingle();
+        if (node != null) {
+          assertEquals(propertyValue,node.getProperty(propertyKey));
+        }
+        tx.success();
+      }
+     }
+    private void sleep(){
+      try {
+        Thread.sleep(delay);
+      }
+ catch (      InterruptedException e) {
+        Thread.currentThread().interrupt();
+        throw new RuntimeException(e);
+      }
+    }
+  }
+}

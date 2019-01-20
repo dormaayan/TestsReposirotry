@@ -1,0 +1,83 @@
+/** 
+ * Testcase for https://issues.apache.org/jira/browse/HBASE-13811
+ */
+@Category({MediumTests.class}) public class TestSplitWalDataLoss {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestSplitWalDataLoss.class);
+  private static final Logger LOG=LoggerFactory.getLogger(TestSplitWalDataLoss.class);
+  private final HBaseTestingUtility testUtil=new HBaseTestingUtility();
+  private NamespaceDescriptor namespace=NamespaceDescriptor.create(getClass().getSimpleName()).build();
+  private TableName tableName=TableName.valueOf(namespace.getName(),"dataloss");
+  private byte[] family=Bytes.toBytes("f");
+  private byte[] qualifier=Bytes.toBytes("q");
+  @Before public void setUp() throws Exception {
+    testUtil.getConfiguration().setInt("hbase.regionserver.msginterval",30000);
+    testUtil.startMiniCluster(2);
+    Admin admin=testUtil.getAdmin();
+    admin.createNamespace(namespace);
+    admin.createTable(TableDescriptorBuilder.newBuilder(tableName).setColumnFamily(ColumnFamilyDescriptorBuilder.of(family)).build());
+    testUtil.waitTableAvailable(tableName);
+  }
+  @After public void tearDown() throws Exception {
+    testUtil.shutdownMiniCluster();
+  }
+  @Test public void test() throws IOException, InterruptedException {
+    final HRegionServer rs=testUtil.getRSForFirstRegionInTable(tableName);
+    final HRegion region=(HRegion)rs.getRegions(tableName).get(0);
+    HRegion spiedRegion=spy(region);
+    final MutableBoolean flushed=new MutableBoolean(false);
+    final MutableBoolean reported=new MutableBoolean(false);
+    doAnswer(new Answer<FlushResult>(){
+      @Override public FlushResult answer(      InvocationOnMock invocation) throws Throwable {
+synchronized (flushed) {
+          flushed.setValue(true);
+          flushed.notifyAll();
+        }
+synchronized (reported) {
+          while (!reported.booleanValue()) {
+            reported.wait();
+          }
+        }
+        rs.getWAL(region.getRegionInfo()).abortCacheFlush(region.getRegionInfo().getEncodedNameAsBytes());
+        throw new DroppedSnapshotException("testcase");
+      }
+    }
+).when(spiedRegion).internalFlushCacheAndCommit(Matchers.<WAL>any(),Matchers.<MonitoredTask>any(),Matchers.<PrepareFlushResult>any(),Matchers.<Collection<HStore>>any());
+    String key=null;
+    for (    Map.Entry<String,HRegion> entry : rs.onlineRegions.entrySet()) {
+      if (entry.getValue().getRegionInfo().getTable().equals(this.tableName)) {
+        key=entry.getKey();
+        break;
+      }
+    }
+    rs.onlineRegions.put(key,spiedRegion);
+    Connection conn=testUtil.getConnection();
+    try (Table table=conn.getTable(tableName)){
+      table.put(new Put(Bytes.toBytes("row0")).addColumn(family,qualifier,Bytes.toBytes("val0")));
+    }
+     long oldestSeqIdOfStore=region.getOldestSeqIdOfStore(family);
+    LOG.info("CHANGE OLDEST " + oldestSeqIdOfStore);
+    assertTrue(oldestSeqIdOfStore > HConstants.NO_SEQNUM);
+    rs.cacheFlusher.requestFlush(spiedRegion,false,FlushLifeCycleTracker.DUMMY);
+synchronized (flushed) {
+      while (!flushed.booleanValue()) {
+        flushed.wait();
+      }
+    }
+    try (Table table=conn.getTable(tableName)){
+      table.put(new Put(Bytes.toBytes("row1")).addColumn(family,qualifier,Bytes.toBytes("val1")));
+    }
+     long now=EnvironmentEdgeManager.currentTime();
+    rs.tryRegionServerReport(now - 500,now);
+synchronized (reported) {
+      reported.setValue(true);
+      reported.notifyAll();
+    }
+    while (testUtil.getRSForFirstRegionInTable(tableName) == rs) {
+      Thread.sleep(100);
+    }
+    try (Table table=conn.getTable(tableName)){
+      Result result=table.get(new Get(Bytes.toBytes("row0")));
+      assertArrayEquals(Bytes.toBytes("val0"),result.getValue(family,qualifier));
+    }
+   }
+}

@@ -1,0 +1,181 @@
+@RunWith(Parameterized.class) public class ReadablesTest {
+  @Parameters public static Collection<ReadMethod> readMethods(){
+    return Arrays.asList((readable,length) -> {
+      SectionedCharBuffer readText=new SectionedCharBuffer(length);
+      readable.read(readText,readText.front());
+      return copyOfRange(readText.array(),readText.pivot(),readText.front());
+    }
+,(readable,length) -> {
+      char[] result=new char[length];
+      readable.read(result,0,length);
+      return result;
+    }
+);
+  }
+  @Rule public final TestDirectory directory=TestDirectory.testDirectory();
+interface ReadMethod {
+    char[] read(    CharReadable readable,    int length) throws IOException ;
+  }
+  @Parameter public ReadMethod readMethod;
+  @Test public void shouldReadTextCompressedInZipArchiveWithSingleFileIn() throws Exception {
+    String text="abcdefghijlkmnopqrstuvxyz";
+    File compressed=compressWithZip(text);
+    assertReadText(compressed,text);
+  }
+  @Test public void shouldReadTextCompressedInGZipFile() throws Exception {
+    String text="abcdefghijlkmnopqrstuvxyz";
+    File compressed=compressWithGZip(text);
+    assertReadText(compressed,text);
+  }
+  @Test public void shouldReadPlainTextFile() throws Exception {
+    String text="abcdefghijlkmnopqrstuvxyz";
+    File plainText=write(text);
+    assertReadText(plainText,text);
+  }
+  @Test public void shouldReadTheOnlyRealFileInThere() throws Exception {
+    String text="abcdefghijlkmnopqrstuvxyz";
+    File compressed=compressWithZip(text,".nothing",".DS_Store","__MACOSX/","__MACOSX/file");
+    assertReadText(compressed,text);
+  }
+  @Test public void shouldFailWhenThereAreMoreThanOneSuitableFileInThere() throws Exception {
+    String text="abcdefghijlkmnopqrstuvxyz";
+    File compressed=compressWithZip(text,".nothing",".DS_Store","somewhere/something");
+    CharReadable readable;
+    try {
+      readable=Readables.files(Charset.defaultCharset(),compressed);
+      fail("Should fail since there are multiple suitable files in the zip archive");
+    }
+ catch (    IOException e) {
+      assertThat(e.getMessage(),containsString("Multiple"));
+    }
+  }
+  @Test public void shouldTrackPosition() throws Exception {
+    String data="1234567890";
+    CharReadable reader=Readables.wrap(data);
+    SectionedCharBuffer buffer=new SectionedCharBuffer(4);
+    int expected=0;
+    do {
+      buffer=reader.read(buffer,buffer.front());
+      expected+=buffer.available();
+      assertEquals(expected,reader.position());
+    }
+ while (buffer.hasAvailable());
+    assertEquals(data.toCharArray().length,expected);
+  }
+  @Test public void shouldComplyWithUtf8CharsetForExample() throws Exception {
+    shouldComplyWithSpecifiedCharset(StandardCharsets.UTF_8);
+  }
+  @Test public void shouldComplyWithIso88591CharsetForExample() throws Exception {
+    shouldComplyWithSpecifiedCharset(StandardCharsets.ISO_8859_1);
+  }
+  @Test public void shouldSkipBOM() throws Exception {
+    String text="abcdefghijklmnop";
+    shouldReadTextFromFileWithBom(Magic.BOM_UTF_32_BE,text);
+    shouldReadTextFromFileWithBom(Magic.BOM_UTF_32_LE,text);
+    shouldReadTextFromFileWithBom(Magic.BOM_UTF_16_BE,text);
+    shouldReadTextFromFileWithBom(Magic.BOM_UTF_16_LE,text);
+    shouldReadTextFromFileWithBom(Magic.BOM_UTF_8,text);
+  }
+  @Test public void shouldReadTextFromWrappedInputStream() throws Exception {
+    String text="abcdefghijklmnop";
+    File file=writeToFile(text,Charset.defaultCharset());
+    assertReadTextAsInputStream(file,text);
+  }
+  @Test public void shouldSkipBomWhenWrappingInputStream() throws Exception {
+    String text="abcdefghijklmnop";
+    shouldReadTextFromInputStreamWithBom(Magic.BOM_UTF_32_BE,text);
+    shouldReadTextFromInputStreamWithBom(Magic.BOM_UTF_32_LE,text);
+    shouldReadTextFromInputStreamWithBom(Magic.BOM_UTF_16_BE,text);
+    shouldReadTextFromInputStreamWithBom(Magic.BOM_UTF_16_LE,text);
+    shouldReadTextFromInputStreamWithBom(Magic.BOM_UTF_8,text);
+  }
+  @Test public void shouldExtractFirstLine() throws Exception {
+    String firstLine="characters of first line";
+    String secondLine="here on the second line";
+    CharReadable reader=Readables.wrap(firstLine + "\n" + secondLine);
+    char[] firstLineCharacters=Readables.extractFirstLineFrom(reader);
+    char[] secondLineCharacters=new char[secondLine.length()];
+    reader.read(secondLineCharacters,0,secondLineCharacters.length);
+    assertArrayEquals(firstLine.toCharArray(),firstLineCharacters);
+    assertArrayEquals(secondLine.toCharArray(),secondLineCharacters);
+  }
+  @Test public void shouldExtractOnlyLine() throws Exception {
+    String firstLine="characters of only line";
+    CharReadable reader=Readables.wrap(firstLine);
+    char[] firstLineCharacters=Readables.extractFirstLineFrom(reader);
+    int readAfterwards=reader.read(new char[1],0,1);
+    assertArrayEquals(firstLine.toCharArray(),firstLineCharacters);
+    assertEquals(-1,readAfterwards);
+  }
+  private void shouldReadTextFromFileWithBom(  Magic bom,  String text) throws IOException {
+    assertReadText(writeToFile(bom.bytes(),text,bom.encoding()),text);
+  }
+  private void shouldReadTextFromInputStreamWithBom(  Magic bom,  String text) throws IOException {
+    assertReadTextAsInputStream(writeToFile(bom.bytes(),text,bom.encoding()),text);
+  }
+  private void shouldComplyWithSpecifiedCharset(  Charset charset) throws Exception {
+    String data="abcåäö[]{}";
+    File file=writeToFile(data,charset);
+    CharReadable reader=Readables.files(charset,file);
+    SectionedCharBuffer buffer=new SectionedCharBuffer(100);
+    buffer=reader.read(buffer,buffer.front());
+    char[] expected=data.toCharArray();
+    char[] array=buffer.array();
+    assertEquals(expected.length,buffer.available());
+    for (int i=0; i < expected.length; i++) {
+      assertEquals(expected[i],array[buffer.pivot() + i]);
+    }
+  }
+  private File writeToFile(  String data,  Charset charset) throws IOException {
+    File file=new File(directory.directory(),"text-" + charset.name());
+    try (Writer writer=new OutputStreamWriter(new FileOutputStream(file),charset)){
+      writer.append(data);
+    }
+     return file;
+  }
+  private File writeToFile(  byte[] header,  String data,  Charset charset) throws IOException {
+    File file=new File(directory.directory(),"text-" + charset.name());
+    try (OutputStream out=new FileOutputStream(file);Writer writer=new OutputStreamWriter(out,charset)){
+      out.write(header);
+      writer.append(data);
+    }
+     return file;
+  }
+  private File write(  String text) throws IOException {
+    File file=directory.file("plain-text");
+    try (OutputStream out=new FileOutputStream(file)){
+      out.write(text.getBytes());
+    }
+     return file;
+  }
+  private File compressWithZip(  String text,  String... otherEntries) throws IOException {
+    File file=directory.file("compressed");
+    try (ZipOutputStream out=new ZipOutputStream(new FileOutputStream(file))){
+      for (      String otherEntry : otherEntries) {
+        out.putNextEntry(new ZipEntry(otherEntry));
+      }
+      out.putNextEntry(new ZipEntry("file"));
+      out.write(text.getBytes());
+    }
+     return file;
+  }
+  private File compressWithGZip(  String text) throws IOException {
+    File file=directory.file("compressed");
+    try (GZIPOutputStream out=new GZIPOutputStream(new FileOutputStream(file))){
+      out.write(text.getBytes());
+    }
+     return file;
+  }
+  private void assertReadText(  File file,  String text) throws IOException {
+    assertReadText(Readables.files(Charset.defaultCharset(),file),text);
+  }
+  private void assertReadTextAsInputStream(  File file,  String text) throws IOException {
+    try (InputStream stream=new FileInputStream(file)){
+      assertReadText(Readables.wrap(stream,file.getPath(),Charset.defaultCharset(),file.length()),text);
+    }
+   }
+  private void assertReadText(  CharReadable readable,  String text) throws IOException {
+    char[] readText=readMethod.read(readable,text.toCharArray().length);
+    assertArrayEquals(readText,text.toCharArray());
+  }
+}

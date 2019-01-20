@@ -1,0 +1,45 @@
+@Test public void testOpenRegionWrittenToWAL() throws Exception {
+  final ServerName serverName=ServerName.valueOf(name.getMethodName(),100,42);
+  final RegionServerServices rss=spy(TEST_UTIL.createMockRegionServerService(serverName));
+  HTableDescriptor htd=new HTableDescriptor(TableName.valueOf(name.getMethodName()));
+  htd.addFamily(new HColumnDescriptor(fam1));
+  htd.addFamily(new HColumnDescriptor(fam2));
+  HRegionInfo hri=new HRegionInfo(htd.getTableName(),HConstants.EMPTY_BYTE_ARRAY,HConstants.EMPTY_BYTE_ARRAY);
+  HRegion region=HBaseTestingUtility.createRegionAndWAL(hri,TEST_UTIL.getDataTestDir(),TEST_UTIL.getConfiguration(),htd);
+  assertNotNull(region);
+  region.put(new Put(Bytes.toBytes("a")).addColumn(fam1,fam1,fam1));
+  region.flush(true);
+  HBaseTestingUtility.closeRegionAndWAL(region);
+  ArgumentCaptor<WALEdit> editCaptor=ArgumentCaptor.forClass(WALEdit.class);
+  WAL wal=mockWAL();
+  when(rss.getWAL((HRegionInfo)any())).thenReturn(wal);
+  try {
+    region=HRegion.openHRegion(hri,htd,rss.getWAL(hri),TEST_UTIL.getConfiguration(),rss,null);
+    verify(wal,times(1)).append((HRegionInfo)any(),(WALKeyImpl)any(),editCaptor.capture(),anyBoolean());
+    WALEdit edit=editCaptor.getValue();
+    assertNotNull(edit);
+    assertNotNull(edit.getCells());
+    assertEquals(1,edit.getCells().size());
+    RegionEventDescriptor desc=WALEdit.getRegionEventDescriptor(edit.getCells().get(0));
+    assertNotNull(desc);
+    LOG.info("RegionEventDescriptor from WAL: " + desc);
+    assertEquals(RegionEventDescriptor.EventType.REGION_OPEN,desc.getEventType());
+    assertTrue(Bytes.equals(desc.getTableName().toByteArray(),htd.getTableName().toBytes()));
+    assertTrue(Bytes.equals(desc.getEncodedRegionName().toByteArray(),hri.getEncodedNameAsBytes()));
+    assertTrue(desc.getLogSequenceNumber() > 0);
+    assertEquals(serverName,ProtobufUtil.toServerName(desc.getServer()));
+    assertEquals(2,desc.getStoresCount());
+    StoreDescriptor store=desc.getStores(0);
+    assertTrue(Bytes.equals(store.getFamilyName().toByteArray(),fam1));
+    assertEquals(store.getStoreHomeDir(),Bytes.toString(fam1));
+    assertEquals(1,store.getStoreFileCount());
+    assertFalse(store.getStoreFile(0).contains("/"));
+    store=desc.getStores(1);
+    assertTrue(Bytes.equals(store.getFamilyName().toByteArray(),fam2));
+    assertEquals(store.getStoreHomeDir(),Bytes.toString(fam2));
+    assertEquals(0,store.getStoreFileCount());
+  }
+  finally {
+    HBaseTestingUtility.closeRegionAndWAL(region);
+  }
+}

@@ -1,0 +1,71 @@
+/** 
+ * This test checks to ensure that the IndexAuditTrail starts properly when indexing to a remote cluster. The cluster started by the integration tests is indexed into by the remote cluster started before the test. The cluster started by the integrations tests may also index into itself...
+ */
+@ClusterScope(scope=Scope.TEST,numDataNodes=1,numClientNodes=0,transportClientRatio=0.0,supportsDedicatedMasters=false) @TestLogging("org.elasticsearch.xpack.security.audit.index:TRACE") public class RemoteIndexAuditTrailStartingTests extends SecurityIntegTestCase {
+  public static final String SECOND_CLUSTER_NODE_PREFIX="remote_" + TEST_CLUSTER_NODE_PREFIX;
+  private InternalTestCluster remoteCluster;
+  private final boolean sslEnabled=randomBoolean();
+  private final boolean localAudit=randomBoolean();
+  private final String outputs=randomFrom("index","logfile","index,logfile");
+  @Override public boolean transportSSLEnabled(){
+    return sslEnabled;
+  }
+  @Override public Settings nodeSettings(  int nodeOrdinal){
+    return Settings.builder().put(super.nodeSettings(nodeOrdinal)).put("xpack.security.audit.enabled",localAudit).put("xpack.security.audit.outputs",outputs).build();
+  }
+  @Override protected Set<String> excludeTemplates(){
+    return Sets.newHashSet(SecurityIndexManager.SECURITY_TEMPLATE_NAME,IndexAuditTrail.INDEX_TEMPLATE_NAME);
+  }
+  @Override protected int numberOfShards(){
+    return 1;
+  }
+  @Before public void startRemoteCluster() throws IOException, InterruptedException {
+    final List<String> addresses=new ArrayList<>();
+    NodesInfoResponse response=client().admin().cluster().prepareNodesInfo().execute().actionGet();
+    final String clusterName=response.getClusterName().value();
+    for (    NodeInfo nodeInfo : response.getNodes()) {
+      TransportAddress address=nodeInfo.getTransport().address().publishAddress();
+      addresses.add(address.address().getHostString() + ":" + address.address().getPort());
+    }
+    String cluster2Name=clusterName(Scope.TEST.name(),randomLong());
+    final int numNodes=1;
+    SecuritySettingsSource cluster2SettingsSource=new SecuritySettingsSource(numNodes,sslEnabled,createTempDir(),Scope.TEST){
+      @Override public Settings nodeSettings(      int nodeOrdinal){
+        Settings.Builder builder=Settings.builder().put(super.nodeSettings(nodeOrdinal)).put("xpack.security.audit.enabled",true).put("xpack.security.audit.outputs",randomFrom("index","index,logfile")).putList("xpack.security.audit.index.client.hosts",addresses.toArray(new String[addresses.size()])).put("xpack.security.audit.index.client.cluster.name",clusterName).put("xpack.security.audit.index.client.xpack.security.user",TEST_USER_NAME + ":" + SecuritySettingsSourceField.TEST_PASSWORD).put("xpack.security.audit.index.settings.index.number_of_shards",1).put("xpack.security.audit.index.settings.index.number_of_replicas",0);
+        addClientSSLSettings(builder,"xpack.security.audit.index.client.");
+        builder.put("xpack.security.audit.index.client.xpack.security.transport.ssl.enabled",sslEnabled);
+        return builder.build();
+      }
+    }
+;
+    remoteCluster=new InternalTestCluster(randomLong(),createTempDir(),false,true,numNodes,numNodes,cluster2Name,cluster2SettingsSource,0,false,SECOND_CLUSTER_NODE_PREFIX,getMockPlugins(),getClientWrapper());
+    remoteCluster.beforeTest(random(),0.0);
+    assertNoTimeout(remoteCluster.client().admin().cluster().prepareHealth().setWaitForGreenStatus().get());
+  }
+  @After public void stopRemoteCluster() throws Exception {
+    List<Closeable> toStop=new ArrayList<>();
+    toStop.add(() -> StreamSupport.stream(internalCluster().getInstances(AuditTrailService.class).spliterator(),false).map(s -> s.getAuditTrails()).flatMap(List::stream).filter(t -> t.name().equals(IndexAuditTrail.NAME)).forEach((auditTrail) -> ((IndexAuditTrail)auditTrail).stop()));
+    if (remoteCluster != null) {
+      toStop.add(() -> StreamSupport.stream(remoteCluster.getInstances(AuditTrailService.class).spliterator(),false).map(s -> s.getAuditTrails()).flatMap(List::stream).filter(t -> t.name().equals(IndexAuditTrail.NAME)).forEach((auditTrail) -> ((IndexAuditTrail)auditTrail).stop()));
+      toStop.add(() -> remoteCluster.wipe(excludeTemplates()));
+      toStop.add(remoteCluster::afterTest);
+      toStop.add(remoteCluster);
+    }
+    IOUtils.close(toStop);
+  }
+  public void testThatRemoteAuditInstancesAreStarted() throws Exception {
+    logger.info("Test configuration: ssl=[{}] localAudit=[{}][{}]",sslEnabled,localAudit,outputs);
+    for (    InternalTestCluster cluster : Arrays.asList(remoteCluster,internalCluster())) {
+      for (      AuditTrailService auditTrailService : cluster.getInstances(AuditTrailService.class)) {
+        Optional<AuditTrail> auditTrail=auditTrailService.getAuditTrails().stream().filter(t -> t.name().equals(IndexAuditTrail.NAME)).findAny();
+        if (cluster == remoteCluster || (localAudit && outputs.contains("index"))) {
+          assertTrue(auditTrail.isPresent());
+        }
+        if (auditTrail.isPresent()) {
+          IndexAuditTrail indexAuditTrail=(IndexAuditTrail)auditTrail.get();
+          assertBusy(() -> assertSame("trail not started remoteCluster: " + (remoteCluster == cluster),indexAuditTrail.state(),IndexAuditTrail.State.STARTED));
+        }
+      }
+    }
+  }
+}

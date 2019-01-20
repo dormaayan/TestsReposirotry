@@ -1,0 +1,36 @@
+/** 
+ * Tests that with scheduling futures and pipelined deployment, the target vertex will not deploy its task before the source vertex does.
+ */
+@Test public void testScheduleSourceBeforeTarget() throws Exception {
+  final int parallelism=1;
+  final JobVertex sourceVertex=new JobVertex("source");
+  sourceVertex.setParallelism(parallelism);
+  sourceVertex.setInvokableClass(NoOpInvokable.class);
+  final JobVertex targetVertex=new JobVertex("target");
+  targetVertex.setParallelism(parallelism);
+  targetVertex.setInvokableClass(NoOpInvokable.class);
+  targetVertex.connectNewDataSetAsInput(sourceVertex,DistributionPattern.ALL_TO_ALL,ResultPartitionType.PIPELINED);
+  final JobID jobId=new JobID();
+  final JobGraph jobGraph=new JobGraph(jobId,"test",sourceVertex,targetVertex);
+  final CompletableFuture<LogicalSlot> sourceFuture=new CompletableFuture<>();
+  final CompletableFuture<LogicalSlot> targetFuture=new CompletableFuture<>();
+  ProgrammedSlotProvider slotProvider=new ProgrammedSlotProvider(parallelism);
+  slotProvider.addSlot(sourceVertex.getID(),0,sourceFuture);
+  slotProvider.addSlot(targetVertex.getID(),0,targetFuture);
+  final ExecutionGraph eg=createExecutionGraph(jobGraph,slotProvider);
+  final TaskManagerGateway gatewaySource=createTaskManager();
+  final TaskManagerGateway gatewayTarget=createTaskManager();
+  final SimpleSlot sourceSlot=createSlot(gatewaySource,jobId);
+  final SimpleSlot targetSlot=createSlot(gatewayTarget,jobId);
+  eg.setScheduleMode(ScheduleMode.EAGER);
+  eg.setQueuedSchedulingAllowed(true);
+  eg.scheduleForExecution();
+  assertEquals(JobStatus.RUNNING,eg.getState());
+  targetFuture.complete(targetSlot);
+  verify(gatewayTarget,new Timeout(50,times(0))).submitTask(any(TaskDeploymentDescriptor.class),any(Time.class));
+  assertEquals(JobStatus.RUNNING,eg.getState());
+  sourceFuture.complete(sourceSlot);
+  verify(gatewaySource,timeout(1000)).submitTask(any(TaskDeploymentDescriptor.class),any(Time.class));
+  verify(gatewayTarget,timeout(1000)).submitTask(any(TaskDeploymentDescriptor.class),any(Time.class));
+  assertEquals(JobStatus.RUNNING,eg.getState());
+}

@@ -1,0 +1,144 @@
+@SuppressWarnings("Duplicates") public abstract class ConstraintTestBase<G extends KernelAPIWriteTestSupport> extends KernelAPIWriteTestBase<G> {
+  protected abstract LabelSchemaDescriptor labelSchemaDescriptor(  int labelId,  int... propertyIds);
+  protected abstract ConstraintDescriptor uniqueConstraintDescriptor(  int labelId,  int... propertyIds);
+  @Before public void setup(){
+    try (org.neo4j.graphdb.Transaction tx=graphDb.beginTx()){
+      for (      ConstraintDefinition definition : graphDb.schema().getConstraints()) {
+        definition.drop();
+      }
+      tx.success();
+    }
+   }
+  @Test public void shouldFindConstraintsBySchema() throws Exception {
+    addConstraints("FOO","prop");
+    try (Transaction tx=beginTransaction()){
+      int label=tx.tokenWrite().labelGetOrCreateForName("FOO");
+      int prop=tx.tokenWrite().propertyKeyGetOrCreateForName("prop");
+      LabelSchemaDescriptor descriptor=labelSchemaDescriptor(label,prop);
+      List<ConstraintDescriptor> constraints=asList(tx.schemaRead().constraintsGetForSchema(descriptor));
+      assertThat(constraints,hasSize(1));
+      assertThat(constraints.get(0).schema().getPropertyId(),equalTo(prop));
+    }
+   }
+  @Test public void shouldFindConstraintsByLabel() throws Exception {
+    addConstraints("FOO","prop1","FOO","prop2");
+    try (Transaction tx=beginTransaction()){
+      int label=tx.tokenWrite().labelGetOrCreateForName("FOO");
+      List<ConstraintDescriptor> constraints=asList(tx.schemaRead().constraintsGetForLabel(label));
+      assertThat(constraints,hasSize(2));
+    }
+   }
+  @Test public void shouldBeAbleCheckExistenceOfConstraints() throws Exception {
+    try (org.neo4j.graphdb.Transaction tx=graphDb.beginTx()){
+      graphDb.schema().constraintFor(label("FOO")).assertPropertyIsUnique("prop1").create();
+      ConstraintDefinition dropped=graphDb.schema().constraintFor(label("FOO")).assertPropertyIsUnique("prop2").create();
+      dropped.drop();
+      tx.success();
+    }
+     try (Transaction tx=beginTransaction()){
+      int label=tx.tokenWrite().labelGetOrCreateForName("FOO");
+      int prop1=tx.tokenWrite().propertyKeyGetOrCreateForName("prop1");
+      int prop2=tx.tokenWrite().propertyKeyGetOrCreateForName("prop2");
+      assertTrue(tx.schemaRead().constraintExists(uniqueConstraintDescriptor(label,prop1)));
+      assertFalse(tx.schemaRead().constraintExists(uniqueConstraintDescriptor(label,prop2)));
+    }
+   }
+  @Test public void shouldFindAllConstraints() throws Exception {
+    addConstraints("FOO","prop1","BAR","prop2","BAZ","prop3");
+    try (Transaction tx=beginTransaction()){
+      List<ConstraintDescriptor> constraints=asList(tx.schemaRead().constraintsGetAll());
+      assertThat(constraints,hasSize(3));
+    }
+   }
+  @Test public void shouldCheckUniquenessWhenAddingLabel() throws Exception {
+    long nodeConflicting, nodeNotConflicting;
+    addConstraints("FOO","prop");
+    try (org.neo4j.graphdb.Transaction tx=graphDb.beginTx()){
+      Node conflict=graphDb.createNode();
+      conflict.setProperty("prop",1337);
+      nodeConflicting=conflict.getId();
+      Node ok=graphDb.createNode();
+      ok.setProperty("prop",42);
+      nodeNotConflicting=ok.getId();
+      Node existing=graphDb.createNode();
+      existing.addLabel(Label.label("FOO"));
+      existing.setProperty("prop",1337);
+      tx.success();
+    }
+     int label;
+    try (Transaction tx=beginTransaction()){
+      label=tx.tokenWrite().labelGetOrCreateForName("FOO");
+      assertTrue(tx.dataWrite().nodeAddLabel(nodeNotConflicting,label));
+      try {
+        tx.dataWrite().nodeAddLabel(nodeConflicting,label);
+        fail();
+      }
+ catch (      ConstraintValidationException e) {
+      }
+      tx.success();
+    }
+     try (Transaction tx=beginTransaction();NodeCursor nodeCursor=tx.cursors().allocateNodeCursor()){
+      tx.dataRead().singleNode(nodeNotConflicting,nodeCursor);
+      assertTrue(nodeCursor.next());
+      assertTrue(nodeCursor.labels().contains(label));
+      tx.dataRead().singleNode(nodeConflicting,nodeCursor);
+      assertTrue(nodeCursor.next());
+      assertFalse(nodeCursor.labels().contains(label));
+    }
+   }
+  @Test public void shouldCheckUniquenessWhenAddingProperties() throws Exception {
+    long nodeConflicting, nodeNotConflicting;
+    addConstraints("FOO","prop");
+    try (org.neo4j.graphdb.Transaction tx=graphDb.beginTx()){
+      Node conflict=graphDb.createNode();
+      conflict.addLabel(Label.label("FOO"));
+      nodeConflicting=conflict.getId();
+      Node ok=graphDb.createNode();
+      ok.addLabel(Label.label("BAR"));
+      nodeNotConflicting=ok.getId();
+      Node existing=graphDb.createNode();
+      existing.addLabel(Label.label("FOO"));
+      existing.setProperty("prop",1337);
+      tx.success();
+    }
+     int property;
+    try (Transaction tx=beginTransaction()){
+      property=tx.tokenWrite().propertyKeyGetOrCreateForName("prop");
+      tx.dataWrite().nodeSetProperty(nodeNotConflicting,property,intValue(1337));
+      try {
+        tx.dataWrite().nodeSetProperty(nodeConflicting,property,intValue(1337));
+        fail();
+      }
+ catch (      ConstraintValidationException e) {
+      }
+      tx.success();
+    }
+     try (Transaction tx=beginTransaction();NodeCursor nodeCursor=tx.cursors().allocateNodeCursor();PropertyCursor propertyCursor=tx.cursors().allocatePropertyCursor()){
+      tx.dataRead().singleNode(nodeNotConflicting,nodeCursor);
+      assertTrue(nodeCursor.next());
+      nodeCursor.properties(propertyCursor);
+      assertTrue(hasKey(propertyCursor,property));
+      tx.dataRead().singleNode(nodeConflicting,nodeCursor);
+      assertTrue(nodeCursor.next());
+      nodeCursor.properties(propertyCursor);
+      assertFalse(hasKey(propertyCursor,property));
+    }
+   }
+  private boolean hasKey(  PropertyCursor propertyCursor,  int key){
+    while (propertyCursor.next()) {
+      if (propertyCursor.propertyKey() == key) {
+        return true;
+      }
+    }
+    return false;
+  }
+  private void addConstraints(  String... labelProps){
+    assert labelProps.length % 2 == 0;
+    try (org.neo4j.graphdb.Transaction tx=graphDb.beginTx()){
+      for (int i=0; i < labelProps.length; i+=2) {
+        graphDb.schema().constraintFor(label(labelProps[i])).assertPropertyIsUnique(labelProps[i + 1]).create();
+      }
+      tx.success();
+    }
+   }
+}

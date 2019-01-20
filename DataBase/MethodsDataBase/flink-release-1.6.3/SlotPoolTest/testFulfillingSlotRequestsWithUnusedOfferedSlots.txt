@@ -1,0 +1,37 @@
+/** 
+ * Tests that unused offered slots are directly used to fulfill pending slot requests. Moreover it tests that the old slot request is canceled <p>See FLINK-8089, FLINK-8934
+ */
+@Test public void testFulfillingSlotRequestsWithUnusedOfferedSlots() throws Exception {
+  final SlotPool slotPool=new SlotPool(rpcService,jobId,LocationPreferenceSchedulingStrategy.getInstance());
+  final ArrayBlockingQueue<AllocationID> allocationIds=new ArrayBlockingQueue<>(2);
+  resourceManagerGateway.setRequestSlotConsumer((  SlotRequest slotRequest) -> allocationIds.offer(slotRequest.getAllocationId()));
+  final ArrayBlockingQueue<AllocationID> canceledAllocations=new ArrayBlockingQueue<>(2);
+  resourceManagerGateway.setCancelSlotConsumer(canceledAllocations::offer);
+  final SlotRequestId slotRequestId1=new SlotRequestId();
+  final SlotRequestId slotRequestId2=new SlotRequestId();
+  try {
+    final SlotPoolGateway slotPoolGateway=setupSlotPool(slotPool,resourceManagerGateway);
+    final ScheduledUnit scheduledUnit=new ScheduledUnit(new JobVertexID(),null,null);
+    CompletableFuture<LogicalSlot> slotFuture1=slotPoolGateway.allocateSlot(slotRequestId1,scheduledUnit,SlotProfile.noRequirements(),true,timeout);
+    final AllocationID allocationId1=allocationIds.take();
+    CompletableFuture<LogicalSlot> slotFuture2=slotPoolGateway.allocateSlot(slotRequestId2,scheduledUnit,SlotProfile.noRequirements(),true,timeout);
+    final AllocationID allocationId2=allocationIds.take();
+    slotPoolGateway.releaseSlot(slotRequestId1,null,null);
+    try {
+      slotFuture1.get();
+      fail("The first slot future should have failed because it was cancelled.");
+    }
+ catch (    ExecutionException ee) {
+      assertTrue(ExceptionUtils.stripExecutionException(ee) instanceof FlinkException);
+    }
+    assertEquals(allocationId1,canceledAllocations.take());
+    final SlotOffer slotOffer=new SlotOffer(allocationId1,0,ResourceProfile.UNKNOWN);
+    slotPoolGateway.registerTaskManager(taskManagerLocation.getResourceID()).get();
+    assertTrue(slotPoolGateway.offerSlot(taskManagerLocation,taskManagerGateway,slotOffer).get());
+    assertEquals(allocationId1,slotFuture2.get().getAllocationId());
+    assertEquals(allocationId2,canceledAllocations.take());
+  }
+  finally {
+    RpcUtils.terminateRpcEndpoint(slotPool,timeout);
+  }
+}

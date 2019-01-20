@@ -1,0 +1,49 @@
+@Test public void testReversibleStoreScanner() throws IOException {
+  FileSystem fs=TEST_UTIL.getTestFileSystem();
+  Path hfilePath=new Path(new Path(TEST_UTIL.getDataTestDir("testReversibleStoreScanner"),"regionname"),"familyname");
+  CacheConfig cacheConf=new CacheConfig(TEST_UTIL.getConfiguration());
+  HFileContextBuilder hcBuilder=new HFileContextBuilder();
+  hcBuilder.withBlockSize(2 * 1024);
+  HFileContext hFileContext=hcBuilder.build();
+  StoreFileWriter writer1=new StoreFileWriter.Builder(TEST_UTIL.getConfiguration(),cacheConf,fs).withOutputDir(hfilePath).withFileContext(hFileContext).build();
+  StoreFileWriter writer2=new StoreFileWriter.Builder(TEST_UTIL.getConfiguration(),cacheConf,fs).withOutputDir(hfilePath).withFileContext(hFileContext).build();
+  MemStore memstore=new DefaultMemStore();
+  writeMemstoreAndStoreFiles(memstore,new StoreFileWriter[]{writer1,writer2});
+  HStoreFile sf1=new HStoreFile(fs,writer1.getPath(),TEST_UTIL.getConfiguration(),cacheConf,BloomType.NONE,true);
+  HStoreFile sf2=new HStoreFile(fs,writer2.getPath(),TEST_UTIL.getConfiguration(),cacheConf,BloomType.NONE,true);
+  ScanInfo scanInfo=new ScanInfo(TEST_UTIL.getConfiguration(),FAMILYNAME,0,Integer.MAX_VALUE,Long.MAX_VALUE,KeepDeletedCells.FALSE,HConstants.DEFAULT_BLOCKSIZE,0,CellComparatorImpl.COMPARATOR,false);
+  Scan scan=new Scan();
+  scan.setReversed(true);
+  StoreScanner storeScanner=getReversibleStoreScanner(memstore,sf1,sf2,scan,scanInfo,MAXMVCC);
+  verifyCountAndOrder(storeScanner,QUALSIZE * ROWSIZE,ROWSIZE,false);
+  int startRowNum=ROWSIZE / 2;
+  byte[] startRow=ROWS[startRowNum];
+  scan.withStartRow(startRow);
+  storeScanner=getReversibleStoreScanner(memstore,sf1,sf2,scan,scanInfo,MAXMVCC);
+  verifyCountAndOrder(storeScanner,QUALSIZE * (startRowNum + 1),startRowNum + 1,false);
+  assertTrue(QUALSIZE > 2);
+  scan.addColumn(FAMILYNAME,QUALS[0]);
+  scan.addColumn(FAMILYNAME,QUALS[2]);
+  storeScanner=getReversibleStoreScanner(memstore,sf1,sf2,scan,scanInfo,MAXMVCC);
+  verifyCountAndOrder(storeScanner,2 * (startRowNum + 1),startRowNum + 1,false);
+  for (int readPoint=0; readPoint < MAXMVCC; readPoint++) {
+    LOG.info("Setting read point to " + readPoint);
+    storeScanner=getReversibleStoreScanner(memstore,sf1,sf2,scan,scanInfo,readPoint);
+    int expectedRowCount=0;
+    int expectedKVCount=0;
+    for (int i=startRowNum; i >= 0; i--) {
+      int kvCount=0;
+      if (makeMVCC(i,0) <= readPoint) {
+        kvCount++;
+      }
+      if (makeMVCC(i,2) <= readPoint) {
+        kvCount++;
+      }
+      if (kvCount > 0) {
+        expectedRowCount++;
+        expectedKVCount+=kvCount;
+      }
+    }
+    verifyCountAndOrder(storeScanner,expectedKVCount,expectedRowCount,false);
+  }
+}

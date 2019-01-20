@@ -1,0 +1,66 @@
+public class JdbcMessageIdRepositoryTest extends CamelSpringTestSupport {
+  protected static final String SELECT_ALL_STRING="SELECT messageId FROM CAMEL_MESSAGEPROCESSED WHERE processorName = ?";
+  protected static final String CLEAR_STRING="DELETE FROM CAMEL_MESSAGEPROCESSED WHERE processorName = ?";
+  protected static final String PROCESSOR_NAME="myProcessorName";
+  protected JdbcTemplate jdbcTemplate;
+  protected DataSource dataSource;
+  @EndpointInject(uri="mock:result") protected MockEndpoint resultEndpoint;
+  @EndpointInject(uri="mock:error") protected MockEndpoint errorEndpoint;
+  @Override @Before public void setUp() throws Exception {
+    super.setUp();
+    dataSource=context.getRegistry().lookupByNameAndType("dataSource",DataSource.class);
+    jdbcTemplate=new JdbcTemplate(dataSource);
+    jdbcTemplate.afterPropertiesSet();
+  }
+  @Test public void testDuplicateMessagesAreFilteredOut() throws Exception {
+    resultEndpoint.expectedBodiesReceived("one","two","three");
+    errorEndpoint.expectedMessageCount(0);
+    template.sendBodyAndHeader("direct:start","one","messageId","1");
+    template.sendBodyAndHeader("direct:start","two","messageId","2");
+    template.sendBodyAndHeader("direct:start","one","messageId","1");
+    template.sendBodyAndHeader("direct:start","two","messageId","2");
+    template.sendBodyAndHeader("direct:start","one","messageId","1");
+    template.sendBodyAndHeader("direct:start","three","messageId","3");
+    assertMockEndpointsSatisfied();
+    List<String> receivedMessageIds=jdbcTemplate.queryForList(SELECT_ALL_STRING,String.class,PROCESSOR_NAME);
+    assertEquals(3,receivedMessageIds.size());
+    assertTrue(receivedMessageIds.contains("1"));
+    assertTrue(receivedMessageIds.contains("2"));
+    assertTrue(receivedMessageIds.contains("3"));
+  }
+  @Test public void testFailedExchangesNotAdded() throws Exception {
+    RouteBuilder interceptor=new RouteBuilder(context){
+      @Override public void configure() throws Exception {
+        interceptSendToEndpoint("mock:result").process(new Processor(){
+          public void process(          Exchange exchange) throws Exception {
+            String id=exchange.getIn().getHeader("messageId",String.class);
+            if (id.equals("2")) {
+              throw new IllegalArgumentException("Damn I cannot handle id 2");
+            }
+          }
+        }
+);
+      }
+    }
+;
+    RouteDefinition routeDefinition=context.getRouteDefinition("JdbcMessageIdRepositoryTest");
+    routeDefinition.adviceWith(context,interceptor);
+    errorEndpoint.expectedMessageCount(2);
+    resultEndpoint.expectedBodiesReceived("one","three");
+    template.sendBodyAndHeader("direct:start","one","messageId","1");
+    template.sendBodyAndHeader("direct:start","two","messageId","2");
+    template.sendBodyAndHeader("direct:start","one","messageId","1");
+    template.sendBodyAndHeader("direct:start","two","messageId","2");
+    template.sendBodyAndHeader("direct:start","one","messageId","1");
+    template.sendBodyAndHeader("direct:start","three","messageId","3");
+    assertMockEndpointsSatisfied();
+    jdbcTemplate.update(CLEAR_STRING,PROCESSOR_NAME);
+    List<String> receivedMessageIds=jdbcTemplate.queryForList(SELECT_ALL_STRING,String.class,PROCESSOR_NAME);
+    assertEquals(0,receivedMessageIds.size());
+    assertFalse("Should not contain message 1",receivedMessageIds.contains("1"));
+    assertFalse("Should not contain message 3",receivedMessageIds.contains("3"));
+  }
+  @Override protected AbstractApplicationContext createApplicationContext(){
+    return new ClassPathXmlApplicationContext("org/apache/camel/processor/idempotent/jdbc/spring.xml");
+  }
+}

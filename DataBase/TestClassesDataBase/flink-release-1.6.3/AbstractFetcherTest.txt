@@ -1,0 +1,267 @@
+/** 
+ * Tests for the  {@link AbstractFetcher}.
+ */
+@SuppressWarnings("serial") public class AbstractFetcherTest {
+  @Test public void testIgnorePartitionStateSentinelInSnapshot() throws Exception {
+    final String testTopic="test topic name";
+    Map<KafkaTopicPartition,Long> originalPartitions=new HashMap<>();
+    originalPartitions.put(new KafkaTopicPartition(testTopic,1),KafkaTopicPartitionStateSentinel.LATEST_OFFSET);
+    originalPartitions.put(new KafkaTopicPartition(testTopic,2),KafkaTopicPartitionStateSentinel.GROUP_OFFSET);
+    originalPartitions.put(new KafkaTopicPartition(testTopic,3),KafkaTopicPartitionStateSentinel.EARLIEST_OFFSET);
+    TestSourceContext<Long> sourceContext=new TestSourceContext<>();
+    TestFetcher<Long> fetcher=new TestFetcher<>(sourceContext,originalPartitions,null,null,new TestProcessingTimeService(),0);
+synchronized (sourceContext.getCheckpointLock()) {
+      HashMap<KafkaTopicPartition,Long> currentState=fetcher.snapshotCurrentState();
+      fetcher.commitInternalOffsetsToKafka(currentState,new KafkaCommitCallback(){
+        @Override public void onSuccess(){
+        }
+        @Override public void onException(        Throwable cause){
+          throw new RuntimeException("Callback failed",cause);
+        }
+      }
+);
+      assertTrue(fetcher.getLastCommittedOffsets().isPresent());
+      assertEquals(Collections.emptyMap(),fetcher.getLastCommittedOffsets().get());
+    }
+  }
+  @Test public void testSkipCorruptedRecord() throws Exception {
+    final String testTopic="test topic name";
+    Map<KafkaTopicPartition,Long> originalPartitions=new HashMap<>();
+    originalPartitions.put(new KafkaTopicPartition(testTopic,1),KafkaTopicPartitionStateSentinel.LATEST_OFFSET);
+    TestSourceContext<Long> sourceContext=new TestSourceContext<>();
+    TestFetcher<Long> fetcher=new TestFetcher<>(sourceContext,originalPartitions,null,null,new TestProcessingTimeService(),0);
+    final KafkaTopicPartitionState<Object> partitionStateHolder=fetcher.subscribedPartitionStates().get(0);
+    fetcher.emitRecord(1L,partitionStateHolder,1L);
+    fetcher.emitRecord(2L,partitionStateHolder,2L);
+    assertEquals(2L,sourceContext.getLatestElement().getValue().longValue());
+    assertEquals(2L,partitionStateHolder.getOffset());
+    fetcher.emitRecord(null,partitionStateHolder,3L);
+    assertEquals(2L,sourceContext.getLatestElement().getValue().longValue());
+    assertEquals(3L,partitionStateHolder.getOffset());
+  }
+  @Test public void testSkipCorruptedRecordWithPunctuatedWatermarks() throws Exception {
+    final String testTopic="test topic name";
+    Map<KafkaTopicPartition,Long> originalPartitions=new HashMap<>();
+    originalPartitions.put(new KafkaTopicPartition(testTopic,1),KafkaTopicPartitionStateSentinel.LATEST_OFFSET);
+    TestSourceContext<Long> sourceContext=new TestSourceContext<>();
+    TestProcessingTimeService processingTimeProvider=new TestProcessingTimeService();
+    TestFetcher<Long> fetcher=new TestFetcher<>(sourceContext,originalPartitions,null,new SerializedValue<AssignerWithPunctuatedWatermarks<Long>>(new PunctuatedTestExtractor()),processingTimeProvider,0);
+    final KafkaTopicPartitionState<Object> partitionStateHolder=fetcher.subscribedPartitionStates().get(0);
+    fetcher.emitRecord(1L,partitionStateHolder,1L);
+    fetcher.emitRecord(2L,partitionStateHolder,2L);
+    fetcher.emitRecord(3L,partitionStateHolder,3L);
+    assertEquals(3L,sourceContext.getLatestElement().getValue().longValue());
+    assertEquals(3L,sourceContext.getLatestElement().getTimestamp());
+    assertTrue(sourceContext.hasWatermark());
+    assertEquals(3L,sourceContext.getLatestWatermark().getTimestamp());
+    assertEquals(3L,partitionStateHolder.getOffset());
+    fetcher.emitRecord(null,partitionStateHolder,4L);
+    assertEquals(3L,sourceContext.getLatestElement().getValue().longValue());
+    assertEquals(3L,sourceContext.getLatestElement().getTimestamp());
+    assertFalse(sourceContext.hasWatermark());
+    assertEquals(4L,partitionStateHolder.getOffset());
+  }
+  @Test public void testSkipCorruptedRecordWithPeriodicWatermarks() throws Exception {
+    final String testTopic="test topic name";
+    Map<KafkaTopicPartition,Long> originalPartitions=new HashMap<>();
+    originalPartitions.put(new KafkaTopicPartition(testTopic,1),KafkaTopicPartitionStateSentinel.LATEST_OFFSET);
+    TestSourceContext<Long> sourceContext=new TestSourceContext<>();
+    TestProcessingTimeService processingTimeProvider=new TestProcessingTimeService();
+    TestFetcher<Long> fetcher=new TestFetcher<>(sourceContext,originalPartitions,new SerializedValue<AssignerWithPeriodicWatermarks<Long>>(new PeriodicTestExtractor()),null,processingTimeProvider,10);
+    final KafkaTopicPartitionState<Object> partitionStateHolder=fetcher.subscribedPartitionStates().get(0);
+    fetcher.emitRecord(1L,partitionStateHolder,1L);
+    fetcher.emitRecord(2L,partitionStateHolder,2L);
+    fetcher.emitRecord(3L,partitionStateHolder,3L);
+    assertEquals(3L,sourceContext.getLatestElement().getValue().longValue());
+    assertEquals(3L,sourceContext.getLatestElement().getTimestamp());
+    assertEquals(3L,partitionStateHolder.getOffset());
+    processingTimeProvider.setCurrentTime(10L);
+    assertTrue(sourceContext.hasWatermark());
+    assertEquals(3L,sourceContext.getLatestWatermark().getTimestamp());
+    fetcher.emitRecord(null,partitionStateHolder,4L);
+    assertEquals(3L,sourceContext.getLatestElement().getValue().longValue());
+    assertEquals(3L,sourceContext.getLatestElement().getTimestamp());
+    assertEquals(4L,partitionStateHolder.getOffset());
+    processingTimeProvider.setCurrentTime(20L);
+    assertFalse(sourceContext.hasWatermark());
+  }
+  @Test public void testPunctuatedWatermarks() throws Exception {
+    final String testTopic="test topic name";
+    Map<KafkaTopicPartition,Long> originalPartitions=new HashMap<>();
+    originalPartitions.put(new KafkaTopicPartition(testTopic,7),KafkaTopicPartitionStateSentinel.LATEST_OFFSET);
+    originalPartitions.put(new KafkaTopicPartition(testTopic,13),KafkaTopicPartitionStateSentinel.LATEST_OFFSET);
+    originalPartitions.put(new KafkaTopicPartition(testTopic,21),KafkaTopicPartitionStateSentinel.LATEST_OFFSET);
+    TestSourceContext<Long> sourceContext=new TestSourceContext<>();
+    TestProcessingTimeService processingTimeProvider=new TestProcessingTimeService();
+    TestFetcher<Long> fetcher=new TestFetcher<>(sourceContext,originalPartitions,null,new SerializedValue<AssignerWithPunctuatedWatermarks<Long>>(new PunctuatedTestExtractor()),processingTimeProvider,0);
+    final KafkaTopicPartitionState<Object> part1=fetcher.subscribedPartitionStates().get(0);
+    final KafkaTopicPartitionState<Object> part2=fetcher.subscribedPartitionStates().get(1);
+    final KafkaTopicPartitionState<Object> part3=fetcher.subscribedPartitionStates().get(2);
+    fetcher.emitRecord(1L,part1,1L);
+    fetcher.emitRecord(2L,part1,2L);
+    fetcher.emitRecord(3L,part1,3L);
+    assertEquals(3L,sourceContext.getLatestElement().getValue().longValue());
+    assertEquals(3L,sourceContext.getLatestElement().getTimestamp());
+    assertFalse(sourceContext.hasWatermark());
+    fetcher.emitRecord(12L,part2,1L);
+    assertEquals(12L,sourceContext.getLatestElement().getValue().longValue());
+    assertEquals(12L,sourceContext.getLatestElement().getTimestamp());
+    assertFalse(sourceContext.hasWatermark());
+    fetcher.emitRecord(101L,part3,1L);
+    fetcher.emitRecord(102L,part3,2L);
+    assertEquals(102L,sourceContext.getLatestElement().getValue().longValue());
+    assertEquals(102L,sourceContext.getLatestElement().getTimestamp());
+    assertTrue(sourceContext.hasWatermark());
+    assertEquals(3L,sourceContext.getLatestWatermark().getTimestamp());
+    fetcher.emitRecord(1003L,part3,3L);
+    fetcher.emitRecord(1004L,part3,4L);
+    fetcher.emitRecord(1005L,part3,5L);
+    assertEquals(1005L,sourceContext.getLatestElement().getValue().longValue());
+    assertEquals(1005L,sourceContext.getLatestElement().getTimestamp());
+    fetcher.emitRecord(30L,part1,4L);
+    assertEquals(30L,sourceContext.getLatestElement().getValue().longValue());
+    assertEquals(30L,sourceContext.getLatestElement().getTimestamp());
+    assertTrue(sourceContext.hasWatermark());
+    assertEquals(12L,sourceContext.getLatestWatermark().getTimestamp());
+    fetcher.emitRecord(13L,part2,2L);
+    assertFalse(sourceContext.hasWatermark());
+    fetcher.emitRecord(14L,part2,3L);
+    assertFalse(sourceContext.hasWatermark());
+    fetcher.emitRecord(15L,part2,3L);
+    assertTrue(sourceContext.hasWatermark());
+    assertEquals(15L,sourceContext.getLatestWatermark().getTimestamp());
+  }
+  @Test public void testPeriodicWatermarks() throws Exception {
+    final String testTopic="test topic name";
+    Map<KafkaTopicPartition,Long> originalPartitions=new HashMap<>();
+    originalPartitions.put(new KafkaTopicPartition(testTopic,7),KafkaTopicPartitionStateSentinel.LATEST_OFFSET);
+    originalPartitions.put(new KafkaTopicPartition(testTopic,13),KafkaTopicPartitionStateSentinel.LATEST_OFFSET);
+    originalPartitions.put(new KafkaTopicPartition(testTopic,21),KafkaTopicPartitionStateSentinel.LATEST_OFFSET);
+    TestSourceContext<Long> sourceContext=new TestSourceContext<>();
+    TestProcessingTimeService processingTimeService=new TestProcessingTimeService();
+    TestFetcher<Long> fetcher=new TestFetcher<>(sourceContext,originalPartitions,new SerializedValue<AssignerWithPeriodicWatermarks<Long>>(new PeriodicTestExtractor()),null,processingTimeService,10);
+    final KafkaTopicPartitionState<Object> part1=fetcher.subscribedPartitionStates().get(0);
+    final KafkaTopicPartitionState<Object> part2=fetcher.subscribedPartitionStates().get(1);
+    final KafkaTopicPartitionState<Object> part3=fetcher.subscribedPartitionStates().get(2);
+    fetcher.emitRecord(1L,part1,1L);
+    fetcher.emitRecord(2L,part1,2L);
+    fetcher.emitRecord(3L,part1,3L);
+    assertEquals(3L,sourceContext.getLatestElement().getValue().longValue());
+    assertEquals(3L,sourceContext.getLatestElement().getTimestamp());
+    fetcher.emitRecord(12L,part2,1L);
+    assertEquals(12L,sourceContext.getLatestElement().getValue().longValue());
+    assertEquals(12L,sourceContext.getLatestElement().getTimestamp());
+    fetcher.emitRecord(101L,part3,1L);
+    fetcher.emitRecord(102L,part3,2L);
+    assertEquals(102L,sourceContext.getLatestElement().getValue().longValue());
+    assertEquals(102L,sourceContext.getLatestElement().getTimestamp());
+    processingTimeService.setCurrentTime(10);
+    assertEquals(3L,sourceContext.getLatestWatermark().getTimestamp());
+    fetcher.emitRecord(1003L,part3,3L);
+    fetcher.emitRecord(1004L,part3,4L);
+    fetcher.emitRecord(1005L,part3,5L);
+    assertEquals(1005L,sourceContext.getLatestElement().getValue().longValue());
+    assertEquals(1005L,sourceContext.getLatestElement().getTimestamp());
+    fetcher.emitRecord(30L,part1,4L);
+    assertEquals(30L,sourceContext.getLatestElement().getValue().longValue());
+    assertEquals(30L,sourceContext.getLatestElement().getTimestamp());
+    processingTimeService.setCurrentTime(20);
+    assertEquals(12L,sourceContext.getLatestWatermark().getTimestamp());
+    fetcher.emitRecord(13L,part2,2L);
+    fetcher.emitRecord(14L,part2,3L);
+    fetcher.emitRecord(15L,part2,3L);
+    processingTimeService.setCurrentTime(30);
+    long watermarkTs=sourceContext.getLatestWatermark().getTimestamp();
+    assertTrue(watermarkTs >= 13L && watermarkTs <= 15L);
+  }
+  @Test public void testPeriodicWatermarksWithNoSubscribedPartitionsShouldYieldNoWatermarks() throws Exception {
+    final String testTopic="test topic name";
+    Map<KafkaTopicPartition,Long> originalPartitions=new HashMap<>();
+    TestSourceContext<Long> sourceContext=new TestSourceContext<>();
+    TestProcessingTimeService processingTimeProvider=new TestProcessingTimeService();
+    TestFetcher<Long> fetcher=new TestFetcher<>(sourceContext,originalPartitions,new SerializedValue<AssignerWithPeriodicWatermarks<Long>>(new PeriodicTestExtractor()),null,processingTimeProvider,10);
+    processingTimeProvider.setCurrentTime(10);
+    assertFalse(sourceContext.hasWatermark());
+    fetcher.addDiscoveredPartitions(Collections.singletonList(new KafkaTopicPartition(testTopic,0)));
+    fetcher.emitRecord(100L,fetcher.subscribedPartitionStates().get(0),3L);
+    processingTimeProvider.setCurrentTime(20);
+    assertEquals(100,sourceContext.getLatestWatermark().getTimestamp());
+  }
+  @Test public void testConcurrentPartitionsDiscoveryAndLoopFetching() throws Exception {
+    final KafkaTopicPartition testPartition=new KafkaTopicPartition("test",42);
+    @SuppressWarnings("unchecked") SourceContext<String> sourceContext=new TestSourceContext<>();
+    Map<KafkaTopicPartition,Long> partitionsWithInitialOffsets=Collections.singletonMap(testPartition,KafkaTopicPartitionStateSentinel.GROUP_OFFSET);
+    final OneShotLatch fetchLoopWaitLatch=new OneShotLatch();
+    final OneShotLatch stateIterationBlockLatch=new OneShotLatch();
+    final TestFetcher<String> fetcher=new TestFetcher<>(sourceContext,partitionsWithInitialOffsets,null,null,new TestProcessingTimeService(),10,fetchLoopWaitLatch,stateIterationBlockLatch);
+    final CheckedThread checkedThread=new CheckedThread(){
+      @Override public void go() throws Exception {
+        fetcher.runFetchLoop();
+      }
+    }
+;
+    checkedThread.start();
+    fetchLoopWaitLatch.await();
+    fetcher.addDiscoveredPartitions(Collections.singletonList(testPartition));
+    stateIterationBlockLatch.trigger();
+    checkedThread.sync();
+  }
+private static final class TestFetcher<T> extends AbstractFetcher<T,Object> {
+    Optional<Map<KafkaTopicPartition,Long>> lastCommittedOffsets=Optional.empty();
+    private final OneShotLatch fetchLoopWaitLatch;
+    private final OneShotLatch stateIterationBlockLatch;
+    TestFetcher(    SourceContext<T> sourceContext,    Map<KafkaTopicPartition,Long> assignedPartitionsWithStartOffsets,    SerializedValue<AssignerWithPeriodicWatermarks<T>> watermarksPeriodic,    SerializedValue<AssignerWithPunctuatedWatermarks<T>> watermarksPunctuated,    ProcessingTimeService processingTimeProvider,    long autoWatermarkInterval) throws Exception {
+      this(sourceContext,assignedPartitionsWithStartOffsets,watermarksPeriodic,watermarksPunctuated,processingTimeProvider,autoWatermarkInterval,null,null);
+    }
+    TestFetcher(    SourceContext<T> sourceContext,    Map<KafkaTopicPartition,Long> assignedPartitionsWithStartOffsets,    SerializedValue<AssignerWithPeriodicWatermarks<T>> watermarksPeriodic,    SerializedValue<AssignerWithPunctuatedWatermarks<T>> watermarksPunctuated,    ProcessingTimeService processingTimeProvider,    long autoWatermarkInterval,    OneShotLatch fetchLoopWaitLatch,    OneShotLatch stateIterationBlockLatch) throws Exception {
+      super(sourceContext,assignedPartitionsWithStartOffsets,watermarksPeriodic,watermarksPunctuated,processingTimeProvider,autoWatermarkInterval,TestFetcher.class.getClassLoader(),new UnregisteredMetricsGroup(),false);
+      this.fetchLoopWaitLatch=fetchLoopWaitLatch;
+      this.stateIterationBlockLatch=stateIterationBlockLatch;
+    }
+    /** 
+ * Emulation of partition's iteration which is required for {@link AbstractFetcherTest#testConcurrentPartitionsDiscoveryAndLoopFetching}.
+ */
+    @Override public void runFetchLoop() throws Exception {
+      if (fetchLoopWaitLatch != null) {
+        for (        KafkaTopicPartitionState ignored : subscribedPartitionStates()) {
+          fetchLoopWaitLatch.trigger();
+          stateIterationBlockLatch.await();
+        }
+      }
+ else {
+        throw new UnsupportedOperationException();
+      }
+    }
+    @Override public void cancel(){
+      throw new UnsupportedOperationException();
+    }
+    @Override public Object createKafkaPartitionHandle(    KafkaTopicPartition partition){
+      return new Object();
+    }
+    @Override protected void doCommitInternalOffsetsToKafka(    Map<KafkaTopicPartition,Long> offsets,    @Nonnull KafkaCommitCallback callback) throws Exception {
+      lastCommittedOffsets=Optional.of(offsets);
+      callback.onSuccess();
+    }
+    public Optional<Map<KafkaTopicPartition,Long>> getLastCommittedOffsets(){
+      return lastCommittedOffsets;
+    }
+  }
+private static class PeriodicTestExtractor implements AssignerWithPeriodicWatermarks<Long> {
+    private volatile long maxTimestamp=Long.MIN_VALUE;
+    @Override public long extractTimestamp(    Long element,    long previousElementTimestamp){
+      maxTimestamp=Math.max(maxTimestamp,element);
+      return element;
+    }
+    @Nullable @Override public Watermark getCurrentWatermark(){
+      return new Watermark(maxTimestamp);
+    }
+  }
+private static class PunctuatedTestExtractor implements AssignerWithPunctuatedWatermarks<Long> {
+    @Override public long extractTimestamp(    Long element,    long previousElementTimestamp){
+      return element;
+    }
+    @Nullable @Override public Watermark checkAndGetNextWatermark(    Long lastElement,    long extractedTimestamp){
+      return extractedTimestamp % 3 == 0 ? new Watermark(extractedTimestamp) : null;
+    }
+  }
+}

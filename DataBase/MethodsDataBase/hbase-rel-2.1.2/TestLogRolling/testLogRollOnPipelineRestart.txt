@@ -1,0 +1,110 @@
+/** 
+ * Test that WAL is rolled when all data nodes in the pipeline have been restarted.
+ * @throws Exception
+ */
+@Test public void testLogRollOnPipelineRestart() throws Exception {
+  LOG.info("Starting testLogRollOnPipelineRestart");
+  assertTrue("This test requires WAL file replication.",fs.getDefaultReplication(TEST_UTIL.getDataTestDirOnTestFS()) > 1);
+  LOG.info("Replication=" + fs.getDefaultReplication(TEST_UTIL.getDataTestDirOnTestFS()));
+  Table t=TEST_UTIL.getConnection().getTable(TableName.META_TABLE_NAME);
+  try {
+    this.server=cluster.getRegionServer(0);
+    TableDescriptor desc=TableDescriptorBuilder.newBuilder(TableName.valueOf(getName())).setColumnFamily(ColumnFamilyDescriptorBuilder.of(HConstants.CATALOG_FAMILY)).build();
+    admin.createTable(desc);
+    Table table=TEST_UTIL.getConnection().getTable(desc.getTableName());
+    server=TEST_UTIL.getRSForFirstRegionInTable(desc.getTableName());
+    RegionInfo region=server.getRegions(desc.getTableName()).get(0).getRegionInfo();
+    final WAL log=server.getWAL(region);
+    final List<Path> paths=new ArrayList<>(1);
+    final List<Integer> preLogRolledCalled=new ArrayList<>();
+    paths.add(AbstractFSWALProvider.getCurrentFileName(log));
+    log.registerWALActionsListener(new WALActionsListener(){
+      @Override public void preLogRoll(      Path oldFile,      Path newFile){
+        LOG.debug("preLogRoll: oldFile=" + oldFile + " newFile="+ newFile);
+        preLogRolledCalled.add(new Integer(1));
+      }
+      @Override public void postLogRoll(      Path oldFile,      Path newFile){
+        paths.add(newFile);
+      }
+    }
+);
+    writeData(table,1002);
+    long curTime=System.currentTimeMillis();
+    LOG.info("log.getCurrentFileName()): " + AbstractFSWALProvider.getCurrentFileName(log));
+    long oldFilenum=AbstractFSWALProvider.extractFileNumFromWAL(log);
+    assertTrue("Log should have a timestamp older than now",curTime > oldFilenum && oldFilenum != -1);
+    assertTrue("The log shouldn't have rolled yet",oldFilenum == AbstractFSWALProvider.extractFileNumFromWAL(log));
+    dfsCluster.restartDataNodes();
+    Thread.sleep(1000);
+    dfsCluster.waitActive();
+    LOG.info("Data Nodes restarted");
+    validateData(table,1002);
+    writeData(table,1003);
+    long newFilenum=AbstractFSWALProvider.extractFileNumFromWAL(log);
+    assertTrue("Missing datanode should've triggered a log roll",newFilenum > oldFilenum && newFilenum > curTime);
+    validateData(table,1003);
+    writeData(table,1004);
+    dfsCluster.restartDataNodes();
+    Thread.sleep(1000);
+    dfsCluster.waitActive();
+    LOG.info("Data Nodes restarted");
+    validateData(table,1004);
+    writeData(table,1005);
+    log.rollWriter(true);
+    assertTrue("preLogRolledCalled has size of " + preLogRolledCalled.size(),preLogRolledCalled.size() >= 1);
+    Set<String> loggedRows=new HashSet<>();
+    FSUtils fsUtils=FSUtils.getInstance(fs,TEST_UTIL.getConfiguration());
+    for (    Path p : paths) {
+      LOG.debug("recovering lease for " + p);
+      fsUtils.recoverFileLease(((HFileSystem)fs).getBackingFs(),p,TEST_UTIL.getConfiguration(),null);
+      LOG.debug("Reading WAL " + FSUtils.getPath(p));
+      WAL.Reader reader=null;
+      try {
+        reader=WALFactory.createReader(fs,p,TEST_UTIL.getConfiguration());
+        WAL.Entry entry;
+        while ((entry=reader.next()) != null) {
+          LOG.debug("#" + entry.getKey().getSequenceId() + ": "+ entry.getEdit().getCells());
+          for (          Cell cell : entry.getEdit().getCells()) {
+            loggedRows.add(Bytes.toStringBinary(cell.getRowArray(),cell.getRowOffset(),cell.getRowLength()));
+          }
+        }
+      }
+ catch (      EOFException e) {
+        LOG.debug("EOF reading file " + FSUtils.getPath(p));
+      }
+ finally {
+        if (reader != null)         reader.close();
+      }
+    }
+    assertTrue(loggedRows.contains("row1002"));
+    assertTrue(loggedRows.contains("row1003"));
+    assertTrue(loggedRows.contains("row1004"));
+    assertTrue(loggedRows.contains("row1005"));
+    for (    HRegion r : server.getOnlineRegionsLocalContext()) {
+      try {
+        r.flush(true);
+      }
+ catch (      Exception e) {
+        LOG.info(e.toString(),e);
+      }
+    }
+    ResultScanner scanner=table.getScanner(new Scan());
+    try {
+      for (int i=2; i <= 5; i++) {
+        Result r=scanner.next();
+        assertNotNull(r);
+        assertFalse(r.isEmpty());
+        assertEquals("row100" + i,Bytes.toString(r.getRow()));
+      }
+    }
+  finally {
+      scanner.close();
+    }
+    for (    JVMClusterUtil.RegionServerThread rsThread : TEST_UTIL.getHBaseCluster().getRegionServerThreads()) {
+      assertFalse(rsThread.getRegionServer().isAborted());
+    }
+  }
+  finally {
+    if (t != null)     t.close();
+  }
+}

@@ -1,0 +1,43 @@
+/** 
+ * This tests that DFSInputStream failures are counted for a given read operation, and not over the lifetime of the stream. It is a regression test for HDFS-127.
+ */
+@Test public void testFailuresArePerOperation() throws Exception {
+  long fileSize=4096;
+  Path file=new Path("/testFile");
+  conf.setInt(HdfsClientConfigKeys.Retry.WINDOW_BASE_KEY,10);
+  conf.setInt(DFS_CLIENT_SOCKET_TIMEOUT_KEY,2 * 1000);
+  MiniDFSCluster cluster=new MiniDFSCluster.Builder(conf).build();
+  try {
+    cluster.waitActive();
+    FileSystem fs=cluster.getFileSystem();
+    NamenodeProtocols preSpyNN=cluster.getNameNodeRpc();
+    NamenodeProtocols spyNN=spy(preSpyNN);
+    DFSClient client=new DFSClient(null,spyNN,conf,null);
+    int maxBlockAcquires=client.getConf().getMaxBlockAcquireFailures();
+    assertTrue(maxBlockAcquires > 0);
+    DFSTestUtil.createFile(fs,file,fileSize,(short)1,12345L);
+    doAnswer(new FailNTimesAnswer(preSpyNN,maxBlockAcquires + 1)).when(spyNN).getBlockLocations(anyString(),anyLong(),anyLong());
+    try {
+      IOUtils.copyBytes(client.open(file.toString()),new IOUtils.NullOutputStream(),conf,true);
+      fail("Didn't get exception");
+    }
+ catch (    IOException ioe) {
+      DFSClient.LOG.info("Got expected exception",ioe);
+    }
+    doAnswer(new FailNTimesAnswer(preSpyNN,maxBlockAcquires)).when(spyNN).getBlockLocations(anyString(),anyLong(),anyLong());
+    IOUtils.copyBytes(client.open(file.toString()),new IOUtils.NullOutputStream(),conf,true);
+    DFSClient.LOG.info("Starting test case for failure reset");
+    doAnswer(new FailNTimesAnswer(preSpyNN,maxBlockAcquires)).when(spyNN).getBlockLocations(anyString(),anyLong(),anyLong());
+    DFSInputStream is=client.open(file.toString());
+    byte buf[]=new byte[10];
+    IOUtils.readFully(is,buf,0,buf.length);
+    DFSClient.LOG.info("First read successful after some failures.");
+    doAnswer(new FailNTimesAnswer(preSpyNN,maxBlockAcquires)).when(spyNN).getBlockLocations(anyString(),anyLong(),anyLong());
+    is.openInfo(true);
+    is.seek(0);
+    IOUtils.readFully(is,buf,0,buf.length);
+  }
+  finally {
+    cluster.shutdown();
+  }
+}

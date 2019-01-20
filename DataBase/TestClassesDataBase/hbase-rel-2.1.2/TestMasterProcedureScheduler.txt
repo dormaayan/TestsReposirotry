@@ -1,0 +1,647 @@
+@Category({MasterTests.class,SmallTests.class}) public class TestMasterProcedureScheduler {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestMasterProcedureScheduler.class);
+  private static final Logger LOG=LoggerFactory.getLogger(TestMasterProcedureScheduler.class);
+  private MasterProcedureScheduler queue;
+  @Rule public TestName name=new TestName();
+  @Before public void setUp() throws IOException {
+    queue=new MasterProcedureScheduler(pid -> null);
+    queue.start();
+  }
+  @After public void tearDown() throws IOException {
+    assertEquals("proc-queue expected to be empty",0,queue.size());
+    queue.stop();
+    queue.clear();
+  }
+  /** 
+ * Verify simple create/insert/fetch/delete of the table queue.
+ */
+  @Test public void testSimpleTableOpsQueues() throws Exception {
+    final int NUM_TABLES=10;
+    final int NUM_ITEMS=10;
+    int count=0;
+    for (int i=1; i <= NUM_TABLES; ++i) {
+      TableName tableName=TableName.valueOf(String.format("test-%04d",i));
+      for (int j=1; j <= NUM_ITEMS; ++j) {
+        queue.addBack(new TestTableProcedure(i * 1000 + j,tableName,TableProcedureInterface.TableOperationType.EDIT));
+        assertEquals(++count,queue.size());
+      }
+    }
+    assertEquals(NUM_TABLES * NUM_ITEMS,queue.size());
+    for (int j=1; j <= NUM_ITEMS; ++j) {
+      for (int i=1; i <= NUM_TABLES; ++i) {
+        Procedure<?> proc=queue.poll();
+        assertTrue(proc != null);
+        TableName tableName=((TestTableProcedure)proc).getTableName();
+        queue.waitTableExclusiveLock(proc,tableName);
+        queue.wakeTableExclusiveLock(proc,tableName);
+        queue.completionCleanup(proc);
+        assertEquals(--count,queue.size());
+        assertEquals(i * 1000 + j,proc.getProcId());
+      }
+    }
+    assertEquals(0,queue.size());
+    for (int i=1; i <= NUM_TABLES; ++i) {
+      final TableName tableName=TableName.valueOf(String.format("test-%04d",i));
+      final TestTableProcedure dummyProc=new TestTableProcedure(100,tableName,TableProcedureInterface.TableOperationType.DELETE);
+      assertTrue(queue.markTableAsDeleted(tableName,dummyProc));
+    }
+  }
+  /** 
+ * Check that the table queue is not deletable until every procedure in-progress is completed (this is a special case for write-locks).
+ */
+  @Test public void testCreateDeleteTableOperationsWithWriteLock() throws Exception {
+    final TableName tableName=TableName.valueOf(name.getMethodName());
+    final TestTableProcedure dummyProc=new TestTableProcedure(100,tableName,TableProcedureInterface.TableOperationType.DELETE);
+    queue.addBack(new TestTableProcedure(1,tableName,TableProcedureInterface.TableOperationType.EDIT));
+    assertFalse(queue.markTableAsDeleted(tableName,dummyProc));
+    Procedure<?> proc=queue.poll();
+    assertEquals(1,proc.getProcId());
+    assertEquals(false,queue.waitTableExclusiveLock(proc,tableName));
+    assertEquals(0,queue.size());
+    assertFalse(queue.markTableAsDeleted(tableName,dummyProc));
+    queue.wakeTableExclusiveLock(proc,tableName);
+    assertTrue(queue.markTableAsDeleted(tableName,proc));
+  }
+  /** 
+ * Check that the table queue is not deletable until every procedure in-progress is completed (this is a special case for read-locks).
+ */
+  @Test public void testCreateDeleteTableOperationsWithReadLock() throws Exception {
+    final TableName tableName=TableName.valueOf(name.getMethodName());
+    final int nitems=2;
+    final TestTableProcedure dummyProc=new TestTableProcedure(100,tableName,TableProcedureInterface.TableOperationType.DELETE);
+    for (int i=1; i <= nitems; ++i) {
+      queue.addBack(new TestTableProcedure(i,tableName,TableProcedureInterface.TableOperationType.READ));
+    }
+    assertFalse(queue.markTableAsDeleted(tableName,dummyProc));
+    Procedure<?>[] procs=new Procedure[nitems];
+    for (int i=0; i < nitems; ++i) {
+      Procedure<?> proc=queue.poll();
+      procs[i]=proc;
+      assertEquals(i + 1,proc.getProcId());
+      assertEquals(false,queue.waitTableSharedLock(proc,tableName));
+      assertFalse(queue.markTableAsDeleted(tableName,dummyProc));
+    }
+    for (int i=0; i < nitems; ++i) {
+      assertFalse(queue.markTableAsDeleted(tableName,dummyProc));
+      queue.wakeTableSharedLock(procs[i],tableName);
+    }
+    assertEquals(0,queue.size());
+    assertTrue(queue.markTableAsDeleted(tableName,dummyProc));
+  }
+  /** 
+ * Verify the correct logic of RWLocks on the queue
+ */
+  @Test public void testVerifyRwLocks() throws Exception {
+    final TableName tableName=TableName.valueOf(name.getMethodName());
+    queue.addBack(new TestTableProcedure(1,tableName,TableProcedureInterface.TableOperationType.EDIT));
+    queue.addBack(new TestTableProcedure(2,tableName,TableProcedureInterface.TableOperationType.READ));
+    queue.addBack(new TestTableProcedure(3,tableName,TableProcedureInterface.TableOperationType.EDIT));
+    Procedure<?> proc=queue.poll();
+    assertEquals(1,proc.getProcId());
+    assertEquals(false,queue.waitTableExclusiveLock(proc,tableName));
+    assertEquals(null,queue.poll(0));
+    queue.wakeTableExclusiveLock(proc,tableName);
+    Procedure<?> rdProc=queue.poll();
+    assertEquals(2,rdProc.getProcId());
+    assertEquals(false,queue.waitTableSharedLock(rdProc,tableName));
+    assertEquals(null,queue.poll(0));
+    queue.wakeTableSharedLock(rdProc,tableName);
+    queue.addBack(new TestTableProcedure(4,tableName,TableProcedureInterface.TableOperationType.READ));
+    queue.addBack(new TestTableProcedure(5,tableName,TableProcedureInterface.TableOperationType.READ));
+    Procedure<?> wrProc=queue.poll();
+    assertEquals(false,queue.waitTableExclusiveLock(wrProc,tableName));
+    assertEquals(null,queue.poll(0));
+    queue.wakeTableExclusiveLock(wrProc,tableName);
+    rdProc=queue.poll();
+    assertEquals(4,rdProc.getProcId());
+    assertEquals(false,queue.waitTableSharedLock(rdProc,tableName));
+    Procedure<?> rdProc2=queue.poll();
+    assertEquals(5,rdProc2.getProcId());
+    assertEquals(false,queue.waitTableSharedLock(rdProc2,tableName));
+    queue.wakeTableSharedLock(rdProc,tableName);
+    queue.wakeTableSharedLock(rdProc2,tableName);
+    assertEquals(0,queue.size());
+    assertTrue("queue should be deleted",queue.markTableAsDeleted(tableName,wrProc));
+  }
+  @Test public void testVerifyNamespaceRwLocks() throws Exception {
+    String nsName1="ns1";
+    String nsName2="ns2";
+    TableName tableName1=TableName.valueOf(nsName1,name.getMethodName());
+    TableName tableName2=TableName.valueOf(nsName2,name.getMethodName());
+    queue.addBack(new TestNamespaceProcedure(1,nsName1,TableProcedureInterface.TableOperationType.EDIT));
+    queue.addBack(new TestTableProcedure(2,tableName1,TableProcedureInterface.TableOperationType.EDIT));
+    queue.addBack(new TestTableProcedure(3,tableName2,TableProcedureInterface.TableOperationType.EDIT));
+    queue.addBack(new TestNamespaceProcedure(4,nsName2,TableProcedureInterface.TableOperationType.EDIT));
+    Procedure<?> procNs1=queue.poll();
+    assertEquals(1,procNs1.getProcId());
+    assertFalse(queue.waitNamespaceExclusiveLock(procNs1,nsName1));
+    Procedure<?> procNs2=queue.poll();
+    assertEquals(4,procNs2.getProcId());
+    assertFalse(queue.waitNamespaceExclusiveLock(procNs2,nsName2));
+    queue.wakeNamespaceExclusiveLock(procNs2,nsName2);
+    queue.yield(procNs2);
+    procNs2=queue.poll();
+    assertEquals(4,procNs2.getProcId());
+    assertFalse(queue.waitNamespaceExclusiveLock(procNs2,nsName2));
+    assertNull(queue.poll());
+    queue.wakeNamespaceExclusiveLock(procNs1,nsName1);
+    long procId=queue.poll().getProcId();
+    assertEquals(2,procId);
+    queue.wakeNamespaceExclusiveLock(procNs2,nsName2);
+    procId=queue.poll().getProcId();
+    assertEquals(3,procId);
+  }
+  @Test public void testVerifyNamespaceXLock() throws Exception {
+    String nsName="ns1";
+    TableName tableName=TableName.valueOf(nsName,name.getMethodName());
+    queue.addBack(new TestNamespaceProcedure(1,nsName,TableProcedureInterface.TableOperationType.CREATE));
+    queue.addBack(new TestTableProcedure(2,tableName,TableProcedureInterface.TableOperationType.READ));
+    Procedure<?> proc=queue.poll();
+    assertEquals(1,proc.getProcId());
+    assertEquals(false,queue.waitNamespaceExclusiveLock(proc,nsName));
+    assertEquals(null,queue.poll(0));
+    queue.wakeNamespaceExclusiveLock(proc,nsName);
+    proc=queue.poll();
+    assertEquals(2,proc.getProcId());
+    assertEquals(false,queue.waitTableExclusiveLock(proc,tableName));
+    queue.wakeTableExclusiveLock(proc,tableName);
+  }
+  @Test public void testXLockWaitingForExecutingSharedLockToRelease(){
+    final TableName tableName=TableName.valueOf(name.getMethodName());
+    final RegionInfo regionA=RegionInfoBuilder.newBuilder(tableName).setStartKey(Bytes.toBytes("a")).setEndKey(Bytes.toBytes("b")).build();
+    queue.addBack(new TestRegionProcedure(1,tableName,TableProcedureInterface.TableOperationType.REGION_ASSIGN,regionA));
+    queue.addBack(new TestTableProcedure(2,tableName,TableProcedureInterface.TableOperationType.EDIT));
+    Procedure<?> proc=queue.poll();
+    assertEquals(1,proc.getProcId());
+    assertEquals(false,queue.waitRegion(proc,regionA));
+    assertEquals(null,queue.poll(0));
+    queue.wakeRegion(proc,regionA);
+    proc=queue.poll();
+    assertEquals(2,proc.getProcId());
+    assertEquals(false,queue.waitTableExclusiveLock(proc,tableName));
+    queue.addBack(new TestRegionProcedure(3,tableName,TableProcedureInterface.TableOperationType.REGION_UNASSIGN,regionA));
+    assertEquals(null,queue.poll(0));
+    queue.wakeTableExclusiveLock(proc,tableName);
+    proc=queue.poll();
+    assertEquals(3,proc.getProcId());
+    assertEquals(false,queue.waitRegion(proc,regionA));
+    assertEquals(null,queue.poll(0));
+    queue.wakeRegion(proc,regionA);
+  }
+  @Test public void testVerifyRegionLocks() throws Exception {
+    final TableName tableName=TableName.valueOf(name.getMethodName());
+    final RegionInfo regionA=RegionInfoBuilder.newBuilder(tableName).setStartKey(Bytes.toBytes("a")).setEndKey(Bytes.toBytes("b")).build();
+    final RegionInfo regionB=RegionInfoBuilder.newBuilder(tableName).setStartKey(Bytes.toBytes("b")).setEndKey(Bytes.toBytes("c")).build();
+    final RegionInfo regionC=RegionInfoBuilder.newBuilder(tableName).setStartKey(Bytes.toBytes("c")).setEndKey(Bytes.toBytes("d")).build();
+    queue.addBack(new TestTableProcedure(1,tableName,TableProcedureInterface.TableOperationType.EDIT));
+    queue.addBack(new TestRegionProcedure(2,tableName,TableProcedureInterface.TableOperationType.REGION_MERGE,regionA,regionB));
+    queue.addBack(new TestRegionProcedure(3,tableName,TableProcedureInterface.TableOperationType.REGION_SPLIT,regionA));
+    queue.addBack(new TestRegionProcedure(4,tableName,TableProcedureInterface.TableOperationType.REGION_SPLIT,regionB));
+    queue.addBack(new TestRegionProcedure(5,tableName,TableProcedureInterface.TableOperationType.REGION_UNASSIGN,regionC));
+    Procedure<?> proc=queue.poll();
+    assertEquals(1,proc.getProcId());
+    assertEquals(false,queue.waitTableExclusiveLock(proc,tableName));
+    assertEquals(null,queue.poll(0));
+    queue.wakeTableExclusiveLock(proc,tableName);
+    Procedure<?> mergeProc=queue.poll();
+    assertEquals(2,mergeProc.getProcId());
+    assertEquals(false,queue.waitRegions(mergeProc,tableName,regionA,regionB));
+    Procedure<?> procA=queue.poll();
+    assertEquals(3,procA.getProcId());
+    assertEquals(true,queue.waitRegions(procA,tableName,regionA));
+    Procedure<?> procB=queue.poll();
+    assertEquals(4,procB.getProcId());
+    assertEquals(true,queue.waitRegions(procB,tableName,regionB));
+    Procedure<?> procC=queue.poll();
+    assertEquals(5,procC.getProcId());
+    assertEquals(false,queue.waitRegions(procC,tableName,regionC));
+    assertEquals(null,queue.poll(0));
+    queue.wakeRegions(mergeProc,tableName,regionA,regionB);
+    procA=queue.poll();
+    assertEquals(3,procA.getProcId());
+    assertEquals(false,queue.waitRegions(procA,tableName,regionA));
+    procB=queue.poll();
+    assertEquals(4,procB.getProcId());
+    assertEquals(false,queue.waitRegions(procB,tableName,regionB));
+    queue.wakeRegions(procA,tableName,regionA);
+    queue.wakeRegions(procB,tableName,regionB);
+    queue.wakeRegions(procC,tableName,regionC);
+  }
+  @Test public void testVerifySubProcRegionLocks() throws Exception {
+    final TableName tableName=TableName.valueOf(name.getMethodName());
+    final RegionInfo regionA=RegionInfoBuilder.newBuilder(tableName).setStartKey(Bytes.toBytes("a")).setEndKey(Bytes.toBytes("b")).build();
+    final RegionInfo regionB=RegionInfoBuilder.newBuilder(tableName).setStartKey(Bytes.toBytes("b")).setEndKey(Bytes.toBytes("c")).build();
+    final RegionInfo regionC=RegionInfoBuilder.newBuilder(tableName).setStartKey(Bytes.toBytes("c")).setEndKey(Bytes.toBytes("d")).build();
+    queue.addBack(new TestTableProcedure(1,tableName,TableProcedureInterface.TableOperationType.ENABLE));
+    Procedure<?> rootProc=queue.poll();
+    assertEquals(1,rootProc.getProcId());
+    assertEquals(false,queue.waitTableExclusiveLock(rootProc,tableName));
+    assertEquals(null,queue.poll(0));
+    Procedure<?>[] subProcs=new Procedure[]{new TestRegionProcedure(1,2,tableName,TableProcedureInterface.TableOperationType.REGION_EDIT,regionA),new TestRegionProcedure(1,3,tableName,TableProcedureInterface.TableOperationType.REGION_EDIT,regionB),new TestRegionProcedure(1,4,tableName,TableProcedureInterface.TableOperationType.REGION_EDIT,regionC)};
+    for (int i=subProcs.length - 1; i >= 0; --i) {
+      queue.addFront(subProcs[i]);
+    }
+    assertEquals(subProcs.length,queue.size());
+    for (int i=0; i < subProcs.length; ++i) {
+      TestRegionProcedure regionProc=(TestRegionProcedure)queue.poll(0);
+      assertEquals(subProcs[i].getProcId(),regionProc.getProcId());
+      assertEquals(false,queue.waitRegions(regionProc,tableName,regionProc.getRegionInfo()));
+    }
+    assertEquals(null,queue.poll(0));
+    for (int i=0; i < subProcs.length; ++i) {
+      TestRegionProcedure regionProc=(TestRegionProcedure)subProcs[i];
+      queue.wakeRegions(regionProc,tableName,regionProc.getRegionInfo());
+    }
+    assertEquals(null,queue.poll(0));
+    queue.wakeTableExclusiveLock(rootProc,tableName);
+  }
+  @Test public void testInheritedRegionXLock(){
+    final TableName tableName=TableName.valueOf(name.getMethodName());
+    final RegionInfo region=RegionInfoBuilder.newBuilder(tableName).setStartKey(Bytes.toBytes("a")).setEndKey(Bytes.toBytes("b")).build();
+    queue.addBack(new TestRegionProcedure(1,tableName,TableProcedureInterface.TableOperationType.REGION_SPLIT,region));
+    queue.addBack(new TestRegionProcedure(1,2,tableName,TableProcedureInterface.TableOperationType.REGION_UNASSIGN,region));
+    queue.addBack(new TestRegionProcedure(3,tableName,TableProcedureInterface.TableOperationType.REGION_EDIT,region));
+    Procedure<?> rootProc=queue.poll();
+    assertEquals(1,rootProc.getProcId());
+    assertEquals(false,queue.waitRegion(rootProc,region));
+    Procedure<?> childProc=queue.poll();
+    assertEquals(2,childProc.getProcId());
+    assertEquals(false,queue.waitRegion(childProc,region));
+    Procedure<?> proc=queue.poll();
+    assertEquals(3,proc.getProcId());
+    assertEquals(true,queue.waitRegion(proc,region));
+    queue.wakeRegion(childProc,region);
+    assertEquals(null,queue.poll(0));
+    queue.wakeRegion(rootProc,region);
+    proc=queue.poll();
+    assertEquals(3,proc.getProcId());
+    assertEquals(false,queue.waitRegion(proc,region));
+    queue.wakeRegion(proc,region);
+  }
+  @Test public void testSuspendedProcedure() throws Exception {
+    final TableName tableName=TableName.valueOf(name.getMethodName());
+    queue.addBack(new TestTableProcedure(1,tableName,TableProcedureInterface.TableOperationType.READ));
+    queue.addBack(new TestTableProcedure(2,tableName,TableProcedureInterface.TableOperationType.READ));
+    Procedure<?> proc=queue.poll();
+    assertEquals(1,proc.getProcId());
+    ProcedureEvent<?> event=new ProcedureEvent<>("testSuspendedProcedureEvent");
+    assertEquals(true,event.suspendIfNotReady(proc));
+    proc=queue.poll();
+    assertEquals(2,proc.getProcId());
+    assertEquals(null,queue.poll(0));
+    event.wake(queue);
+    proc=queue.poll();
+    assertEquals(1,proc.getProcId());
+    assertEquals(null,queue.poll(0));
+  }
+  private static RegionInfo[] generateRegionInfo(  final TableName tableName){
+    return new RegionInfo[]{RegionInfoBuilder.newBuilder(tableName).setStartKey(Bytes.toBytes("a")).setEndKey(Bytes.toBytes("b")).build(),RegionInfoBuilder.newBuilder(tableName).setStartKey(Bytes.toBytes("b")).setEndKey(Bytes.toBytes("c")).build(),RegionInfoBuilder.newBuilder(tableName).setStartKey(Bytes.toBytes("c")).setEndKey(Bytes.toBytes("d")).build()};
+  }
+  @Test public void testParentXLockAndChildrenSharedLock() throws Exception {
+    final TableName tableName=TableName.valueOf(name.getMethodName());
+    final RegionInfo[] regions=generateRegionInfo(tableName);
+    final TestRegionProcedure[] childProcs=new TestRegionProcedure[regions.length];
+    for (int i=0; i < regions.length; ++i) {
+      childProcs[i]=new TestRegionProcedure(1,2 + i,tableName,TableProcedureInterface.TableOperationType.REGION_ASSIGN,regions[i]);
+    }
+    testInheritedXLockAndChildrenSharedLock(tableName,new TestTableProcedure(1,tableName,TableProcedureInterface.TableOperationType.CREATE),childProcs);
+  }
+  @Test public void testRootXLockAndChildrenSharedLock() throws Exception {
+    final TableName tableName=TableName.valueOf(name.getMethodName());
+    final RegionInfo[] regions=generateRegionInfo(tableName);
+    final TestRegionProcedure[] childProcs=new TestRegionProcedure[regions.length];
+    for (int i=0; i < regions.length; ++i) {
+      childProcs[i]=new TestRegionProcedure(1,2,3 + i,tableName,TableProcedureInterface.TableOperationType.REGION_ASSIGN,regions[i]);
+    }
+    testInheritedXLockAndChildrenSharedLock(tableName,new TestTableProcedure(1,tableName,TableProcedureInterface.TableOperationType.CREATE),childProcs);
+  }
+  private void testInheritedXLockAndChildrenSharedLock(  final TableName tableName,  final TestTableProcedure rootProc,  final TestRegionProcedure[] childProcs) throws Exception {
+    queue.addBack(rootProc);
+    Procedure<?> parentProc=queue.poll();
+    assertEquals(rootProc,parentProc);
+    assertEquals(false,queue.waitTableExclusiveLock(parentProc,tableName));
+    for (int i=0; i < childProcs.length; ++i) {
+      queue.addFront(childProcs[i]);
+    }
+    queue.addBack(new TestTableProcedure(100,tableName,TableProcedureInterface.TableOperationType.EDIT));
+    for (int i=0; i < childProcs.length; ++i) {
+      TestRegionProcedure childProc=(TestRegionProcedure)queue.poll();
+      LOG.debug("fetch children " + childProc);
+      assertEquals(false,queue.waitRegions(childProc,tableName,childProc.getRegionInfo()));
+      queue.wakeRegions(childProc,tableName,childProc.getRegionInfo());
+    }
+    assertEquals(null,queue.poll(0));
+    queue.wakeTableExclusiveLock(parentProc,tableName);
+    Procedure<?> proc=queue.poll();
+    assertEquals(100,proc.getProcId());
+    assertEquals(false,queue.waitTableExclusiveLock(proc,tableName));
+    queue.wakeTableExclusiveLock(proc,tableName);
+  }
+  @Test public void testParentXLockAndChildrenXLock() throws Exception {
+    final TableName tableName=TableName.valueOf(name.getMethodName());
+    testInheritedXLockAndChildrenXLock(tableName,new TestTableProcedure(1,tableName,TableProcedureInterface.TableOperationType.EDIT),new TestTableProcedure(1,2,tableName,TableProcedureInterface.TableOperationType.EDIT));
+  }
+  @Test public void testRootXLockAndChildrenXLock() throws Exception {
+    final TableName tableName=TableName.valueOf(name.getMethodName());
+    testInheritedXLockAndChildrenXLock(tableName,new TestTableProcedure(1,tableName,TableProcedureInterface.TableOperationType.EDIT),new TestTableProcedure(1,2,3,tableName,TableProcedureInterface.TableOperationType.EDIT));
+  }
+  private void testInheritedXLockAndChildrenXLock(  final TableName tableName,  final TestTableProcedure rootProc,  final TestTableProcedure childProc) throws Exception {
+    queue.addBack(rootProc);
+    Procedure<?> parentProc=queue.poll();
+    assertEquals(rootProc,parentProc);
+    assertEquals(false,queue.waitTableExclusiveLock(parentProc,tableName));
+    queue.addFront(childProc);
+    Procedure<?> proc=queue.poll();
+    assertEquals(childProc,proc);
+    assertEquals(false,queue.waitTableExclusiveLock(proc,tableName));
+    queue.wakeTableExclusiveLock(proc,tableName);
+    queue.wakeTableExclusiveLock(parentProc,tableName);
+  }
+  @Test public void testYieldWithXLockHeld() throws Exception {
+    final TableName tableName=TableName.valueOf(name.getMethodName());
+    queue.addBack(new TestTableProcedure(1,tableName,TableProcedureInterface.TableOperationType.EDIT));
+    queue.addBack(new TestTableProcedure(2,tableName,TableProcedureInterface.TableOperationType.EDIT));
+    Procedure<?> proc=queue.poll();
+    assertEquals(1,proc.getProcId());
+    assertEquals(false,queue.waitTableExclusiveLock(proc,tableName));
+    assertEquals(null,queue.poll(0));
+    queue.yield(proc);
+    proc=queue.poll();
+    assertEquals(1,proc.getProcId());
+    queue.wakeTableExclusiveLock(proc,tableName);
+    proc=queue.poll();
+    assertEquals(2,proc.getProcId());
+  }
+  @Test public void testYieldWithSharedLockHeld() throws Exception {
+    final TableName tableName=TableName.valueOf(name.getMethodName());
+    queue.addBack(new TestTableProcedure(1,tableName,TableProcedureInterface.TableOperationType.READ));
+    queue.addBack(new TestTableProcedure(2,tableName,TableProcedureInterface.TableOperationType.READ));
+    queue.addBack(new TestTableProcedure(3,tableName,TableProcedureInterface.TableOperationType.EDIT));
+    Procedure<?> proc1=queue.poll();
+    assertEquals(1,proc1.getProcId());
+    assertEquals(false,queue.waitTableSharedLock(proc1,tableName));
+    Procedure<?> proc2=queue.poll();
+    assertEquals(2,proc2.getProcId());
+    assertEquals(false,queue.waitTableSharedLock(proc2,tableName));
+    assertEquals(null,queue.poll(0));
+    queue.yield(proc1);
+    queue.yield(proc2);
+    proc1=queue.poll();
+    assertEquals(1,proc1.getProcId());
+    proc2=queue.poll();
+    assertEquals(2,proc2.getProcId());
+    queue.wakeTableSharedLock(proc1,tableName);
+    queue.wakeTableSharedLock(proc2,tableName);
+    Procedure<?> proc3=queue.poll();
+    assertEquals(3,proc3.getProcId());
+  }
+public static class TestTableProcedure extends TestProcedure implements TableProcedureInterface {
+    private final TableOperationType opType;
+    private final TableName tableName;
+    public TestTableProcedure(){
+      throw new UnsupportedOperationException("recovery should not be triggered here");
+    }
+    public TestTableProcedure(    long procId,    TableName tableName,    TableOperationType opType){
+      this(-1,procId,tableName,opType);
+    }
+    public TestTableProcedure(    long parentProcId,    long procId,    TableName tableName,    TableOperationType opType){
+      this(-1,parentProcId,procId,tableName,opType);
+    }
+    public TestTableProcedure(    long rootProcId,    long parentProcId,    long procId,    TableName tableName,    TableOperationType opType){
+      super(procId,parentProcId,rootProcId,null);
+      this.tableName=tableName;
+      this.opType=opType;
+    }
+    @Override public TableName getTableName(){
+      return tableName;
+    }
+    @Override public TableOperationType getTableOperationType(){
+      return opType;
+    }
+    @Override public void toStringClassDetails(    final StringBuilder sb){
+      sb.append(getClass().getSimpleName());
+      sb.append("(table=");
+      sb.append(getTableName());
+      sb.append(")");
+    }
+  }
+public static class TestTableProcedureWithEvent extends TestTableProcedure {
+    private final ProcedureEvent<?> event;
+    public TestTableProcedureWithEvent(    long procId,    TableName tableName,    TableOperationType opType){
+      super(procId,tableName,opType);
+      event=new ProcedureEvent<>(tableName + " procId=" + procId);
+    }
+    public ProcedureEvent<?> getEvent(){
+      return event;
+    }
+  }
+public static class TestRegionProcedure extends TestTableProcedure {
+    private final RegionInfo[] regionInfo;
+    public TestRegionProcedure(){
+      throw new UnsupportedOperationException("recovery should not be triggered here");
+    }
+    public TestRegionProcedure(    long procId,    TableName tableName,    TableOperationType opType,    RegionInfo... regionInfo){
+      this(-1,procId,tableName,opType,regionInfo);
+    }
+    public TestRegionProcedure(    long parentProcId,    long procId,    TableName tableName,    TableOperationType opType,    RegionInfo... regionInfo){
+      this(-1,parentProcId,procId,tableName,opType,regionInfo);
+    }
+    public TestRegionProcedure(    long rootProcId,    long parentProcId,    long procId,    TableName tableName,    TableOperationType opType,    RegionInfo... regionInfo){
+      super(rootProcId,parentProcId,procId,tableName,opType);
+      this.regionInfo=regionInfo;
+    }
+    public RegionInfo[] getRegionInfo(){
+      return regionInfo;
+    }
+    @Override public void toStringClassDetails(    final StringBuilder sb){
+      sb.append(getClass().getSimpleName());
+      sb.append("(regions=");
+      sb.append(Arrays.toString(getRegionInfo()));
+      sb.append(")");
+    }
+  }
+public static class TestNamespaceProcedure extends TestProcedure implements TableProcedureInterface {
+    private final TableOperationType opType;
+    private final String nsName;
+    public TestNamespaceProcedure(){
+      throw new UnsupportedOperationException("recovery should not be triggered here");
+    }
+    public TestNamespaceProcedure(    long procId,    String nsName,    TableOperationType opType){
+      super(procId);
+      this.nsName=nsName;
+      this.opType=opType;
+    }
+    @Override public TableName getTableName(){
+      return TableName.NAMESPACE_TABLE_NAME;
+    }
+    @Override public TableOperationType getTableOperationType(){
+      return opType;
+    }
+    @Override public void toStringClassDetails(    final StringBuilder sb){
+      sb.append(getClass().getSimpleName());
+      sb.append("(ns=");
+      sb.append(nsName);
+      sb.append(")");
+    }
+  }
+public static class TestPeerProcedure extends TestProcedure implements PeerProcedureInterface {
+    private final String peerId;
+    private final PeerOperationType opType;
+    public TestPeerProcedure(    long procId,    String peerId,    PeerOperationType opType){
+      super(procId);
+      this.peerId=peerId;
+      this.opType=opType;
+    }
+    @Override public String getPeerId(){
+      return peerId;
+    }
+    @Override public PeerOperationType getPeerOperationType(){
+      return opType;
+    }
+  }
+  private static LockProcedure createLockProcedure(  LockType lockType,  long procId) throws Exception {
+    LockProcedure procedure=new LockProcedure();
+    Field typeField=LockProcedure.class.getDeclaredField("type");
+    typeField.setAccessible(true);
+    typeField.set(procedure,lockType);
+    Method setProcIdMethod=Procedure.class.getDeclaredMethod("setProcId",long.class);
+    setProcIdMethod.setAccessible(true);
+    setProcIdMethod.invoke(procedure,procId);
+    return procedure;
+  }
+  private static LockProcedure createExclusiveLockProcedure(  long procId) throws Exception {
+    return createLockProcedure(LockType.EXCLUSIVE,procId);
+  }
+  private static LockProcedure createSharedLockProcedure(  long procId) throws Exception {
+    return createLockProcedure(LockType.SHARED,procId);
+  }
+  private static void assertLockResource(  LockedResource resource,  LockedResourceType resourceType,  String resourceName){
+    assertEquals(resourceType,resource.getResourceType());
+    assertEquals(resourceName,resource.getResourceName());
+  }
+  private static void assertExclusiveLock(  LockedResource resource,  Procedure<?> procedure){
+    assertEquals(LockType.EXCLUSIVE,resource.getLockType());
+    assertEquals(procedure,resource.getExclusiveLockOwnerProcedure());
+    assertEquals(0,resource.getSharedLockCount());
+  }
+  private static void assertSharedLock(  LockedResource resource,  int lockCount){
+    assertEquals(LockType.SHARED,resource.getLockType());
+    assertEquals(lockCount,resource.getSharedLockCount());
+  }
+  @Test public void testListLocksServer() throws Exception {
+    LockProcedure procedure=createExclusiveLockProcedure(0);
+    queue.waitServerExclusiveLock(procedure,ServerName.valueOf("server1,1234,0"));
+    List<LockedResource> resources=queue.getLocks();
+    assertEquals(1,resources.size());
+    LockedResource serverResource=resources.get(0);
+    assertLockResource(serverResource,LockedResourceType.SERVER,"server1,1234,0");
+    assertExclusiveLock(serverResource,procedure);
+    assertTrue(serverResource.getWaitingProcedures().isEmpty());
+  }
+  @Test public void testListLocksNamespace() throws Exception {
+    LockProcedure procedure=createExclusiveLockProcedure(1);
+    queue.waitNamespaceExclusiveLock(procedure,"ns1");
+    List<LockedResource> locks=queue.getLocks();
+    assertEquals(2,locks.size());
+    LockedResource namespaceResource=locks.get(0);
+    assertLockResource(namespaceResource,LockedResourceType.NAMESPACE,"ns1");
+    assertExclusiveLock(namespaceResource,procedure);
+    assertTrue(namespaceResource.getWaitingProcedures().isEmpty());
+    LockedResource tableResource=locks.get(1);
+    assertLockResource(tableResource,LockedResourceType.TABLE,TableName.NAMESPACE_TABLE_NAME.getNameAsString());
+    assertSharedLock(tableResource,1);
+    assertTrue(tableResource.getWaitingProcedures().isEmpty());
+  }
+  @Test public void testListLocksTable() throws Exception {
+    LockProcedure procedure=createExclusiveLockProcedure(2);
+    queue.waitTableExclusiveLock(procedure,TableName.valueOf("ns2","table2"));
+    List<LockedResource> locks=queue.getLocks();
+    assertEquals(2,locks.size());
+    LockedResource namespaceResource=locks.get(0);
+    assertLockResource(namespaceResource,LockedResourceType.NAMESPACE,"ns2");
+    assertSharedLock(namespaceResource,1);
+    assertTrue(namespaceResource.getWaitingProcedures().isEmpty());
+    LockedResource tableResource=locks.get(1);
+    assertLockResource(tableResource,LockedResourceType.TABLE,"ns2:table2");
+    assertExclusiveLock(tableResource,procedure);
+    assertTrue(tableResource.getWaitingProcedures().isEmpty());
+  }
+  @Test public void testListLocksRegion() throws Exception {
+    LockProcedure procedure=createExclusiveLockProcedure(3);
+    RegionInfo regionInfo=RegionInfoBuilder.newBuilder(TableName.valueOf("ns3","table3")).build();
+    queue.waitRegion(procedure,regionInfo);
+    List<LockedResource> resources=queue.getLocks();
+    assertEquals(3,resources.size());
+    LockedResource namespaceResource=resources.get(0);
+    assertLockResource(namespaceResource,LockedResourceType.NAMESPACE,"ns3");
+    assertSharedLock(namespaceResource,1);
+    assertTrue(namespaceResource.getWaitingProcedures().isEmpty());
+    LockedResource tableResource=resources.get(1);
+    assertLockResource(tableResource,LockedResourceType.TABLE,"ns3:table3");
+    assertSharedLock(tableResource,1);
+    assertTrue(tableResource.getWaitingProcedures().isEmpty());
+    LockedResource regionResource=resources.get(2);
+    assertLockResource(regionResource,LockedResourceType.REGION,regionInfo.getEncodedName());
+    assertExclusiveLock(regionResource,procedure);
+    assertTrue(regionResource.getWaitingProcedures().isEmpty());
+  }
+  @Test public void testListLocksPeer() throws Exception {
+    String peerId="1";
+    LockProcedure procedure=createExclusiveLockProcedure(4);
+    queue.waitPeerExclusiveLock(procedure,peerId);
+    List<LockedResource> locks=queue.getLocks();
+    assertEquals(1,locks.size());
+    LockedResource resource=locks.get(0);
+    assertLockResource(resource,LockedResourceType.PEER,peerId);
+    assertExclusiveLock(resource,procedure);
+    assertTrue(resource.getWaitingProcedures().isEmpty());
+    assertFalse(queue.waitPeerExclusiveLock(procedure,peerId));
+    LockProcedure procedure2=createExclusiveLockProcedure(5);
+    assertTrue(queue.waitPeerExclusiveLock(procedure2,peerId));
+    locks=queue.getLocks();
+    assertEquals(1,locks.size());
+    resource=locks.get(0);
+    assertLockResource(resource,LockedResourceType.PEER,peerId);
+    assertExclusiveLock(resource,procedure);
+    assertEquals(1,resource.getWaitingProcedures().size());
+  }
+  @Test public void testListLocksWaiting() throws Exception {
+    LockProcedure procedure1=createExclusiveLockProcedure(1);
+    queue.waitTableExclusiveLock(procedure1,TableName.valueOf("ns4","table4"));
+    LockProcedure procedure2=createSharedLockProcedure(2);
+    queue.waitTableSharedLock(procedure2,TableName.valueOf("ns4","table4"));
+    LockProcedure procedure3=createExclusiveLockProcedure(3);
+    queue.waitTableExclusiveLock(procedure3,TableName.valueOf("ns4","table4"));
+    List<LockedResource> resources=queue.getLocks();
+    assertEquals(2,resources.size());
+    LockedResource namespaceResource=resources.get(0);
+    assertLockResource(namespaceResource,LockedResourceType.NAMESPACE,"ns4");
+    assertSharedLock(namespaceResource,1);
+    assertTrue(namespaceResource.getWaitingProcedures().isEmpty());
+    LockedResource tableLock=resources.get(1);
+    assertLockResource(tableLock,LockedResourceType.TABLE,"ns4:table4");
+    assertExclusiveLock(tableLock,procedure1);
+    List<Procedure<?>> waitingProcedures=tableLock.getWaitingProcedures();
+    assertEquals(2,waitingProcedures.size());
+    LockProcedure waitingProcedure2=(LockProcedure)waitingProcedures.get(0);
+    assertEquals(LockType.SHARED,waitingProcedure2.getType());
+    assertEquals(procedure2,waitingProcedure2);
+    LockProcedure waitingProcedure3=(LockProcedure)waitingProcedures.get(1);
+    assertEquals(LockType.EXCLUSIVE,waitingProcedure3.getType());
+    assertEquals(procedure3,waitingProcedure3);
+  }
+  @Test public void testAcquireSharedLockWhileParentHoldingExclusiveLock(){
+    TableName tableName=TableName.valueOf(name.getMethodName());
+    RegionInfo regionInfo=RegionInfoBuilder.newBuilder(tableName).build();
+    TestTableProcedure parentProc=new TestTableProcedure(1,tableName,TableOperationType.EDIT);
+    TestRegionProcedure proc=new TestRegionProcedure(1,2,tableName,TableOperationType.REGION_EDIT,regionInfo);
+    queue.addBack(parentProc);
+    assertSame(parentProc,queue.poll());
+    assertFalse(queue.waitTableExclusiveLock(parentProc,tableName));
+    queue.addFront(proc);
+    assertSame(proc,queue.poll());
+    assertFalse(queue.waitRegion(proc,regionInfo));
+    queue.wakeRegion(proc,regionInfo);
+    queue.wakeTableExclusiveLock(parentProc,tableName);
+  }
+}

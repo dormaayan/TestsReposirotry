@@ -1,0 +1,40 @@
+/** 
+ * Tests request back off configuration is correctly forwarded to the channels.
+ */
+@Test public void testRequestBackoffConfiguration() throws Exception {
+  ResultPartitionID[] partitionIds=new ResultPartitionID[]{new ResultPartitionID(),new ResultPartitionID(),new ResultPartitionID()};
+  InputChannelDeploymentDescriptor[] channelDescs=new InputChannelDeploymentDescriptor[]{new InputChannelDeploymentDescriptor(partitionIds[0],ResultPartitionLocation.createLocal()),new InputChannelDeploymentDescriptor(partitionIds[1],ResultPartitionLocation.createRemote(new ConnectionID(new InetSocketAddress("localhost",5000),0))),new InputChannelDeploymentDescriptor(partitionIds[2],ResultPartitionLocation.createUnknown())};
+  InputGateDeploymentDescriptor gateDesc=new InputGateDeploymentDescriptor(new IntermediateDataSetID(),ResultPartitionType.PIPELINED,0,channelDescs);
+  int initialBackoff=137;
+  int maxBackoff=1001;
+  final NetworkEnvironment netEnv=new NetworkEnvironment(100,32,initialBackoff,maxBackoff,2,8,enableCreditBasedFlowControl);
+  SingleInputGate gate=SingleInputGate.create("TestTask",new JobID(),new ExecutionAttemptID(),gateDesc,netEnv,mock(TaskActions.class),UnregisteredMetricGroups.createUnregisteredTaskMetricGroup().getIOMetricGroup());
+  try {
+    assertEquals(gateDesc.getConsumedPartitionType(),gate.getConsumedPartitionType());
+    Map<IntermediateResultPartitionID,InputChannel> channelMap=gate.getInputChannels();
+    assertEquals(3,channelMap.size());
+    InputChannel localChannel=channelMap.get(partitionIds[0].getPartitionId());
+    assertEquals(LocalInputChannel.class,localChannel.getClass());
+    InputChannel remoteChannel=channelMap.get(partitionIds[1].getPartitionId());
+    assertEquals(RemoteInputChannel.class,remoteChannel.getClass());
+    InputChannel unknownChannel=channelMap.get(partitionIds[2].getPartitionId());
+    assertEquals(UnknownInputChannel.class,unknownChannel.getClass());
+    InputChannel[] channels=new InputChannel[]{localChannel,remoteChannel,unknownChannel};
+    for (    InputChannel ch : channels) {
+      assertEquals(0,ch.getCurrentBackoff());
+      assertTrue(ch.increaseBackoff());
+      assertEquals(initialBackoff,ch.getCurrentBackoff());
+      assertTrue(ch.increaseBackoff());
+      assertEquals(initialBackoff * 2,ch.getCurrentBackoff());
+      assertTrue(ch.increaseBackoff());
+      assertEquals(initialBackoff * 2 * 2,ch.getCurrentBackoff());
+      assertTrue(ch.increaseBackoff());
+      assertEquals(maxBackoff,ch.getCurrentBackoff());
+      assertFalse(ch.increaseBackoff());
+    }
+  }
+  finally {
+    gate.releaseAllResources();
+    netEnv.shutdown();
+  }
+}

@@ -1,0 +1,83 @@
+/** 
+ * @version 
+ */
+public class ManagedFileIdempotentConsumerTest extends ManagementTestSupport {
+  protected Endpoint startEndpoint;
+  protected MockEndpoint resultEndpoint;
+  private File store=new File("target/idempotentfilestore.dat");
+  private IdempotentRepository<String> repo;
+  @Test public void testDuplicateMessagesAreFilteredOut() throws Exception {
+    if (isPlatform("aix")) {
+      return;
+    }
+    MBeanServer mbeanServer=getMBeanServer();
+    Set<ObjectName> names=mbeanServer.queryNames(new ObjectName("org.apache.camel" + ":type=services,*"),null);
+    ObjectName on=null;
+    for (    ObjectName name : names) {
+      if (name.toString().contains("FileIdempotentRepository")) {
+        on=name;
+        break;
+      }
+    }
+    assertTrue("Should be registered",mbeanServer.isRegistered(on));
+    String path=(String)mbeanServer.getAttribute(on,"FilePath");
+    assertEquals(FileUtil.normalizePath("target/idempotentfilestore.dat"),FileUtil.normalizePath(path));
+    Integer size=(Integer)mbeanServer.getAttribute(on,"CacheSize");
+    assertEquals(1,size.intValue());
+    assertFalse(repo.contains("1"));
+    assertFalse(repo.contains("2"));
+    assertFalse(repo.contains("3"));
+    assertTrue(repo.contains("4"));
+    resultEndpoint.expectedBodiesReceived("one","two","three");
+    sendMessage("1","one");
+    sendMessage("2","two");
+    sendMessage("1","one");
+    sendMessage("2","two");
+    sendMessage("4","four");
+    sendMessage("1","one");
+    sendMessage("3","three");
+    resultEndpoint.assertIsSatisfied();
+    assertTrue(repo.contains("1"));
+    assertTrue(repo.contains("2"));
+    assertTrue(repo.contains("3"));
+    assertTrue(repo.contains("4"));
+    size=(Integer)mbeanServer.getAttribute(on,"CacheSize");
+    assertEquals(4,size.intValue());
+    mbeanServer.invoke(on,"remove",new Object[]{"1"},new String[]{"java.lang.String"});
+    mbeanServer.invoke(on,"reset",null,null);
+    size=(Integer)mbeanServer.getAttribute(on,"CacheSize");
+    assertEquals(3,size.intValue());
+    assertFalse(repo.contains("1"));
+    assertTrue(repo.contains("2"));
+    assertTrue(repo.contains("3"));
+    assertTrue(repo.contains("4"));
+  }
+  protected void sendMessage(  final Object messageId,  final Object body){
+    template.send(startEndpoint,new Processor(){
+      public void process(      Exchange exchange){
+        Message in=exchange.getIn();
+        in.setBody(body);
+        in.setHeader("messageId",messageId);
+      }
+    }
+);
+  }
+  @Override @Before public void setUp() throws Exception {
+    if (store.exists()) {
+      store.delete();
+    }
+    repo=FileIdempotentRepository.fileIdempotentRepository(store);
+    repo.add("4");
+    super.setUp();
+    startEndpoint=resolveMandatoryEndpoint("direct:start");
+    resultEndpoint=getMockEndpoint("mock:result");
+  }
+  protected RouteBuilder createRouteBuilder(){
+    return new RouteBuilder(){
+      public void configure(){
+        from("direct:start").idempotentConsumer(header("messageId"),repo).to("mock:result");
+      }
+    }
+;
+  }
+}

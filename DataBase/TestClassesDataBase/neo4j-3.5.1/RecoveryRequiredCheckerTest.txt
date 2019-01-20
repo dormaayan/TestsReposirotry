@@ -1,0 +1,86 @@
+public class RecoveryRequiredCheckerTest {
+  private final EphemeralFileSystemRule fileSystemRule=new EphemeralFileSystemRule();
+  private final PageCacheRule pageCacheRule=new PageCacheRule();
+  private final TestDirectory testDirectory=TestDirectory.testDirectory(fileSystemRule.get());
+  @Rule public RuleChain ruleChain=RuleChain.outerRule(pageCacheRule).around(fileSystemRule).around(testDirectory);
+  private final Monitors monitors=new Monitors();
+  private EphemeralFileSystemAbstraction fileSystem;
+  private File storeDir;
+  private DatabaseLayout databaseLayout;
+  @Before public void setup(){
+    databaseLayout=testDirectory.databaseLayout();
+    storeDir=databaseLayout.databaseDirectory();
+    fileSystem=fileSystemRule.get();
+    new TestGraphDatabaseFactory().setFileSystem(fileSystem).newImpermanentDatabase(storeDir).shutdown();
+  }
+  @Test public void shouldNotWantToRecoverIntactStore() throws Exception {
+    PageCache pageCache=pageCacheRule.getPageCache(fileSystem);
+    RecoveryRequiredChecker recoverer=getRecoveryCheckerWithDefaultConfig(fileSystem,pageCache);
+    assertThat(recoverer.isRecoveryRequiredAt(databaseLayout),is(false));
+  }
+  @Test public void shouldNotThrowIfIntactStore() throws RecoveryRequiredException, IOException {
+    PageCache pageCache=pageCacheRule.getPageCache(fileSystem);
+    RecoveryRequiredChecker.assertRecoveryIsNotRequired(fileSystem,pageCache,Config.defaults(),databaseLayout,new Monitors());
+  }
+  @Test public void shouldWantToRecoverBrokenStore() throws Exception {
+    try (FileSystemAbstraction fileSystemAbstraction=createAndCrashWithDefaultConfig()){
+      PageCache pageCache=pageCacheRule.getPageCache(fileSystemAbstraction);
+      RecoveryRequiredChecker recoverer=getRecoveryCheckerWithDefaultConfig(fileSystemAbstraction,pageCache);
+      assertThat(recoverer.isRecoveryRequiredAt(databaseLayout),is(true));
+    }
+   }
+  @Test(expected=RecoveryRequiredException.class) public void shouldThrowIfBrokenStore() throws IOException, RecoveryRequiredException {
+    try (FileSystemAbstraction fileSystemAbstraction=createAndCrashWithDefaultConfig()){
+      PageCache pageCache=pageCacheRule.getPageCache(fileSystemAbstraction);
+      RecoveryRequiredChecker.assertRecoveryIsNotRequired(fileSystemAbstraction,pageCache,Config.defaults(),databaseLayout,new Monitors());
+      fail();
+    }
+   }
+  @Test public void shouldBeAbleToRecoverBrokenStore() throws Exception {
+    try (FileSystemAbstraction fileSystemAbstraction=createAndCrashWithDefaultConfig()){
+      PageCache pageCache=pageCacheRule.getPageCache(fileSystemAbstraction);
+      RecoveryRequiredChecker recoverer=getRecoveryCheckerWithDefaultConfig(fileSystemAbstraction,pageCache);
+      assertThat(recoverer.isRecoveryRequiredAt(databaseLayout),is(true));
+      new TestGraphDatabaseFactory().setFileSystem(fileSystemAbstraction).newImpermanentDatabase(storeDir).shutdown();
+      assertThat(recoverer.isRecoveryRequiredAt(databaseLayout),is(false));
+    }
+   }
+  @Test public void shouldBeAbleToRecoverBrokenStoreWithLogsInSeparateRelativeLocation() throws Exception {
+    File customTransactionLogsLocation=new File(storeDir,"tx-logs");
+    Config config=Config.defaults(logical_logs_location,customTransactionLogsLocation.getName());
+    recoverBrokenStoreWithConfig(config);
+  }
+  @Test public void shouldBeAbleToRecoverBrokenStoreWithLogsInSeparateAbsoluteLocation() throws Exception {
+    File customTransactionLogsLocation=testDirectory.directory("tx-logs");
+    Config config=Config.defaults(logical_logs_location,customTransactionLogsLocation.getAbsolutePath());
+    recoverBrokenStoreWithConfig(config);
+  }
+  private void recoverBrokenStoreWithConfig(  Config config) throws IOException {
+    try (FileSystemAbstraction fileSystemAbstraction=createSomeDataAndCrash(storeDir,fileSystem,config)){
+      PageCache pageCache=pageCacheRule.getPageCache(fileSystemAbstraction);
+      RecoveryRequiredChecker recoverer=getRecoveryChecker(fileSystemAbstraction,pageCache,config);
+      assertThat(recoverer.isRecoveryRequiredAt(databaseLayout),is(true));
+      new TestGraphDatabaseFactory().setFileSystem(fileSystemAbstraction).newEmbeddedDatabaseBuilder(storeDir).setConfig(config.getRaw()).newGraphDatabase().shutdown();
+      assertThat(recoverer.isRecoveryRequiredAt(databaseLayout),is(false));
+    }
+   }
+  private FileSystemAbstraction createAndCrashWithDefaultConfig(){
+    return createSomeDataAndCrash(storeDir,fileSystem,Config.defaults());
+  }
+  private RecoveryRequiredChecker getRecoveryCheckerWithDefaultConfig(  FileSystemAbstraction fileSystem,  PageCache pageCache){
+    return getRecoveryChecker(fileSystem,pageCache,Config.defaults());
+  }
+  private RecoveryRequiredChecker getRecoveryChecker(  FileSystemAbstraction fileSystem,  PageCache pageCache,  Config config){
+    return new RecoveryRequiredChecker(fileSystem,pageCache,config,monitors);
+  }
+  private static FileSystemAbstraction createSomeDataAndCrash(  File store,  EphemeralFileSystemAbstraction fileSystem,  Config config){
+    final GraphDatabaseService db=new TestGraphDatabaseFactory().setFileSystem(fileSystem).newImpermanentDatabaseBuilder(store).setConfig(config.getRaw()).newGraphDatabase();
+    try (Transaction tx=db.beginTx()){
+      db.createNode();
+      tx.success();
+    }
+     EphemeralFileSystemAbstraction snapshot=fileSystem.snapshot();
+    db.shutdown();
+    return snapshot;
+  }
+}

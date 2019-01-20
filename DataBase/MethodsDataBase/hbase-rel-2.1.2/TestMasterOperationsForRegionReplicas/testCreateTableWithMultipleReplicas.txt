@@ -1,0 +1,94 @@
+@Test public void testCreateTableWithMultipleReplicas() throws Exception {
+  final TableName tableName=TableName.valueOf(name.getMethodName());
+  final int numRegions=3;
+  final int numReplica=2;
+  try {
+    HTableDescriptor desc=new HTableDescriptor(tableName);
+    desc.setRegionReplication(numReplica);
+    desc.addFamily(new HColumnDescriptor("family"));
+    ADMIN.createTable(desc,Bytes.toBytes("A"),Bytes.toBytes("Z"),numRegions);
+    TEST_UTIL.waitTableEnabled(tableName);
+    validateNumberOfRowsInMeta(tableName,numRegions,ADMIN.getConnection());
+    List<RegionInfo> hris=MetaTableAccessor.getTableRegions(ADMIN.getConnection(),tableName);
+    assert (hris.size() == numRegions * numReplica);
+    for (int i=0; i < numRegions; i++) {
+      for (int j=0; j < numReplica; j++) {
+        RegionInfo replica=RegionReplicaUtil.getRegionInfoForReplica(hris.get(i),j);
+        RegionState state=TEST_UTIL.getHBaseCluster().getMaster().getAssignmentManager().getRegionStates().getRegionState(replica);
+        assert (state != null);
+      }
+    }
+    List<Result> metaRows=MetaTableAccessor.fullScanRegions(ADMIN.getConnection());
+    int numRows=0;
+    for (    Result result : metaRows) {
+      RegionLocations locations=MetaTableAccessor.getRegionLocations(result);
+      RegionInfo hri=locations.getRegionLocation().getRegionInfo();
+      if (!hri.getTable().equals(tableName))       continue;
+      numRows+=1;
+      HRegionLocation[] servers=locations.getRegionLocations();
+      assert (servers.length == 2);
+      assert (!servers[0].equals(servers[1]));
+    }
+    assert (numRows == numRegions);
+    validateFromSnapshotFromMeta(TEST_UTIL,tableName,numRegions,numReplica,ADMIN.getConnection());
+    ServerName master=TEST_UTIL.getHBaseClusterInterface().getClusterMetrics().getMasterName();
+    TEST_UTIL.getHBaseClusterInterface().stopMaster(master);
+    TEST_UTIL.getHBaseClusterInterface().waitForMasterToStop(master,30000);
+    TEST_UTIL.getHBaseClusterInterface().startMaster(master.getHostname(),master.getPort());
+    TEST_UTIL.getHBaseClusterInterface().waitForActiveAndReadyMaster();
+    for (int i=0; i < numRegions; i++) {
+      for (int j=0; j < numReplica; j++) {
+        RegionInfo replica=RegionReplicaUtil.getRegionInfoForReplica(hris.get(i),j);
+        RegionState state=TEST_UTIL.getHBaseCluster().getMaster().getAssignmentManager().getRegionStates().getRegionState(replica);
+        assert (state != null);
+      }
+    }
+    validateFromSnapshotFromMeta(TEST_UTIL,tableName,numRegions,numReplica,ADMIN.getConnection());
+    List<Integer> rsports=new ArrayList<>();
+    for (    JVMClusterUtil.RegionServerThread rst : TEST_UTIL.getHBaseCluster().getLiveRegionServerThreads()) {
+      rsports.add(rst.getRegionServer().getRpcServer().getListenerAddress().getPort());
+    }
+    TEST_UTIL.shutdownMiniHBaseCluster();
+    TEST_UTIL.startMiniHBaseCluster(1,numSlaves,rsports);
+    TEST_UTIL.waitTableEnabled(tableName);
+    validateFromSnapshotFromMeta(TEST_UTIL,tableName,numRegions,numReplica,ADMIN.getConnection());
+    TEST_UTIL.shutdownMiniHBaseCluster();
+    TEST_UTIL.startMiniHBaseCluster(1,1);
+    TEST_UTIL.waitTableEnabled(tableName);
+    validateSingleRegionServerAssignment(ADMIN.getConnection(),numRegions,numReplica);
+    for (int i=1; i < numSlaves; i++) {
+      TEST_UTIL.getMiniHBaseCluster().startRegionServer();
+    }
+    ADMIN.disableTable(tableName);
+    assert (ADMIN.isTableDisabled(tableName));
+    desc.setRegionReplication(numReplica + 1);
+    ADMIN.modifyTable(tableName,desc);
+    ADMIN.enableTable(tableName);
+    LOG.info(ADMIN.getTableDescriptor(tableName).toString());
+    assert (ADMIN.isTableEnabled(tableName));
+    List<RegionInfo> regions=TEST_UTIL.getMiniHBaseCluster().getMaster().getAssignmentManager().getRegionStates().getRegionsOfTable(tableName);
+    assertTrue("regions.size=" + regions.size() + ", numRegions="+ numRegions+ ", numReplica="+ numReplica,regions.size() == numRegions * (numReplica + 1));
+    ADMIN.disableTable(tableName);
+    desc.setRegionReplication(numReplica);
+    ADMIN.modifyTable(tableName,desc);
+    ADMIN.enableTable(tableName);
+    assert (ADMIN.isTableEnabled(tableName));
+    regions=TEST_UTIL.getMiniHBaseCluster().getMaster().getAssignmentManager().getRegionStates().getRegionsOfTable(tableName);
+    assert (regions.size() == numRegions * numReplica);
+    hris=MetaTableAccessor.getTableRegions(ADMIN.getConnection(),tableName);
+    assert (hris.size() == numRegions * numReplica);
+    Map<RegionInfo,Integer> defaultReplicas=new HashMap<>();
+    for (    RegionInfo hri : hris) {
+      Integer i;
+      RegionInfo regionReplica0=RegionReplicaUtil.getRegionInfoForDefaultReplica(hri);
+      defaultReplicas.put(regionReplica0,(i=defaultReplicas.get(regionReplica0)) == null ? 1 : i + 1);
+    }
+    assert (defaultReplicas.size() == numRegions);
+    Collection<Integer> counts=new HashSet<>(defaultReplicas.values());
+    assert (counts.size() == 1 && counts.contains(numReplica));
+  }
+  finally {
+    ADMIN.disableTable(tableName);
+    ADMIN.deleteTable(tableName);
+  }
+}

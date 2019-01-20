@@ -1,0 +1,125 @@
+@Category({MasterTests.class,LargeTests.class}) @Ignore public class TestMasterProcedureWalLease {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestMasterProcedureWalLease.class);
+  private static final Logger LOG=LoggerFactory.getLogger(TestMasterProcedureWalLease.class);
+  @Rule public TestName name=new TestName();
+  protected static final HBaseTestingUtility UTIL=new HBaseTestingUtility();
+  private static void setupConf(  Configuration conf){
+    conf.setInt(WALProcedureStore.MAX_RETRIES_BEFORE_ROLL_CONF_KEY,1);
+    conf.setInt(WALProcedureStore.WAIT_BEFORE_ROLL_CONF_KEY,0);
+    conf.setInt(WALProcedureStore.ROLL_RETRIES_CONF_KEY,1);
+    conf.setInt(WALProcedureStore.MAX_SYNC_FAILURE_ROLL_CONF_KEY,1);
+  }
+  @Before public void setup() throws Exception {
+    setupConf(UTIL.getConfiguration());
+    UTIL.startMiniCluster(2,3);
+  }
+  @After public void tearDown() throws Exception {
+    try {
+      UTIL.shutdownMiniCluster();
+    }
+ catch (    Exception e) {
+      LOG.warn("failure shutting down cluster",e);
+    }
+  }
+  @Test public void testWalRecoverLease() throws Exception {
+    final ProcedureStore masterStore=getMasterProcedureExecutor().getStore();
+    assertTrue("expected WALStore for this test",masterStore instanceof WALProcedureStore);
+    HMaster firstMaster=UTIL.getHBaseCluster().getMaster();
+    final CountDownLatch masterStoreAbort=new CountDownLatch(1);
+    masterStore.registerListener(new ProcedureStore.ProcedureStoreListener(){
+      @Override public void postSync(){
+      }
+      @Override public void abortProcess(){
+        LOG.debug("Abort store of Master");
+        masterStoreAbort.countDown();
+      }
+    }
+);
+    HMaster backupMaster3=Mockito.mock(HMaster.class);
+    Mockito.doReturn(firstMaster.getConfiguration()).when(backupMaster3).getConfiguration();
+    Mockito.doReturn(true).when(backupMaster3).isActiveMaster();
+    final WALProcedureStore backupStore3=new WALProcedureStore(firstMaster.getConfiguration(),((WALProcedureStore)masterStore).getWALDir(),null,new MasterProcedureEnv.WALStoreLeaseRecovery(backupMaster3));
+    final CountDownLatch backupStore3Abort=new CountDownLatch(1);
+    backupStore3.registerListener(new ProcedureStore.ProcedureStoreListener(){
+      @Override public void postSync(){
+      }
+      @Override public void abortProcess(){
+        LOG.debug("Abort store of backupMaster3");
+        backupStore3Abort.countDown();
+        backupStore3.stop(true);
+      }
+    }
+);
+    backupStore3.start(1);
+    backupStore3.recoverLease();
+    TableDescriptor htd=MasterProcedureTestingUtility.createHTD(TableName.valueOf(name.getMethodName()),"f");
+    RegionInfo[] regions=ModifyRegionUtils.createRegionInfos(htd,null);
+    LOG.debug("submit proc");
+    try {
+      getMasterProcedureExecutor().submitProcedure(new CreateTableProcedure(getMasterProcedureExecutor().getEnvironment(),htd,regions));
+      fail("expected RuntimeException 'sync aborted'");
+    }
+ catch (    RuntimeException e) {
+      LOG.info("got " + e.getMessage());
+    }
+    LOG.debug("wait master store abort");
+    masterStoreAbort.await();
+    LOG.debug("wait backup master to startup");
+    MasterProcedureTestingUtility.waitBackupMaster(UTIL,firstMaster);
+    assertEquals(true,firstMaster.isStopped());
+    LOG.debug("wait the store to abort");
+    backupStore3.getStoreTracker().setDeleted(1,false);
+    try {
+      backupStore3.delete(1);
+      fail("expected RuntimeException 'sync aborted'");
+    }
+ catch (    RuntimeException e) {
+      LOG.info("got " + e.getMessage());
+    }
+    backupStore3Abort.await();
+  }
+  /** 
+ * Tests proper fencing in case the current WAL store is fenced
+ */
+  @Test public void testWALfencingWithoutWALRolling() throws IOException {
+    testWALfencing(false);
+  }
+  /** 
+ * Tests proper fencing in case the current WAL store does not receive writes until after the new WAL does a couple of WAL rolls.
+ */
+  @Test public void testWALfencingWithWALRolling() throws IOException {
+    testWALfencing(true);
+  }
+  public void testWALfencing(  boolean walRolls) throws IOException {
+    final ProcedureStore procStore=getMasterProcedureExecutor().getStore();
+    assertTrue("expected WALStore for this test",procStore instanceof WALProcedureStore);
+    HMaster firstMaster=UTIL.getHBaseCluster().getMaster();
+    firstMaster.getConfiguration().setLong(WALProcedureStore.ROLL_THRESHOLD_CONF_KEY,1);
+    HMaster backupMaster3=Mockito.mock(HMaster.class);
+    Mockito.doReturn(firstMaster.getConfiguration()).when(backupMaster3).getConfiguration();
+    Mockito.doReturn(true).when(backupMaster3).isActiveMaster();
+    final WALProcedureStore procStore2=new WALProcedureStore(firstMaster.getConfiguration(),((WALProcedureStore)procStore).getWALDir(),null,new MasterProcedureEnv.WALStoreLeaseRecovery(backupMaster3));
+    LOG.info("Starting new WALProcedureStore");
+    procStore2.start(1);
+    procStore2.recoverLease();
+    if (walRolls) {
+      LOG.info("Inserting into second WALProcedureStore, causing WAL rolls");
+      for (int i=0; i < 512; i++) {
+        Procedure proc2=new TestProcedure(i);
+        procStore2.insert(proc2,null);
+        procStore2.delete(proc2.getProcId());
+      }
+    }
+    LOG.info("Inserting into first WALProcedureStore");
+    try {
+      procStore.insert(new TestProcedure(11),null);
+      fail("Inserting into Procedure Store should have failed");
+    }
+ catch (    Exception ex) {
+      LOG.info("Received expected exception",ex);
+    }
+  }
+  private ProcedureExecutor<MasterProcedureEnv> getMasterProcedureExecutor(){
+    return UTIL.getHBaseCluster().getMaster().getMasterProcedureExecutor();
+  }
+}

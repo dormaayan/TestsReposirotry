@@ -1,0 +1,41 @@
+/** 
+ * Tests simple folding state queryable state instance. Each source emits (subtaskIndex, 0)..(subtaskIndex, numElements) tuples, which are then queried. The folding state sums these up and maps them to Strings. The test succeeds after each subtask index is queried with result n*(n+1)/2 (as a String).
+ */
+@Test public void testFoldingState() throws Exception {
+  final Deadline deadline=Deadline.now().plus(TEST_TIMEOUT);
+  final int numElements=1024;
+  StreamExecutionEnvironment env=StreamExecutionEnvironment.getExecutionEnvironment();
+  env.setStateBackend(stateBackend);
+  env.setParallelism(maxParallelism);
+  env.setRestartStrategy(RestartStrategies.fixedDelayRestart(Integer.MAX_VALUE,1000L));
+  DataStream<Tuple2<Integer,Long>> source=env.addSource(new TestAscendingValueSource(numElements));
+  FoldingStateDescriptor<Tuple2<Integer,Long>,String> foldingState=new FoldingStateDescriptor<>("any","0",new SumFold(),StringSerializer.INSTANCE);
+  source.keyBy(new KeySelector<Tuple2<Integer,Long>,Integer>(){
+    private static final long serialVersionUID=-842809958106747539L;
+    @Override public Integer getKey(    Tuple2<Integer,Long> value){
+      return value.f0;
+    }
+  }
+).asQueryableState("pumba",foldingState);
+  try (AutoCancellableJob autoCancellableJob=new AutoCancellableJob(deadline,clusterClient,env)){
+    final JobID jobId=autoCancellableJob.getJobId();
+    final JobGraph jobGraph=autoCancellableJob.getJobGraph();
+    clusterClient.setDetached(true);
+    clusterClient.submitJob(jobGraph,AbstractQueryableStateTestBase.class.getClassLoader());
+    final String expected=Integer.toString(numElements * (numElements + 1) / 2);
+    for (int key=0; key < maxParallelism; key++) {
+      boolean success=false;
+      while (deadline.hasTimeLeft() && !success) {
+        CompletableFuture<FoldingState<Tuple2<Integer,Long>,String>> future=getKvState(deadline,client,jobId,"pumba",key,BasicTypeInfo.INT_TYPE_INFO,foldingState,false,executor);
+        String value=future.get(deadline.timeLeft().toMillis(),TimeUnit.MILLISECONDS).get();
+        if (expected.equals(value)) {
+          success=true;
+        }
+ else {
+          Thread.sleep(RETRY_TIMEOUT);
+        }
+      }
+      assertTrue("Did not succeed query",success);
+    }
+  }
+ }

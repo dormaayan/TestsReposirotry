@@ -1,0 +1,159 @@
+public class TransactionLogFileTest {
+  private final TestDirectory directory=TestDirectory.testDirectory();
+  private final DefaultFileSystemRule fileSystemRule=new DefaultFileSystemRule();
+  private final LifeRule life=new LifeRule(true);
+  @Rule public RuleChain ruleChain=RuleChain.outerRule(directory).around(fileSystemRule).around(life);
+  private final LogVersionRepository logVersionRepository=new SimpleLogVersionRepository(1L);
+  private final TransactionIdStore transactionIdStore=new SimpleTransactionIdStore(2L,0,BASE_TX_COMMIT_TIMESTAMP,0,0);
+  @Test public void skipLogFileWithoutHeader() throws IOException {
+    FileSystemAbstraction fs=fileSystemRule.get();
+    LogFiles logFiles=LogFilesBuilder.builder(directory.databaseLayout(),fs).withTransactionIdStore(transactionIdStore).withLogVersionRepository(logVersionRepository).build();
+    life.add(logFiles);
+    life.start();
+    logVersionRepository.incrementAndGetVersion();
+    fs.create(logFiles.getLogFileForVersion(logVersionRepository.getCurrentLogVersion())).close();
+    transactionIdStore.transactionCommitted(5L,5L,5L);
+    PhysicalLogicalTransactionStore.LogVersionLocator versionLocator=new PhysicalLogicalTransactionStore.LogVersionLocator(4L);
+    logFiles.accept(versionLocator);
+    LogPosition logPosition=versionLocator.getLogPosition();
+    assertEquals(1,logPosition.getLogVersion());
+  }
+  @Test public void shouldOpenInFreshDirectoryAndFinallyAddHeader() throws Exception {
+    String name="log";
+    FileSystemAbstraction fs=fileSystemRule.get();
+    LogFiles logFiles=LogFilesBuilder.builder(directory.databaseLayout(),fs).withTransactionIdStore(transactionIdStore).withLogVersionRepository(logVersionRepository).build();
+    life.start();
+    life.add(logFiles);
+    life.shutdown();
+    File file=LogFilesBuilder.logFilesBasedOnlyBuilder(directory.databaseDir(),fs).build().getLogFileForVersion(1L);
+    LogHeader header=readLogHeader(fs,file);
+    assertEquals(1L,header.logVersion);
+    assertEquals(2L,header.lastCommittedTxId);
+  }
+  @Test public void shouldWriteSomeDataIntoTheLog() throws Exception {
+    String name="log";
+    FileSystemAbstraction fs=fileSystemRule.get();
+    LogFiles logFiles=LogFilesBuilder.builder(directory.databaseLayout(),fs).withTransactionIdStore(transactionIdStore).withLogVersionRepository(logVersionRepository).build();
+    life.start();
+    life.add(logFiles);
+    FlushablePositionAwareChannel writer=logFiles.getLogFile().getWriter();
+    LogPositionMarker positionMarker=new LogPositionMarker();
+    writer.getCurrentPosition(positionMarker);
+    int intValue=45;
+    long longValue=4854587;
+    writer.putInt(intValue);
+    writer.putLong(longValue);
+    writer.prepareForFlush().flush();
+    try (ReadableClosableChannel reader=logFiles.getLogFile().getReader(positionMarker.newPosition())){
+      assertEquals(intValue,reader.getInt());
+      assertEquals(longValue,reader.getLong());
+    }
+   }
+  @Test public void shouldReadOlderLogs() throws Exception {
+    FileSystemAbstraction fs=fileSystemRule.get();
+    LogFiles logFiles=LogFilesBuilder.builder(directory.databaseLayout(),fs).withTransactionIdStore(transactionIdStore).withLogVersionRepository(logVersionRepository).build();
+    life.start();
+    life.add(logFiles);
+    LogFile logFile=logFiles.getLogFile();
+    FlushablePositionAwareChannel writer=logFile.getWriter();
+    LogPositionMarker positionMarker=new LogPositionMarker();
+    writer.getCurrentPosition(positionMarker);
+    LogPosition position1=positionMarker.newPosition();
+    int intValue=45;
+    long longValue=4854587;
+    byte[] someBytes=someBytes(40);
+    writer.putInt(intValue);
+    writer.putLong(longValue);
+    writer.put(someBytes,someBytes.length);
+    writer.prepareForFlush().flush();
+    writer.getCurrentPosition(positionMarker);
+    LogPosition position2=positionMarker.newPosition();
+    long longValue2=123456789L;
+    writer.putLong(longValue2);
+    writer.put(someBytes,someBytes.length);
+    writer.prepareForFlush().flush();
+    try (ReadableClosableChannel reader=logFile.getReader(position1)){
+      assertEquals(intValue,reader.getInt());
+      assertEquals(longValue,reader.getLong());
+      assertArrayEquals(someBytes,readBytes(reader,40));
+    }
+     try (ReadableClosableChannel reader=logFile.getReader(position2)){
+      assertEquals(longValue2,reader.getLong());
+      assertArrayEquals(someBytes,readBytes(reader,40));
+    }
+   }
+  @Test public void shouldVisitLogFile() throws Exception {
+    String name="log";
+    FileSystemAbstraction fs=fileSystemRule.get();
+    LogFiles logFiles=LogFilesBuilder.builder(directory.databaseLayout(),fs).withTransactionIdStore(transactionIdStore).withLogVersionRepository(logVersionRepository).build();
+    life.start();
+    life.add(logFiles);
+    LogFile logFile=logFiles.getLogFile();
+    FlushablePositionAwareChannel writer=logFile.getWriter();
+    LogPositionMarker mark=new LogPositionMarker();
+    writer.getCurrentPosition(mark);
+    for (int i=0; i < 5; i++) {
+      writer.put((byte)i);
+    }
+    writer.prepareForFlush();
+    final AtomicBoolean called=new AtomicBoolean();
+    logFile.accept(channel -> {
+      for (int i=0; i < 5; i++) {
+        assertEquals((byte)i,channel.get());
+      }
+      called.set(true);
+      return true;
+    }
+,mark.newPosition());
+    assertTrue(called.get());
+  }
+  @Test public void shouldCloseChannelInFailedAttemptToReadHeaderAfterOpen() throws Exception {
+    FileSystemAbstraction fs=mock(FileSystemAbstraction.class);
+    LogFiles logFiles=LogFilesBuilder.builder(directory.databaseLayout(),fs).withTransactionIdStore(transactionIdStore).withLogVersionRepository(logVersionRepository).build();
+    int logVersion=0;
+    File logFile=logFiles.getLogFileForVersion(logVersion);
+    StoreChannel channel=mock(StoreChannel.class);
+    when(channel.read(any(ByteBuffer.class))).thenReturn(LogHeader.LOG_HEADER_SIZE / 2);
+    when(fs.fileExists(logFile)).thenReturn(true);
+    when(fs.open(eq(logFile),any(OpenMode.class))).thenReturn(channel);
+    try {
+      logFiles.openForVersion(logVersion);
+      fail("Should have failed");
+    }
+ catch (    IncompleteLogHeaderException e) {
+      verify(channel).close();
+    }
+  }
+  @Test public void shouldSuppressFailureToCloseChannelInFailedAttemptToReadHeaderAfterOpen() throws Exception {
+    FileSystemAbstraction fs=mock(FileSystemAbstraction.class);
+    LogFiles logFiles=LogFilesBuilder.builder(directory.databaseLayout(),fs).withTransactionIdStore(transactionIdStore).withLogVersionRepository(logVersionRepository).build();
+    int logVersion=0;
+    File logFile=logFiles.getLogFileForVersion(logVersion);
+    StoreChannel channel=mock(StoreChannel.class);
+    when(channel.read(any(ByteBuffer.class))).thenReturn(LogHeader.LOG_HEADER_SIZE / 2);
+    when(fs.fileExists(logFile)).thenReturn(true);
+    when(fs.open(eq(logFile),any(OpenMode.class))).thenReturn(channel);
+    doThrow(IOException.class).when(channel).close();
+    try {
+      logFiles.openForVersion(logVersion);
+      fail("Should have failed");
+    }
+ catch (    IncompleteLogHeaderException e) {
+      verify(channel).close();
+      assertEquals(1,e.getSuppressed().length);
+      assertTrue(e.getSuppressed()[0] instanceof IOException);
+    }
+  }
+  private static byte[] readBytes(  ReadableClosableChannel reader,  int length) throws IOException {
+    byte[] result=new byte[length];
+    reader.get(result,length);
+    return result;
+  }
+  private static byte[] someBytes(  int length){
+    byte[] result=new byte[length];
+    for (int i=0; i < length; i++) {
+      result[i]=(byte)(i % 5);
+    }
+    return result;
+  }
+}

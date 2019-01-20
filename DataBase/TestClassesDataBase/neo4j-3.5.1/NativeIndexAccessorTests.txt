@@ -1,0 +1,565 @@
+/** 
+ * Tests for <ul> <li> {@link NumberIndexAccessor}</li> <li> {@link NativeIndexUpdater}</li> <li> {@link NumberIndexReader}</li> </ul>
+ */
+public abstract class NativeIndexAccessorTests<KEY extends NativeIndexKey<KEY>,VALUE extends NativeIndexValue> extends NativeIndexTestUtil<KEY,VALUE> {
+  private NativeIndexAccessor<KEY,VALUE> accessor;
+  @Rule public ExpectedException expected=ExpectedException.none();
+  @Before public void setupAccessor() throws IOException {
+    accessor=makeAccessor();
+  }
+  abstract NativeIndexAccessor<KEY,VALUE> makeAccessor() throws IOException ;
+  abstract IndexCapability indexCapability();
+  @After public void closeAccessor(){
+    accessor.close();
+  }
+  @Test public void shouldHandleCloseWithoutCallsToProcess() throws Exception {
+    IndexUpdater updater=accessor.newUpdater(ONLINE);
+    updater.close();
+  }
+  @Test public void processMustThrowAfterClose() throws Exception {
+    IndexUpdater updater=accessor.newUpdater(ONLINE);
+    updater.close();
+    expected.expect(IllegalStateException.class);
+    updater.process(simpleUpdate());
+  }
+  @Test public void shouldIndexAdd() throws Exception {
+    IndexEntryUpdate<IndexDescriptor>[] updates=someUpdatesSingleType();
+    try (IndexUpdater updater=accessor.newUpdater(ONLINE)){
+      processAll(updater,updates);
+    }
+     forceAndCloseAccessor();
+    verifyUpdates(updates);
+  }
+  @Test public void shouldIndexChange() throws Exception {
+    IndexEntryUpdate<IndexDescriptor>[] updates=someUpdatesSingleType();
+    processAll(updates);
+    Iterator<IndexEntryUpdate<IndexDescriptor>> generator=filter(skipExisting(updates),valueCreatorUtil.randomUpdateGenerator(random));
+    for (int i=0; i < updates.length; i++) {
+      IndexEntryUpdate<IndexDescriptor> update=updates[i];
+      Value newValue=generator.next().values()[0];
+      updates[i]=change(update.getEntityId(),indexDescriptor,update.values()[0],newValue);
+    }
+    processAll(updates);
+    forceAndCloseAccessor();
+    verifyUpdates(updates);
+  }
+  @Test public void shouldIndexRemove() throws Exception {
+    IndexEntryUpdate<IndexDescriptor>[] updates=someUpdatesSingleType();
+    processAll(updates);
+    for (int i=0; i < updates.length; i++) {
+      IndexEntryUpdate<IndexDescriptor> update=updates[i];
+      IndexEntryUpdate<IndexDescriptor> remove=remove(update.getEntityId(),indexDescriptor,update.values());
+      processAll(remove);
+      forceAndCloseAccessor();
+      verifyUpdates(Arrays.copyOfRange(updates,i + 1,updates.length));
+      setupAccessor();
+    }
+  }
+  @Test public void shouldHandleRandomUpdates() throws Exception {
+    Set<IndexEntryUpdate<IndexDescriptor>> expectedData=new HashSet<>();
+    Iterator<IndexEntryUpdate<IndexDescriptor>> newDataGenerator=valueCreatorUtil.randomUpdateGenerator(random);
+    int rounds=50;
+    for (int round=0; round < rounds; round++) {
+      IndexEntryUpdate<IndexDescriptor>[] batch=generateRandomUpdates(expectedData,newDataGenerator,random.nextInt(5,20),(float)round / rounds * 2);
+      processAll(batch);
+      applyUpdatesToExpectedData(expectedData,batch);
+      forceAndCloseAccessor();
+      verifyUpdates(expectedData.toArray(new IndexEntryUpdate[0]));
+      setupAccessor();
+    }
+  }
+  @Test public void shouldReturnZeroCountForEmptyIndex(){
+    try (IndexReader reader=accessor.newReader()){
+      IndexEntryUpdate<IndexDescriptor> update=valueCreatorUtil.randomUpdateGenerator(random).next();
+      long count=reader.countIndexedNodes(123,valueCreatorUtil.indexDescriptor.properties(),update.values()[0]);
+      assertEquals(0,count);
+    }
+   }
+  @Test public void shouldReturnCountOneForExistingData() throws Exception {
+    IndexEntryUpdate<IndexDescriptor>[] updates=someUpdatesSingleType();
+    processAll(updates);
+    try (IndexReader reader=accessor.newReader()){
+      for (      IndexEntryUpdate<IndexDescriptor> update : updates) {
+        long count=reader.countIndexedNodes(update.getEntityId(),valueCreatorUtil.indexDescriptor.properties(),update.values());
+        assertEquals(1,count);
+      }
+      Iterator<IndexEntryUpdate<IndexDescriptor>> generator=filter(skipExisting(updates),valueCreatorUtil.randomUpdateGenerator(random));
+      long count=reader.countIndexedNodes(123,valueCreatorUtil.indexDescriptor.properties(),generator.next().values()[0]);
+      assertEquals(0,count);
+    }
+   }
+  @Test public void shouldReturnCountZeroForMismatchingData() throws Exception {
+    IndexEntryUpdate<IndexDescriptor>[] updates=someUpdatesSingleTypeNoDuplicates();
+    processAll(updates);
+    IndexReader reader=accessor.newReader();
+    for (    IndexEntryUpdate<IndexDescriptor> update : updates) {
+      int[] propKeys=valueCreatorUtil.indexDescriptor.properties();
+      long countWithMismatchingData=reader.countIndexedNodes(update.getEntityId() + 1,propKeys,update.values());
+      long countWithNonExistentEntityId=reader.countIndexedNodes(NON_EXISTENT_ENTITY_ID,propKeys,update.values());
+      long countWithNonExistentValue=reader.countIndexedNodes(update.getEntityId(),propKeys,generateUniqueValue(updates));
+      assertEquals(0,countWithMismatchingData);
+      assertEquals(0,countWithNonExistentEntityId);
+      assertEquals(0,countWithNonExistentValue);
+    }
+  }
+  @Test public void shouldReturnAllEntriesForExistsPredicate() throws Exception {
+    IndexEntryUpdate<IndexDescriptor>[] updates=someUpdatesSingleType();
+    processAll(updates);
+    IndexReader reader=accessor.newReader();
+    LongIterator result=query(reader,IndexQuery.exists(0));
+    assertEntityIdHits(extractEntityIds(updates,alwaysTrue()),result);
+  }
+  @Test public void shouldReturnNoEntriesForExistsPredicateForEmptyIndex() throws Exception {
+    IndexReader reader=accessor.newReader();
+    LongIterator result=query(reader,IndexQuery.exists(0));
+    long[] actual=PrimitiveLongCollections.asArray(result);
+    assertEquals(0,actual.length);
+  }
+  @Test public void shouldReturnMatchingEntriesForExactPredicate() throws Exception {
+    IndexEntryUpdate<IndexDescriptor>[] updates=someUpdatesSingleType();
+    processAll(updates);
+    IndexReader reader=accessor.newReader();
+    for (    IndexEntryUpdate<IndexDescriptor> update : updates) {
+      Value value=update.values()[0];
+      LongIterator result=query(reader,IndexQuery.exact(0,value));
+      assertEntityIdHits(extractEntityIds(updates,in(value)),result);
+    }
+  }
+  @Test public void shouldReturnNoEntriesForMismatchingExactPredicate() throws Exception {
+    IndexEntryUpdate<IndexDescriptor>[] updates=someUpdatesSingleType();
+    processAll(updates);
+    IndexReader reader=accessor.newReader();
+    Object value=generateUniqueValue(updates);
+    LongIterator result=query(reader,IndexQuery.exact(0,value));
+    assertEntityIdHits(EMPTY_LONG_ARRAY,result);
+  }
+  @Test public void shouldReturnMatchingEntriesForRangePredicateWithInclusiveStartAndExclusiveEnd() throws Exception {
+    IndexEntryUpdate<IndexDescriptor>[] updates=someUpdatesSingleTypeNoDuplicates(supportedTypesExcludingNonOrderable());
+    processAll(updates);
+    valueCreatorUtil.sort(updates);
+    IndexReader reader=accessor.newReader();
+    LongIterator result=query(reader,valueCreatorUtil.rangeQuery(valueOf(updates[0]),true,valueOf(updates[updates.length - 1]),false));
+    assertEntityIdHits(extractEntityIds(Arrays.copyOf(updates,updates.length - 1),alwaysTrue()),result);
+  }
+  @Test public void shouldReturnMatchingEntriesForRangePredicateWithInclusiveStartAndInclusiveEnd() throws Exception {
+    IndexEntryUpdate<IndexDescriptor>[] updates=someUpdatesSingleTypeNoDuplicates(supportedTypesExcludingNonOrderable());
+    shouldReturnMatchingEntriesForRangePredicateWithInclusiveStartAndInclusiveEnd(updates);
+  }
+  void shouldReturnMatchingEntriesForRangePredicateWithInclusiveStartAndInclusiveEnd(  IndexEntryUpdate<IndexDescriptor>[] updates) throws IndexEntryConflictException, IndexNotApplicableKernelException {
+    processAll(updates);
+    valueCreatorUtil.sort(updates);
+    IndexReader reader=accessor.newReader();
+    LongIterator result=query(reader,valueCreatorUtil.rangeQuery(valueOf(updates[0]),true,valueOf(updates[updates.length - 1]),true));
+    assertEntityIdHits(extractEntityIds(updates,alwaysTrue()),result);
+  }
+  @Test public void shouldReturnMatchingEntriesForRangePredicateWithExclusiveStartAndExclusiveEnd() throws Exception {
+    IndexEntryUpdate<IndexDescriptor>[] updates=someUpdatesSingleTypeNoDuplicates(supportedTypesExcludingNonOrderable());
+    processAll(updates);
+    valueCreatorUtil.sort(updates);
+    IndexReader reader=accessor.newReader();
+    LongIterator result=query(reader,valueCreatorUtil.rangeQuery(valueOf(updates[0]),false,valueOf(updates[updates.length - 1]),false));
+    assertEntityIdHits(extractEntityIds(Arrays.copyOfRange(updates,1,updates.length - 1),alwaysTrue()),result);
+  }
+  @Test public void shouldReturnMatchingEntriesForRangePredicateWithExclusiveStartAndInclusiveEnd() throws Exception {
+    IndexEntryUpdate<IndexDescriptor>[] updates=someUpdatesSingleTypeNoDuplicates(supportedTypesExcludingNonOrderable());
+    processAll(updates);
+    valueCreatorUtil.sort(updates);
+    IndexReader reader=accessor.newReader();
+    LongIterator result=query(reader,valueCreatorUtil.rangeQuery(valueOf(updates[0]),false,valueOf(updates[updates.length - 1]),true));
+    assertEntityIdHits(extractEntityIds(Arrays.copyOfRange(updates,1,updates.length),alwaysTrue()),result);
+  }
+  @Test public void shouldReturnNoEntriesForRangePredicateOutsideAnyMatch() throws Exception {
+    IndexEntryUpdate<IndexDescriptor>[] updates=someUpdatesSingleTypeNoDuplicates(supportedTypesExcludingNonOrderable());
+    valueCreatorUtil.sort(updates);
+    processAll(updates[0],updates[1],updates[updates.length - 1],updates[updates.length - 2]);
+    IndexReader reader=accessor.newReader();
+    LongIterator result=query(reader,valueCreatorUtil.rangeQuery(valueOf(updates[2]),true,valueOf(updates[updates.length - 3]),true));
+    assertEntityIdHits(EMPTY_LONG_ARRAY,result);
+  }
+  @Test(timeout=10_000L) public void mustHandleNestedQueries() throws Exception {
+    IndexEntryUpdate<IndexDescriptor>[] updates=someUpdatesSingleTypeNoDuplicates(supportedTypesExcludingNonOrderable());
+    mustHandleNestedQueries(updates);
+  }
+  void mustHandleNestedQueries(  IndexEntryUpdate<IndexDescriptor>[] updates) throws IndexEntryConflictException, IndexNotApplicableKernelException {
+    processAll(updates);
+    valueCreatorUtil.sort(updates);
+    IndexReader reader=accessor.newReader();
+    IndexQuery outerQuery=valueCreatorUtil.rangeQuery(valueOf(updates[2]),true,valueOf(updates[3]),true);
+    IndexQuery innerQuery=valueCreatorUtil.rangeQuery(valueOf(updates[0]),true,valueOf(updates[1]),true);
+    long[] expectedOuter=new long[]{entityIdOf(updates[2]),entityIdOf(updates[3])};
+    long[] expectedInner=new long[]{entityIdOf(updates[0]),entityIdOf(updates[1])};
+    LongIterator outerIter=query(reader,outerQuery);
+    Collection<Long> outerResult=new ArrayList<>();
+    while (outerIter.hasNext()) {
+      outerResult.add(outerIter.next());
+      LongIterator innerIter=query(reader,innerQuery);
+      assertEntityIdHits(expectedInner,innerIter);
+    }
+    assertEntityIdHits(expectedOuter,outerResult);
+  }
+  @Test public void mustHandleMultipleNestedQueries() throws Exception {
+    IndexEntryUpdate<IndexDescriptor>[] updates=someUpdatesSingleTypeNoDuplicates(supportedTypesExcludingNonOrderable());
+    mustHandleMultipleNestedQueries(updates);
+  }
+  void mustHandleMultipleNestedQueries(  IndexEntryUpdate<IndexDescriptor>[] updates) throws IndexEntryConflictException, IndexNotApplicableKernelException {
+    processAll(updates);
+    valueCreatorUtil.sort(updates);
+    IndexReader reader=accessor.newReader();
+    IndexQuery query1=valueCreatorUtil.rangeQuery(valueOf(updates[4]),true,valueOf(updates[5]),true);
+    IndexQuery query2=valueCreatorUtil.rangeQuery(valueOf(updates[2]),true,valueOf(updates[3]),true);
+    IndexQuery query3=valueCreatorUtil.rangeQuery(valueOf(updates[0]),true,valueOf(updates[1]),true);
+    long[] expected1=new long[]{entityIdOf(updates[4]),entityIdOf(updates[5])};
+    long[] expected2=new long[]{entityIdOf(updates[2]),entityIdOf(updates[3])};
+    long[] expected3=new long[]{entityIdOf(updates[0]),entityIdOf(updates[1])};
+    Collection<Long> result1=new ArrayList<>();
+    LongIterator iter1=query(reader,query1);
+    while (iter1.hasNext()) {
+      result1.add(iter1.next());
+      Collection<Long> result2=new ArrayList<>();
+      LongIterator iter2=query(reader,query2);
+      while (iter2.hasNext()) {
+        result2.add(iter2.next());
+        Collection<Long> result3=new ArrayList<>();
+        LongIterator iter3=query(reader,query3);
+        while (iter3.hasNext()) {
+          result3.add(iter3.next());
+        }
+        assertEntityIdHits(expected3,result3);
+      }
+      assertEntityIdHits(expected2,result2);
+    }
+    assertEntityIdHits(expected1,result1);
+  }
+  private long entityIdOf(  IndexEntryUpdate<IndexDescriptor> update){
+    return update.getEntityId();
+  }
+  @Test public void shouldHandleMultipleConsecutiveUpdaters() throws Exception {
+    IndexEntryUpdate<IndexDescriptor>[] updates=someUpdatesSingleType();
+    for (    IndexEntryUpdate<IndexDescriptor> update : updates) {
+      try (IndexUpdater updater=accessor.newUpdater(ONLINE)){
+        updater.process(update);
+      }
+     }
+    forceAndCloseAccessor();
+    verifyUpdates(updates);
+  }
+  @Test public void requestForSecondUpdaterMustThrow() throws Exception {
+    try (IndexUpdater ignored=accessor.newUpdater(ONLINE)){
+      expected.expect(IllegalStateException.class);
+      accessor.newUpdater(ONLINE);
+    }
+   }
+  @Test public void dropShouldDeleteAndCloseIndex(){
+    assertFilePresent();
+    accessor.drop();
+    assertFileNotPresent();
+  }
+  @Test public void forceShouldCheckpointTree() throws Exception {
+    IndexEntryUpdate<IndexDescriptor>[] data=someUpdatesSingleType();
+    processAll(data);
+    accessor.force(IOLimiter.UNLIMITED);
+    accessor.close();
+    verifyUpdates(data);
+  }
+  @SuppressWarnings("unchecked") @Test public void closeShouldCloseTreeWithoutCheckpoint() throws Exception {
+    IndexEntryUpdate<IndexDescriptor>[] data=someUpdatesSingleType();
+    processAll(data);
+    accessor.close();
+    verifyUpdates(new IndexEntryUpdate[0]);
+  }
+  @Test public void snapshotFilesShouldReturnIndexFile(){
+    ResourceIterator<File> files=accessor.snapshotFiles();
+    assertTrue(files.hasNext());
+    assertEquals(getIndexFile(),files.next());
+    assertFalse(files.hasNext());
+  }
+  @Test public void shouldSampleIndex() throws Exception {
+    IndexEntryUpdate<IndexDescriptor>[] updates=someUpdatesSingleType();
+    processAll(updates);
+    try (IndexReader reader=accessor.newReader()){
+      IndexSampler sampler=reader.createSampler();
+      IndexSample sample=sampler.sampleIndex();
+      assertEquals(updates.length,sample.indexSize());
+      assertEquals(updates.length,sample.sampleSize());
+      assertEquals(countUniqueValues(updates),sample.uniqueValues());
+    }
+   }
+  @Test public void readingAfterDropShouldThrow(){
+    accessor.drop();
+    expected.expect(IllegalStateException.class);
+    accessor.newReader();
+  }
+  @Test public void writingAfterDropShouldThrow(){
+    accessor.drop();
+    expected.expect(IllegalStateException.class);
+    accessor.newUpdater(IndexUpdateMode.ONLINE);
+  }
+  @Test public void readingAfterCloseShouldThrow(){
+    accessor.close();
+    expected.expect(IllegalStateException.class);
+    accessor.newReader();
+  }
+  @Test public void writingAfterCloseShouldThrow(){
+    accessor.close();
+    expected.expect(IllegalStateException.class);
+    accessor.newUpdater(IndexUpdateMode.ONLINE);
+  }
+  @Test public void shouldSeeAllEntriesInAllEntriesReader() throws Exception {
+    IndexEntryUpdate<IndexDescriptor>[] updates=someUpdatesSingleType();
+    processAll(updates);
+    Set<Long> ids=asUniqueSet(accessor.newAllEntriesReader());
+    Set<Long> expectedIds=Stream.of(updates).map(IndexEntryUpdate::getEntityId).collect(Collectors.toCollection(HashSet::new));
+    assertEquals(expectedIds,ids);
+  }
+  @Test public void shouldSeeNoEntriesInAllEntriesReaderOnEmptyIndex(){
+    Set<Long> ids=asUniqueSet(accessor.newAllEntriesReader());
+    Set<Long> expectedIds=Collections.emptySet();
+    assertEquals(expectedIds,ids);
+  }
+  @Test public void shouldNotSeeFilteredEntries() throws Exception {
+    IndexEntryUpdate<IndexDescriptor>[] updates=someUpdatesSingleTypeNoDuplicates(supportedTypesExcludingNonOrderable());
+    processAll(updates);
+    valueCreatorUtil.sort(updates);
+    IndexReader reader=accessor.newReader();
+    NodeValueIterator iter=new NodeValueIterator();
+    IndexQuery.ExactPredicate filter=IndexQuery.exact(0,valueOf(updates[1]));
+    IndexQuery rangeQuery=valueCreatorUtil.rangeQuery(valueOf(updates[0]),true,valueOf(updates[2]),true);
+    IndexProgressor.NodeValueClient filterClient=filterClient(iter,filter);
+    reader.query(filterClient,IndexOrder.NONE,false,rangeQuery);
+    assertTrue(iter.hasNext());
+    assertEquals(entityIdOf(updates[1]),iter.next());
+    assertFalse(iter.hasNext());
+  }
+  @Test public void respectIndexOrder() throws Exception {
+    int nUpdates=10000;
+    ValueType[] types=supportedTypesExcludingNonOrderable();
+    Iterator<IndexEntryUpdate<IndexDescriptor>> randomUpdateGenerator=valueCreatorUtil.randomUpdateGenerator(random,types);
+    IndexEntryUpdate<IndexDescriptor>[] someUpdates=new IndexEntryUpdate[nUpdates];
+    for (int i=0; i < nUpdates; i++) {
+      someUpdates[i]=randomUpdateGenerator.next();
+    }
+    processAll(someUpdates);
+    Value[] allValues=valueCreatorUtil.extractValuesFromUpdates(someUpdates);
+    try (IndexReader reader=accessor.newReader()){
+      ValueGroup valueGroup=random.among(allValues).valueGroup();
+      IndexQuery.RangePredicate<?> supportedQuery=IndexQuery.range(0,valueGroup);
+      IndexOrder[] supportedOrders=indexCapability().orderCapability(valueGroup.category());
+      for (      IndexOrder supportedOrder : supportedOrders) {
+        if (supportedOrder == IndexOrder.NONE) {
+          continue;
+        }
+        Value[] expectedValues=Arrays.stream(allValues).filter(v -> v.valueGroup() == valueGroup).toArray(Value[]::new);
+        if (supportedOrder == IndexOrder.ASCENDING) {
+          Arrays.sort(expectedValues,Values.COMPARATOR);
+        }
+        if (supportedOrder == IndexOrder.DESCENDING) {
+          Arrays.sort(expectedValues,Values.COMPARATOR.reversed());
+        }
+        SimpleNodeValueClient client=new SimpleNodeValueClient();
+        reader.query(client,supportedOrder,true,supportedQuery);
+        int i=0;
+        while (client.next()) {
+          assertEquals("values in order",expectedValues[i++],client.values[0]);
+        }
+        assertEquals("found all values",i,expectedValues.length);
+      }
+    }
+   }
+  @Test public void throwForUnsupportedIndexOrder() throws Exception {
+    try (IndexReader reader=accessor.newReader()){
+      IndexOrder unsupportedOrder=IndexOrder.DESCENDING;
+      IndexQuery.ExactPredicate unsupportedQuery=IndexQuery.exact(0,PointValue.MAX_VALUE);
+      expected.expect(UnsupportedOperationException.class);
+      expected.expectMessage(CoreMatchers.allOf(CoreMatchers.containsString("unsupported order"),CoreMatchers.containsString(unsupportedOrder.toString()),CoreMatchers.containsString(unsupportedQuery.toString())));
+      reader.query(new SimpleNodeValueClient(),unsupportedOrder,false,unsupportedQuery);
+    }
+   }
+  @Test public void getValues() throws IndexEntryConflictException, IndexNotApplicableKernelException {
+    int nUpdates=10000;
+    Iterator<IndexEntryUpdate<IndexDescriptor>> randomUpdateGenerator=valueCreatorUtil.randomUpdateGenerator(random);
+    IndexEntryUpdate<IndexDescriptor>[] someUpdates=new IndexEntryUpdate[nUpdates];
+    for (int i=0; i < nUpdates; i++) {
+      someUpdates[i]=randomUpdateGenerator.next();
+    }
+    processAll(someUpdates);
+    Value[] allValues=valueCreatorUtil.extractValuesFromUpdates(someUpdates);
+    Value value=random.among(allValues);
+    ValueGroup valueGroup=value.valueGroup();
+    IndexValueCapability valueCapability=indexCapability().valueCapability(valueGroup.category());
+    if (!valueCapability.equals(IndexValueCapability.YES)) {
+      return;
+    }
+    IndexQuery.RangePredicate<?> supportedQuery;
+    List<Value> expectedValues;
+    if (Values.isGeometryValue(value)) {
+      CoordinateReferenceSystem crs=((PointValue)value).getCoordinateReferenceSystem();
+      supportedQuery=IndexQuery.range(0,crs);
+      expectedValues=Arrays.stream(allValues).filter(v -> v.valueGroup() == ValueGroup.GEOMETRY).filter(v -> ((PointValue)v).getCoordinateReferenceSystem() == crs).collect(Collectors.toList());
+    }
+ else {
+      supportedQuery=IndexQuery.range(0,valueGroup);
+      expectedValues=Arrays.stream(allValues).filter(v -> v.valueGroup() == valueGroup).collect(Collectors.toList());
+    }
+    try (IndexReader reader=accessor.newReader()){
+      SimpleNodeValueClient client=new SimpleNodeValueClient();
+      reader.query(client,IndexOrder.NONE,true,supportedQuery);
+      while (client.next()) {
+        Value foundValue=client.values[0];
+        assertTrue("found value that was not expected " + foundValue,expectedValues.remove(foundValue));
+      }
+      assertThat("did not find all expected values",expectedValues.size(),CoreMatchers.is(0));
+    }
+   }
+  private Value generateUniqueValue(  IndexEntryUpdate<IndexDescriptor>[] updates){
+    return filter(skipExisting(updates),valueCreatorUtil.randomUpdateGenerator(random)).next().values()[0];
+  }
+  private static Predicate<IndexEntryUpdate<IndexDescriptor>> skipExisting(  IndexEntryUpdate<IndexDescriptor>[] existing){
+    return update -> {
+      for (      IndexEntryUpdate<IndexDescriptor> e : existing) {
+        if (Arrays.equals(e.values(),update.values())) {
+          return false;
+        }
+      }
+      return true;
+    }
+;
+  }
+  private Value valueOf(  IndexEntryUpdate<IndexDescriptor> update){
+    return update.values()[0];
+  }
+  private IndexProgressor.NodeValueClient filterClient(  final NodeValueIterator iter,  final IndexQuery filter){
+    return new IndexProgressor.NodeValueClient(){
+      @Override public void initialize(      IndexDescriptor descriptor,      IndexProgressor progressor,      IndexQuery[] query,      IndexOrder indexOrder,      boolean needsValues){
+        iter.initialize(descriptor,progressor,query,indexOrder,needsValues);
+      }
+      @Override public boolean acceptNode(      long reference,      Value... values){
+        if (values.length > 1) {
+          return false;
+        }
+        return filter.acceptsValue(values[0]) && iter.acceptNode(reference,values);
+      }
+      @Override public boolean needsValues(){
+        return true;
+      }
+    }
+;
+  }
+  private LongIterator query(  IndexReader reader,  IndexQuery query) throws IndexNotApplicableKernelException {
+    NodeValueIterator client=new NodeValueIterator();
+    reader.query(client,IndexOrder.NONE,false,query);
+    return client;
+  }
+  private void assertEntityIdHits(  long[] expected,  LongIterator result){
+    long[] actual=PrimitiveLongCollections.asArray(result);
+    assertSameContent(expected,actual);
+  }
+  private void assertEntityIdHits(  long[] expected,  Collection<Long> result){
+    long[] actual=new long[result.size()];
+    int index=0;
+    for (    Long aLong : result) {
+      actual[index++]=aLong;
+    }
+    assertSameContent(expected,actual);
+  }
+  private void assertSameContent(  long[] expected,  long[] actual){
+    Arrays.sort(actual);
+    Arrays.sort(expected);
+    assertArrayEquals(format("Expected arrays to be equal but wasn't.%nexpected:%s%n  actual:%s%n",Arrays.toString(expected),Arrays.toString(actual)),expected,actual);
+  }
+  private long[] extractEntityIds(  IndexEntryUpdate<?>[] updates,  Predicate<Value> valueFilter){
+    long[] entityIds=new long[updates.length];
+    int cursor=0;
+    for (    IndexEntryUpdate<?> update : updates) {
+      if (valueFilter.test(update.values()[0])) {
+        entityIds[cursor++]=update.getEntityId();
+      }
+    }
+    return Arrays.copyOf(entityIds,cursor);
+  }
+  private void applyUpdatesToExpectedData(  Set<IndexEntryUpdate<IndexDescriptor>> expectedData,  IndexEntryUpdate<IndexDescriptor>[] batch){
+    for (    IndexEntryUpdate<IndexDescriptor> update : batch) {
+      IndexEntryUpdate<IndexDescriptor> addition=null;
+      IndexEntryUpdate<IndexDescriptor> removal=null;
+switch (update.updateMode()) {
+case ADDED:
+        addition=valueCreatorUtil.add(update.getEntityId(),update.values()[0]);
+      break;
+case CHANGED:
+    addition=valueCreatorUtil.add(update.getEntityId(),update.values()[0]);
+  removal=valueCreatorUtil.add(update.getEntityId(),update.beforeValues()[0]);
+break;
+case REMOVED:
+removal=valueCreatorUtil.add(update.getEntityId(),update.values()[0]);
+break;
+default :
+throw new IllegalArgumentException(update.updateMode().name());
+}
+if (removal != null) {
+expectedData.remove(removal);
+}
+if (addition != null) {
+expectedData.add(addition);
+}
+}
+}
+private IndexEntryUpdate<IndexDescriptor>[] generateRandomUpdates(Set<IndexEntryUpdate<IndexDescriptor>> expectedData,Iterator<IndexEntryUpdate<IndexDescriptor>> newDataGenerator,int count,float removeFactor){
+@SuppressWarnings("unchecked") IndexEntryUpdate<IndexDescriptor>[] updates=new IndexEntryUpdate[count];
+float addChangeRatio=0.5f;
+for (int i=0; i < count; i++) {
+float factor=random.nextFloat();
+if (!expectedData.isEmpty() && factor < removeFactor) {
+IndexEntryUpdate<IndexDescriptor> toRemove=selectRandomItem(expectedData);
+updates[i]=remove(toRemove.getEntityId(),indexDescriptor,toRemove.values());
+}
+ else if (!expectedData.isEmpty() && factor < (1 - removeFactor) * addChangeRatio) {
+IndexEntryUpdate<IndexDescriptor> toChange=selectRandomItem(expectedData);
+IndexEntryUpdate<IndexDescriptor> updateContainingValue=newDataGenerator.next();
+updates[i]=change(toChange.getEntityId(),indexDescriptor,toChange.values(),updateContainingValue.values());
+}
+ else {
+updates[i]=newDataGenerator.next();
+}
+}
+return updates;
+}
+@SuppressWarnings("unchecked") private IndexEntryUpdate<IndexDescriptor> selectRandomItem(Set<IndexEntryUpdate<IndexDescriptor>> expectedData){
+return expectedData.toArray(new IndexEntryUpdate[0])[random.nextInt(expectedData.size())];
+}
+@SafeVarargs private final void processAll(IndexEntryUpdate<IndexDescriptor>... updates) throws IndexEntryConflictException {
+try (IndexUpdater updater=accessor.newUpdater(ONLINE)){
+for (IndexEntryUpdate<IndexDescriptor> update : updates) {
+updater.process(update);
+}
+}
+ }
+private void forceAndCloseAccessor(){
+accessor.force(IOLimiter.UNLIMITED);
+closeAccessor();
+}
+private void processAll(IndexUpdater updater,IndexEntryUpdate<IndexDescriptor>[] updates) throws IndexEntryConflictException {
+for (IndexEntryUpdate<IndexDescriptor> update : updates) {
+updater.process(update);
+}
+}
+private IndexEntryUpdate<IndexDescriptor> simpleUpdate(){
+return IndexEntryUpdate.add(0,indexDescriptor,of(0));
+}
+private IndexEntryUpdate<IndexDescriptor>[] someUpdatesSingleType(){
+ValueType type=random.randomValues().among(valueCreatorUtil.supportedTypes());
+return valueCreatorUtil.someUpdates(random,new ValueType[]{type},true);
+}
+private IndexEntryUpdate<IndexDescriptor>[] someUpdatesSingleTypeNoDuplicates(){
+return someUpdatesSingleTypeNoDuplicates(valueCreatorUtil.supportedTypes());
+}
+private IndexEntryUpdate<IndexDescriptor>[] someUpdatesSingleTypeNoDuplicates(ValueType[] types){
+ValueType type;
+do {
+type=random.randomValues().among(types);
+}
+ while (type == ValueType.BOOLEAN);
+return valueCreatorUtil.someUpdates(random,new ValueType[]{type},false);
+}
+private ValueType[] supportedTypesExcludingNonOrderable(){
+return RandomValues.excluding(valueCreatorUtil.supportedTypes(),t -> t.valueGroup == ValueGroup.GEOMETRY || t.valueGroup == ValueGroup.GEOMETRY_ARRAY || t == ValueType.STRING || t == ValueType.STRING_ARRAY);
+}
+}

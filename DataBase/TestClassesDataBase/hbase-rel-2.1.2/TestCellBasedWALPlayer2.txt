@@ -1,0 +1,126 @@
+/** 
+ * Basic test for the WALPlayer M/R tool
+ */
+@Category({MapReduceTests.class,LargeTests.class}) public class TestCellBasedWALPlayer2 {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestCellBasedWALPlayer2.class);
+  private static final HBaseTestingUtility TEST_UTIL=new HBaseTestingUtility();
+  private static MiniHBaseCluster cluster;
+  private static Path rootDir;
+  private static Path walRootDir;
+  private static FileSystem fs;
+  private static FileSystem logFs;
+  private static Configuration conf;
+  @Rule public TestName name=new TestName();
+  @BeforeClass public static void beforeClass() throws Exception {
+    conf=TEST_UTIL.getConfiguration();
+    rootDir=TEST_UTIL.createRootDir();
+    walRootDir=TEST_UTIL.createWALRootDir();
+    fs=FSUtils.getRootDirFileSystem(conf);
+    logFs=FSUtils.getWALFileSystem(conf);
+    cluster=TEST_UTIL.startMiniCluster();
+  }
+  @AfterClass public static void afterClass() throws Exception {
+    TEST_UTIL.shutdownMiniCluster();
+    fs.delete(rootDir,true);
+    logFs.delete(walRootDir,true);
+  }
+  /** 
+ * Simple end-to-end test
+ * @throws Exception
+ */
+  @Test public void testWALPlayer() throws Exception {
+    final TableName tableName1=TableName.valueOf(name.getMethodName() + "1");
+    final TableName tableName2=TableName.valueOf(name.getMethodName() + "2");
+    final byte[] FAMILY=Bytes.toBytes("family");
+    final byte[] COLUMN1=Bytes.toBytes("c1");
+    final byte[] COLUMN2=Bytes.toBytes("c2");
+    final byte[] ROW=Bytes.toBytes("row");
+    Table t1=TEST_UTIL.createTable(tableName1,FAMILY);
+    Table t2=TEST_UTIL.createTable(tableName2,FAMILY);
+    Put p=new Put(ROW);
+    p.addColumn(FAMILY,COLUMN1,COLUMN1);
+    p.addColumn(FAMILY,COLUMN2,COLUMN2);
+    t1.put(p);
+    Delete d=new Delete(ROW);
+    d.addColumns(FAMILY,COLUMN1);
+    t1.delete(d);
+    WAL log=cluster.getRegionServer(0).getWAL(null);
+    log.rollWriter();
+    String walInputDir=new Path(cluster.getMaster().getMasterFileSystem().getWALRootDir(),HConstants.HREGION_LOGDIR_NAME).toString();
+    Configuration configuration=TEST_UTIL.getConfiguration();
+    WALPlayer player=new WALPlayer(configuration);
+    String optionName="_test_.name";
+    configuration.set(optionName,"1000");
+    player.setupTime(configuration,optionName);
+    assertEquals(1000,configuration.getLong(optionName,0));
+    assertEquals(0,ToolRunner.run(configuration,player,new String[]{walInputDir,tableName1.getNameAsString(),tableName2.getNameAsString()}));
+    Get g=new Get(ROW);
+    Result r=t2.get(g);
+    assertEquals(1,r.size());
+    assertTrue(CellUtil.matchingQualifier(r.rawCells()[0],COLUMN2));
+  }
+  /** 
+ * Test WALKeyValueMapper setup and map
+ */
+  @Test public void testWALKeyValueMapper() throws Exception {
+    testWALKeyValueMapper(WALPlayer.TABLES_KEY);
+  }
+  @Test public void testWALKeyValueMapperWithDeprecatedConfig() throws Exception {
+    testWALKeyValueMapper("hlog.input.tables");
+  }
+  private void testWALKeyValueMapper(  final String tableConfigKey) throws Exception {
+    Configuration configuration=new Configuration();
+    configuration.set(tableConfigKey,"table");
+    WALCellMapper mapper=new WALCellMapper();
+    WALKey key=mock(WALKey.class);
+    when(key.getTableName()).thenReturn(TableName.valueOf("table"));
+    @SuppressWarnings("unchecked") Mapper<WALKey,WALEdit,ImmutableBytesWritable,Cell>.Context context=mock(Context.class);
+    when(context.getConfiguration()).thenReturn(configuration);
+    WALEdit value=mock(WALEdit.class);
+    ArrayList<Cell> values=new ArrayList<>();
+    KeyValue kv1=new KeyValue(Bytes.toBytes("row"),Bytes.toBytes("family"),null);
+    values.add(kv1);
+    when(value.getCells()).thenReturn(values);
+    mapper.setup(context);
+    doAnswer(new Answer<Void>(){
+      @Override public Void answer(      InvocationOnMock invocation) throws Throwable {
+        ImmutableBytesWritable writer=(ImmutableBytesWritable)invocation.getArguments()[0];
+        MapReduceExtendedCell key=(MapReduceExtendedCell)invocation.getArguments()[1];
+        assertEquals("row",Bytes.toString(writer.get()));
+        assertEquals("row",Bytes.toString(CellUtil.cloneRow(key)));
+        return null;
+      }
+    }
+).when(context).write(any(ImmutableBytesWritable.class),any(MapReduceExtendedCell.class));
+    mapper.map(key,value,context);
+  }
+  /** 
+ * Test main method
+ */
+  @Test public void testMainMethod() throws Exception {
+    PrintStream oldPrintStream=System.err;
+    SecurityManager SECURITY_MANAGER=System.getSecurityManager();
+    LauncherSecurityManager newSecurityManager=new LauncherSecurityManager();
+    System.setSecurityManager(newSecurityManager);
+    ByteArrayOutputStream data=new ByteArrayOutputStream();
+    String[] args={};
+    System.setErr(new PrintStream(data));
+    try {
+      System.setErr(new PrintStream(data));
+      try {
+        WALPlayer.main(args);
+        fail("should be SecurityException");
+      }
+ catch (      SecurityException e) {
+        assertEquals(-1,newSecurityManager.getExitCode());
+        assertTrue(data.toString().contains("ERROR: Wrong number of arguments:"));
+        assertTrue(data.toString().contains("Usage: WALPlayer [options] <wal inputdir>" + " <tables> [<tableMappings>]"));
+        assertTrue(data.toString().contains("-Dwal.bulk.output=/path/for/output"));
+      }
+    }
+  finally {
+      System.setErr(oldPrintStream);
+      System.setSecurityManager(SECURITY_MANAGER);
+    }
+  }
+}

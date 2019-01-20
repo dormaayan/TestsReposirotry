@@ -1,0 +1,77 @@
+@Test(timeout=60000) public void testPromotionFromAcquired() throws YarnException, IOException {
+  assertEquals(0,amClient.ask.size());
+  assertEquals(0,amClient.release.size());
+  amClient.addContainerRequest(new AMRMClient.ContainerRequest(capability,null,null,priority2,0,true,null,ExecutionTypeRequest.newInstance(ExecutionType.OPPORTUNISTIC,true)));
+  int oppContainersRequestedAny=amClient.getTable(0).get(priority2,ResourceRequest.ANY,ExecutionType.OPPORTUNISTIC,capability).remoteRequest.getNumContainers();
+  assertEquals(1,oppContainersRequestedAny);
+  assertEquals(1,amClient.ask.size());
+  assertEquals(0,amClient.release.size());
+  int allocatedContainerCount=0;
+  Map<ContainerId,Container> allocatedOpportContainers=new HashMap<>();
+  int iterationsLeft=50;
+  amClient.getNMTokenCache().clearCache();
+  Assert.assertEquals(0,amClient.getNMTokenCache().numberOfTokensInCache());
+  HashMap<String,Token> receivedNMTokens=new HashMap<>();
+  updateMetrics("Before Opp Allocation");
+  while (allocatedContainerCount < oppContainersRequestedAny && iterationsLeft-- > 0) {
+    AllocateResponse allocResponse=amClient.allocate(0.1f);
+    assertEquals(0,amClient.ask.size());
+    assertEquals(0,amClient.release.size());
+    allocatedContainerCount+=allocResponse.getAllocatedContainers().size();
+    for (    Container container : allocResponse.getAllocatedContainers()) {
+      if (container.getExecutionType() == ExecutionType.OPPORTUNISTIC) {
+        allocatedOpportContainers.put(container.getId(),container);
+        removeCR(container);
+      }
+    }
+    for (    NMToken token : allocResponse.getNMTokens()) {
+      String nodeID=token.getNodeId().toString();
+      receivedNMTokens.put(nodeID,token.getToken());
+    }
+    if (allocatedContainerCount < oppContainersRequestedAny) {
+      sleep(100);
+    }
+  }
+  assertEquals(oppContainersRequestedAny,allocatedContainerCount);
+  assertEquals(oppContainersRequestedAny,allocatedOpportContainers.size());
+  updateMetrics("After Opp Allocation / Before Promotion");
+  try {
+    Container c=allocatedOpportContainers.values().iterator().next();
+    amClient.requestContainerUpdate(c,UpdateContainerRequest.newInstance(c.getVersion(),c.getId(),ContainerUpdateType.PROMOTE_EXECUTION_TYPE,null,ExecutionType.OPPORTUNISTIC));
+    Assert.fail("Should throw Exception..");
+  }
+ catch (  IllegalArgumentException e) {
+    System.out.println("## " + e.getMessage());
+    Assert.assertTrue(e.getMessage().contains("target should be GUARANTEED and original should be OPPORTUNISTIC"));
+  }
+  Container c=allocatedOpportContainers.values().iterator().next();
+  amClient.requestContainerUpdate(c,UpdateContainerRequest.newInstance(c.getVersion(),c.getId(),ContainerUpdateType.PROMOTE_EXECUTION_TYPE,null,ExecutionType.GUARANTEED));
+  iterationsLeft=120;
+  Map<ContainerId,UpdatedContainer> updatedContainers=new HashMap<>();
+  while (iterationsLeft-- > 0 && updatedContainers.isEmpty()) {
+    AllocateResponse allocResponse=amClient.allocate(0.1f);
+    if (allocResponse.getUpdatedContainers() != null) {
+      for (      UpdatedContainer updatedContainer : allocResponse.getUpdatedContainers()) {
+        System.out.println("Got update..");
+        updatedContainers.put(updatedContainer.getContainer().getId(),updatedContainer);
+      }
+    }
+    if (iterationsLeft > 0) {
+      sleep(100);
+    }
+  }
+  updateMetrics("After Promotion");
+  assertEquals(1,updatedContainers.size());
+  for (  ContainerId cId : allocatedOpportContainers.keySet()) {
+    Container orig=allocatedOpportContainers.get(cId);
+    UpdatedContainer updatedContainer=updatedContainers.get(cId);
+    assertNotNull(updatedContainer);
+    assertEquals(ExecutionType.GUARANTEED,updatedContainer.getContainer().getExecutionType());
+    assertEquals(orig.getResource(),updatedContainer.getContainer().getResource());
+    assertEquals(orig.getNodeId(),updatedContainer.getContainer().getNodeId());
+    assertEquals(orig.getVersion() + 1,updatedContainer.getContainer().getVersion());
+  }
+  assertEquals(0,amClient.ask.size());
+  assertEquals(0,amClient.release.size());
+  amClient.ask.clear();
+}

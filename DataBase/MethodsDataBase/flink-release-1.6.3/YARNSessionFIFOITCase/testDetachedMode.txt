@@ -1,0 +1,94 @@
+/** 
+ * Test regular operation, including command line parameter parsing.
+ */
+@Test(timeout=60000) public void testDetachedMode() throws InterruptedException, IOException {
+  LOG.info("Starting testDetachedMode()");
+  addTestAppender(FlinkYarnSessionCli.class,Level.INFO);
+  File exampleJarLocation=getTestJarPath("StreamingWordCount.jar");
+  File tmpInFile=tmp.newFile();
+  FileUtils.writeStringToFile(tmpInFile,WordCountData.TEXT);
+  ArrayList<String> args=new ArrayList<>();
+  args.add("-j");
+  args.add(flinkUberjar.getAbsolutePath());
+  args.add("-t");
+  args.add(flinkLibFolder.getAbsolutePath());
+  args.add("-n");
+  args.add("1");
+  args.add("-jm");
+  args.add("768m");
+  args.add("-tm");
+  args.add("1024m");
+  if (SecureTestEnvironment.getTestKeytab() != null) {
+    args.add("-D" + SecurityOptions.KERBEROS_LOGIN_KEYTAB.key() + "="+ SecureTestEnvironment.getTestKeytab());
+  }
+  if (SecureTestEnvironment.getHadoopServicePrincipal() != null) {
+    args.add("-D" + SecurityOptions.KERBEROS_LOGIN_PRINCIPAL.key() + "="+ SecureTestEnvironment.getHadoopServicePrincipal());
+  }
+  args.add("--name");
+  args.add("MyCustomName");
+  args.add("--detached");
+  Runner clusterRunner=startWithArgs(args.toArray(new String[args.size()]),"Flink JobManager is now running on",RunTypes.YARN_SESSION);
+  clusterRunner.join();
+  if (!isNewMode) {
+    checkForLogString("The Flink YARN client has been started in detached mode");
+    LOG.info("Waiting until two containers are running");
+    while (getRunningContainers() < 2) {
+      sleep(500);
+    }
+    long startTime=System.nanoTime();
+    while (System.nanoTime() - startTime < TimeUnit.NANOSECONDS.convert(10,TimeUnit.SECONDS) && !(verifyStringsInNamedLogFiles(new String[]{"YARN Application Master started"},"jobmanager.log") && verifyStringsInNamedLogFiles(new String[]{"Starting TaskManager actor"},"taskmanager.log"))) {
+      LOG.info("Still waiting for JM/TM to initialize...");
+      sleep(500);
+    }
+  }
+  Runner jobRunner=startWithArgs(new String[]{"run","--detached",exampleJarLocation.getAbsolutePath(),"--input",tmpInFile.getAbsoluteFile().toString()},"Job has been submitted with JobID",RunTypes.CLI_FRONTEND);
+  jobRunner.join();
+  if (isNewMode) {
+    LOG.info("Waiting until two containers are running");
+    while (getRunningContainers() < 2) {
+      sleep(500);
+    }
+  }
+  long startTime=System.nanoTime();
+  while (System.nanoTime() - startTime < TimeUnit.NANOSECONDS.convert(10,TimeUnit.SECONDS) && !(verifyStringsInNamedLogFiles(new String[]{"switched from state RUNNING to FINISHED"},"jobmanager.log"))) {
+    LOG.info("Still waiting for cluster to finish job...");
+    sleep(500);
+  }
+  LOG.info("Two containers are running. Killing the application");
+  try {
+    YarnClient yc=YarnClient.createYarnClient();
+    yc.init(YARN_CONFIGURATION);
+    yc.start();
+    List<ApplicationReport> apps=yc.getApplications(EnumSet.of(YarnApplicationState.RUNNING));
+    Assert.assertEquals(1,apps.size());
+    ApplicationReport app=apps.get(0);
+    Assert.assertEquals("MyCustomName",app.getName());
+    ApplicationId id=app.getApplicationId();
+    yc.killApplication(id);
+    while (yc.getApplications(EnumSet.of(YarnApplicationState.KILLED)).size() == 0 && yc.getApplications(EnumSet.of(YarnApplicationState.FINISHED)).size() == 0) {
+      sleep(500);
+    }
+  }
+ catch (  Throwable t) {
+    LOG.warn("Killing failed",t);
+    Assert.fail();
+  }
+ finally {
+    String confDirPath=System.getenv("FLINK_CONF_DIR");
+    File configDirectory=new File(confDirPath);
+    LOG.info("testDetachedPerJobYarnClusterInternal: Using configuration directory " + configDirectory.getAbsolutePath());
+    LOG.info("testDetachedPerJobYarnClusterInternal: Trying to load configuration file");
+    Configuration configuration=GlobalConfiguration.loadConfiguration(configDirectory.getAbsolutePath());
+    try {
+      File yarnPropertiesFile=FlinkYarnSessionCli.getYarnPropertiesLocation(configuration.getString(YarnConfigOptions.PROPERTIES_FILE_LOCATION));
+      if (yarnPropertiesFile.exists()) {
+        LOG.info("testDetachedPerJobYarnClusterInternal: Cleaning up temporary Yarn address reference: {}",yarnPropertiesFile.getAbsolutePath());
+        yarnPropertiesFile.delete();
+      }
+    }
+ catch (    Exception e) {
+      LOG.warn("testDetachedPerJobYarnClusterInternal: Exception while deleting the JobManager address file",e);
+    }
+  }
+  LOG.info("Finished testDetachedMode()");
+}

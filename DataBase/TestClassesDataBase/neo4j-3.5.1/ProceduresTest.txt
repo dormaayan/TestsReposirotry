@@ -1,0 +1,114 @@
+public class ProceduresTest {
+  @Rule public ExpectedException exception=ExpectedException.none();
+  private final Procedures procs=new Procedures();
+  private final ProcedureSignature signature=procedureSignature("org","myproc").out("name",NTString).build();
+  private final CallableProcedure procedure=procedure(signature);
+  private final ResourceTracker resourceTracker=new StubResourceManager();
+  @Test public void shouldGetRegisteredProcedure() throws Throwable {
+    procs.register(procedure);
+    assertThat(procs.procedure(signature.name()).signature(),equalTo(signature));
+  }
+  @Test public void shouldGetAllRegisteredProcedures() throws Throwable {
+    procs.register(procedure(procedureSignature("org","myproc1").out("age",NTInteger).build()));
+    procs.register(procedure(procedureSignature("org","myproc2").out("age",NTInteger).build()));
+    procs.register(procedure(procedureSignature("org","myproc3").out("age",NTInteger).build()));
+    List<ProcedureSignature> signatures=Iterables.asList(procs.getAllProcedures());
+    assertThat(signatures,containsInAnyOrder(procedureSignature("org","myproc1").out("age",NTInteger).build(),procedureSignature("org","myproc2").out("age",NTInteger).build(),procedureSignature("org","myproc3").out("age",NTInteger).build()));
+  }
+  @Test public void shouldCallRegisteredProcedure() throws Throwable {
+    procs.register(procedure);
+    RawIterator<Object[],ProcedureException> result=procs.callProcedure(new BasicContext(),signature.name(),new Object[]{1337},resourceTracker);
+    assertThat(asList(result),contains(equalTo(new Object[]{1337})));
+  }
+  @Test public void shouldNotAllowCallingNonExistingProcedure() throws Throwable {
+    exception.expect(ProcedureException.class);
+    exception.expectMessage("There is no procedure with the name `org.myproc` registered for this " + "database instance. Please ensure you've spelled the " + "procedure name correctly and that the procedure is properly deployed.");
+    procs.callProcedure(new BasicContext(),signature.name(),new Object[]{1337},resourceTracker);
+  }
+  @Test public void shouldNotAllowRegisteringConflictingName() throws Throwable {
+    procs.register(procedure);
+    exception.expect(ProcedureException.class);
+    exception.expectMessage("Unable to register procedure, because the name `org.myproc` is already in use.");
+    procs.register(procedure);
+  }
+  @Test public void shouldNotAllowDuplicateFieldNamesInInput() throws Throwable {
+    exception.expect(ProcedureException.class);
+    exception.expectMessage("Procedure `asd(a :: ANY?, a :: ANY?) :: ()` cannot be " + "registered, because it contains a duplicated input field, 'a'. " + "You need to rename or remove one of the duplicate fields.");
+    procs.register(procedureWithSignature(procedureSignature("asd").in("a",NTAny).in("a",NTAny).build()));
+  }
+  @Test public void shouldNotAllowDuplicateFieldNamesInOutput() throws Throwable {
+    exception.expect(ProcedureException.class);
+    exception.expectMessage("Procedure `asd() :: (a :: ANY?, a :: ANY?)` cannot be registered, " + "because it contains a duplicated output field, 'a'. " + "You need to rename or remove one of the duplicate fields.");
+    procs.register(procedureWithSignature(procedureSignature("asd").out("a",NTAny).out("a",NTAny).build()));
+  }
+  @Test public void shouldSignalNonExistingProcedure() throws Throwable {
+    exception.expect(ProcedureException.class);
+    exception.expectMessage("There is no procedure with the name `org.myproc` registered for this " + "database instance. Please ensure you've spelled the " + "procedure name correctly and that the procedure is properly deployed.");
+    procs.procedure(signature.name());
+  }
+  @Test public void shouldMakeContextAvailable() throws Throwable {
+    Key<String> someKey=key("someKey",String.class);
+    procs.register(new CallableProcedure.BasicProcedure(signature){
+      @Override public RawIterator<Object[],ProcedureException> apply(      Context ctx,      Object[] input,      ResourceTracker resourceTracker) throws ProcedureException {
+        return RawIterator.<Object[],ProcedureException>of(new Object[]{ctx.get(someKey)});
+      }
+    }
+);
+    BasicContext ctx=new BasicContext();
+    ctx.put(someKey,"hello, world");
+    RawIterator<Object[],ProcedureException> result=procs.callProcedure(ctx,signature.name(),new Object[0],resourceTracker);
+    assertThat(asList(result),contains(equalTo(new Object[]{"hello, world"})));
+  }
+  @Test public void shouldFailCompileProcedureWithReadConflict() throws Throwable {
+    exception.expect(ProcedureException.class);
+    exception.expectMessage("Conflicting procedure annotation, cannot use PerformsWrites and mode");
+    procs.registerProcedure(ProcedureWithReadConflictAnnotation.class);
+  }
+  @Test public void shouldFailCompileProcedureWithWriteConflict() throws Throwable {
+    exception.expect(ProcedureException.class);
+    exception.expectMessage("Conflicting procedure annotation, cannot use PerformsWrites and mode");
+    procs.registerProcedure(ProcedureWithWriteConflictAnnotation.class);
+  }
+  @Test public void shouldFailCompileProcedureWithSchemaConflict() throws Throwable {
+    exception.expect(ProcedureException.class);
+    exception.expectMessage("Conflicting procedure annotation, cannot use PerformsWrites and mode");
+    procs.registerProcedure(ProcedureWithSchemaConflictAnnotation.class);
+  }
+  @Test public void shouldFailCompileProcedureWithDBMSConflict() throws Throwable {
+    exception.expect(ProcedureException.class);
+    exception.expectMessage("Conflicting procedure annotation, cannot use PerformsWrites and mode");
+    procs.registerProcedure(ProcedureWithDBMSConflictAnnotation.class);
+  }
+public static class ProcedureWithReadConflictAnnotation {
+    @PerformsWrites @Procedure(mode=Mode.READ) public void shouldCompile(){
+    }
+  }
+public static class ProcedureWithWriteConflictAnnotation {
+    @PerformsWrites @Procedure(mode=Mode.WRITE) public void shouldCompileToo(){
+    }
+  }
+public static class ProcedureWithDBMSConflictAnnotation {
+    @PerformsWrites @Procedure(mode=Mode.DBMS) public void shouldNotCompile(){
+    }
+  }
+public static class ProcedureWithSchemaConflictAnnotation {
+    @PerformsWrites @Procedure(mode=Mode.SCHEMA) public void shouldNotCompile(){
+    }
+  }
+  private CallableProcedure.BasicProcedure procedureWithSignature(  final ProcedureSignature signature){
+    return new CallableProcedure.BasicProcedure(signature){
+      @Override public RawIterator<Object[],ProcedureException> apply(      Context ctx,      Object[] input,      ResourceTracker resourceTracker) throws ProcedureException {
+        return null;
+      }
+    }
+;
+  }
+  private CallableProcedure procedure(  ProcedureSignature signature){
+    return new CallableProcedure.BasicProcedure(signature){
+      @Override public RawIterator<Object[],ProcedureException> apply(      Context ctx,      Object[] input,      ResourceTracker resourceTracker){
+        return RawIterator.<Object[],ProcedureException>of(input);
+      }
+    }
+;
+  }
+}

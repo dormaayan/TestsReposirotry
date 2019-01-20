@@ -1,0 +1,135 @@
+/** 
+ * Confirm that the function of FlushLifeCycleTracker is OK as we do not use it in our own code.
+ */
+@Category({CoprocessorTests.class,MediumTests.class}) public class TestFlushLifeCycleTracker {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestFlushLifeCycleTracker.class);
+  private static final HBaseTestingUtility UTIL=new HBaseTestingUtility();
+  private static final TableName NAME=TableName.valueOf(TestFlushLifeCycleTracker.class.getSimpleName());
+  private static final byte[] CF=Bytes.toBytes("CF");
+  private static final byte[] QUALIFIER=Bytes.toBytes("CQ");
+  private HRegion region;
+  private static FlushLifeCycleTracker TRACKER;
+  private static volatile CountDownLatch ARRIVE;
+  private static volatile CountDownLatch BLOCK;
+public static final class FlushObserver implements RegionObserver, RegionCoprocessor {
+    @Override public Optional<RegionObserver> getRegionObserver(){
+      return Optional.of(this);
+    }
+    @Override public void preFlush(    ObserverContext<RegionCoprocessorEnvironment> c,    FlushLifeCycleTracker tracker) throws IOException {
+      if (TRACKER != null) {
+        assertSame(tracker,TRACKER);
+      }
+    }
+    @Override public InternalScanner preFlush(    ObserverContext<RegionCoprocessorEnvironment> c,    Store store,    InternalScanner scanner,    FlushLifeCycleTracker tracker) throws IOException {
+      if (TRACKER != null) {
+        assertSame(tracker,TRACKER);
+      }
+      return scanner;
+    }
+    @Override public void postFlush(    ObserverContext<RegionCoprocessorEnvironment> c,    FlushLifeCycleTracker tracker) throws IOException {
+      if (TRACKER != null) {
+        assertSame(tracker,TRACKER);
+      }
+    }
+    @Override public void postFlush(    ObserverContext<RegionCoprocessorEnvironment> c,    Store store,    StoreFile resultFile,    FlushLifeCycleTracker tracker) throws IOException {
+      if (TRACKER != null) {
+        assertSame(tracker,TRACKER);
+      }
+      CountDownLatch arrive=ARRIVE;
+      if (arrive != null) {
+        arrive.countDown();
+        try {
+          BLOCK.await();
+        }
+ catch (        InterruptedException e) {
+          throw new InterruptedIOException();
+        }
+      }
+    }
+  }
+private static final class Tracker implements FlushLifeCycleTracker {
+    private String reason;
+    private boolean beforeExecutionCalled;
+    private boolean afterExecutionCalled;
+    private boolean completed=false;
+    @Override public synchronized void notExecuted(    String reason){
+      this.reason=reason;
+      completed=true;
+      notifyAll();
+    }
+    @Override public void beforeExecution(){
+      this.beforeExecutionCalled=true;
+    }
+    @Override public synchronized void afterExecution(){
+      this.afterExecutionCalled=true;
+      completed=true;
+      notifyAll();
+    }
+    public synchronized void await() throws InterruptedException {
+      while (!completed) {
+        wait();
+      }
+    }
+  }
+  @BeforeClass public static void setUpBeforeClass() throws Exception {
+    UTIL.startMiniCluster(3);
+  }
+  @AfterClass public static void tearDownAfterClass() throws Exception {
+    UTIL.shutdownMiniCluster();
+  }
+  @Before public void setUp() throws IOException {
+    UTIL.getAdmin().createTable(TableDescriptorBuilder.newBuilder(NAME).setColumnFamily(ColumnFamilyDescriptorBuilder.of(CF)).setCoprocessor(FlushObserver.class.getName()).build());
+    region=UTIL.getHBaseCluster().getRegions(NAME).get(0);
+  }
+  @After public void tearDown() throws IOException {
+    region=null;
+    TRACKER=null;
+    UTIL.deleteTable(NAME);
+  }
+  @Test public void test() throws IOException, InterruptedException {
+    try (Table table=UTIL.getConnection().getTable(NAME)){
+      for (int i=0; i < 100; i++) {
+        byte[] row=Bytes.toBytes(i);
+        table.put(new Put(row,true).add(CellBuilderFactory.create(CellBuilderType.SHALLOW_COPY).setRow(row).setFamily(CF).setQualifier(QUALIFIER).setTimestamp(HConstants.LATEST_TIMESTAMP).setType(Type.Put).setValue(Bytes.toBytes(i)).build()));
+      }
+    }
+     Tracker tracker=new Tracker();
+    TRACKER=tracker;
+    region.requestFlush(tracker);
+    tracker.await();
+    assertNull(tracker.reason);
+    assertTrue(tracker.beforeExecutionCalled);
+    assertTrue(tracker.afterExecutionCalled);
+    tracker=new Tracker();
+    TRACKER=tracker;
+    region.requestFlush(tracker);
+    tracker.await();
+    assertNull(tracker.reason);
+    assertTrue(tracker.beforeExecutionCalled);
+    assertTrue(tracker.afterExecutionCalled);
+  }
+  @Test public void testNotExecuted() throws IOException, InterruptedException {
+    try (Table table=UTIL.getConnection().getTable(NAME)){
+      for (int i=0; i < 100; i++) {
+        byte[] row=Bytes.toBytes(i);
+        table.put(new Put(row,true).add(CellBuilderFactory.create(CellBuilderType.SHALLOW_COPY).setRow(row).setFamily(CF).setQualifier(QUALIFIER).setTimestamp(HConstants.LATEST_TIMESTAMP).setType(Type.Put).setValue(Bytes.toBytes(i)).build()));
+      }
+    }
+     Tracker tracker1=new Tracker();
+    ARRIVE=new CountDownLatch(1);
+    BLOCK=new CountDownLatch(1);
+    region.requestFlush(tracker1);
+    ARRIVE.await();
+    Tracker tracker2=new Tracker();
+    region.requestFlush(tracker2);
+    tracker2.await();
+    assertNotNull(tracker2.reason);
+    assertFalse(tracker2.beforeExecutionCalled);
+    assertFalse(tracker2.afterExecutionCalled);
+    BLOCK.countDown();
+    tracker1.await();
+    assertNull(tracker1.reason);
+    assertTrue(tracker1.beforeExecutionCalled);
+    assertTrue(tracker1.afterExecutionCalled);
+  }
+}

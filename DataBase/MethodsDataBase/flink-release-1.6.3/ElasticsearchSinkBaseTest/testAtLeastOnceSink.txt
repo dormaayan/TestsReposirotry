@@ -1,0 +1,30 @@
+/** 
+ * Tests that the sink correctly waits for pending requests (including re-added requests) on checkpoints; we set a timeout because the test will not finish if the logic is broken.
+ */
+@Test(timeout=5000) public void testAtLeastOnceSink() throws Throwable {
+  final DummyElasticsearchSink<String> sink=new DummyElasticsearchSink<>(new HashMap<String,String>(),new SimpleSinkFunction<String>(),new DummyRetryFailureHandler());
+  final OneInputStreamOperatorTestHarness<String,Object> testHarness=new OneInputStreamOperatorTestHarness<>(new StreamSink<>(sink));
+  testHarness.open();
+  sink.setMockItemFailuresListForNextBulkItemResponses(Collections.singletonList(new Exception("artificial failure for record")));
+  testHarness.processElement(new StreamRecord<>("msg"));
+  verify(sink.getMockBulkProcessor(),times(1)).add(any(IndexRequest.class));
+  CheckedThread snapshotThread=new CheckedThread(){
+    @Override public void go() throws Exception {
+      testHarness.snapshot(1L,1000L);
+    }
+  }
+;
+  snapshotThread.start();
+  while (snapshotThread.getState() != Thread.State.WAITING) {
+    Thread.sleep(10);
+  }
+  sink.continueFlush();
+  while (snapshotThread.getState() != Thread.State.WAITING) {
+    Thread.sleep(10);
+  }
+  Assert.assertEquals(1,sink.getNumPendingRequests());
+  sink.setMockItemFailuresListForNextBulkItemResponses(Collections.singletonList((Exception)null));
+  sink.continueFlush();
+  snapshotThread.sync();
+  testHarness.close();
+}

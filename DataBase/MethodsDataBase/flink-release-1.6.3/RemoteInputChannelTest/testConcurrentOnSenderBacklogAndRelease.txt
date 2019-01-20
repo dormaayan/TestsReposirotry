@@ -1,0 +1,48 @@
+/** 
+ * Tests to verify that there is no race condition with two things running in parallel: requesting floating buffers on sender backlog and some other thread releasing the input channel.
+ */
+@Test public void testConcurrentOnSenderBacklogAndRelease() throws Exception {
+  final NetworkBufferPool networkBufferPool=new NetworkBufferPool(130,32);
+  final int numExclusiveBuffers=2;
+  final int numFloatingBuffers=128;
+  final ExecutorService executor=Executors.newFixedThreadPool(2);
+  final SingleInputGate inputGate=createSingleInputGate();
+  final RemoteInputChannel inputChannel=createRemoteInputChannel(inputGate);
+  inputGate.setInputChannel(inputChannel.partitionId.getPartitionId(),inputChannel);
+  Throwable thrown=null;
+  try {
+    final BufferPool bufferPool=networkBufferPool.createBufferPool(numFloatingBuffers,numFloatingBuffers);
+    inputGate.setBufferPool(bufferPool);
+    inputGate.assignExclusiveSegments(networkBufferPool,numExclusiveBuffers);
+    inputChannel.requestSubpartition(0);
+    final Callable<Void> requestBufferTask=new Callable<Void>(){
+      @Override public Void call() throws Exception {
+        while (true) {
+          for (int j=1; j <= numFloatingBuffers; j++) {
+            inputChannel.onSenderBacklog(j);
+          }
+          if (inputChannel.isReleased()) {
+            return null;
+          }
+        }
+      }
+    }
+;
+    final Callable<Void> releaseTask=new Callable<Void>(){
+      @Override public Void call() throws Exception {
+        inputChannel.releaseAllResources();
+        return null;
+      }
+    }
+;
+    submitTasksAndWaitForResults(executor,new Callable[]{requestBufferTask,releaseTask});
+    assertEquals("There should be no buffers available in the channel.",0,inputChannel.getNumberOfAvailableBuffers());
+    assertEquals("There should be 130 buffers available in local pool.",130,bufferPool.getNumberOfAvailableMemorySegments() + networkBufferPool.getNumberOfAvailableMemorySegments());
+  }
+ catch (  Throwable t) {
+    thrown=t;
+  }
+ finally {
+    cleanup(networkBufferPool,executor,null,thrown,inputChannel);
+  }
+}

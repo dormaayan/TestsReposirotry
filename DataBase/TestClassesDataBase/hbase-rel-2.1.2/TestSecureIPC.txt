@@ -1,0 +1,181 @@
+@RunWith(Parameterized.class) @Category({SecurityTests.class,MediumTests.class}) public class TestSecureIPC {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestSecureIPC.class);
+  private static final HBaseTestingUtility TEST_UTIL=new HBaseTestingUtility();
+  private static final File KEYTAB_FILE=new File(TEST_UTIL.getDataTestDir("keytab").toUri().getPath());
+  private static MiniKdc KDC;
+  private static String HOST="localhost";
+  private static String PRINCIPAL;
+  String krbKeytab;
+  String krbPrincipal;
+  UserGroupInformation ugi;
+  Configuration clientConf;
+  Configuration serverConf;
+  @Rule public ExpectedException exception=ExpectedException.none();
+  @Parameters(name="{index}: rpcClientImpl={0}, rpcServerImpl={1}") public static Collection<Object[]> parameters(){
+    List<Object[]> params=new ArrayList<>();
+    List<String> rpcClientImpls=Arrays.asList(BlockingRpcClient.class.getName(),NettyRpcClient.class.getName());
+    List<String> rpcServerImpls=Arrays.asList(SimpleRpcServer.class.getName(),NettyRpcServer.class.getName());
+    for (    String rpcClientImpl : rpcClientImpls) {
+      for (      String rpcServerImpl : rpcServerImpls) {
+        params.add(new Object[]{rpcClientImpl,rpcServerImpl});
+      }
+    }
+    return params;
+  }
+  @Parameter(0) public String rpcClientImpl;
+  @Parameter(1) public String rpcServerImpl;
+  @BeforeClass public static void setUp() throws Exception {
+    KDC=TEST_UTIL.setupMiniKdc(KEYTAB_FILE);
+    PRINCIPAL="hbase/" + HOST;
+    KDC.createPrincipal(KEYTAB_FILE,PRINCIPAL);
+    HBaseKerberosUtils.setPrincipalForTesting(PRINCIPAL + "@" + KDC.getRealm());
+  }
+  @AfterClass public static void tearDown() throws IOException {
+    if (KDC != null) {
+      KDC.stop();
+    }
+    TEST_UTIL.cleanupTestDir();
+  }
+  @Before public void setUpTest() throws Exception {
+    krbKeytab=getKeytabFileForTesting();
+    krbPrincipal=getPrincipalForTesting();
+    ugi=loginKerberosPrincipal(krbKeytab,krbPrincipal);
+    clientConf=getSecuredConfiguration();
+    clientConf.set(RpcClientFactory.CUSTOM_RPC_CLIENT_IMPL_CONF_KEY,rpcClientImpl);
+    serverConf=getSecuredConfiguration();
+    serverConf.set(RpcServerFactory.CUSTOM_RPC_SERVER_IMPL_CONF_KEY,rpcServerImpl);
+  }
+  @Test public void testRpcCallWithEnabledKerberosSaslAuth() throws Exception {
+    UserGroupInformation ugi2=UserGroupInformation.getCurrentUser();
+    assertSame(ugi2,ugi);
+    assertEquals(AuthenticationMethod.KERBEROS,ugi.getAuthenticationMethod());
+    assertEquals(krbPrincipal,ugi.getUserName());
+    callRpcService(User.create(ugi2));
+  }
+  @Test public void testRpcFallbackToSimpleAuth() throws Exception {
+    String clientUsername="testuser";
+    UserGroupInformation clientUgi=UserGroupInformation.createUserForTesting(clientUsername,new String[]{clientUsername});
+    assertNotSame(ugi,clientUgi);
+    assertEquals(AuthenticationMethod.SIMPLE,clientUgi.getAuthenticationMethod());
+    assertEquals(clientUsername,clientUgi.getUserName());
+    clientConf.set(User.HBASE_SECURITY_CONF_KEY,"simple");
+    serverConf.setBoolean(RpcServer.FALLBACK_TO_INSECURE_CLIENT_AUTH,true);
+    callRpcService(User.create(clientUgi));
+  }
+  void setRpcProtection(  String clientProtection,  String serverProtection){
+    clientConf.set("hbase.rpc.protection",clientProtection);
+    serverConf.set("hbase.rpc.protection",serverProtection);
+  }
+  /** 
+ * Test various combinations of Server and Client qops.
+ * @throws Exception
+ */
+  @Test public void testSaslWithCommonQop() throws Exception {
+    setRpcProtection("privacy,authentication","authentication");
+    callRpcService(User.create(ugi));
+    setRpcProtection("authentication","privacy,authentication");
+    callRpcService(User.create(ugi));
+    setRpcProtection("integrity,authentication","privacy,authentication");
+    callRpcService(User.create(ugi));
+    setRpcProtection("integrity,authentication","integrity,authentication");
+    callRpcService(User.create(ugi));
+    setRpcProtection("privacy,authentication","privacy,authentication");
+    callRpcService(User.create(ugi));
+  }
+  @Test public void testSaslNoCommonQop() throws Exception {
+    exception.expect(SaslException.class);
+    exception.expectMessage("No common protection layer between client and server");
+    setRpcProtection("integrity","privacy");
+    callRpcService(User.create(ugi));
+  }
+  /** 
+ * Test sasl encryption with Crypto AES.
+ * @throws Exception
+ */
+  @Test public void testSaslWithCryptoAES() throws Exception {
+    setRpcProtection("privacy","privacy");
+    setCryptoAES("true","true");
+    callRpcService(User.create(ugi));
+  }
+  /** 
+ * Test various combinations of Server and Client configuration for Crypto AES.
+ * @throws Exception
+ */
+  @Test public void testDifferentConfWithCryptoAES() throws Exception {
+    setRpcProtection("privacy","privacy");
+    setCryptoAES("false","true");
+    callRpcService(User.create(ugi));
+    setCryptoAES("true","false");
+    try {
+      callRpcService(User.create(ugi));
+      fail("The exception should be thrown out for the rpc timeout.");
+    }
+ catch (    Exception e) {
+    }
+  }
+  void setCryptoAES(  String clientCryptoAES,  String serverCryptoAES){
+    clientConf.set("hbase.rpc.crypto.encryption.aes.enabled",clientCryptoAES);
+    serverConf.set("hbase.rpc.crypto.encryption.aes.enabled",serverCryptoAES);
+  }
+  private UserGroupInformation loginKerberosPrincipal(  String krbKeytab,  String krbPrincipal) throws Exception {
+    Configuration cnf=new Configuration();
+    cnf.set(CommonConfigurationKeys.HADOOP_SECURITY_AUTHENTICATION,"kerberos");
+    UserGroupInformation.setConfiguration(cnf);
+    UserGroupInformation.loginUserFromKeytab(krbPrincipal,krbKeytab);
+    return UserGroupInformation.getLoginUser();
+  }
+  /** 
+ * Sets up a RPC Server and a Client. Does a RPC checks the result. If an exception is thrown from the stub, this function will throw root cause of that exception.
+ */
+  private void callRpcService(  User clientUser) throws Exception {
+    SecurityInfo securityInfoMock=Mockito.mock(SecurityInfo.class);
+    Mockito.when(securityInfoMock.getServerPrincipal()).thenReturn(HBaseKerberosUtils.KRB_PRINCIPAL);
+    SecurityInfo.addInfo("TestProtobufRpcProto",securityInfoMock);
+    InetSocketAddress isa=new InetSocketAddress(HOST,0);
+    RpcServerInterface rpcServer=RpcServerFactory.createRpcServer(null,"AbstractTestSecureIPC",Lists.newArrayList(new RpcServer.BlockingServiceAndInterface((BlockingService)SERVICE,null)),isa,serverConf,new FifoRpcScheduler(serverConf,1));
+    rpcServer.start();
+    try (RpcClient rpcClient=RpcClientFactory.createClient(clientConf,HConstants.DEFAULT_CLUSTER_ID.toString())){
+      BlockingInterface stub=newBlockingStub(rpcClient,rpcServer.getListenerAddress(),clientUser);
+      TestThread th1=new TestThread(stub);
+      final Throwable exception[]=new Throwable[1];
+      Collections.synchronizedList(new ArrayList<Throwable>());
+      Thread.UncaughtExceptionHandler exceptionHandler=new Thread.UncaughtExceptionHandler(){
+        @Override public void uncaughtException(        Thread th,        Throwable ex){
+          exception[0]=ex;
+        }
+      }
+;
+      th1.setUncaughtExceptionHandler(exceptionHandler);
+      th1.start();
+      th1.join();
+      if (exception[0] != null) {
+        while (exception[0].getCause() != null) {
+          exception[0]=exception[0].getCause();
+        }
+        throw (Exception)exception[0];
+      }
+    }
+  finally {
+      rpcServer.stop();
+    }
+  }
+public static class TestThread extends Thread {
+    private final BlockingInterface stub;
+    public TestThread(    BlockingInterface stub){
+      this.stub=stub;
+    }
+    @Override public void run(){
+      try {
+        int[] messageSize=new int[]{100,1000,10000};
+        for (int i=0; i < messageSize.length; i++) {
+          String input=RandomStringUtils.random(messageSize[i]);
+          String result=stub.echo(null,TestProtos.EchoRequestProto.newBuilder().setMessage(input).build()).getMessage();
+          assertEquals(input,result);
+        }
+      }
+ catch (      org.apache.hbase.thirdparty.com.google.protobuf.ServiceException e) {
+        throw new RuntimeException(e);
+      }
+    }
+  }
+}

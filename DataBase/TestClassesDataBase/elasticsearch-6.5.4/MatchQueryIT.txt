@@ -1,0 +1,87 @@
+public class MatchQueryIT extends ESIntegTestCase {
+  private static final String INDEX="test";
+  /** 
+ * Test setup.
+ */
+  @Before public void setUp() throws Exception {
+    super.setUp();
+    CreateIndexRequestBuilder builder=prepareCreate(INDEX).setSettings(Settings.builder().put(indexSettings()).put("index.analysis.filter.syns.type","synonym").putList("index.analysis.filter.syns.synonyms","wtf, what the fudge","foo, bar baz").put("index.analysis.analyzer.lower_syns.type","custom").put("index.analysis.analyzer.lower_syns.tokenizer","standard").putList("index.analysis.analyzer.lower_syns.filter","lowercase","syns").put("index.analysis.filter.graphsyns.type","synonym_graph").putList("index.analysis.filter.graphsyns.synonyms","wtf, what the fudge","foo, bar baz").put("index.analysis.analyzer.lower_graphsyns.type","custom").put("index.analysis.analyzer.lower_graphsyns.tokenizer","standard").putList("index.analysis.analyzer.lower_graphsyns.filter","lowercase","graphsyns"));
+    assertAcked(builder.addMapping(INDEX,createMapping()));
+    ensureGreen();
+  }
+  private List<IndexRequestBuilder> getDocs(){
+    List<IndexRequestBuilder> builders=new ArrayList<>();
+    builders.add(client().prepareIndex("test","test","1").setSource("field","say wtf happened foo"));
+    builders.add(client().prepareIndex("test","test","2").setSource("field","bar baz what the fudge man"));
+    builders.add(client().prepareIndex("test","test","3").setSource("field","wtf"));
+    builders.add(client().prepareIndex("test","test","4").setSource("field","what is the name for fudge"));
+    builders.add(client().prepareIndex("test","test","5").setSource("field","bar two three"));
+    builders.add(client().prepareIndex("test","test","6").setSource("field","bar baz two three"));
+    return builders;
+  }
+  /** 
+ * Setup the index mappings for the test index.
+ * @return the json builder with the index mappings
+ * @throws IOException on error creating mapping json
+ */
+  private XContentBuilder createMapping() throws IOException {
+    return XContentFactory.jsonBuilder().startObject().startObject(INDEX).startObject("properties").startObject("field").field("type","text").endObject().endObject().endObject().endObject();
+  }
+  public void testSimpleMultiTermPhrase() throws ExecutionException, InterruptedException {
+    indexRandom(true,false,getDocs());
+    SearchResponse searchResponse=client().prepareSearch(INDEX).setQuery(QueryBuilders.matchPhraseQuery("field","foo two three").analyzer("lower_syns")).get();
+    assertHitCount(searchResponse,1L);
+    assertSearchHits(searchResponse,"5");
+    searchResponse=client().prepareSearch(INDEX).setQuery(QueryBuilders.matchPhraseQuery("field","foo two three").analyzer("lower_graphsyns")).get();
+    assertHitCount(searchResponse,1L);
+    assertSearchHits(searchResponse,"6");
+  }
+  public void testSimpleMultiTermAnd() throws ExecutionException, InterruptedException {
+    indexRandom(true,false,getDocs());
+    SearchResponse searchResponse=client().prepareSearch(INDEX).setQuery(QueryBuilders.matchQuery("field","say what the fudge").operator(Operator.AND).analyzer("lower_syns")).get();
+    assertHitCount(searchResponse,1L);
+    assertSearchHits(searchResponse,"1");
+    searchResponse=client().prepareSearch(INDEX).setQuery(QueryBuilders.matchQuery("field","say what the fudge").operator(Operator.AND).analyzer("lower_graphsyns")).get();
+    assertHitCount(searchResponse,1L);
+    assertSearchHits(searchResponse,"1");
+  }
+  public void testMinShouldMatch() throws ExecutionException, InterruptedException {
+    indexRandom(true,false,getDocs());
+    SearchResponse searchResponse=client().prepareSearch(INDEX).setQuery(QueryBuilders.matchQuery("field","three what the fudge foo").operator(Operator.OR).analyzer("lower_graphsyns").autoGenerateSynonymsPhraseQuery(false)).get();
+    assertHitCount(searchResponse,6L);
+    assertSearchHits(searchResponse,"1","2","3","4","5","6");
+    searchResponse=client().prepareSearch(INDEX).setQuery(QueryBuilders.matchQuery("field","three what the fudge foo").operator(Operator.OR).analyzer("lower_graphsyns").minimumShouldMatch("80%")).get();
+    assertHitCount(searchResponse,3L);
+    assertSearchHits(searchResponse,"1","2","6");
+  }
+  public void testMultiTermsSynonymsPhrase() throws ExecutionException, InterruptedException {
+    List<IndexRequestBuilder> builders=getDocs();
+    indexRandom(true,false,builders);
+    SearchResponse searchResponse=client().prepareSearch(INDEX).setQuery(QueryBuilders.matchQuery("field","wtf").analyzer("lower_graphsyns").operator(Operator.AND)).get();
+    assertHitCount(searchResponse,3L);
+    assertSearchHits(searchResponse,"1","2","3");
+  }
+  public void testPhrasePrefix() throws ExecutionException, InterruptedException {
+    List<IndexRequestBuilder> builders=getDocs();
+    builders.add(client().prepareIndex("test","test","7").setSource("field","WTFD!"));
+    builders.add(client().prepareIndex("test","test","8").setSource("field","Weird Al's WHAT THE FUDGESICLE"));
+    indexRandom(true,false,builders);
+    SearchResponse searchResponse=client().prepareSearch(INDEX).setQuery(QueryBuilders.matchPhrasePrefixQuery("field","wtf").analyzer("lower_graphsyns")).get();
+    assertHitCount(searchResponse,5L);
+    assertSearchHits(searchResponse,"1","2","3","7","8");
+  }
+  public void testCommonTerms() throws ExecutionException, InterruptedException {
+    String route="commonTermsTest";
+    List<IndexRequestBuilder> builders=getDocs();
+    for (    IndexRequestBuilder indexRequet : builders) {
+      indexRequet.setRouting(route);
+    }
+    indexRandom(true,false,builders);
+    SearchResponse searchResponse=client().prepareSearch(INDEX).setRouting(route).setQuery(QueryBuilders.matchQuery("field","bar three happened").operator(Operator.OR)).get();
+    assertHitCount(searchResponse,4L);
+    assertSearchHits(searchResponse,"1","2","5","6");
+    searchResponse=client().prepareSearch(INDEX).setRouting(route).setQuery(QueryBuilders.matchQuery("field","bar three happened").operator(Operator.OR).cutoffFrequency(1f)).get();
+    assertHitCount(searchResponse,1L);
+    assertSearchHits(searchResponse,"1");
+  }
+}

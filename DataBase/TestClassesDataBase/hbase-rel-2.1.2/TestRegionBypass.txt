@@ -1,0 +1,100 @@
+/** 
+ * Tests bypass on a region assign/unassign
+ */
+@Category({LargeTests.class}) public class TestRegionBypass {
+  private final static Logger LOG=LoggerFactory.getLogger(TestRegionBypass.class);
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestRegionBypass.class);
+  @Rule public TestName name=new TestName();
+  private static final HBaseTestingUtility TEST_UTIL=new HBaseTestingUtility();
+  private TableName tableName;
+  @BeforeClass public static void startCluster() throws Exception {
+    TEST_UTIL.startMiniCluster(2);
+  }
+  @AfterClass public static void stopCluster() throws Exception {
+    TEST_UTIL.shutdownMiniCluster();
+  }
+  @Before public void before() throws IOException {
+    this.tableName=TableName.valueOf(this.name.getMethodName());
+    TEST_UTIL.createTable(this.tableName,Bytes.toBytes("cf"));
+  }
+  @Test public void testBypass() throws IOException {
+    Admin admin=TEST_UTIL.getAdmin();
+    List<RegionInfo> regions=admin.getRegions(this.tableName);
+    for (    RegionInfo ri : regions) {
+      admin.unassign(ri.getRegionName(),false);
+    }
+    List<Long> pids=new ArrayList<>(regions.size());
+    for (    RegionInfo ri : regions) {
+      Procedure<MasterProcedureEnv> p=new StallingAssignProcedure(ri);
+      pids.add(TEST_UTIL.getHBaseCluster().getMaster().getMasterProcedureExecutor().submitProcedure(p));
+    }
+    for (    Long pid : pids) {
+      while (!TEST_UTIL.getHBaseCluster().getMaster().getMasterProcedureExecutor().isStarted(pid)) {
+        Thread.currentThread().yield();
+      }
+    }
+    List<Procedure<MasterProcedureEnv>> ps=TEST_UTIL.getHBaseCluster().getMaster().getMasterProcedureExecutor().getProcedures();
+    for (    Procedure<MasterProcedureEnv> p : ps) {
+      if (p instanceof StallingAssignProcedure) {
+        List<Boolean> bs=TEST_UTIL.getHbck().bypassProcedure(Arrays.<Long>asList(p.getProcId()),1,false,false);
+        for (        Boolean b : bs) {
+          LOG.info("BYPASSED {} {}",p.getProcId(),b);
+        }
+      }
+    }
+    for (    Procedure<MasterProcedureEnv> p : ps) {
+      if (p instanceof StallingAssignProcedure) {
+        ((StallingAssignProcedure)p).latch.countDown();
+      }
+    }
+    for (    RegionInfo ri : regions) {
+      try {
+        admin.assign(ri.getRegionName());
+      }
+ catch (      Throwable dnrioe) {
+        LOG.info("Expected {}",dnrioe);
+      }
+    }
+    while (!TEST_UTIL.getHBaseCluster().getMaster().getMasterProcedureExecutor().getActiveProcIds().isEmpty()) {
+      Thread.currentThread().yield();
+    }
+    for (    RegionInfo ri : regions) {
+      TEST_UTIL.getHbck().assigns(Arrays.<String>asList(ri.getEncodedName()),true);
+    }
+    while (!TEST_UTIL.getHBaseCluster().getMaster().getMasterProcedureExecutor().getActiveProcIds().isEmpty()) {
+      Thread.currentThread().yield();
+    }
+    for (    RegionInfo ri : regions) {
+      assertTrue(ri.toString(),TEST_UTIL.getMiniHBaseCluster().getMaster().getAssignmentManager().getRegionStates().isRegionOnline(ri));
+    }
+  }
+  /** 
+ * An AssignProcedure that Stalls just before the finish.
+ */
+public static class StallingAssignProcedure extends AssignProcedure {
+    public final CountDownLatch latch=new CountDownLatch(2);
+    public StallingAssignProcedure(){
+      super();
+    }
+    public StallingAssignProcedure(    RegionInfo regionInfo){
+      super(regionInfo);
+    }
+    @Override void setTransitionState(    MasterProcedureProtos.RegionTransitionState state){
+      if (state == MasterProcedureProtos.RegionTransitionState.REGION_TRANSITION_DISPATCH) {
+        try {
+          LOG.info("LATCH2 {}",this.latch.getCount());
+          this.latch.await();
+          LOG.info("LATCH3 {}",this.latch.getCount());
+        }
+ catch (        InterruptedException e) {
+          e.printStackTrace();
+        }
+      }
+ else       if (state == MasterProcedureProtos.RegionTransitionState.REGION_TRANSITION_QUEUE) {
+        LOG.info("LATCH1 {}",this.latch.getCount());
+        this.latch.countDown();
+      }
+      super.setTransitionState(state);
+    }
+  }
+}

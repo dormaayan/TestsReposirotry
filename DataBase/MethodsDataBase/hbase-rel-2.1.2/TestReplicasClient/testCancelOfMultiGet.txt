@@ -1,0 +1,57 @@
+@Ignore @Test public void testCancelOfMultiGet() throws Exception {
+  openRegion(hriSecondary);
+  try {
+    List<Put> puts=new ArrayList<>(2);
+    byte[] b1=Bytes.toBytes("testCancelOfMultiGet" + 0);
+    Put p=new Put(b1);
+    p.addColumn(f,b1,b1);
+    puts.add(p);
+    byte[] b2=Bytes.toBytes("testCancelOfMultiGet" + 1);
+    p=new Put(b2);
+    p.addColumn(f,b2,b2);
+    puts.add(p);
+    table.put(puts);
+    LOG.debug("PUT done");
+    flushRegion(hriPrimary);
+    LOG.info("flush done");
+    Thread.sleep(1000 + REFRESH_PERIOD * 2);
+    AsyncProcess ap=((ClusterConnection)HTU.getConnection()).getAsyncProcess();
+    SlowMeCopro.getPrimaryCdl().set(new CountDownLatch(1));
+    List<Get> gets=new ArrayList<>();
+    Get g=new Get(b1);
+    g.setCheckExistenceOnly(true);
+    g.setConsistency(Consistency.TIMELINE);
+    gets.add(g);
+    g=new Get(b2);
+    g.setCheckExistenceOnly(true);
+    g.setConsistency(Consistency.TIMELINE);
+    gets.add(g);
+    Object[] results=new Object[2];
+    int operationTimeout=((ClusterConnection)HTU.getConnection()).getConnectionConfiguration().getOperationTimeout();
+    int readTimeout=((ClusterConnection)HTU.getConnection()).getConnectionConfiguration().getReadRpcTimeout();
+    AsyncProcessTask task=AsyncProcessTask.newBuilder().setPool(HTable.getDefaultExecutor(HTU.getConfiguration())).setTableName(table.getName()).setRowAccess(gets).setResults(results).setOperationTimeout(operationTimeout).setRpcTimeout(readTimeout).build();
+    AsyncRequestFuture reqs=ap.submit(task);
+    reqs.waitUntilDone();
+    for (    Object r : results) {
+      Assert.assertTrue(((Result)r).isStale());
+      Assert.assertTrue(((Result)r).getExists());
+    }
+    Set<CancellableRegionServerCallable> set=((AsyncRequestFutureImpl<?>)reqs).getCallsInProgress();
+    Assert.assertTrue(!set.isEmpty());
+    for (    CancellableRegionServerCallable m : set) {
+      Assert.assertTrue(m.isCancelled());
+    }
+  }
+  finally {
+    SlowMeCopro.getPrimaryCdl().get().countDown();
+    SlowMeCopro.sleepTime.set(0);
+    SlowMeCopro.slowDownNext.set(false);
+    SlowMeCopro.countOfNext.set(0);
+    for (int i=0; i < 2; i++) {
+      byte[] b1=Bytes.toBytes("testCancelOfMultiGet" + i);
+      Delete d=new Delete(b1);
+      table.delete(d);
+    }
+    closeRegion(hriSecondary);
+  }
+}

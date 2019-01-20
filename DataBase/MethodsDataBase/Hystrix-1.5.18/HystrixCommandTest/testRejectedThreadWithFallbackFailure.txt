@@ -1,0 +1,46 @@
+/** 
+ * Test when a command fails to get queued up in the threadpool where the command implemented getFallback but it fails. <p> We specifically want to protect against developers getting random thread exceptions and instead just correctly receives an HystrixRuntimeException.
+ */
+@Test public void testRejectedThreadWithFallbackFailure() throws ExecutionException, InterruptedException {
+  TestCircuitBreaker circuitBreaker=new TestCircuitBreaker();
+  SingleThreadedPoolWithQueue pool=new SingleThreadedPoolWithQueue(1);
+  HystrixCommandKey key=HystrixCommandKey.Factory.asKey("Rejection-A");
+  TestCommandRejection command1=new TestCommandRejection(key,circuitBreaker,pool,500,600,TestCommandRejection.FALLBACK_FAILURE);
+  TestCommandRejection command2=new TestCommandRejection(key,circuitBreaker,pool,500,600,TestCommandRejection.FALLBACK_SUCCESS);
+  TestCommandRejection command3=new TestCommandRejection(key,circuitBreaker,pool,500,600,TestCommandRejection.FALLBACK_FAILURE);
+  Future<Boolean> f1=null;
+  Future<Boolean> f2=null;
+  try {
+    f1=command1.queue();
+    f2=command2.queue();
+    assertEquals(false,command3.queue().get());
+    fail("we shouldn't get here");
+  }
+ catch (  Exception e) {
+    e.printStackTrace();
+    if (e instanceof HystrixRuntimeException && e.getCause() instanceof RejectedExecutionException) {
+      HystrixRuntimeException de=(HystrixRuntimeException)e;
+      assertNotNull(de.getFallbackException());
+      assertFalse(de.getFallbackException() instanceof UnsupportedOperationException);
+      assertNotNull(de.getImplementingClass());
+      assertNotNull(de.getCause());
+      assertTrue(de.getCause() instanceof RejectedExecutionException);
+    }
+ else {
+      fail("the exception should be HystrixRuntimeException with cause as RejectedExecutionException");
+    }
+  }
+  assertCommandExecutionEvents(command1);
+  assertCommandExecutionEvents(command2);
+  assertCommandExecutionEvents(command3,HystrixEventType.THREAD_POOL_REJECTED,HystrixEventType.FALLBACK_FAILURE);
+  int numInFlight=circuitBreaker.metrics.getCurrentConcurrentExecutionCount();
+  assertTrue("Expected at most 1 in flight but got : " + numInFlight,numInFlight <= 1);
+  HystrixRequestLog requestLog=HystrixRequestLog.getCurrentRequest();
+  assertEquals(3,requestLog.getAllExecutedCommands().size());
+  assertTrue(requestLog.getExecutedCommandsAsString().contains("Executed"));
+  long startTime=System.currentTimeMillis();
+  f1.get();
+  f2.get();
+  assertEquals(0,circuitBreaker.metrics.getCurrentConcurrentExecutionCount());
+  System.out.println("Time blocked : " + (System.currentTimeMillis() - startTime));
+}

@@ -1,0 +1,74 @@
+/** 
+ * Statement that in case of timeout, unlike junit  {@link org.junit.internal.runners.statements.FailOnTimeout}will print thread dumps of all threads in JVM, that should help in investigation of stuck threads.
+ */
+private class VerboseFailOnTimeout extends Statement {
+  private final Statement originalStatement;
+  private final TimeUnit timeUnit;
+  private final long timeout;
+  private final List<VerboseTimeoutBuilder.FailureParameter<?>> additionalParameters;
+  VerboseFailOnTimeout(  Statement statement,  VerboseTimeoutBuilder builder){
+    originalStatement=statement;
+    timeout=builder.timeout;
+    timeUnit=builder.getTimeUnit();
+    additionalParameters=builder.getAdditionalParameters();
+  }
+  @Override public void evaluate() throws Throwable {
+    CallableStatement callable=new CallableStatement();
+    FutureTask<Throwable> task=new FutureTask<>(callable);
+    Thread thread=new Thread(task,"Time-limited test");
+    thread.setDaemon(true);
+    thread.start();
+    callable.awaitStarted();
+    Throwable throwable=getResult(task,thread);
+    if (throwable != null) {
+      throw throwable;
+    }
+  }
+  private Throwable getResult(  FutureTask<Throwable> task,  Thread thread) throws Throwable {
+    try {
+      if (timeout > 0) {
+        return task.get(timeout,timeUnit);
+      }
+ else {
+        return task.get();
+      }
+    }
+ catch (    ExecutionException e) {
+      printThreadDump();
+      return e.getCause();
+    }
+catch (    TimeoutException e) {
+      if (!additionalParameters.isEmpty()) {
+        System.err.println("==== Requested additional parameters: ====");
+        for (        VerboseTimeoutBuilder.FailureParameter<?> additionalParameter : additionalParameters) {
+          System.err.println(additionalParameter.describe());
+        }
+      }
+      System.err.println("=== Thread dump ===");
+      printThreadDump();
+      return buildTimeoutException(thread);
+    }
+  }
+  private Throwable buildTimeoutException(  Thread thread){
+    StackTraceElement[] stackTrace=thread.getStackTrace();
+    TestTimedOutException timedOutException=new TestTimedOutException(timeout,timeUnit);
+    timedOutException.setStackTrace(stackTrace);
+    return timedOutException;
+  }
+private class CallableStatement implements Callable<Throwable> {
+    private final CountDownLatch startLatch=new CountDownLatch(1);
+    @Override public Throwable call(){
+      try {
+        startLatch.countDown();
+        originalStatement.evaluate();
+      }
+ catch (      Throwable e) {
+        return e;
+      }
+      return null;
+    }
+    public void awaitStarted() throws InterruptedException {
+      startLatch.await();
+    }
+  }
+}

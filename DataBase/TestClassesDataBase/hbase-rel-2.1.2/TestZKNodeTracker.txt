@@ -1,0 +1,198 @@
+@Category({ZKTests.class,MediumTests.class}) public class TestZKNodeTracker {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestZKNodeTracker.class);
+  private static final Logger LOG=LoggerFactory.getLogger(TestZKNodeTracker.class);
+  private final static HBaseZKTestingUtility TEST_UTIL=new HBaseZKTestingUtility();
+  @BeforeClass public static void setUpBeforeClass() throws Exception {
+    TEST_UTIL.startMiniZKCluster();
+  }
+  @AfterClass public static void tearDownAfterClass() throws Exception {
+    TEST_UTIL.shutdownMiniZKCluster();
+  }
+  /** 
+ * Test that we can interrupt a node that is blocked on a wait.
+ */
+  @Test public void testInterruptible() throws IOException, InterruptedException {
+    Abortable abortable=new StubAbortable();
+    ZKWatcher zk=new ZKWatcher(TEST_UTIL.getConfiguration(),"testInterruptible",abortable);
+    final TestTracker tracker=new TestTracker(zk,"/xyz",abortable);
+    tracker.start();
+    Thread t=new Thread(){
+      @Override public void run(){
+        try {
+          tracker.blockUntilAvailable();
+        }
+ catch (        InterruptedException e) {
+          throw new RuntimeException("Interrupted",e);
+        }
+      }
+    }
+;
+    t.start();
+    while (!t.isAlive()) {
+      Threads.sleep(1);
+    }
+    tracker.stop();
+    t.join();
+  }
+  @Test public void testNodeTracker() throws Exception {
+    Abortable abortable=new StubAbortable();
+    ZKWatcher zk=new ZKWatcher(TEST_UTIL.getConfiguration(),"testNodeTracker",abortable);
+    ZKUtil.createAndFailSilent(zk,zk.getZNodePaths().baseZNode);
+    final String node=ZNodePaths.joinZNode(zk.getZNodePaths().baseZNode,Long.toString(ThreadLocalRandom.current().nextLong()));
+    final byte[] dataOne=Bytes.toBytes("dataOne");
+    final byte[] dataTwo=Bytes.toBytes("dataTwo");
+    TestTracker localTracker=new TestTracker(zk,node,abortable);
+    localTracker.start();
+    zk.registerListener(localTracker);
+    assertNull(localTracker.getData(false));
+    WaitToGetDataThread thread=new WaitToGetDataThread(zk,node);
+    thread.start();
+    assertFalse(thread.hasData);
+    TestTracker secondTracker=new TestTracker(zk,node,null);
+    secondTracker.start();
+    zk.registerListener(secondTracker);
+    TestingZKListener zkListener=new TestingZKListener(zk,node);
+    zk.registerListener(zkListener);
+    assertEquals(0,zkListener.createdLock.availablePermits());
+    final ZooKeeper zkconn=ZooKeeperHelper.getConnectedZooKeeper(ZKConfig.getZKQuorumServersString(TEST_UTIL.getConfiguration()),60000);
+    zkconn.create(node,dataOne,Ids.OPEN_ACL_UNSAFE,CreateMode.PERSISTENT);
+    zkListener.waitForCreation();
+    thread.join();
+    assertNotNull(localTracker.getData(false));
+    assertNotNull(localTracker.blockUntilAvailable());
+    assertTrue(Bytes.equals(localTracker.getData(false),dataOne));
+    assertTrue(thread.hasData);
+    assertTrue(Bytes.equals(thread.tracker.getData(false),dataOne));
+    LOG.info("Successfully got data one");
+    assertNotNull(secondTracker.getData(false));
+    assertNotNull(secondTracker.blockUntilAvailable());
+    assertTrue(Bytes.equals(secondTracker.getData(false),dataOne));
+    LOG.info("Successfully got data one with the second tracker");
+    zkconn.delete(node,-1);
+    zkListener.waitForDeletion();
+    TestTracker threadTracker=thread.tracker;
+    thread=new WaitToGetDataThread(zk,node,threadTracker);
+    thread.start();
+    assertFalse(thread.hasData);
+    assertNull(secondTracker.getData(false));
+    assertNull(localTracker.getData(false));
+    LOG.info("Successfully made unavailable");
+    zkconn.create(node,dataTwo,Ids.OPEN_ACL_UNSAFE,CreateMode.PERSISTENT);
+    zkListener.waitForCreation();
+    thread.join();
+    assertNotNull(localTracker.getData(false));
+    assertNotNull(localTracker.blockUntilAvailable());
+    assertTrue(Bytes.equals(localTracker.getData(false),dataTwo));
+    assertNotNull(secondTracker.getData(false));
+    assertNotNull(secondTracker.blockUntilAvailable());
+    assertTrue(Bytes.equals(secondTracker.getData(false),dataTwo));
+    assertTrue(thread.hasData);
+    assertTrue(Bytes.equals(thread.tracker.getData(false),dataTwo));
+    LOG.info("Successfully got data two on all trackers and threads");
+    zkconn.setData(node,dataOne,-1);
+    zkListener.waitForDataChange();
+    assertNotNull(localTracker.getData(false));
+    assertNotNull(localTracker.blockUntilAvailable());
+    assertTrue(Bytes.equals(localTracker.getData(false),dataOne));
+    assertNotNull(secondTracker.getData(false));
+    assertNotNull(secondTracker.blockUntilAvailable());
+    assertTrue(Bytes.equals(secondTracker.getData(false),dataOne));
+    assertTrue(thread.hasData);
+    assertTrue(Bytes.equals(thread.tracker.getData(false),dataOne));
+    LOG.info("Successfully got data one following a data change on all trackers and threads");
+  }
+public static class WaitToGetDataThread extends Thread {
+    TestTracker tracker;
+    boolean hasData;
+    public WaitToGetDataThread(    ZKWatcher zk,    String node){
+      tracker=new TestTracker(zk,node,null);
+      tracker.start();
+      zk.registerListener(tracker);
+      hasData=false;
+    }
+    public WaitToGetDataThread(    ZKWatcher zk,    String node,    TestTracker tracker){
+      this.tracker=tracker;
+      hasData=false;
+    }
+    @Override public void run(){
+      LOG.info("Waiting for data to be available in WaitToGetDataThread");
+      try {
+        tracker.blockUntilAvailable();
+      }
+ catch (      InterruptedException e) {
+        e.printStackTrace();
+      }
+      LOG.info("Data now available in tracker from WaitToGetDataThread");
+      hasData=true;
+    }
+  }
+public static class TestTracker extends ZKNodeTracker {
+    public TestTracker(    ZKWatcher watcher,    String node,    Abortable abortable){
+      super(watcher,node,abortable);
+    }
+  }
+public static class TestingZKListener extends ZKListener {
+    private static final Logger LOG=LoggerFactory.getLogger(TestingZKListener.class);
+    private Semaphore deletedLock;
+    private Semaphore createdLock;
+    private Semaphore changedLock;
+    private String node;
+    public TestingZKListener(    ZKWatcher watcher,    String node){
+      super(watcher);
+      deletedLock=new Semaphore(0);
+      createdLock=new Semaphore(0);
+      changedLock=new Semaphore(0);
+      this.node=node;
+    }
+    @Override public void nodeDeleted(    String path){
+      if (path.equals(node)) {
+        LOG.debug("nodeDeleted(" + path + ")");
+        deletedLock.release();
+      }
+    }
+    @Override public void nodeCreated(    String path){
+      if (path.equals(node)) {
+        LOG.debug("nodeCreated(" + path + ")");
+        createdLock.release();
+      }
+    }
+    @Override public void nodeDataChanged(    String path){
+      if (path.equals(node)) {
+        LOG.debug("nodeDataChanged(" + path + ")");
+        changedLock.release();
+      }
+    }
+    public void waitForDeletion() throws InterruptedException {
+      deletedLock.acquire();
+    }
+    public void waitForCreation() throws InterruptedException {
+      createdLock.acquire();
+    }
+    public void waitForDataChange() throws InterruptedException {
+      changedLock.acquire();
+    }
+  }
+public static class StubAbortable implements Abortable {
+    @Override public void abort(    final String msg,    final Throwable t){
+    }
+    @Override public boolean isAborted(){
+      return false;
+    }
+  }
+  @Test public void testCleanZNode() throws Exception {
+    ZKWatcher zkw=new ZKWatcher(TEST_UTIL.getConfiguration(),"testNodeTracker",new TestZKNodeTracker.StubAbortable());
+    final ServerName sn=ServerName.valueOf("127.0.0.1:52",45L);
+    ZKUtil.createAndFailSilent(zkw,TEST_UTIL.getConfiguration().get(HConstants.ZOOKEEPER_ZNODE_PARENT,HConstants.DEFAULT_ZOOKEEPER_ZNODE_PARENT));
+    final String nodeName=zkw.getZNodePaths().masterAddressZNode;
+    ZKUtil.createAndFailSilent(zkw,nodeName);
+    MasterAddressTracker.deleteIfEquals(zkw,sn.toString());
+    assertNotNull(ZKUtil.getData(zkw,nodeName));
+    ZKUtil.setData(zkw,nodeName,MasterAddressTracker.toByteArray(sn,0));
+    MasterAddressTracker.deleteIfEquals(zkw,ServerName.valueOf("127.0.0.2:52",45L).toString());
+    assertNotNull(ZKUtil.getData(zkw,nodeName));
+    ZKUtil.setData(zkw,nodeName,MasterAddressTracker.toByteArray(sn,0));
+    MasterAddressTracker.deleteIfEquals(zkw,sn.toString());
+    assertNull(ZKUtil.getData(zkw,nodeName));
+    MasterAddressTracker.deleteIfEquals(zkw,sn.toString());
+  }
+}

@@ -1,0 +1,165 @@
+/** 
+ * Test cases for in progress tailing edit logs by the standby node.
+ */
+public class TestStandbyInProgressTail {
+  private static final Log LOG=LogFactory.getLog(TestStandbyInProgressTail.class);
+  private Configuration conf;
+  private MiniQJMHACluster qjmhaCluster;
+  private MiniDFSCluster cluster;
+  private NameNode nn0;
+  private NameNode nn1;
+  @Before public void startUp() throws IOException {
+    conf=new Configuration();
+    conf.setInt(DFSConfigKeys.DFS_HA_TAILEDITS_PERIOD_KEY,20 * 60);
+    conf.setBoolean(DFSConfigKeys.DFS_HA_TAILEDITS_INPROGRESS_KEY,true);
+    HAUtil.setAllowStandbyReads(conf,true);
+    qjmhaCluster=new MiniQJMHACluster.Builder(conf).build();
+    cluster=qjmhaCluster.getDfsCluster();
+    nn0=cluster.getNameNode(0);
+    nn1=cluster.getNameNode(1);
+  }
+  @After public void tearDown() throws IOException {
+    if (qjmhaCluster != null) {
+      qjmhaCluster.shutdown();
+    }
+  }
+  @Test public void testDefault() throws Exception {
+    if (qjmhaCluster != null) {
+      qjmhaCluster.shutdown();
+    }
+    conf=new Configuration();
+    conf.setInt(DFSConfigKeys.DFS_HA_TAILEDITS_PERIOD_KEY,20 * 60);
+    conf.setBoolean(DFSConfigKeys.DFS_HA_TAILEDITS_INPROGRESS_KEY,false);
+    HAUtil.setAllowStandbyReads(conf,true);
+    qjmhaCluster=new MiniQJMHACluster.Builder(conf).build();
+    cluster=qjmhaCluster.getDfsCluster();
+    try {
+      List<URI> allDirs=Lists.newArrayList();
+      allDirs.addAll(cluster.getNameDirs(0));
+      allDirs.addAll(cluster.getNameDirs(1));
+      assertNoEditFiles(allDirs);
+      cluster.transitionToActive(0);
+      assertEditFiles(cluster.getNameDirs(0),NNStorage.getInProgressEditsFileName(1));
+      assertNoEditFiles(cluster.getNameDirs(1));
+      cluster.getNameNode(0).getRpcServer().mkdirs("/test",FsPermission.createImmutable((short)0755),true);
+      cluster.getNameNode(1).getNamesystem().getEditLogTailer().doTailEdits();
+      assertNull(getFileInfo(cluster.getNameNode(1),"/test",true,false,false));
+      cluster.restartNameNode(1);
+      assertEditFiles(cluster.getNameDirs(0),NNStorage.getInProgressEditsFileName(1));
+      assertNoEditFiles(cluster.getNameDirs(1));
+      assertNull(getFileInfo(cluster.getNameNode(1),"/test",true,false,false));
+      cluster.getNameNode(0).getRpcServer().mkdirs("/test2",FsPermission.createImmutable((short)0755),true);
+      cluster.restartNameNode(0);
+      cluster.transitionToActive(1);
+      assertNotNull(getFileInfo(cluster.getNameNode(1),"/test",true,false,false));
+      assertNotNull(getFileInfo(cluster.getNameNode(1),"/test2",true,false,false));
+    }
+  finally {
+      if (qjmhaCluster != null) {
+        qjmhaCluster.shutdown();
+      }
+    }
+  }
+  @Test public void testSetup() throws Exception {
+    List<URI> allDirs=Lists.newArrayList();
+    allDirs.addAll(cluster.getNameDirs(0));
+    allDirs.addAll(cluster.getNameDirs(1));
+    assertNoEditFiles(allDirs);
+    cluster.transitionToActive(0);
+    assertEditFiles(cluster.getNameDirs(0),NNStorage.getInProgressEditsFileName(1));
+    assertNoEditFiles(cluster.getNameDirs(1));
+    cluster.getNameNode(0).getRpcServer().mkdirs("/test",FsPermission.createImmutable((short)0755),true);
+    nn1.getNamesystem().getEditLogTailer().doTailEdits();
+    assertNotNull(getFileInfo(cluster.getNameNode(1),"/test",true,false,false));
+    cluster.restartNameNode(1);
+    assertEditFiles(cluster.getNameDirs(0),NNStorage.getInProgressEditsFileName(1));
+    assertNoEditFiles(cluster.getNameDirs(1));
+    assertNotNull(getFileInfo(cluster.getNameNode(1),"/test",true,false,false));
+    cluster.getNameNode(0).getRpcServer().mkdirs("/test2",FsPermission.createImmutable((short)0755),true);
+    cluster.restartNameNode(0);
+    cluster.transitionToActive(1);
+    assertNotNull(getFileInfo(cluster.getNameNode(1),"/test",true,false,false));
+    assertNotNull(getFileInfo(cluster.getNameNode(1),"/test2",true,false,false));
+  }
+  @Test public void testHalfStartInProgressTail() throws Exception {
+    cluster.transitionToActive(0);
+    assertEditFiles(cluster.getNameDirs(0),NNStorage.getInProgressEditsFileName(1));
+    assertNoEditFiles(cluster.getNameDirs(1));
+    cluster.getNameNode(0).getRpcServer().mkdirs("/test",FsPermission.createImmutable((short)0755),true);
+    nn1.getNamesystem().getEditLogTailer().doTailEdits();
+    assertNotNull(getFileInfo(nn1,"/test",true,false,false));
+    cluster.getNameNode(0).getRpcServer().mkdirs("/test2",FsPermission.createImmutable((short)0755),true);
+    nn0.getRpcServer().rollEditLog();
+    assertNull(getFileInfo(nn1,"/test2",true,false,false));
+    cluster.getNameNode(0).getRpcServer().mkdirs("/test3",FsPermission.createImmutable((short)0755),true);
+    nn1.getNamesystem().getEditLogTailer().doTailEdits();
+    assertNotNull(getFileInfo(nn1,"/test",true,false,false));
+    assertNotNull(getFileInfo(nn1,"/test2",true,false,false));
+    assertNotNull(getFileInfo(nn1,"/test3",true,false,false));
+  }
+  @Test public void testInitStartInProgressTail() throws Exception {
+    cluster.transitionToActive(0);
+    assertEditFiles(cluster.getNameDirs(0),NNStorage.getInProgressEditsFileName(1));
+    assertNoEditFiles(cluster.getNameDirs(1));
+    cluster.getNameNode(0).getRpcServer().mkdirs("/test",FsPermission.createImmutable((short)0755),true);
+    cluster.getNameNode(0).getRpcServer().mkdirs("/test2",FsPermission.createImmutable((short)0755),true);
+    nn0.getRpcServer().rollEditLog();
+    cluster.getNameNode(0).getRpcServer().mkdirs("/test3",FsPermission.createImmutable((short)0755),true);
+    assertNull(getFileInfo(nn1,"/test",true,false,false));
+    assertNull(getFileInfo(nn1,"/test2",true,false,false));
+    assertNull(getFileInfo(nn1,"/test3",true,false,false));
+    nn1.getNamesystem().getEditLogTailer().doTailEdits();
+    assertNotNull(getFileInfo(nn1,"/test",true,false,false));
+    assertNotNull(getFileInfo(nn1,"/test2",true,false,false));
+    assertNotNull(getFileInfo(nn1,"/test3",true,false,false));
+  }
+  @Test public void testNewStartInProgressTail() throws Exception {
+    cluster.transitionToActive(0);
+    assertEditFiles(cluster.getNameDirs(0),NNStorage.getInProgressEditsFileName(1));
+    assertNoEditFiles(cluster.getNameDirs(1));
+    cluster.getNameNode(0).getRpcServer().mkdirs("/test",FsPermission.createImmutable((short)0755),true);
+    cluster.getNameNode(0).getRpcServer().mkdirs("/test2",FsPermission.createImmutable((short)0755),true);
+    nn1.getNamesystem().getEditLogTailer().doTailEdits();
+    nn0.getRpcServer().rollEditLog();
+    assertNotNull(getFileInfo(nn1,"/test",true,false,false));
+    assertNotNull(getFileInfo(nn1,"/test2",true,false,false));
+    cluster.getNameNode(0).getRpcServer().mkdirs("/test3",FsPermission.createImmutable((short)0755),true);
+    nn1.getNamesystem().getEditLogTailer().doTailEdits();
+    assertNotNull(getFileInfo(nn1,"/test",true,false,false));
+    assertNotNull(getFileInfo(nn1,"/test2",true,false,false));
+    assertNotNull(getFileInfo(nn1,"/test3",true,false,false));
+  }
+  @Test public void testNonUniformConfig() throws Exception {
+    Configuration newConf=cluster.getNameNode(0).getConf();
+    newConf.setBoolean(DFSConfigKeys.DFS_HA_TAILEDITS_INPROGRESS_KEY,false);
+    cluster.restartNameNode(0);
+    cluster.transitionToActive(0);
+    cluster.getNameNode(0).getRpcServer().mkdirs("/test",FsPermission.createImmutable((short)0755),true);
+    cluster.getNameNode(0).getRpcServer().rollEdits();
+    cluster.getNameNode(1).getNamesystem().getEditLogTailer().doTailEdits();
+    assertNotNull(getFileInfo(nn1,"/test",true,false,false));
+  }
+  /** 
+ * Check that no edits files are present in the given storage dirs.
+ */
+  private static void assertNoEditFiles(  Iterable<URI> dirs) throws IOException {
+    assertEditFiles(dirs);
+  }
+  /** 
+ * Check that the given list of edits files are present in the given storage dirs.
+ */
+  private static void assertEditFiles(  Iterable<URI> dirs,  String... files) throws IOException {
+    for (    URI u : dirs) {
+      File editDirRoot=new File(u.getPath());
+      File editDir=new File(editDirRoot,"current");
+      GenericTestUtils.assertExists(editDir);
+      if (files.length == 0) {
+        LOG.info("Checking no edit files exist in " + editDir);
+      }
+ else {
+        LOG.info("Checking for following edit files in " + editDir + ": "+ Joiner.on(",").join(files));
+      }
+      GenericTestUtils.assertGlobEquals(editDir,"edits_.*",files);
+    }
+  }
+}

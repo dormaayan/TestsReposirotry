@@ -1,0 +1,89 @@
+@Test public void testLinearPropagation_1() throws Exception {
+  Nd4j.create(1);
+  val config=VoidConfiguration.builder().meshBuildMode(MeshBuildMode.MESH).build();
+  val connector=new DummyTransport.Connector();
+  val rootTransport=new DummyTransport(rootId,connector,rootId,config);
+  val rootServer=new ModelParameterServer(config,rootTransport,true);
+  val rootUpdatesCounter=new AtomicInteger(0);
+  rootTransport.addRequestConsumer(ModelParametersRequest.class,new Consumer<ModelParametersRequest>(){
+    @Override public void accept(    ModelParametersRequest modelParametersRequest) throws Exception {
+      val msg=new ModelParametersMessage("123",Nd4j.create(10));
+      msg.setRequestId(modelParametersRequest.getRequestId());
+      rootTransport.sendMessage(msg,modelParametersRequest.getOriginatorId());
+    }
+  }
+);
+  rootTransport.addRequestConsumer(UpdaterParametersRequest.class,new Consumer<UpdaterParametersRequest>(){
+    @Override public void accept(    UpdaterParametersRequest updatersParametersRequest) throws Exception {
+      val msg=new UpdaterParametersMessage("123",Nd4j.create(10));
+      msg.setRequestId(updatersParametersRequest.getRequestId());
+      rootTransport.sendMessage(msg,updatersParametersRequest.getOriginatorId());
+    }
+  }
+);
+  rootServer.addUpdatesSubscriber(new AbstractUpdatesHandler(){
+    @Override public INDArray getParametersArray(){
+      return null;
+    }
+    @Override public void onNext(    INDArray array){
+      assertNotNull(array);
+      rootUpdatesCounter.incrementAndGet();
+    }
+  }
+);
+  connector.register(rootTransport);
+  rootServer.launch();
+  val servers=new ArrayList<ModelParameterServer>();
+  val transports=new ArrayList<DummyTransport>();
+  for (int e=0; e < 7; e++) {
+    val clientTransport=new DummyTransport(String.valueOf(e),connector,rootId,config);
+    val clientServer=new ModelParameterServer(config,clientTransport,false);
+    servers.add(clientServer);
+    transports.add(clientTransport);
+    connector.register(clientTransport);
+    clientServer.launch();
+    log.info("Client [{}] started",e);
+  }
+  val mesh=rootTransport.getMesh();
+  val rootNode=mesh.getRootNode();
+  val nodesForRemap=new LinkedTransferQueue<MeshOrganizer.Node>();
+  MeshOrganizer.Node lastNode=null;
+  int cnt=0;
+  for (  val d : rootNode.getDownstreamNodes()) {
+    assertEquals(0,d.numberOfDownstreams());
+    assertEquals(0,d.numberOfDownstreams());
+    if (cnt++ > 0) {
+      rootNode.removeFromDownstreams(d);
+      lastNode.addDownstreamNode(d);
+      lastNode=d;
+    }
+ else     lastNode=d;
+  }
+  assertEquals(1,rootNode.numberOfDownstreams());
+  val nodes=new ArrayList<MeshOrganizer.Node>(mesh.flatNodes());
+  for (  val n : nodes) {
+    if (!n.getId().equals("6"))     assertEquals(1,n.numberOfDownstreams());
+ else     assertEquals(0,n.numberOfDownstreams());
+  }
+  for (int e=0; e < 7; e++) {
+    val t=transports.get(e);
+    t.setMesh(mesh);
+  }
+  val middleTransport=transports.get(3);
+  log.info("Upstream ID: [{}]",middleTransport.getUpstreamId());
+  val middleServer=servers.get(3);
+  val update=Nd4j.create(10,10);
+  middleServer.sendUpdate(update);
+  connector.blockUntilFinished();
+  int failCnt=0;
+  for (int e=0; e < 7; e++) {
+    val s=servers.get(e);
+    if (e != 3)     if (1 != s.getUpdates().size()) {
+      log.info("Node [{}] have no updates",e);
+      failCnt++;
+    }
+ else     assertEquals(0,s.getUpdates().size());
+  }
+  assertEquals(0,failCnt);
+  assertEquals(1,rootUpdatesCounter.get());
+}

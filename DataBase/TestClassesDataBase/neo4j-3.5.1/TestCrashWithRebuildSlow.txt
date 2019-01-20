@@ -1,0 +1,111 @@
+/** 
+ * Test for making sure that slow id generator rebuild is exercised
+ */
+public class TestCrashWithRebuildSlow {
+  @Rule public final TestDirectory testDir=TestDirectory.testDirectory();
+  @Rule public final EphemeralFileSystemRule fs=new EphemeralFileSystemRule();
+  @Test public void crashAndRebuildSlowWithDynamicStringDeletions() throws Exception {
+    final GraphDatabaseAPI db=(GraphDatabaseAPI)new TestGraphDatabaseFactory().setFileSystem(fs.get()).newImpermanentDatabaseBuilder(testDir.databaseDir()).setConfig(GraphDatabaseSettings.record_id_batch_size,"1").newGraphDatabase();
+    List<Long> deletedNodeIds=produceNonCleanDefraggedStringStore(db);
+    Map<IdType,Long> highIdsBeforeCrash=getHighIds(db);
+    db.getDependencyResolver().resolveDependency(PageCache.class).flushAndForce();
+    long checksumBefore=fs.get().checksum();
+    long checksumBefore2=fs.get().checksum();
+    assertThat(checksumBefore,Matchers.equalTo(checksumBefore2));
+    EphemeralFileSystemAbstraction snapshot=fs.snapshot(db::shutdown);
+    long snapshotChecksum=snapshot.checksum();
+    if (snapshotChecksum != checksumBefore) {
+      try (OutputStream out=new FileOutputStream(testDir.file("snapshot.zip"))){
+        snapshot.dumpZip(out);
+      }
+       try (OutputStream out=new FileOutputStream(testDir.file("fs.zip"))){
+        fs.get().dumpZip(out);
+      }
+     }
+    assertThat(snapshotChecksum,equalTo(checksumBefore));
+    assertNumberOfFreeIdsEquals(testDir.databaseDir(),snapshot,0);
+    GraphDatabaseAPI newDb=(GraphDatabaseAPI)new TestGraphDatabaseFactory().setFileSystem(snapshot).newImpermanentDatabaseBuilder(testDir.databaseDir()).setConfig(GraphDatabaseSettings.rebuild_idgenerators_fast,FALSE).newGraphDatabase();
+    Map<IdType,Long> highIdsAfterCrash=getHighIds(newDb);
+    assertEquals(highIdsBeforeCrash,highIdsAfterCrash);
+    try (Transaction tx=newDb.beginTx()){
+      int nameCount=0;
+      int relCount=0;
+      for (      Node node : newDb.getAllNodes()) {
+        nameCount++;
+        assertThat(node,inTx(newDb,hasProperty("name"),true));
+        relCount+=Iterables.count(node.getRelationships(Direction.OUTGOING));
+      }
+      assertEquals(16,nameCount);
+      assertEquals(12,relCount);
+      List<Long> newIds=new ArrayList<>();
+      newIds.add(newDb.createNode().getId());
+      newIds.add(newDb.createNode().getId());
+      newIds.add(newDb.createNode().getId());
+      newIds.add(newDb.createNode().getId());
+      assertThat(newIds,is(deletedNodeIds));
+      tx.success();
+    }
+  finally {
+      newDb.shutdown();
+      snapshot.close();
+    }
+  }
+  private static List<Long> produceNonCleanDefraggedStringStore(  GraphDatabaseService db){
+    List<Node> nodes=new ArrayList<>();
+    try (Transaction tx=db.beginTx()){
+      Node previous=null;
+      for (int i=0; i < 20; i++) {
+        Node node=db.createNode();
+        node.setProperty("name","a looooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooong" + " string");
+        nodes.add(node);
+        if (previous != null) {
+          Relationship rel=previous.createRelationshipTo(node,MyRelTypes.TEST);
+        }
+        previous=node;
+      }
+      tx.success();
+    }
+     List<Long> deletedNodeIds=new ArrayList<>();
+    try (Transaction tx=db.beginTx()){
+      Node a=nodes.get(5);
+      Node b=nodes.get(7);
+      Node c=nodes.get(8);
+      Node d=nodes.get(10);
+      deletedNodeIds.add(a.getId());
+      deletedNodeIds.add(b.getId());
+      deletedNodeIds.add(c.getId());
+      deletedNodeIds.add(d.getId());
+      delete(a);
+      delete(b);
+      delete(c);
+      delete(d);
+      tx.success();
+    }
+     return deletedNodeIds;
+  }
+  private static void delete(  Node node){
+    for (    Relationship rel : node.getRelationships()) {
+      rel.delete();
+    }
+    node.delete();
+  }
+  private static Map<IdType,Long> getHighIds(  GraphDatabaseAPI db){
+    final Map<IdType,Long> highIds=new HashMap<>();
+    NeoStores neoStores=db.getDependencyResolver().resolveDependency(RecordStorageEngine.class).testAccessNeoStores();
+    Visitor<CommonAbstractStore,RuntimeException> visitor=store -> {
+      highIds.put(store.getIdType(),store.getHighId());
+      return true;
+    }
+;
+    neoStores.visitStore(visitor);
+    return highIds;
+  }
+  private static void assertNumberOfFreeIdsEquals(  File databaseDirectory,  FileSystemAbstraction fs,  long numberOfFreeIds){
+    long fileSize=fs.getFileSize(new File(databaseDirectory,"neostore.propertystore.db.strings.id"));
+    long fileSizeWithoutHeader=fileSize - 9;
+    long actualFreeIds=fileSizeWithoutHeader / 8;
+    assertThat("Id file should at least have a 9 byte header",fileSize,greaterThanOrEqualTo(9L));
+    assertThat("File should contain the expected number of free ids",actualFreeIds,is(numberOfFreeIds));
+    assertThat("File size should not contain more bytes than expected",8 * numberOfFreeIds,is(fileSizeWithoutHeader));
+  }
+}

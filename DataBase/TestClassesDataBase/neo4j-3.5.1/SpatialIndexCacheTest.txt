@@ -1,0 +1,93 @@
+public class SpatialIndexCacheTest {
+  @SuppressWarnings("Duplicates") @Test public void stressCache() throws Exception {
+    StringFactory factory=new StringFactory();
+    SpatialIndexCache<String> cache=new SpatialIndexCache<>(factory);
+    ExecutorService pool=Executors.newFixedThreadPool(20);
+    Future<?>[] futures=new Future[100];
+    AtomicBoolean shouldContinue=new AtomicBoolean(true);
+    try {
+      for (int i=0; i < futures.length; i++) {
+        futures[i]=pool.submit(new CacheStresser(cache,shouldContinue));
+      }
+      Thread.sleep(5_000);
+      shouldContinue.set(false);
+      for (      Future<?> future : futures) {
+        future.get(10,TimeUnit.SECONDS);
+      }
+    }
+  finally {
+      pool.shutdown();
+    }
+  }
+  @Test public void stressInstantiationWithClose() throws Throwable {
+    StringFactory factory=new StringFactory();
+    SpatialIndexCache<String> cache=new SpatialIndexCache<>(factory);
+    Race race=new Race().withRandomStartDelays();
+    MutableInt instantiatedAtClose=new MutableInt();
+    race.addContestant(() -> {
+      try {
+        cache.uncheckedSelect(CoordinateReferenceSystem.WGS84);
+        cache.uncheckedSelect(CoordinateReferenceSystem.Cartesian_3D);
+      }
+ catch (      IllegalStateException e) {
+      }
+    }
+,1);
+    race.addContestant(() -> {
+      cache.closeInstantiateCloseLock();
+      instantiatedAtClose.setValue(count(cache));
+    }
+,1);
+    race.go();
+    try {
+      cache.uncheckedSelect(CoordinateReferenceSystem.Cartesian);
+      fail("No instantiation after closed");
+    }
+ catch (    IllegalStateException e) {
+    }
+    assertEquals(instantiatedAtClose.intValue(),count(cache));
+  }
+  private static final CoordinateReferenceSystem[] coordinateReferenceSystems=Iterators.stream(CoordinateReferenceSystem.all().iterator()).toArray(CoordinateReferenceSystem[]::new);
+static class CacheStresser implements Runnable {
+    private final SpatialIndexCache<String> cache;
+    private final AtomicBoolean shouldContinue;
+    private final Random random=new Random();
+    CacheStresser(    SpatialIndexCache<String> cache,    AtomicBoolean shouldContinue){
+      this.cache=cache;
+      this.shouldContinue=shouldContinue;
+    }
+    @Override public void run(){
+      while (shouldContinue.get()) {
+        stress();
+      }
+    }
+    private void stress(){
+      cache.select(coordinateReferenceSystems[random.nextInt(coordinateReferenceSystems.length)]);
+      for (      String s : cache) {
+        if (s == null) {
+          throw new IllegalStateException("iterated over null");
+        }
+      }
+    }
+  }
+private static class StringFactory implements SpatialIndexCache.Factory<String> {
+    AtomicInteger[] counters=new AtomicInteger[coordinateReferenceSystems.length];
+    StringFactory(){
+      for (int i=0; i < counters.length; i++) {
+        counters[i]=new AtomicInteger(0);
+      }
+    }
+    @Override public String newSpatial(    CoordinateReferenceSystem crs){
+      for (int i=0; i < coordinateReferenceSystems.length; i++) {
+        if (coordinateReferenceSystems[i].equals(crs)) {
+          int count=counters[i].incrementAndGet();
+          if (count > 1) {
+            throw new IllegalStateException("called new on same crs multiple times");
+          }
+          break;
+        }
+      }
+      return crs.toString();
+    }
+  }
+}

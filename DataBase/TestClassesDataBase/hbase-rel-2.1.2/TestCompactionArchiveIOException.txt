@@ -1,0 +1,94 @@
+/** 
+ * Tests that archiving compacted files behaves correctly when encountering exceptions.
+ */
+@Category(MediumTests.class) public class TestCompactionArchiveIOException {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestCompactionArchiveIOException.class);
+  private static final String ERROR_FILE="fffffffffffffffffdeadbeef";
+  public HBaseTestingUtility testUtil;
+  private Path testDir;
+  @Rule public TestName name=new TestName();
+  @Before public void setup() throws Exception {
+    testUtil=new HBaseTestingUtility();
+    testUtil.startMiniDFSCluster(1);
+    testDir=testUtil.getDataTestDirOnTestFS();
+    FSUtils.setRootDir(testUtil.getConfiguration(),testDir);
+  }
+  @After public void tearDown() throws Exception {
+    testUtil.cleanupTestDir();
+    testUtil.shutdownMiniDFSCluster();
+  }
+  @Test public void testRemoveCompactedFilesWithException() throws Exception {
+    byte[] fam=Bytes.toBytes("f");
+    byte[] col=Bytes.toBytes("c");
+    byte[] val=Bytes.toBytes("val");
+    TableName tableName=TableName.valueOf(name.getMethodName());
+    TableDescriptor htd=TableDescriptorBuilder.newBuilder(tableName).setColumnFamily(ColumnFamilyDescriptorBuilder.of(fam)).build();
+    RegionInfo info=RegionInfoBuilder.newBuilder(tableName).build();
+    HRegion region=initHRegion(htd,info);
+    RegionServerServices rss=mock(RegionServerServices.class);
+    List<HRegion> regions=new ArrayList<>();
+    regions.add(region);
+    Mockito.doReturn(regions).when(rss).getRegions();
+    final CompactedHFilesDischarger cleaner=new CompactedHFilesDischarger(1000,(Stoppable)null,rss,false);
+    int batchSize=10;
+    int fileCount=10;
+    for (int f=0; f < fileCount; f++) {
+      int start=f * batchSize;
+      for (int i=start; i < start + batchSize; i++) {
+        Put p=new Put(Bytes.toBytes("row" + i));
+        p.addColumn(fam,col,val);
+        region.put(p);
+      }
+      region.flush(true);
+    }
+    HStore store=region.getStore(fam);
+    assertEquals(fileCount,store.getStorefilesCount());
+    Collection<HStoreFile> storefiles=store.getStorefiles();
+    for (    HStoreFile file : storefiles) {
+      assertFalse(file.isCompactedAway());
+    }
+    StoreFileManager fileManager=store.getStoreEngine().getStoreFileManager();
+    Collection<HStoreFile> initialCompactedFiles=fileManager.getCompactedfiles();
+    assertTrue(initialCompactedFiles == null || initialCompactedFiles.isEmpty());
+    region.compact(true);
+    Collection<HStoreFile> compactedFilesPreClean=fileManager.getCompactedfiles();
+    assertNotNull(compactedFilesPreClean);
+    assertTrue(compactedFilesPreClean.size() > 0);
+    HRegionFileSystem regionFS=region.getRegionFileSystem();
+    Path errFile=regionFS.getStoreFilePath(Bytes.toString(fam),ERROR_FILE);
+    FSDataOutputStream out=regionFS.getFileSystem().create(errFile);
+    out.writeInt(1);
+    out.close();
+    HStoreFile errStoreFile=new MockHStoreFile(testUtil,errFile,1,0,false,1);
+    fileManager.addCompactionResults(ImmutableList.of(errStoreFile),ImmutableList.of());
+    cleaner.chore();
+    Collection<HStoreFile> compactedFilesPostClean=fileManager.getCompactedfiles();
+    assertEquals(1,compactedFilesPostClean.size());
+    for (    HStoreFile origFile : compactedFilesPreClean) {
+      assertFalse(compactedFilesPostClean.contains(origFile));
+    }
+    try {
+      region.close();
+    }
+ catch (    FailedArchiveException e) {
+      assertEquals(1,e.getFailedFiles().size());
+      assertEquals(ERROR_FILE,e.getFailedFiles().iterator().next().getName());
+    }
+  }
+  private HRegion initHRegion(  TableDescriptor htd,  RegionInfo info) throws IOException {
+    Configuration conf=testUtil.getConfiguration();
+    ChunkCreator.initialize(MemStoreLABImpl.CHUNK_SIZE_DEFAULT,false,0,0,0,null);
+    Path tableDir=FSUtils.getTableDir(testDir,htd.getTableName());
+    Path regionDir=new Path(tableDir,info.getEncodedName());
+    Path storeDir=new Path(regionDir,htd.getColumnFamilies()[0].getNameAsString());
+    FileSystem errFS=spy(testUtil.getTestFileSystem());
+    doThrow(new IOException("Error for test")).when(errFS).rename(eq(new Path(storeDir,ERROR_FILE)),any());
+    HRegionFileSystem fs=new HRegionFileSystem(conf,errFS,tableDir,info);
+    final Configuration walConf=new Configuration(conf);
+    FSUtils.setRootDir(walConf,tableDir);
+    final WALFactory wals=new WALFactory(walConf,"log_" + info.getEncodedName());
+    HRegion region=new HRegion(fs,wals.getWAL(info),conf,htd,null);
+    region.initialize();
+    return region;
+  }
+}

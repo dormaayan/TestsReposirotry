@@ -1,0 +1,107 @@
+public final class ClusterOutputPostProcessorTest extends MahoutTestCase {
+  private static final double[][] REFERENCE={{1,1},{2,1},{1,2},{4,4},{5,4},{4,5},{5,5}};
+  private FileSystem fs;
+  private Path outputPath;
+  private Configuration conf;
+  @Override @Before public void setUp() throws Exception {
+    super.setUp();
+    Configuration conf=getConfiguration();
+    fs=FileSystem.get(conf);
+  }
+  private static List<VectorWritable> getPointsWritable(  double[][] raw){
+    List<VectorWritable> points=Lists.newArrayList();
+    for (    double[] fr : raw) {
+      Vector vec=new RandomAccessSparseVector(fr.length);
+      vec.assign(fr);
+      points.add(new VectorWritable(vec));
+    }
+    return points;
+  }
+  /** 
+ * Story: User wants to use cluster post processor after canopy clustering and then run clustering on the output clusters
+ */
+  @Test public void testTopDownClustering() throws Exception {
+    List<VectorWritable> points=getPointsWritable(REFERENCE);
+    Path pointsPath=getTestTempDirPath("points");
+    conf=getConfiguration();
+    ClusteringTestUtils.writePointsToFile(points,new Path(pointsPath,"file1"),fs,conf);
+    ClusteringTestUtils.writePointsToFile(points,new Path(pointsPath,"file2"),fs,conf);
+    outputPath=getTestTempDirPath("output");
+    topLevelClustering(pointsPath,conf);
+    Map<String,Path> postProcessedClusterDirectories=ouputPostProcessing(conf);
+    assertPostProcessedOutput(postProcessedClusterDirectories);
+    bottomLevelClustering(postProcessedClusterDirectories);
+  }
+  private void assertTopLevelCluster(  Entry<String,Path> cluster){
+    String clusterId=cluster.getKey();
+    Path clusterPath=cluster.getValue();
+    try {
+      if ("0".equals(clusterId)) {
+        assertPointsInFirstTopLevelCluster(clusterPath);
+      }
+ else       if ("1".equals(clusterId)) {
+        assertPointsInSecondTopLevelCluster(clusterPath);
+      }
+    }
+ catch (    IOException e) {
+      Assert.fail("Exception occurred while asserting top level cluster.");
+    }
+  }
+  private void assertPointsInFirstTopLevelCluster(  Path clusterPath) throws IOException {
+    List<Vector> vectorsInCluster=getVectorsInCluster(clusterPath);
+    for (    Vector vector : vectorsInCluster) {
+      Assert.assertTrue(ArrayUtils.contains(new String[]{"{0:1.0,1:1.0}","{0:2.0,1:1.0}","{0:1.0,1:2.0}"},vector.asFormatString()));
+    }
+  }
+  private void assertPointsInSecondTopLevelCluster(  Path clusterPath) throws IOException {
+    List<Vector> vectorsInCluster=getVectorsInCluster(clusterPath);
+    for (    Vector vector : vectorsInCluster) {
+      Assert.assertTrue(ArrayUtils.contains(new String[]{"{0:4.0,1:4.0}","{0:5.0,1:4.0}","{0:4.0,1:5.0}","{0:5.0,1:5.0}"},vector.asFormatString()));
+    }
+  }
+  private List<Vector> getVectorsInCluster(  Path clusterPath) throws IOException {
+    Path[] partFilePaths=FileUtil.stat2Paths(fs.globStatus(clusterPath));
+    FileStatus[] listStatus=fs.listStatus(partFilePaths);
+    List<Vector> vectors=Lists.newArrayList();
+    for (    FileStatus partFile : listStatus) {
+      SequenceFile.Reader topLevelClusterReader=new SequenceFile.Reader(fs,partFile.getPath(),conf);
+      Writable clusterIdAsKey=new LongWritable();
+      VectorWritable point=new VectorWritable();
+      while (topLevelClusterReader.next(clusterIdAsKey,point)) {
+        vectors.add(point.get());
+      }
+    }
+    return vectors;
+  }
+  private void bottomLevelClustering(  Map<String,Path> postProcessedClusterDirectories) throws IOException, InterruptedException, ClassNotFoundException {
+    for (    Entry<String,Path> topLevelCluster : postProcessedClusterDirectories.entrySet()) {
+      String clusterId=topLevelCluster.getKey();
+      Path topLevelclusterPath=topLevelCluster.getValue();
+      Path bottomLevelCluster=PathDirectory.getBottomLevelClusterPath(outputPath,clusterId);
+      CanopyDriver.run(conf,topLevelclusterPath,bottomLevelCluster,new ManhattanDistanceMeasure(),2.1,2.0,true,0.0,true);
+      assertBottomLevelCluster(bottomLevelCluster);
+    }
+  }
+  private void assertBottomLevelCluster(  Path bottomLevelCluster){
+    Path clusteredPointsPath=new Path(bottomLevelCluster,"clusteredPoints");
+    DummyOutputCollector<IntWritable,WeightedVectorWritable> collector=new DummyOutputCollector<>();
+    for (    Pair<IntWritable,WeightedVectorWritable> record : new SequenceFileIterable<IntWritable,WeightedVectorWritable>(new Path(clusteredPointsPath,"part-m-0"),conf)) {
+      collector.collect(record.getFirst(),record.getSecond());
+    }
+    int clusterSize=collector.getKeys().size();
+    assertTrue(clusterSize == 1 || clusterSize == 2);
+  }
+  private void assertPostProcessedOutput(  Map<String,Path> postProcessedClusterDirectories){
+    for (    Entry<String,Path> cluster : postProcessedClusterDirectories.entrySet()) {
+      assertTopLevelCluster(cluster);
+    }
+  }
+  private Map<String,Path> ouputPostProcessing(  Configuration conf) throws IOException {
+    ClusterOutputPostProcessor clusterOutputPostProcessor=new ClusterOutputPostProcessor(outputPath,outputPath,conf);
+    clusterOutputPostProcessor.process();
+    return clusterOutputPostProcessor.getPostProcessedClusterDirectories();
+  }
+  private void topLevelClustering(  Path pointsPath,  Configuration conf) throws IOException, InterruptedException, ClassNotFoundException {
+    CanopyDriver.run(conf,pointsPath,outputPath,new ManhattanDistanceMeasure(),3.1,2.1,true,0.0,true);
+  }
+}

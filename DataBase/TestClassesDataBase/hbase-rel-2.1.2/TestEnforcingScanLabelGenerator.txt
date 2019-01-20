@@ -1,0 +1,97 @@
+@Category({SecurityTests.class,MediumTests.class}) public class TestEnforcingScanLabelGenerator {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestEnforcingScanLabelGenerator.class);
+  public static final String CONFIDENTIAL="confidential";
+  private static final String SECRET="secret";
+  public static final HBaseTestingUtility TEST_UTIL=new HBaseTestingUtility();
+  private static final byte[] ROW_1=Bytes.toBytes("row1");
+  private final static byte[] CF=Bytes.toBytes("f");
+  private final static byte[] Q1=Bytes.toBytes("q1");
+  private final static byte[] Q2=Bytes.toBytes("q2");
+  private final static byte[] Q3=Bytes.toBytes("q3");
+  private final static byte[] value=Bytes.toBytes("value");
+  public static Configuration conf;
+  @Rule public final TestName TEST_NAME=new TestName();
+  public static User SUPERUSER;
+  public static User TESTUSER;
+  @BeforeClass public static void setupBeforeClass() throws Exception {
+    conf=TEST_UTIL.getConfiguration();
+    VisibilityTestUtil.enableVisiblityLabels(conf);
+    String classes=DefinedSetFilterScanLabelGenerator.class.getCanonicalName() + " , " + EnforcingScanLabelGenerator.class.getCanonicalName();
+    conf.setStrings(VisibilityUtils.VISIBILITY_LABEL_GENERATOR_CLASS,classes);
+    conf.set("hbase.superuser","admin");
+    TEST_UTIL.startMiniCluster(1);
+    SUPERUSER=User.createUserForTesting(conf,"admin",new String[]{"supergroup"});
+    TESTUSER=User.createUserForTesting(conf,"test",new String[]{});
+    TEST_UTIL.waitTableEnabled(LABELS_TABLE_NAME.getName(),50000);
+    SUPERUSER.runAs(new PrivilegedExceptionAction<Void>(){
+      @Override public Void run() throws Exception {
+        try (Connection conn=ConnectionFactory.createConnection(conf)){
+          VisibilityClient.addLabels(conn,new String[]{SECRET,CONFIDENTIAL});
+          VisibilityClient.setAuths(conn,new String[]{CONFIDENTIAL},TESTUSER.getShortName());
+        }
+ catch (        Throwable t) {
+          throw new IOException(t);
+        }
+        return null;
+      }
+    }
+);
+  }
+  @Test public void testEnforcingScanLabelGenerator() throws Exception {
+    final TableName tableName=TableName.valueOf(TEST_NAME.getMethodName());
+    SUPERUSER.runAs(new PrivilegedExceptionAction<Void>(){
+      @Override public Void run() throws Exception {
+        try (Connection connection=ConnectionFactory.createConnection(conf);Table table=TEST_UTIL.createTable(tableName,CF)){
+          Put put=new Put(ROW_1);
+          put.addColumn(CF,Q1,HConstants.LATEST_TIMESTAMP,value);
+          put.setCellVisibility(new CellVisibility(SECRET));
+          table.put(put);
+          put=new Put(ROW_1);
+          put.addColumn(CF,Q2,HConstants.LATEST_TIMESTAMP,value);
+          put.setCellVisibility(new CellVisibility(CONFIDENTIAL));
+          table.put(put);
+          put=new Put(ROW_1);
+          put.addColumn(CF,Q3,HConstants.LATEST_TIMESTAMP,value);
+          table.put(put);
+          return null;
+        }
+       }
+    }
+);
+    SUPERUSER.runAs(new PrivilegedExceptionAction<Void>(){
+      @Override public Void run() throws Exception {
+        try (Connection connection=ConnectionFactory.createConnection(conf);Table table=connection.getTable(tableName)){
+          Get get=new Get(ROW_1);
+          Result result=table.get(get);
+          assertTrue("Missing authorization",result.containsColumn(CF,Q1));
+          assertTrue("Missing authorization",result.containsColumn(CF,Q2));
+          assertTrue("Missing authorization",result.containsColumn(CF,Q3));
+          return null;
+        }
+       }
+    }
+);
+    TESTUSER.runAs(new PrivilegedExceptionAction<Void>(){
+      @Override public Void run() throws Exception {
+        try (Connection connection=ConnectionFactory.createConnection(conf);Table table=connection.getTable(tableName)){
+          Get get=new Get(ROW_1);
+          get.setAuthorizations(new Authorizations(new String[]{SECRET,CONFIDENTIAL}));
+          Result result=table.get(get);
+          assertFalse("Inappropriate authorization",result.containsColumn(CF,Q1));
+          assertTrue("Missing authorization",result.containsColumn(CF,Q2));
+          assertTrue("Inappropriate filtering",result.containsColumn(CF,Q3));
+          get=new Get(ROW_1);
+          result=table.get(get);
+          assertFalse("Inappropriate authorization",result.containsColumn(CF,Q1));
+          assertTrue("Missing authorization",result.containsColumn(CF,Q2));
+          assertTrue("Inappropriate filtering",result.containsColumn(CF,Q3));
+          return null;
+        }
+       }
+    }
+);
+  }
+  @AfterClass public static void tearDownAfterClass() throws Exception {
+    TEST_UTIL.shutdownMiniCluster();
+  }
+}

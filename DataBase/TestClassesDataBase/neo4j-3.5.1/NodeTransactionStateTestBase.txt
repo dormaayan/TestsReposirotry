@@ -1,0 +1,590 @@
+@SuppressWarnings("Duplicates") public abstract class NodeTransactionStateTestBase<G extends KernelAPIWriteTestSupport> extends KernelAPIWriteTestBase<G> {
+  @Test public void shouldSeeNodeInTransaction() throws Exception {
+    long nodeId;
+    try (Transaction tx=beginTransaction()){
+      nodeId=tx.dataWrite().nodeCreate();
+      try (NodeCursor node=tx.cursors().allocateNodeCursor()){
+        tx.dataRead().singleNode(nodeId,node);
+        assertTrue("should access node",node.next());
+        assertEquals(nodeId,node.nodeReference());
+        assertFalse("should only find one node",node.next());
+      }
+       tx.success();
+    }
+     try (org.neo4j.graphdb.Transaction ignore=graphDb.beginTx()){
+      assertEquals(nodeId,graphDb.getNodeById(nodeId).getId());
+    }
+   }
+  @Test public void shouldSeeNewLabeledNodeInTransaction() throws Exception {
+    long nodeId;
+    int labelId;
+    final String labelName="Town";
+    try (Transaction tx=beginTransaction()){
+      nodeId=tx.dataWrite().nodeCreate();
+      labelId=tx.token().labelGetOrCreateForName(labelName);
+      tx.dataWrite().nodeAddLabel(nodeId,labelId);
+      try (NodeCursor node=tx.cursors().allocateNodeCursor()){
+        tx.dataRead().singleNode(nodeId,node);
+        assertTrue("should access node",node.next());
+        LabelSet labels=node.labels();
+        assertEquals(1,labels.numberOfLabels());
+        assertEquals(labelId,labels.label(0));
+        assertTrue(node.hasLabel(labelId));
+        assertFalse(node.hasLabel(labelId + 1));
+        assertFalse("should only find one node",node.next());
+      }
+       tx.success();
+    }
+     try (org.neo4j.graphdb.Transaction ignore=graphDb.beginTx()){
+      assertThat(graphDb.getNodeById(nodeId).getLabels(),equalTo(Iterables.iterable(label(labelName))));
+    }
+   }
+  @Test public void shouldSeeLabelChangesInTransaction() throws Exception {
+    long nodeId;
+    int toRetain, toDelete, toAdd, toRegret;
+    final String toRetainName="ToRetain";
+    final String toDeleteName="ToDelete";
+    final String toAddName="ToAdd";
+    final String toRegretName="ToRegret";
+    try (Transaction tx=beginTransaction()){
+      nodeId=tx.dataWrite().nodeCreate();
+      toRetain=tx.token().labelGetOrCreateForName(toRetainName);
+      toDelete=tx.token().labelGetOrCreateForName(toDeleteName);
+      tx.dataWrite().nodeAddLabel(nodeId,toRetain);
+      tx.dataWrite().nodeAddLabel(nodeId,toDelete);
+      tx.success();
+    }
+     try (org.neo4j.graphdb.Transaction ignore=graphDb.beginTx()){
+      assertThat(graphDb.getNodeById(nodeId).getLabels(),containsInAnyOrder(label(toRetainName),label(toDeleteName)));
+    }
+     try (Transaction tx=beginTransaction()){
+      toAdd=tx.token().labelGetOrCreateForName(toAddName);
+      tx.dataWrite().nodeAddLabel(nodeId,toAdd);
+      tx.dataWrite().nodeRemoveLabel(nodeId,toDelete);
+      toRegret=tx.token().labelGetOrCreateForName(toRegretName);
+      tx.dataWrite().nodeAddLabel(nodeId,toRegret);
+      tx.dataWrite().nodeRemoveLabel(nodeId,toRegret);
+      try (NodeCursor node=tx.cursors().allocateNodeCursor()){
+        tx.dataRead().singleNode(nodeId,node);
+        assertTrue("should access node",node.next());
+        assertLabels(node.labels(),toRetain,toAdd);
+        assertTrue(node.hasLabel(toAdd));
+        assertTrue(node.hasLabel(toRetain));
+        assertFalse(node.hasLabel(toDelete));
+        assertFalse(node.hasLabel(toRegret));
+        assertFalse("should only find one node",node.next());
+      }
+       tx.success();
+    }
+     try (org.neo4j.graphdb.Transaction ignored=graphDb.beginTx()){
+      assertThat(graphDb.getNodeById(nodeId).getLabels(),containsInAnyOrder(label(toRetainName),label(toAddName)));
+    }
+   }
+  @Test public void shouldDiscoverDeletedNodeInTransaction() throws Exception {
+    long nodeId;
+    try (Transaction tx=beginTransaction()){
+      nodeId=tx.dataWrite().nodeCreate();
+      tx.success();
+    }
+     try (Transaction tx=beginTransaction()){
+      assertTrue(tx.dataWrite().nodeDelete(nodeId));
+      try (NodeCursor node=tx.cursors().allocateNodeCursor()){
+        tx.dataRead().singleNode(nodeId,node);
+        assertFalse(node.next());
+      }
+       tx.success();
+    }
+   }
+  @Test public void shouldHandleMultipleNodeDeletions() throws Exception {
+    long nodeId;
+    try (Transaction tx=beginTransaction()){
+      nodeId=tx.dataWrite().nodeCreate();
+      tx.success();
+    }
+     try (Transaction tx=beginTransaction()){
+      assertTrue(tx.dataWrite().nodeDelete(nodeId));
+      assertFalse(tx.dataWrite().nodeDelete(nodeId));
+      tx.success();
+    }
+   }
+  @Test public void shouldSeeNewNodePropertyInTransaction() throws Exception {
+    long nodeId;
+    String propKey1="prop1";
+    String propKey2="prop2";
+    try (Transaction tx=beginTransaction()){
+      nodeId=tx.dataWrite().nodeCreate();
+      int prop1=tx.token().propertyKeyGetOrCreateForName(propKey1);
+      int prop2=tx.token().propertyKeyGetOrCreateForName(propKey2);
+      assertEquals(tx.dataWrite().nodeSetProperty(nodeId,prop1,stringValue("hello")),NO_VALUE);
+      assertEquals(tx.dataWrite().nodeSetProperty(nodeId,prop2,stringValue("world")),NO_VALUE);
+      try (NodeCursor node=tx.cursors().allocateNodeCursor();PropertyCursor property=tx.cursors().allocatePropertyCursor()){
+        tx.dataRead().singleNode(nodeId,node);
+        assertTrue("should access node",node.next());
+        node.properties(property);
+        assertTrue(property.next());
+        assertEquals(prop1,property.propertyKey());
+        assertEquals(property.propertyValue(),stringValue("hello"));
+        assertTrue(property.next());
+        assertEquals(prop2,property.propertyKey());
+        assertEquals(property.propertyValue(),stringValue("world"));
+        assertFalse("should only find two properties",property.next());
+        assertFalse("should only find one node",node.next());
+      }
+       tx.success();
+    }
+   }
+  @Test public void shouldSeeAddedPropertyFromExistingNodeWithoutPropertiesInTransaction() throws Exception {
+    long nodeId;
+    String propKey="prop1";
+    try (Transaction tx=beginTransaction()){
+      nodeId=tx.dataWrite().nodeCreate();
+      tx.success();
+    }
+     try (Transaction tx=beginTransaction()){
+      int propToken=tx.token().propertyKeyGetOrCreateForName(propKey);
+      assertEquals(tx.dataWrite().nodeSetProperty(nodeId,propToken,stringValue("hello")),NO_VALUE);
+      try (NodeCursor node=tx.cursors().allocateNodeCursor();PropertyCursor property=tx.cursors().allocatePropertyCursor()){
+        tx.dataRead().singleNode(nodeId,node);
+        assertTrue("should access node",node.next());
+        node.properties(property);
+        assertTrue(property.next());
+        assertEquals(propToken,property.propertyKey());
+        assertEquals(property.propertyValue(),stringValue("hello"));
+        assertFalse("should only find one properties",property.next());
+        assertFalse("should only find one node",node.next());
+      }
+       tx.success();
+    }
+     try (org.neo4j.graphdb.Transaction ignored=graphDb.beginTx()){
+      assertThat(graphDb.getNodeById(nodeId).getProperty(propKey),equalTo("hello"));
+    }
+   }
+  @Test public void shouldSeeAddedPropertyFromExistingNodeWithPropertiesInTransaction() throws Exception {
+    long nodeId;
+    String propKey1="prop1";
+    String propKey2="prop2";
+    int propToken1;
+    int propToken2;
+    try (Transaction tx=beginTransaction()){
+      nodeId=tx.dataWrite().nodeCreate();
+      propToken1=tx.token().propertyKeyGetOrCreateForName(propKey1);
+      assertEquals(tx.dataWrite().nodeSetProperty(nodeId,propToken1,stringValue("hello")),NO_VALUE);
+      tx.success();
+    }
+     try (Transaction tx=beginTransaction()){
+      propToken2=tx.token().propertyKeyGetOrCreateForName(propKey2);
+      assertEquals(tx.dataWrite().nodeSetProperty(nodeId,propToken2,stringValue("world")),NO_VALUE);
+      try (NodeCursor node=tx.cursors().allocateNodeCursor();PropertyCursor property=tx.cursors().allocatePropertyCursor()){
+        tx.dataRead().singleNode(nodeId,node);
+        assertTrue("should access node",node.next());
+        node.properties(property);
+        assertTrue(property.next());
+        assertEquals(propToken2,property.propertyKey());
+        assertEquals(property.propertyValue(),stringValue("world"));
+        assertTrue(property.next());
+        assertEquals(propToken1,property.propertyKey());
+        assertEquals(property.propertyValue(),stringValue("hello"));
+        assertFalse("should only find two properties",property.next());
+        assertFalse("should only find one node",node.next());
+      }
+       tx.success();
+    }
+     try (org.neo4j.graphdb.Transaction ignored=graphDb.beginTx()){
+      assertThat(graphDb.getNodeById(nodeId).getProperty(propKey1),equalTo("hello"));
+      assertThat(graphDb.getNodeById(nodeId).getProperty(propKey2),equalTo("world"));
+    }
+   }
+  @Test public void shouldSeeUpdatedPropertyFromExistingNodeWithPropertiesInTransaction() throws Exception {
+    long nodeId;
+    String propKey="prop1";
+    int propToken;
+    try (Transaction tx=beginTransaction()){
+      nodeId=tx.dataWrite().nodeCreate();
+      propToken=tx.token().propertyKeyGetOrCreateForName(propKey);
+      assertEquals(tx.dataWrite().nodeSetProperty(nodeId,propToken,stringValue("hello")),NO_VALUE);
+      tx.success();
+    }
+     try (Transaction tx=beginTransaction()){
+      assertEquals(tx.dataWrite().nodeSetProperty(nodeId,propToken,stringValue("world")),stringValue("hello"));
+      try (NodeCursor node=tx.cursors().allocateNodeCursor();PropertyCursor property=tx.cursors().allocatePropertyCursor()){
+        tx.dataRead().singleNode(nodeId,node);
+        assertTrue("should access node",node.next());
+        node.properties(property);
+        assertTrue(property.next());
+        assertEquals(propToken,property.propertyKey());
+        assertEquals(property.propertyValue(),stringValue("world"));
+        assertFalse("should only find one property",property.next());
+        assertFalse("should only find one node",node.next());
+      }
+       tx.success();
+    }
+     try (org.neo4j.graphdb.Transaction ignored=graphDb.beginTx()){
+      assertThat(graphDb.getNodeById(nodeId).getProperty(propKey),equalTo("world"));
+    }
+   }
+  @Test public void shouldSeeRemovedPropertyInTransaction() throws Exception {
+    long nodeId;
+    String propKey="prop1";
+    int propToken;
+    try (Transaction tx=beginTransaction()){
+      nodeId=tx.dataWrite().nodeCreate();
+      propToken=tx.token().propertyKeyGetOrCreateForName(propKey);
+      assertEquals(tx.dataWrite().nodeSetProperty(nodeId,propToken,stringValue("hello")),NO_VALUE);
+      tx.success();
+    }
+     try (Transaction tx=beginTransaction()){
+      assertEquals(tx.dataWrite().nodeRemoveProperty(nodeId,propToken),stringValue("hello"));
+      try (NodeCursor node=tx.cursors().allocateNodeCursor();PropertyCursor property=tx.cursors().allocatePropertyCursor()){
+        tx.dataRead().singleNode(nodeId,node);
+        assertTrue("should access node",node.next());
+        node.properties(property);
+        assertFalse("should not find any properties",property.next());
+        assertFalse("should only find one node",node.next());
+      }
+       tx.success();
+    }
+     try (org.neo4j.graphdb.Transaction ignored=graphDb.beginTx()){
+      assertFalse(graphDb.getNodeById(nodeId).hasProperty(propKey));
+    }
+   }
+  @Test public void shouldSeeRemovedThenAddedPropertyInTransaction() throws Exception {
+    long nodeId;
+    String propKey="prop1";
+    int propToken;
+    try (Transaction tx=beginTransaction()){
+      nodeId=tx.dataWrite().nodeCreate();
+      propToken=tx.token().propertyKeyGetOrCreateForName(propKey);
+      assertEquals(tx.dataWrite().nodeSetProperty(nodeId,propToken,stringValue("hello")),NO_VALUE);
+      tx.success();
+    }
+     try (Transaction tx=beginTransaction()){
+      assertEquals(tx.dataWrite().nodeRemoveProperty(nodeId,propToken),stringValue("hello"));
+      assertEquals(tx.dataWrite().nodeSetProperty(nodeId,propToken,stringValue("world")),NO_VALUE);
+      try (NodeCursor node=tx.cursors().allocateNodeCursor();PropertyCursor property=tx.cursors().allocatePropertyCursor()){
+        tx.dataRead().singleNode(nodeId,node);
+        assertTrue("should access node",node.next());
+        node.properties(property);
+        assertTrue(property.next());
+        assertEquals(propToken,property.propertyKey());
+        assertEquals(property.propertyValue(),stringValue("world"));
+        assertFalse("should not find any properties",property.next());
+        assertFalse("should only find one node",node.next());
+      }
+       tx.success();
+    }
+     try (org.neo4j.graphdb.Transaction ignored=graphDb.beginTx()){
+      assertThat(graphDb.getNodeById(nodeId).getProperty(propKey),equalTo("world"));
+    }
+   }
+  @Test public void shouldSeeExistingNode() throws Exception {
+    long node;
+    try (Transaction tx=beginTransaction()){
+      node=tx.dataWrite().nodeCreate();
+      tx.success();
+    }
+     try (Transaction tx=beginTransaction()){
+      assertTrue(tx.dataRead().nodeExists(node));
+    }
+   }
+  @Test public void shouldNotSeeNonExistingNode() throws Exception {
+    try (Transaction tx=beginTransaction()){
+      assertFalse(tx.dataRead().nodeExists(1337L));
+    }
+   }
+  @Test public void shouldSeeNodeExistingInTxOnly() throws Exception {
+    try (Transaction tx=beginTransaction()){
+      long node=tx.dataWrite().nodeCreate();
+      assertTrue(tx.dataRead().nodeExists(node));
+    }
+   }
+  @Test public void shouldNotSeeDeletedNode() throws Exception {
+    long node;
+    try (Transaction tx=beginTransaction()){
+      node=tx.dataWrite().nodeCreate();
+      tx.success();
+    }
+     try (Transaction tx=beginTransaction()){
+      tx.dataWrite().nodeDelete(node);
+      assertFalse(tx.dataRead().nodeExists(node));
+    }
+   }
+  @Test public void shouldNotFindDeletedNodeInLabelScan() throws Exception {
+    Node node=createNode("label");
+    try (org.neo4j.internal.kernel.api.Transaction tx=beginTransaction();NodeLabelIndexCursor cursor=tx.cursors().allocateNodeLabelIndexCursor()){
+      tx.dataWrite().nodeDelete(node.node);
+      tx.dataRead().nodeLabelScan(node.labels[0],cursor);
+      assertFalse(cursor.next());
+    }
+   }
+  @Test public void shouldNotFindNodeWithRemovedLabelInLabelScan() throws Exception {
+    Node node=createNode("label");
+    try (org.neo4j.internal.kernel.api.Transaction tx=beginTransaction();NodeLabelIndexCursor cursor=tx.cursors().allocateNodeLabelIndexCursor()){
+      tx.dataWrite().nodeRemoveLabel(node.node,node.labels[0]);
+      tx.dataRead().nodeLabelScan(node.labels[0],cursor);
+      assertFalse(cursor.next());
+    }
+   }
+  @Test public void shouldFindUpdatedNodeInInLabelScan() throws Exception {
+    Node node=createNode();
+    try (org.neo4j.internal.kernel.api.Transaction tx=beginTransaction();NodeLabelIndexCursor cursor=tx.cursors().allocateNodeLabelIndexCursor()){
+      int label=tx.tokenWrite().labelGetOrCreateForName("label");
+      tx.dataWrite().nodeAddLabel(node.node,label);
+      tx.dataRead().nodeLabelScan(label,cursor);
+      assertTrue(cursor.next());
+      assertEquals(node.node,cursor.nodeReference());
+    }
+   }
+  @Test public void shouldFindSwappedNodeInLabelScan() throws Exception {
+    Node node1=createNode("label");
+    Node node2=createNode();
+    try (org.neo4j.internal.kernel.api.Transaction tx=beginTransaction();NodeLabelIndexCursor cursor=tx.cursors().allocateNodeLabelIndexCursor()){
+      tx.dataWrite().nodeRemoveLabel(node1.node,node1.labels[0]);
+      tx.dataWrite().nodeAddLabel(node2.node,node1.labels[0]);
+      tx.dataRead().nodeLabelScan(node1.labels[0],cursor);
+      assertTrue(cursor.next());
+      assertEquals(node2.node,cursor.nodeReference());
+    }
+   }
+  @Ignore public void shouldNotFindDeletedNodeInDisjunctionLabelScan() throws Exception {
+    Node node=createNode("label1","label2");
+    try (org.neo4j.internal.kernel.api.Transaction tx=beginTransaction();NodeLabelIndexCursor cursor=tx.cursors().allocateNodeLabelIndexCursor()){
+      tx.dataWrite().nodeDelete(node.node);
+      tx.dataRead().nodeLabelUnionScan(cursor,node.labels);
+      assertFalse(cursor.next());
+    }
+   }
+  @Ignore public void shouldFindNodeWithOneRemovedLabelInDisjunctionLabelScan() throws Exception {
+    Node node=createNode("label1","label2");
+    try (org.neo4j.internal.kernel.api.Transaction tx=beginTransaction();NodeLabelIndexCursor cursor=tx.cursors().allocateNodeLabelIndexCursor()){
+      tx.dataWrite().nodeRemoveLabel(node.node,node.labels[1]);
+      tx.dataRead().nodeLabelUnionScan(cursor,node.labels);
+      assertTrue(cursor.next());
+      assertEquals(node.node,cursor.nodeReference());
+    }
+   }
+  @Ignore public void shouldNotFindNodeWithAllRemovedLabelsInDisjunctionLabelScan() throws Exception {
+    Node node=createNode("label1","label2");
+    try (org.neo4j.internal.kernel.api.Transaction tx=beginTransaction();NodeLabelIndexCursor cursor=tx.cursors().allocateNodeLabelIndexCursor()){
+      tx.dataWrite().nodeRemoveLabel(node.node,node.labels[0]);
+      tx.dataWrite().nodeRemoveLabel(node.node,node.labels[1]);
+      tx.dataRead().nodeLabelUnionScan(cursor,node.labels);
+      assertFalse(cursor.next());
+    }
+   }
+  @Ignore public void shouldNotFindNodeWithOneRemovedLabelsInDisjunctionLabelScan() throws Exception {
+    Node node=createNode("label1");
+    try (org.neo4j.internal.kernel.api.Transaction tx=beginTransaction();NodeLabelIndexCursor cursor=tx.cursors().allocateNodeLabelIndexCursor()){
+      int label1=tx.tokenWrite().labelGetOrCreateForName("label1");
+      int label2=tx.tokenWrite().labelGetOrCreateForName("label2");
+      tx.dataWrite().nodeRemoveLabel(node.node,label1);
+      tx.dataRead().nodeLabelUnionScan(cursor,label1,label2);
+      assertFalse(cursor.next());
+    }
+   }
+  @Ignore public void shouldFindUpdatedNodeInInDisjunctionLabelScan() throws Exception {
+    Node node=createNode("label1");
+    try (org.neo4j.internal.kernel.api.Transaction tx=beginTransaction();NodeLabelIndexCursor cursor=tx.cursors().allocateNodeLabelIndexCursor()){
+      int label2=tx.tokenWrite().labelGetOrCreateForName("label2");
+      tx.dataWrite().nodeAddLabel(node.node,label2);
+      tx.dataRead().nodeLabelUnionScan(cursor,node.labels[0],label2);
+      assertTrue(cursor.next());
+      assertEquals(node.node,cursor.nodeReference());
+    }
+   }
+  @Ignore public void shouldNotFindDeletedNodeInConjunctionLabelScan() throws Exception {
+    Node node=createNode("label1","label2");
+    try (org.neo4j.internal.kernel.api.Transaction tx=beginTransaction();NodeLabelIndexCursor cursor=tx.cursors().allocateNodeLabelIndexCursor()){
+      tx.dataWrite().nodeDelete(node.node);
+      tx.dataRead().nodeLabelIntersectionScan(cursor,node.labels);
+      assertFalse(cursor.next());
+    }
+   }
+  @Ignore public void shouldNotFindNodeWithRemovedLabelInConjunctionLabelScan() throws Exception {
+    Node node=createNode("label1","label2");
+    try (org.neo4j.internal.kernel.api.Transaction tx=beginTransaction();NodeLabelIndexCursor cursor=tx.cursors().allocateNodeLabelIndexCursor()){
+      tx.dataWrite().nodeRemoveLabel(node.node,node.labels[1]);
+      tx.dataRead().nodeLabelIntersectionScan(cursor,node.labels);
+      assertFalse(cursor.next());
+    }
+   }
+  @Ignore public void shouldFindUpdatedNodeInInConjunctionLabelScan() throws Exception {
+    Node node=createNode("label1");
+    try (org.neo4j.internal.kernel.api.Transaction tx=beginTransaction();NodeLabelIndexCursor cursor=tx.cursors().allocateNodeLabelIndexCursor()){
+      int label2=tx.tokenWrite().labelGetOrCreateForName("label2");
+      tx.dataWrite().nodeAddLabel(node.node,label2);
+      tx.dataRead().nodeLabelIntersectionScan(cursor,node.labels[0],label2);
+      assertTrue(cursor.next());
+      assertEquals(node.node,cursor.nodeReference());
+    }
+   }
+  @Ignore public void shouldNotFindNodeWithJustOneUpdatedLabelInInConjunctionLabelScan() throws Exception {
+    Node node=createNode();
+    try (org.neo4j.internal.kernel.api.Transaction tx=beginTransaction();NodeLabelIndexCursor cursor=tx.cursors().allocateNodeLabelIndexCursor()){
+      int label1=tx.tokenWrite().labelGetOrCreateForName("labe1");
+      int label2=tx.tokenWrite().labelGetOrCreateForName("label2");
+      tx.dataWrite().nodeAddLabel(node.node,label2);
+      tx.dataRead().nodeLabelIntersectionScan(cursor,label1,label2);
+      assertFalse(cursor.next());
+    }
+   }
+  @Test public void shouldCountNewLabelsFromTxState() throws Exception {
+    Node node1=createNode("label");
+    Node node2=createNode();
+    try (org.neo4j.internal.kernel.api.Transaction tx=beginTransaction()){
+      tx.dataWrite().nodeAddLabel(node2.node,node1.labels[0]);
+      long countTxState=tx.dataRead().countsForNode(node1.labels[0]);
+      long countNoTxState=tx.dataRead().countsForNodeWithoutTxState(node1.labels[0]);
+      assertEquals(2,countTxState);
+      assertEquals(1,countNoTxState);
+    }
+   }
+  @Test public void shouldCountNewNodesFromTxState() throws Exception {
+    createNode();
+    createNode();
+    try (org.neo4j.internal.kernel.api.Transaction tx=beginTransaction()){
+      tx.dataWrite().nodeCreate();
+      long countTxState=tx.dataRead().countsForNode(-1);
+      long countNoTxState=tx.dataRead().countsForNodeWithoutTxState(-1);
+      assertEquals(3,countTxState);
+      assertEquals(2,countNoTxState);
+    }
+   }
+  @Test public void shouldNotCountRemovedLabelsFromTxState() throws Exception {
+    Node node1=createNode("label");
+    Node node2=createNode("label");
+    try (org.neo4j.internal.kernel.api.Transaction tx=beginTransaction()){
+      tx.dataWrite().nodeRemoveLabel(node2.node,node2.labels[0]);
+      long countTxState=tx.dataRead().countsForNode(node1.labels[0]);
+      long countNoTxState=tx.dataRead().countsForNodeWithoutTxState(node1.labels[0]);
+      assertEquals(1,countTxState);
+      assertEquals(2,countNoTxState);
+    }
+   }
+  @Test public void shouldNotCountRemovedNodesFromTxState() throws Exception {
+    Node node1=createNode("label");
+    Node node2=createNode("label");
+    try (org.neo4j.internal.kernel.api.Transaction tx=beginTransaction()){
+      tx.dataWrite().nodeDelete(node2.node);
+      long countTxState=tx.dataRead().countsForNode(node1.labels[0]);
+      long countNoTxState=tx.dataRead().countsForNodeWithoutTxState(node1.labels[0]);
+      assertEquals(1,countTxState);
+      assertEquals(2,countNoTxState);
+    }
+   }
+  @Test public void hasPropertiesShouldSeeNewlyCreatedProperties() throws Exception {
+    long node;
+    try (Transaction tx=beginTransaction()){
+      node=tx.dataWrite().nodeCreate();
+      tx.success();
+    }
+     try (Transaction tx=beginTransaction()){
+      try (NodeCursor cursor=tx.cursors().allocateNodeCursor();PropertyCursor props=tx.cursors().allocatePropertyCursor()){
+        tx.dataRead().singleNode(node,cursor);
+        assertTrue(cursor.next());
+        assertFalse(hasProperties(cursor,props));
+        tx.dataWrite().nodeSetProperty(node,tx.tokenWrite().propertyKeyGetOrCreateForName("prop"),stringValue("foo"));
+        assertTrue(hasProperties(cursor,props));
+      }
+     }
+   }
+  private boolean hasProperties(  NodeCursor cursor,  PropertyCursor props){
+    cursor.properties(props);
+    return props.next();
+  }
+  @Test public void hasPropertiesShouldSeeNewlyCreatedPropertiesOnNewlyCreatedNode() throws Exception {
+    try (Transaction tx=beginTransaction()){
+      long node=tx.dataWrite().nodeCreate();
+      try (NodeCursor cursor=tx.cursors().allocateNodeCursor();PropertyCursor props=tx.cursors().allocatePropertyCursor()){
+        tx.dataRead().singleNode(node,cursor);
+        assertTrue(cursor.next());
+        assertFalse(hasProperties(cursor,props));
+        tx.dataWrite().nodeSetProperty(node,tx.tokenWrite().propertyKeyGetOrCreateForName("prop"),stringValue("foo"));
+        assertTrue(hasProperties(cursor,props));
+      }
+     }
+   }
+  @Test public void hasPropertiesShouldSeeNewlyRemovedProperties() throws Exception {
+    long node;
+    int prop1, prop2, prop3;
+    try (Transaction tx=beginTransaction()){
+      node=tx.dataWrite().nodeCreate();
+      prop1=tx.tokenWrite().propertyKeyGetOrCreateForName("prop1");
+      prop2=tx.tokenWrite().propertyKeyGetOrCreateForName("prop2");
+      prop3=tx.tokenWrite().propertyKeyGetOrCreateForName("prop3");
+      tx.dataWrite().nodeSetProperty(node,prop1,longValue(1));
+      tx.dataWrite().nodeSetProperty(node,prop2,longValue(2));
+      tx.dataWrite().nodeSetProperty(node,prop3,longValue(3));
+      tx.success();
+    }
+     try (Transaction tx=beginTransaction()){
+      try (NodeCursor cursor=tx.cursors().allocateNodeCursor();PropertyCursor props=tx.cursors().allocatePropertyCursor()){
+        tx.dataRead().singleNode(node,cursor);
+        assertTrue(cursor.next());
+        assertTrue(hasProperties(cursor,props));
+        tx.dataWrite().nodeRemoveProperty(node,prop1);
+        assertTrue(hasProperties(cursor,props));
+        tx.dataWrite().nodeRemoveProperty(node,prop2);
+        assertTrue(hasProperties(cursor,props));
+        tx.dataWrite().nodeRemoveProperty(node,prop3);
+        assertFalse(hasProperties(cursor,props));
+      }
+     }
+   }
+  @Test public void propertyTypeShouldBeTxStateAware() throws Exception {
+    long node;
+    try (Transaction tx=beginTransaction()){
+      node=tx.dataWrite().nodeCreate();
+      tx.success();
+    }
+     try (Transaction tx=beginTransaction()){
+      try (NodeCursor nodes=tx.cursors().allocateNodeCursor();PropertyCursor properties=tx.cursors().allocatePropertyCursor()){
+        tx.dataRead().singleNode(node,nodes);
+        assertTrue(nodes.next());
+        assertFalse(hasProperties(nodes,properties));
+        int prop=tx.tokenWrite().propertyKeyGetOrCreateForName("prop");
+        tx.dataWrite().nodeSetProperty(node,prop,stringValue("foo"));
+        nodes.properties(properties);
+        assertTrue(properties.next());
+        assertThat(properties.propertyType(),equalTo(ValueGroup.TEXT));
+      }
+     }
+   }
+  private void assertLabels(  LabelSet labels,  int... expected){
+    assertEquals(expected.length,labels.numberOfLabels());
+    Arrays.sort(expected);
+    int[] labelArray=new int[labels.numberOfLabels()];
+    for (int i=0; i < labels.numberOfLabels(); i++) {
+      labelArray[i]=labels.label(i);
+    }
+    Arrays.sort(labelArray);
+    assertTrue("labels match expected",Arrays.equals(expected,labelArray));
+  }
+  public Node createNode(  String... labels) throws Exception {
+    long node;
+    int[] labelIds=new int[labels.length];
+    try (Transaction tx=beginTransaction()){
+      Write write=tx.dataWrite();
+      node=write.nodeCreate();
+      for (int i=0; i < labels.length; i++) {
+        labelIds[i]=tx.tokenWrite().labelGetOrCreateForName(labels[i]);
+        write.nodeAddLabel(node,labelIds[i]);
+      }
+      tx.success();
+    }
+     return new Node(node,labelIds);
+  }
+private static class Node {
+    private final long node;
+    private final int[] labels;
+    private Node(    long node,    int[] labels){
+      this.node=node;
+      this.labels=labels;
+    }
+    public long node(){
+      return node;
+    }
+    public int[] labels(){
+      return labels;
+    }
+  }
+}

@@ -1,0 +1,43 @@
+/** 
+ * This test verifies that state is correctly assigned to key groups and that restore restores the relevant key groups in the backend. <p>We have ten key groups. Initially, one backend is responsible for all ten key groups. Then we snapshot, split up the state and restore in to backends where each is responsible for five key groups. Then we make sure that the state is only available in the correct backend.
+ * @throws Exception
+ */
+@Test public void testKeyGroupSnapshotRestore() throws Exception {
+  final int MAX_PARALLELISM=10;
+  CheckpointStreamFactory streamFactory=createStreamFactory();
+  SharedStateRegistry sharedStateRegistry=new SharedStateRegistry();
+  final AbstractKeyedStateBackend<Integer> backend=createKeyedBackend(IntSerializer.INSTANCE,MAX_PARALLELISM,new KeyGroupRange(0,MAX_PARALLELISM - 1),new DummyEnvironment());
+  ValueStateDescriptor<String> kvId=new ValueStateDescriptor<>("id",String.class);
+  ValueState<String> state=backend.getPartitionedState(VoidNamespace.INSTANCE,VoidNamespaceSerializer.INSTANCE,kvId);
+  int keyInFirstHalf=17;
+  int keyInSecondHalf=42;
+  Random rand=new Random(0);
+  int firstKeyHalf=KeyGroupRangeAssignment.assignKeyToParallelOperator(keyInFirstHalf,MAX_PARALLELISM,2);
+  int secondKeyHalf=KeyGroupRangeAssignment.assignKeyToParallelOperator(keyInFirstHalf,MAX_PARALLELISM,2);
+  while (firstKeyHalf == secondKeyHalf) {
+    keyInSecondHalf=rand.nextInt();
+    secondKeyHalf=KeyGroupRangeAssignment.assignKeyToParallelOperator(keyInSecondHalf,MAX_PARALLELISM,2);
+  }
+  backend.setCurrentKey(keyInFirstHalf);
+  state.update("ShouldBeInFirstHalf");
+  backend.setCurrentKey(keyInSecondHalf);
+  state.update("ShouldBeInSecondHalf");
+  KeyedStateHandle snapshot=runSnapshot(backend.snapshot(0,0,streamFactory,CheckpointOptions.forCheckpointWithDefaultLocation()),sharedStateRegistry);
+  List<KeyedStateHandle> firstHalfKeyGroupStates=StateAssignmentOperation.getKeyedStateHandles(Collections.singletonList(snapshot),KeyGroupRangeAssignment.computeKeyGroupRangeForOperatorIndex(MAX_PARALLELISM,2,0));
+  List<KeyedStateHandle> secondHalfKeyGroupStates=StateAssignmentOperation.getKeyedStateHandles(Collections.singletonList(snapshot),KeyGroupRangeAssignment.computeKeyGroupRangeForOperatorIndex(MAX_PARALLELISM,2,1));
+  backend.dispose();
+  final AbstractKeyedStateBackend<Integer> firstHalfBackend=restoreKeyedBackend(IntSerializer.INSTANCE,MAX_PARALLELISM,new KeyGroupRange(0,4),firstHalfKeyGroupStates,new DummyEnvironment());
+  final AbstractKeyedStateBackend<Integer> secondHalfBackend=restoreKeyedBackend(IntSerializer.INSTANCE,MAX_PARALLELISM,new KeyGroupRange(5,9),secondHalfKeyGroupStates,new DummyEnvironment());
+  ValueState<String> firstHalfState=firstHalfBackend.getPartitionedState(VoidNamespace.INSTANCE,VoidNamespaceSerializer.INSTANCE,kvId);
+  firstHalfBackend.setCurrentKey(keyInFirstHalf);
+  assertTrue(firstHalfState.value().equals("ShouldBeInFirstHalf"));
+  firstHalfBackend.setCurrentKey(keyInSecondHalf);
+  assertTrue(firstHalfState.value() == null);
+  ValueState<String> secondHalfState=secondHalfBackend.getPartitionedState(VoidNamespace.INSTANCE,VoidNamespaceSerializer.INSTANCE,kvId);
+  secondHalfBackend.setCurrentKey(keyInFirstHalf);
+  assertTrue(secondHalfState.value() == null);
+  secondHalfBackend.setCurrentKey(keyInSecondHalf);
+  assertTrue(secondHalfState.value().equals("ShouldBeInSecondHalf"));
+  firstHalfBackend.dispose();
+  secondHalfBackend.dispose();
+}

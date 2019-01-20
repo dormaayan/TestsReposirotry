@@ -1,0 +1,50 @@
+@Test public void testSavepoint() throws Exception {
+  final int parallelism=4;
+  final StreamExecutionEnvironment env=StreamExecutionEnvironment.getExecutionEnvironment();
+  env.setRestartStrategy(RestartStrategies.noRestart());
+  env.setStreamTimeCharacteristic(TimeCharacteristic.EventTime);
+switch (testStateBackend) {
+case StateBackendLoader.ROCKSDB_STATE_BACKEND_NAME:
+    env.setStateBackend(new RocksDBStateBackend(new MemoryStateBackend()));
+  break;
+case StateBackendLoader.MEMORY_STATE_BACKEND_NAME:
+env.setStateBackend(new MemoryStateBackend());
+break;
+default :
+throw new UnsupportedOperationException();
+}
+env.enableCheckpointing(500);
+env.setParallelism(parallelism);
+env.setMaxParallelism(parallelism);
+SourceFunction<Tuple2<Long,Long>> nonParallelSource;
+SourceFunction<Tuple2<Long,Long>> parallelSource;
+RichFlatMapFunction<Tuple2<Long,Long>,Tuple2<Long,Long>> flatMap;
+OneInputStreamOperator<Tuple2<Long,Long>,Tuple2<Long,Long>> timelyOperator;
+if (executionMode == ExecutionMode.PERFORM_SAVEPOINT) {
+nonParallelSource=new MigrationTestUtils.CheckpointingNonParallelSourceWithListState(NUM_SOURCE_ELEMENTS);
+parallelSource=new MigrationTestUtils.CheckpointingParallelSourceWithUnionListState(NUM_SOURCE_ELEMENTS);
+flatMap=new CheckpointingKeyedStateFlatMap();
+timelyOperator=new CheckpointingTimelyStatefulOperator();
+}
+ else if (executionMode == ExecutionMode.VERIFY_SAVEPOINT) {
+nonParallelSource=new MigrationTestUtils.CheckingNonParallelSourceWithListState(NUM_SOURCE_ELEMENTS);
+parallelSource=new MigrationTestUtils.CheckingParallelSourceWithUnionListState(NUM_SOURCE_ELEMENTS);
+flatMap=new CheckingKeyedStateFlatMap();
+timelyOperator=new CheckingTimelyStatefulOperator();
+}
+ else {
+throw new IllegalStateException("Unknown ExecutionMode " + executionMode);
+}
+env.addSource(nonParallelSource).uid("CheckpointingSource1").keyBy(0).flatMap(flatMap).startNewChain().uid("CheckpointingKeyedStateFlatMap1").keyBy(0).transform("timely_stateful_operator",new TypeHint<Tuple2<Long,Long>>(){
+}
+.getTypeInfo(),timelyOperator).uid("CheckpointingTimelyStatefulOperator1").addSink(new MigrationTestUtils.AccumulatorCountingSink<>());
+env.addSource(parallelSource).uid("CheckpointingSource2").keyBy(0).flatMap(flatMap).startNewChain().uid("CheckpointingKeyedStateFlatMap2").keyBy(0).transform("timely_stateful_operator",new TypeHint<Tuple2<Long,Long>>(){
+}
+.getTypeInfo(),timelyOperator).uid("CheckpointingTimelyStatefulOperator2").addSink(new MigrationTestUtils.AccumulatorCountingSink<>());
+if (executionMode == ExecutionMode.PERFORM_SAVEPOINT) {
+executeAndSavepoint(env,"src/test/resources/" + getSavepointPath(testMigrateVersion,testStateBackend),new Tuple2<>(MigrationTestUtils.AccumulatorCountingSink.NUM_ELEMENTS_ACCUMULATOR,NUM_SOURCE_ELEMENTS * 2));
+}
+ else {
+restoreAndExecute(env,getResourceFilename(getSavepointPath(testMigrateVersion,testStateBackend)),new Tuple2<>(MigrationTestUtils.CheckingNonParallelSourceWithListState.SUCCESSFUL_RESTORE_CHECK_ACCUMULATOR,1),new Tuple2<>(MigrationTestUtils.CheckingParallelSourceWithUnionListState.SUCCESSFUL_RESTORE_CHECK_ACCUMULATOR,parallelism),new Tuple2<>(CheckingKeyedStateFlatMap.SUCCESSFUL_RESTORE_CHECK_ACCUMULATOR,NUM_SOURCE_ELEMENTS * 2),new Tuple2<>(CheckingTimelyStatefulOperator.SUCCESSFUL_PROCESS_CHECK_ACCUMULATOR,NUM_SOURCE_ELEMENTS * 2),new Tuple2<>(CheckingTimelyStatefulOperator.SUCCESSFUL_EVENT_TIME_CHECK_ACCUMULATOR,NUM_SOURCE_ELEMENTS * 2),new Tuple2<>(CheckingTimelyStatefulOperator.SUCCESSFUL_PROCESSING_TIME_CHECK_ACCUMULATOR,NUM_SOURCE_ELEMENTS * 2),new Tuple2<>(MigrationTestUtils.AccumulatorCountingSink.NUM_ELEMENTS_ACCUMULATOR,NUM_SOURCE_ELEMENTS * 2));
+}
+}

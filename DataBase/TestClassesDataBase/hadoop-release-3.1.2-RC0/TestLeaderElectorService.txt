@@ -1,0 +1,147 @@
+public class TestLeaderElectorService {
+  private static final String RM1_ADDRESS="1.1.1.1:1";
+  private static final String RM1_NODE_ID="rm1";
+  private static final String RM2_ADDRESS="0.0.0.0:0";
+  private static final String RM2_NODE_ID="rm2";
+  Configuration conf;
+  MockRM rm1;
+  MockRM rm2;
+  TestingCluster zkCluster;
+  @Before public void setUp() throws Exception {
+    Logger rootLogger=LogManager.getRootLogger();
+    rootLogger.setLevel(Level.INFO);
+    conf=new Configuration();
+    conf.setBoolean(YarnConfiguration.RM_HA_ENABLED,true);
+    conf.setBoolean(YarnConfiguration.CURATOR_LEADER_ELECTOR,true);
+    conf.set(YarnConfiguration.RM_CLUSTER_ID,"cluster1");
+    conf.set(YarnConfiguration.RM_HA_IDS,RM1_NODE_ID + "," + RM2_NODE_ID);
+    for (    String confKey : YarnConfiguration.getServiceAddressConfKeys(conf)) {
+      conf.set(HAUtil.addSuffix(confKey,RM1_NODE_ID),RM1_ADDRESS);
+      conf.set(HAUtil.addSuffix(confKey,RM2_NODE_ID),RM2_ADDRESS);
+    }
+    zkCluster=new TestingCluster(3);
+    conf.set(YarnConfiguration.RM_ZK_ADDRESS,zkCluster.getConnectString());
+    zkCluster.start();
+  }
+  @After public void tearDown() throws Exception {
+    if (rm1 != null) {
+      rm1.stop();
+    }
+    if (rm2 != null) {
+      rm2.stop();
+    }
+  }
+  @Test(timeout=20000) public void testRMShutDownCauseFailover() throws Exception {
+    rm1=startRM("rm1",HAServiceState.ACTIVE);
+    rm2=startRM("rm2",HAServiceState.STANDBY);
+    Thread.sleep(5000);
+    waitFor(rm2,HAServiceState.STANDBY);
+    rm1.stop();
+    waitFor(rm2,HAServiceState.ACTIVE);
+  }
+  @Test public void testStateStoreFailureCauseFailover() throws Exception {
+    conf.set(YarnConfiguration.RM_HA_ID,"rm1");
+    MemoryRMStateStore memStore=new MemoryRMStateStore(){
+      @Override public synchronized void storeApplicationStateInternal(      ApplicationId appId,      ApplicationStateData appState) throws Exception {
+        throw new Exception("store app failure.");
+      }
+    }
+;
+    memStore.init(conf);
+    rm1=new MockRM(conf,memStore,true);
+    rm1.init(conf);
+    rm1.start();
+    waitFor(rm1,HAServiceState.ACTIVE);
+    rm2=startRM("rm2",HAServiceState.STANDBY);
+    rm1.submitApp(200,"app1","user1",null,"default",false);
+    waitFor(rm1,HAServiceState.STANDBY);
+    waitFor(rm2,HAServiceState.ACTIVE);
+    rm2.stop();
+    waitFor(rm1,HAServiceState.ACTIVE);
+  }
+  @Test public void testZKClusterDown() throws Exception {
+    rm1=startRM("rm1",HAServiceState.ACTIVE);
+    zkCluster.stop();
+    waitFor(rm1,HAServiceState.STANDBY);
+    Collection<InstanceSpec> instanceSpecs=zkCluster.getInstances();
+    zkCluster=new TestingCluster(instanceSpecs);
+    zkCluster.start();
+    waitFor(rm1,HAServiceState.ACTIVE);
+  }
+  @Test public void testExpireCurrentZKSession() throws Exception {
+    rm1=startRM("rm1",HAServiceState.ACTIVE);
+    CuratorBasedElectorService service=(CuratorBasedElectorService)rm1.getRMContext().getLeaderElectorService();
+    CuratorZookeeperClient client=service.getCuratorClient().getZookeeperClient();
+    KillSession.kill(client.getZooKeeper(),client.getCurrentConnectionString());
+    waitFor(rm1,HAServiceState.ACTIVE);
+  }
+  @Test public void testRMFailToTransitionToActive() throws Exception {
+    conf.set(YarnConfiguration.RM_HA_ID,"rm1");
+    final AtomicBoolean throwException=new AtomicBoolean(true);
+    Thread launchRM=new Thread(){
+      @Override public void run(){
+        rm1=new MockRM(conf,true){
+          @Override synchronized void transitionToActive() throws Exception {
+            if (throwException.get()) {
+              throw new Exception("Fail to transition to active");
+            }
+ else {
+              super.transitionToActive();
+            }
+          }
+        }
+;
+        rm1.init(conf);
+        rm1.start();
+      }
+    }
+;
+    launchRM.start();
+    Thread.sleep(5000);
+    throwException.set(false);
+    waitFor(rm1,HAServiceState.ACTIVE);
+  }
+  @Test public void testKillZKInstance() throws Exception {
+    rm1=startRM("rm1",HAServiceState.ACTIVE);
+    rm2=startRM("rm2",HAServiceState.STANDBY);
+    CuratorBasedElectorService service=(CuratorBasedElectorService)rm1.getRMContext().getLeaderElectorService();
+    ZooKeeper zkClient=service.getCuratorClient().getZookeeperClient().getZooKeeper();
+    InstanceSpec connectionInstance=zkCluster.findConnectionInstance(zkClient);
+    zkCluster.killServer(connectionInstance);
+    GenericTestUtils.waitFor(new Supplier<Boolean>(){
+      @Override public Boolean get(){
+        try {
+          HAServiceState rm1State=rm1.getAdminService().getServiceStatus().getState();
+          HAServiceState rm2State=rm2.getAdminService().getServiceStatus().getState();
+          return (rm1State.equals(HAServiceState.ACTIVE) && rm2State.equals(HAServiceState.STANDBY)) || (rm1State.equals(HAServiceState.STANDBY) && rm2State.equals(HAServiceState.ACTIVE));
+        }
+ catch (        IOException e) {
+        }
+        return false;
+      }
+    }
+,2000,15000);
+  }
+  private MockRM startRM(  String rmId,  HAServiceState state) throws Exception {
+    YarnConfiguration yarnConf=new YarnConfiguration(conf);
+    yarnConf.set(YarnConfiguration.RM_HA_ID,rmId);
+    MockRM rm=new MockRM(yarnConf,true);
+    rm.init(yarnConf);
+    rm.start();
+    waitFor(rm,state);
+    return rm;
+  }
+  private void waitFor(  final MockRM rm,  final HAServiceState state) throws TimeoutException, InterruptedException {
+    GenericTestUtils.waitFor(new Supplier<Boolean>(){
+      @Override public Boolean get(){
+        try {
+          return rm.getAdminService().getServiceStatus().getState().equals(state);
+        }
+ catch (        IOException e) {
+        }
+        return false;
+      }
+    }
+,2000,15000);
+  }
+}

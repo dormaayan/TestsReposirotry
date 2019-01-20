@@ -1,0 +1,51 @@
+@Test @SuppressWarnings("unchecked") public void testStateStoreSuccessfulLocalization() throws Exception {
+  final String user="someuser";
+  final ApplicationId appId=ApplicationId.newInstance(1,1);
+  final Path localDir=new Path("/tmp");
+  Configuration conf=new YarnConfiguration();
+  DrainDispatcher dispatcher=null;
+  dispatcher=createDispatcher(conf);
+  EventHandler<LocalizerEvent> localizerEventHandler=mock(EventHandler.class);
+  EventHandler<LocalizerEvent> containerEventHandler=mock(EventHandler.class);
+  dispatcher.register(LocalizerEventType.class,localizerEventHandler);
+  dispatcher.register(ContainerEventType.class,containerEventHandler);
+  DeletionService mockDelService=mock(DeletionService.class);
+  NMStateStoreService stateStore=mock(NMStateStoreService.class);
+  try {
+    LocalResourcesTracker tracker=new LocalResourcesTrackerImpl(user,appId,dispatcher,false,conf,stateStore,null);
+    ContainerId cId1=BuilderUtils.newContainerId(1,1,1,1);
+    LocalResourceRequest lr1=createLocalResourceRequest(user,1,1,LocalResourceVisibility.APPLICATION);
+    LocalizerContext lc1=new LocalizerContext(user,cId1,null);
+    ResourceEvent reqEvent1=new ResourceRequestEvent(lr1,LocalResourceVisibility.APPLICATION,lc1);
+    tracker.handle(reqEvent1);
+    dispatcher.await();
+    Path hierarchicalPath1=tracker.getPathForLocalization(lr1,localDir,null);
+    ArgumentCaptor<LocalResourceProto> localResourceCaptor=ArgumentCaptor.forClass(LocalResourceProto.class);
+    ArgumentCaptor<Path> pathCaptor=ArgumentCaptor.forClass(Path.class);
+    verify(stateStore).startResourceLocalization(eq(user),eq(appId),localResourceCaptor.capture(),pathCaptor.capture());
+    LocalResourceProto lrProto=localResourceCaptor.getValue();
+    Path localizedPath1=pathCaptor.getValue();
+    Assert.assertEquals(lr1,new LocalResourceRequest(new LocalResourcePBImpl(lrProto)));
+    Assert.assertEquals(hierarchicalPath1,localizedPath1.getParent());
+    ResourceLocalizedEvent rle1=new ResourceLocalizedEvent(lr1,pathCaptor.getValue(),120);
+    tracker.handle(rle1);
+    dispatcher.await();
+    ArgumentCaptor<LocalizedResourceProto> localizedProtoCaptor=ArgumentCaptor.forClass(LocalizedResourceProto.class);
+    verify(stateStore).finishResourceLocalization(eq(user),eq(appId),localizedProtoCaptor.capture());
+    LocalizedResourceProto localizedProto=localizedProtoCaptor.getValue();
+    Assert.assertEquals(lr1,new LocalResourceRequest(new LocalResourcePBImpl(localizedProto.getResource())));
+    Assert.assertEquals(localizedPath1.toString(),localizedProto.getLocalPath());
+    LocalizedResource localizedRsrc1=tracker.getLocalizedResource(lr1);
+    Assert.assertNotNull(localizedRsrc1);
+    tracker.handle(new ResourceReleaseEvent(lr1,cId1));
+    dispatcher.await();
+    boolean removeResult=tracker.remove(localizedRsrc1,mockDelService);
+    Assert.assertTrue(removeResult);
+    verify(stateStore).removeLocalizedResource(eq(user),eq(appId),eq(localizedPath1));
+  }
+  finally {
+    if (dispatcher != null) {
+      dispatcher.stop();
+    }
+  }
+}

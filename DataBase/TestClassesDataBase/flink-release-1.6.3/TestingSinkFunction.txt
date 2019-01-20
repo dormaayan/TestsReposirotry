@@ -1,0 +1,66 @@
+private static class TestingSinkFunction extends RichSinkFunction<String> implements ListCheckpointed<Tuple2<Long,Map<Integer,Set<String>>>>, CheckpointListener {
+  private boolean hasRestoredAfterFailure;
+  private volatile int successfulCheckpoints;
+  private long elementsToFailure;
+  private long elementCounter;
+  private Map<Integer,Set<String>> actualContent=new HashMap<>();
+  TestingSinkFunction(){
+    hasRestoredAfterFailure=false;
+    elementCounter=0;
+    successfulCheckpoints=0;
+  }
+  @Override public void open(  Configuration parameters) throws Exception {
+    assertEquals(1,getRuntimeContext().getNumberOfParallelSubtasks());
+    long failurePosMin=(long)(0.4 * LINES_PER_FILE);
+    long failurePosMax=(long)(0.7 * LINES_PER_FILE);
+    elementsToFailure=(new Random().nextLong() % (failurePosMax - failurePosMin)) + failurePosMin;
+  }
+  @Override public void invoke(  String value) throws Exception {
+    int fileIdx=getFileIdx(value);
+    Set<String> content=actualContent.get(fileIdx);
+    if (content == null) {
+      content=new HashSet<>();
+      actualContent.put(fileIdx,content);
+    }
+    if (!content.add(value + "\n")) {
+      fail("Duplicate line: " + value);
+      System.exit(0);
+    }
+    elementCounter++;
+    if (elementCounter >= NO_OF_FILES * LINES_PER_FILE) {
+      actualCollectedContent=actualContent;
+      throw new SuccessException();
+    }
+    if (!hasRestoredAfterFailure && successfulCheckpoints < 2) {
+      Thread.sleep(5);
+    }
+    if (!hasRestoredAfterFailure && successfulCheckpoints >= 2 && elementCounter >= elementsToFailure) {
+      throw new Exception("Task Failure @ elem: " + elementCounter + " / "+ elementsToFailure);
+    }
+  }
+  @Override public void close(){
+    try {
+      super.close();
+    }
+ catch (    Exception e) {
+      e.printStackTrace();
+    }
+  }
+  @Override public List<Tuple2<Long,Map<Integer,Set<String>>>> snapshotState(  long checkpointId,  long checkpointTimestamp) throws Exception {
+    Tuple2<Long,Map<Integer,Set<String>>> state=new Tuple2<>(elementCounter,actualContent);
+    return Collections.singletonList(state);
+  }
+  @Override public void restoreState(  List<Tuple2<Long,Map<Integer,Set<String>>>> state) throws Exception {
+    Tuple2<Long,Map<Integer,Set<String>>> s=state.get(0);
+    this.elementCounter=s.f0;
+    this.actualContent=s.f1;
+    this.hasRestoredAfterFailure=this.elementCounter != 0;
+  }
+  @Override public void notifyCheckpointComplete(  long checkpointId) throws Exception {
+    this.successfulCheckpoints++;
+  }
+  private int getFileIdx(  String line){
+    String[] tkns=line.split(":");
+    return Integer.parseInt(tkns[0]);
+  }
+}

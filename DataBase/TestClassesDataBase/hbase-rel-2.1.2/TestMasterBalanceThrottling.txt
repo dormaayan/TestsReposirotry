@@ -1,0 +1,83 @@
+@Ignore @Category({MasterTests.class,MediumTests.class}) public class TestMasterBalanceThrottling {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestMasterBalanceThrottling.class);
+  private static final HBaseTestingUtility TEST_UTIL=new HBaseTestingUtility();
+  private static final byte[] FAMILYNAME=Bytes.toBytes("fam");
+  @Before public void setupConfiguration(){
+    TEST_UTIL.getConfiguration().set(HConstants.HBASE_MASTER_LOADBALANCER_CLASS,"org.apache.hadoop.hbase.master.balancer.SimpleLoadBalancer");
+  }
+  @After public void shutdown() throws Exception {
+    TEST_UTIL.getConfiguration().setInt(HConstants.HBASE_BALANCER_MAX_BALANCING,HConstants.DEFAULT_HBASE_BALANCER_PERIOD);
+    TEST_UTIL.getConfiguration().setDouble(HConstants.HBASE_MASTER_BALANCER_MAX_RIT_PERCENT,HConstants.DEFAULT_HBASE_MASTER_BALANCER_MAX_RIT_PERCENT);
+    TEST_UTIL.shutdownMiniCluster();
+  }
+  @Test public void testThrottlingByBalanceInterval() throws Exception {
+    TEST_UTIL.startMiniCluster(2);
+    TableName tableName=createTable("testNoThrottling");
+    final HMaster master=TEST_UTIL.getHBaseCluster().getMaster();
+    unbalance(master,tableName);
+    AtomicInteger maxCount=new AtomicInteger(0);
+    AtomicBoolean stop=new AtomicBoolean(false);
+    Thread checker=startBalancerChecker(master,maxCount,stop);
+    master.balance();
+    stop.set(true);
+    checker.interrupt();
+    checker.join();
+    assertTrue("max regions in transition: " + maxCount.get(),maxCount.get() == 1);
+    TEST_UTIL.deleteTable(tableName);
+  }
+  @Test public void testThrottlingByMaxRitPercent() throws Exception {
+    TEST_UTIL.getConfiguration().setInt(HConstants.HBASE_BALANCER_MAX_BALANCING,500);
+    TEST_UTIL.getConfiguration().setDouble(HConstants.HBASE_MASTER_BALANCER_MAX_RIT_PERCENT,0.05);
+    TEST_UTIL.startMiniCluster(2);
+    TableName tableName=createTable("testThrottlingByMaxRitPercent");
+    final HMaster master=TEST_UTIL.getHBaseCluster().getMaster();
+    unbalance(master,tableName);
+    AtomicInteger maxCount=new AtomicInteger(0);
+    AtomicBoolean stop=new AtomicBoolean(false);
+    Thread checker=startBalancerChecker(master,maxCount,stop);
+    master.balance();
+    stop.set(true);
+    checker.interrupt();
+    checker.join();
+    assertTrue("max regions in transition: " + maxCount.get(),maxCount.get() == 5);
+    TEST_UTIL.deleteTable(tableName);
+  }
+  private TableName createTable(  String table) throws IOException {
+    TableName tableName=TableName.valueOf(table);
+    byte[] startKey=new byte[]{0x00};
+    byte[] stopKey=new byte[]{0x7f};
+    TEST_UTIL.createTable(tableName,new byte[][]{FAMILYNAME},1,startKey,stopKey,100);
+    return tableName;
+  }
+  private Thread startBalancerChecker(  final HMaster master,  final AtomicInteger maxCount,  final AtomicBoolean stop){
+    Runnable checker=new Runnable(){
+      @Override public void run(){
+        while (!stop.get()) {
+          maxCount.set(Math.max(maxCount.get(),master.getAssignmentManager().getRegionStates().getRegionsInTransitionCount()));
+          try {
+            Thread.sleep(10);
+          }
+ catch (          InterruptedException e) {
+            e.printStackTrace();
+          }
+        }
+      }
+    }
+;
+    Thread thread=new Thread(checker);
+    thread.start();
+    return thread;
+  }
+  private void unbalance(  HMaster master,  TableName tableName) throws Exception {
+    while (master.getAssignmentManager().getRegionStates().getRegionsInTransitionCount() > 0) {
+      Thread.sleep(100);
+    }
+    HRegionServer biasedServer=TEST_UTIL.getMiniHBaseCluster().getRegionServer(0);
+    for (    HRegionInfo regionInfo : TEST_UTIL.getAdmin().getTableRegions(tableName)) {
+      master.move(regionInfo.getEncodedNameAsBytes(),Bytes.toBytes(biasedServer.getServerName().getServerName()));
+    }
+    while (master.getAssignmentManager().getRegionStates().getRegionsInTransitionCount() > 0) {
+      Thread.sleep(100);
+    }
+  }
+}

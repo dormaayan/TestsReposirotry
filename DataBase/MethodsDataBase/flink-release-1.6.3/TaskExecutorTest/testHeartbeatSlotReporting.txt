@@ -1,0 +1,58 @@
+/** 
+ * Tests that the correct slot report is sent as part of the heartbeat response.
+ */
+@Test public void testHeartbeatSlotReporting() throws Exception {
+  final long verificationTimeout=1000L;
+  final long heartbeatTimeout=10000L;
+  final String rmAddress="rm";
+  final UUID rmLeaderId=UUID.randomUUID();
+  final TestingResourceManagerGateway rmGateway=new TestingResourceManagerGateway();
+  final CompletableFuture<ResourceID> taskExecutorRegistrationFuture=new CompletableFuture<>();
+  final ResourceID rmResourceId=rmGateway.getOwnResourceId();
+  final CompletableFuture<RegistrationResponse> registrationResponse=CompletableFuture.completedFuture(new TaskExecutorRegistrationSuccess(new InstanceID(),rmResourceId,10L,new ClusterInformation("localhost",1234)));
+  rmGateway.setRegisterTaskExecutorFunction(stringResourceIDIntegerHardwareDescriptionTuple4 -> {
+    taskExecutorRegistrationFuture.complete(stringResourceIDIntegerHardwareDescriptionTuple4.f1);
+    return registrationResponse;
+  }
+);
+  final CompletableFuture<SlotReport> initialSlotReportFuture=new CompletableFuture<>();
+  rmGateway.setSendSlotReportFunction(resourceIDInstanceIDSlotReportTuple3 -> {
+    initialSlotReportFuture.complete(resourceIDInstanceIDSlotReportTuple3.f2);
+    return CompletableFuture.completedFuture(Acknowledge.get());
+  }
+);
+  final CompletableFuture<SlotReport> heartbeatSlotReportFuture=new CompletableFuture<>();
+  rmGateway.setTaskExecutorHeartbeatConsumer((resourceID,slotReport) -> heartbeatSlotReportFuture.complete(slotReport));
+  rpc.registerGateway(rmAddress,rmGateway);
+  final TaskSlotTable taskSlotTable=mock(TaskSlotTable.class);
+  final SlotID slotId=new SlotID(taskManagerLocation.getResourceID(),0);
+  final ResourceProfile resourceProfile=new ResourceProfile(1.0,1);
+  final SlotReport slotReport1=new SlotReport(new SlotStatus(slotId,resourceProfile));
+  final SlotReport slotReport2=new SlotReport(new SlotStatus(slotId,resourceProfile,new JobID(),new AllocationID()));
+  when(taskSlotTable.createSlotReport(any(ResourceID.class))).thenReturn(slotReport1,slotReport2);
+  final HeartbeatServices heartbeatServices=mock(HeartbeatServices.class);
+  when(heartbeatServices.createHeartbeatManager(eq(taskManagerLocation.getResourceID()),any(HeartbeatListener.class),any(ScheduledExecutor.class),any(Logger.class))).thenAnswer(new Answer<HeartbeatManagerImpl<SlotReport,Void>>(){
+    @Override public HeartbeatManagerImpl<SlotReport,Void> answer(    InvocationOnMock invocation) throws Throwable {
+      return spy(new HeartbeatManagerImpl<>(heartbeatTimeout,taskManagerLocation.getResourceID(),(HeartbeatListener<SlotReport,Void>)invocation.getArguments()[1],(Executor)invocation.getArguments()[2],(ScheduledExecutor)invocation.getArguments()[2],(Logger)invocation.getArguments()[3]));
+    }
+  }
+);
+  TaskExecutorLocalStateStoresManager localStateStoresManager=new TaskExecutorLocalStateStoresManager(false,new File[]{tmp.newFolder()},Executors.directExecutor());
+  final TaskManagerServices taskManagerServices=new TaskManagerServicesBuilder().setTaskManagerLocation(taskManagerLocation).setTaskSlotTable(taskSlotTable).setTaskStateManager(localStateStoresManager).build();
+  final TaskExecutor taskManager=new TaskExecutor(rpc,taskManagerConfiguration,haServices,taskManagerServices,heartbeatServices,UnregisteredMetricGroups.createUnregisteredTaskManagerMetricGroup(),dummyBlobCacheService,testingFatalErrorHandler);
+  try {
+    taskManager.start();
+    HeartbeatManager<Void,SlotReport> heartbeatManager=taskManager.getResourceManagerHeartbeatManager();
+    resourceManagerLeaderRetriever.notifyListener(rmAddress,rmLeaderId);
+    assertThat(taskExecutorRegistrationFuture.get(),equalTo(taskManagerLocation.getResourceID()));
+    assertThat(initialSlotReportFuture.get(),equalTo(slotReport1));
+    verify(heartbeatManager,timeout(verificationTimeout)).monitorTarget(any(ResourceID.class),any(HeartbeatTarget.class));
+    TaskExecutorGateway taskExecutorGateway=taskManager.getSelfGateway(TaskExecutorGateway.class);
+    taskExecutorGateway.heartbeatFromResourceManager(rmResourceId);
+    SlotReport actualSlotReport=heartbeatSlotReportFuture.get();
+    assertEquals(slotReport2,actualSlotReport);
+  }
+  finally {
+    RpcUtils.terminateRpcEndpoint(taskManager,timeout);
+  }
+}

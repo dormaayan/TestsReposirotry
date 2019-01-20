@@ -1,0 +1,59 @@
+public class ConstraintRecoveryIT {
+  private static final String KEY="prop";
+  private static final Label LABEL=Label.label("label1");
+  @Rule public EphemeralFileSystemRule fileSystemRule=new EphemeralFileSystemRule();
+  private GraphDatabaseAPI db;
+  @Test public void shouldHaveAvailableOrphanedConstraintIndexIfUniqueConstraintCreationFails(){
+    final EphemeralFileSystemAbstraction fs=fileSystemRule.get();
+    fs.mkdir(new File("/tmp"));
+    File pathToDb=new File("/tmp/bar2");
+    TestGraphDatabaseFactory dbFactory=new TestGraphDatabaseFactory();
+    dbFactory.setFileSystem(fs);
+    final EphemeralFileSystemAbstraction[] storeInNeedOfRecovery=new EphemeralFileSystemAbstraction[1];
+    final AtomicBoolean monitorCalled=new AtomicBoolean(false);
+    Monitors monitors=new Monitors();
+    monitors.addMonitorListener(new IndexingService.MonitorAdapter(){
+      @Override public void indexPopulationScanComplete(){
+        monitorCalled.set(true);
+        db.getDependencyResolver().resolveDependency(RecordStorageEngine.class).testAccessNeoStores().getSchemaStore().flush();
+        storeInNeedOfRecovery[0]=fs.snapshot();
+      }
+    }
+);
+    dbFactory.setMonitors(monitors);
+    db=(GraphDatabaseAPI)dbFactory.newImpermanentDatabaseBuilder(pathToDb).setConfig(default_schema_provider,NATIVE20.providerName()).newGraphDatabase();
+    try (Transaction tx=db.beginTx()){
+      for (int i=0; i < 2; i++) {
+        db.createNode(LABEL).setProperty(KEY,true);
+      }
+      tx.success();
+    }
+     try (Transaction tx=db.beginTx()){
+      db.schema().constraintFor(LABEL).assertPropertyIsUnique(KEY).create();
+      fail("Should have failed with ConstraintViolationException");
+      tx.success();
+    }
+ catch (    ConstraintViolationException ignored) {
+    }
+    db.shutdown();
+    assertTrue(monitorCalled.get());
+    dbFactory=new TestGraphDatabaseFactory();
+    dbFactory.setFileSystem(storeInNeedOfRecovery[0]);
+    db=(GraphDatabaseAPI)dbFactory.newImpermanentDatabase(pathToDb);
+    try (Transaction ignore=db.beginTx()){
+      db.schema().awaitIndexesOnline(10,TimeUnit.SECONDS);
+    }
+     try (Transaction ignore=db.beginTx()){
+      assertEquals(2,Iterables.count(db.getAllNodes()));
+    }
+     try (Transaction ignore=db.beginTx()){
+      assertEquals(0,Iterables.count(Iterables.asList(db.schema().getConstraints())));
+    }
+     try (Transaction ignore=db.beginTx()){
+      IndexDefinition orphanedConstraintIndex=single(db.schema().getIndexes());
+      assertEquals(LABEL.name(),single(orphanedConstraintIndex.getLabels()).name());
+      assertEquals(KEY,single(orphanedConstraintIndex.getPropertyKeys()));
+    }
+     db.shutdown();
+  }
+}

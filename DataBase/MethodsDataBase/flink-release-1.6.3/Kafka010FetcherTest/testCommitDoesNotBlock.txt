@@ -1,0 +1,67 @@
+@Test public void testCommitDoesNotBlock() throws Exception {
+  final KafkaTopicPartition testPartition=new KafkaTopicPartition("test",42);
+  final Map<KafkaTopicPartition,Long> testCommitData=new HashMap<>();
+  testCommitData.put(testPartition,11L);
+  final OneShotLatch sync=new OneShotLatch();
+  final MultiShotLatch blockerLatch=new MultiShotLatch();
+  KafkaConsumer<?,?> mockConsumer=mock(KafkaConsumer.class);
+  when(mockConsumer.poll(anyLong())).thenAnswer(new Answer<ConsumerRecords<?,?>>(){
+    @Override public ConsumerRecords<?,?> answer(    InvocationOnMock invocation) throws InterruptedException {
+      sync.trigger();
+      blockerLatch.await();
+      return ConsumerRecords.empty();
+    }
+  }
+);
+  doAnswer(new Answer<Void>(){
+    @Override public Void answer(    InvocationOnMock invocation){
+      blockerLatch.trigger();
+      return null;
+    }
+  }
+).when(mockConsumer).wakeup();
+  whenNew(KafkaConsumer.class).withAnyArguments().thenReturn(mockConsumer);
+  @SuppressWarnings("unchecked") SourceContext<String> sourceContext=mock(SourceContext.class);
+  Map<KafkaTopicPartition,Long> partitionsWithInitialOffsets=Collections.singletonMap(new KafkaTopicPartition("test",42),KafkaTopicPartitionStateSentinel.GROUP_OFFSET);
+  KeyedDeserializationSchema<String> schema=new KeyedDeserializationSchemaWrapper<>(new SimpleStringSchema());
+  final Kafka010Fetcher<String> fetcher=new Kafka010Fetcher<>(sourceContext,partitionsWithInitialOffsets,null,null,new TestProcessingTimeService(),10,getClass().getClassLoader(),"taskname-with-subtask",schema,new Properties(),0L,new UnregisteredMetricsGroup(),new UnregisteredMetricsGroup(),false);
+  final AtomicReference<Throwable> error=new AtomicReference<>();
+  final Thread fetcherRunner=new Thread("fetcher runner"){
+    @Override public void run(){
+      try {
+        fetcher.runFetchLoop();
+      }
+ catch (      Throwable t) {
+        error.set(t);
+      }
+    }
+  }
+;
+  fetcherRunner.start();
+  sync.await();
+  final AtomicReference<Throwable> commitError=new AtomicReference<>();
+  final Thread committer=new Thread("committer runner"){
+    @Override public void run(){
+      try {
+        fetcher.commitInternalOffsetsToKafka(testCommitData,mock(KafkaCommitCallback.class));
+      }
+ catch (      Throwable t) {
+        commitError.set(t);
+      }
+    }
+  }
+;
+  committer.start();
+  committer.join(30000);
+  assertFalse("The committer did not finish in time",committer.isAlive());
+  fetcher.cancel();
+  fetcherRunner.join();
+  final Throwable fetcherError=error.get();
+  if (fetcherError != null && !(fetcherError instanceof Handover.ClosedException)) {
+    throw new Exception("Exception in the fetcher",fetcherError);
+  }
+  final Throwable committerError=commitError.get();
+  if (committerError != null) {
+    throw new Exception("Exception in the committer",committerError);
+  }
+}

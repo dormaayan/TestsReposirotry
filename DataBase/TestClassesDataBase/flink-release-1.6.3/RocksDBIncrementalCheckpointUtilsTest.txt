@@ -1,0 +1,76 @@
+/** 
+ * Tests to guard  {@link RocksDBIncrementalCheckpointUtils}.
+ */
+public class RocksDBIncrementalCheckpointUtilsTest extends TestLogger {
+  @Rule public final TemporaryFolder tmp=new TemporaryFolder();
+  @Test public void testClipDBWithKeyGroupRange() throws Exception {
+    testClipDBWithKeyGroupRangeHelper(new KeyGroupRange(0,1),new KeyGroupRange(0,2),1);
+    testClipDBWithKeyGroupRangeHelper(new KeyGroupRange(0,1),new KeyGroupRange(0,1),1);
+    testClipDBWithKeyGroupRangeHelper(new KeyGroupRange(0,1),new KeyGroupRange(1,2),1);
+    testClipDBWithKeyGroupRangeHelper(new KeyGroupRange(0,1),new KeyGroupRange(2,4),1);
+    testClipDBWithKeyGroupRangeHelper(new KeyGroupRange(Byte.MAX_VALUE - 15,Byte.MAX_VALUE),new KeyGroupRange(Byte.MAX_VALUE - 10,Byte.MAX_VALUE),1);
+    testClipDBWithKeyGroupRangeHelper(new KeyGroupRange(Short.MAX_VALUE - 15,Short.MAX_VALUE),new KeyGroupRange(Short.MAX_VALUE - 10,Short.MAX_VALUE),2);
+    testClipDBWithKeyGroupRangeHelper(new KeyGroupRange(Byte.MAX_VALUE - 15,Byte.MAX_VALUE - 1),new KeyGroupRange(Byte.MAX_VALUE - 10,Byte.MAX_VALUE),1);
+    testClipDBWithKeyGroupRangeHelper(new KeyGroupRange(Short.MAX_VALUE - 15,Short.MAX_VALUE - 1),new KeyGroupRange(Short.MAX_VALUE - 10,Short.MAX_VALUE),2);
+  }
+  @Test public void testChooseTheBestStateHandleForInitial(){
+    List<KeyedStateHandle> keyedStateHandles=new ArrayList<>(3);
+    KeyedStateHandle keyedStateHandle1=mock(KeyedStateHandle.class);
+    when(keyedStateHandle1.getKeyGroupRange()).thenReturn(new KeyGroupRange(0,3));
+    keyedStateHandles.add(keyedStateHandle1);
+    KeyedStateHandle keyedStateHandle2=mock(KeyedStateHandle.class);
+    when(keyedStateHandle2.getKeyGroupRange()).thenReturn(new KeyGroupRange(4,7));
+    keyedStateHandles.add(keyedStateHandle2);
+    KeyedStateHandle keyedStateHandle3=mock(KeyedStateHandle.class);
+    when(keyedStateHandle3.getKeyGroupRange()).thenReturn(new KeyGroupRange(8,12));
+    keyedStateHandles.add(keyedStateHandle3);
+    Assert.assertNull(RocksDBIncrementalCheckpointUtils.chooseTheBestStateHandleForInitial(keyedStateHandles,new KeyGroupRange(3,5)));
+    Assert.assertEquals(keyedStateHandle2,RocksDBIncrementalCheckpointUtils.chooseTheBestStateHandleForInitial(keyedStateHandles,new KeyGroupRange(3,6)));
+    Assert.assertEquals(keyedStateHandle3,RocksDBIncrementalCheckpointUtils.chooseTheBestStateHandleForInitial(keyedStateHandles,new KeyGroupRange(5,12)));
+    Assert.assertEquals(keyedStateHandle3,RocksDBIncrementalCheckpointUtils.chooseTheBestStateHandleForInitial(keyedStateHandles,new KeyGroupRange(3,12)));
+  }
+  private void testClipDBWithKeyGroupRangeHelper(  KeyGroupRange targetGroupRange,  KeyGroupRange currentGroupRange,  int keyGroupPrefixBytes) throws RocksDBException, IOException {
+    try (RocksDB rocksDB=RocksDB.open(tmp.newFolder().getAbsolutePath());ColumnFamilyHandle columnFamilyHandle=rocksDB.createColumnFamily(new ColumnFamilyDescriptor("test".getBytes()))){
+      int currentGroupRangeStart=currentGroupRange.getStartKeyGroup();
+      int currentGroupRangeEnd=currentGroupRange.getEndKeyGroup();
+      for (int i=currentGroupRangeStart; i <= currentGroupRangeEnd; ++i) {
+        ByteArrayOutputStreamWithPos outputStreamWithPos=new ByteArrayOutputStreamWithPos(32);
+        DataOutputView outputView=new DataOutputViewStreamWrapper(outputStreamWithPos);
+        for (int j=0; j < 100; ++j) {
+          outputStreamWithPos.reset();
+          RocksDBKeySerializationUtils.writeKeyGroup(i,keyGroupPrefixBytes,outputView);
+          RocksDBKeySerializationUtils.writeKey(j,IntSerializer.INSTANCE,outputStreamWithPos,new DataOutputViewStreamWrapper(outputStreamWithPos),false);
+          rocksDB.put(columnFamilyHandle,outputStreamWithPos.toByteArray(),String.valueOf(j).getBytes());
+        }
+      }
+      for (int i=currentGroupRangeStart; i <= currentGroupRangeEnd; ++i) {
+        ByteArrayOutputStreamWithPos outputStreamWithPos=new ByteArrayOutputStreamWithPos(32);
+        DataOutputView outputView=new DataOutputViewStreamWrapper(outputStreamWithPos);
+        for (int j=0; j < 100; ++j) {
+          outputStreamWithPos.reset();
+          RocksDBKeySerializationUtils.writeKeyGroup(i,keyGroupPrefixBytes,outputView);
+          RocksDBKeySerializationUtils.writeKey(j,IntSerializer.INSTANCE,outputStreamWithPos,new DataOutputViewStreamWrapper(outputStreamWithPos),false);
+          byte[] value=rocksDB.get(columnFamilyHandle,outputStreamWithPos.toByteArray());
+          Assert.assertEquals(String.valueOf(j),new String(value));
+        }
+      }
+      RocksDBIncrementalCheckpointUtils.clipDBWithKeyGroupRange(rocksDB,Collections.singletonList(columnFamilyHandle),targetGroupRange,currentGroupRange,keyGroupPrefixBytes);
+      for (int i=currentGroupRangeStart; i <= currentGroupRangeEnd; ++i) {
+        ByteArrayOutputStreamWithPos outputStreamWithPos=new ByteArrayOutputStreamWithPos(32);
+        DataOutputView outputView=new DataOutputViewStreamWrapper(outputStreamWithPos);
+        for (int j=0; j < 100; ++j) {
+          outputStreamWithPos.reset();
+          RocksDBKeySerializationUtils.writeKeyGroup(i,keyGroupPrefixBytes,outputView);
+          RocksDBKeySerializationUtils.writeKey(j,IntSerializer.INSTANCE,outputStreamWithPos,new DataOutputViewStreamWrapper(outputStreamWithPos),false);
+          byte[] value=rocksDB.get(columnFamilyHandle,outputStreamWithPos.toByteArray());
+          if (targetGroupRange.contains(i)) {
+            Assert.assertEquals(String.valueOf(j),new String(value));
+          }
+ else {
+            Assert.assertNull(value);
+          }
+        }
+      }
+    }
+   }
+}

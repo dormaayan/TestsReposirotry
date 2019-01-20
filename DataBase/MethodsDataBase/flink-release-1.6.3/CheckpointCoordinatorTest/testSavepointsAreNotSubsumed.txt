@@ -1,0 +1,45 @@
+/** 
+ * Triggers a savepoint and two checkpoints. The second checkpoint completes and subsumes the first checkpoint, but not the first savepoint. Then we trigger another checkpoint and savepoint. The 2nd savepoint completes and subsumes the last checkpoint, but not the first savepoint.
+ */
+@Test public void testSavepointsAreNotSubsumed() throws Exception {
+  final JobID jid=new JobID();
+  final long timestamp=System.currentTimeMillis();
+  final ExecutionAttemptID attemptID1=new ExecutionAttemptID();
+  final ExecutionAttemptID attemptID2=new ExecutionAttemptID();
+  ExecutionVertex vertex1=mockExecutionVertex(attemptID1);
+  ExecutionVertex vertex2=mockExecutionVertex(attemptID2);
+  StandaloneCheckpointIDCounter counter=new StandaloneCheckpointIDCounter();
+  CheckpointCoordinator coord=new CheckpointCoordinator(jid,600000,600000,0,Integer.MAX_VALUE,CheckpointRetentionPolicy.NEVER_RETAIN_AFTER_TERMINATION,new ExecutionVertex[]{vertex1,vertex2},new ExecutionVertex[]{vertex1,vertex2},new ExecutionVertex[]{vertex1,vertex2},counter,new StandaloneCompletedCheckpointStore(10),new MemoryStateBackend(),Executors.directExecutor(),SharedStateRegistry.DEFAULT_FACTORY);
+  String savepointDir=tmpFolder.newFolder().getAbsolutePath();
+  CompletableFuture<CompletedCheckpoint> savepointFuture1=coord.triggerSavepoint(timestamp,savepointDir);
+  long savepointId1=counter.getLast();
+  assertEquals(1,coord.getNumberOfPendingCheckpoints());
+  assertTrue(coord.triggerCheckpoint(timestamp + 1,false));
+  assertEquals(2,coord.getNumberOfPendingCheckpoints());
+  assertTrue(coord.triggerCheckpoint(timestamp + 2,false));
+  long checkpointId2=counter.getLast();
+  assertEquals(3,coord.getNumberOfPendingCheckpoints());
+  coord.receiveAcknowledgeMessage(new AcknowledgeCheckpoint(jid,attemptID1,checkpointId2));
+  coord.receiveAcknowledgeMessage(new AcknowledgeCheckpoint(jid,attemptID2,checkpointId2));
+  assertEquals(1,coord.getNumberOfPendingCheckpoints());
+  assertEquals(1,coord.getNumberOfRetainedSuccessfulCheckpoints());
+  assertFalse(coord.getPendingCheckpoints().get(savepointId1).isDiscarded());
+  assertFalse(savepointFuture1.isDone());
+  assertTrue(coord.triggerCheckpoint(timestamp + 3,false));
+  assertEquals(2,coord.getNumberOfPendingCheckpoints());
+  CompletableFuture<CompletedCheckpoint> savepointFuture2=coord.triggerSavepoint(timestamp + 4,savepointDir);
+  long savepointId2=counter.getLast();
+  assertEquals(3,coord.getNumberOfPendingCheckpoints());
+  coord.receiveAcknowledgeMessage(new AcknowledgeCheckpoint(jid,attemptID1,savepointId2));
+  coord.receiveAcknowledgeMessage(new AcknowledgeCheckpoint(jid,attemptID2,savepointId2));
+  assertEquals(1,coord.getNumberOfPendingCheckpoints());
+  assertEquals(2,coord.getNumberOfRetainedSuccessfulCheckpoints());
+  assertFalse(coord.getPendingCheckpoints().get(savepointId1).isDiscarded());
+  assertFalse(savepointFuture1.isDone());
+  assertTrue(savepointFuture2.isDone());
+  coord.receiveAcknowledgeMessage(new AcknowledgeCheckpoint(jid,attemptID1,savepointId1));
+  coord.receiveAcknowledgeMessage(new AcknowledgeCheckpoint(jid,attemptID2,savepointId1));
+  assertEquals(0,coord.getNumberOfPendingCheckpoints());
+  assertEquals(3,coord.getNumberOfRetainedSuccessfulCheckpoints());
+  assertTrue(savepointFuture1.isDone());
+}

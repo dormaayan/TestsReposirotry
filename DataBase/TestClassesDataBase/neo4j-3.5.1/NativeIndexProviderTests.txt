@@ -1,0 +1,178 @@
+public abstract class NativeIndexProviderTests {
+  @Rule public PageCacheAndDependenciesRule rules=new PageCacheAndDependenciesRule();
+  private static final int indexId=1;
+  private static final int labelId=1;
+  private static final int propId=1;
+  private IndexProvider provider;
+  private final AssertableLogProvider logging=new AssertableLogProvider();
+  private final IndexProvider.Monitor monitor=new LoggingMonitor(logging.getLog("test"));
+  @Before public void setup() throws IOException {
+    File nativeSchemaIndexStoreDirectory=newProvider().directoryStructure().rootDirectory();
+    rules.fileSystem().mkdirs(nativeSchemaIndexStoreDirectory);
+  }
+  @Test public void getPopulatorMustThrowIfInReadOnlyMode(){
+    provider=newReadOnlyProvider();
+    try {
+      provider.getPopulator(descriptor(),samplingConfig());
+      fail("Should have failed");
+    }
+ catch (    UnsupportedOperationException e) {
+    }
+  }
+  @Test public void shouldNotCheckConflictsWhenApplyingUpdatesInOnlineAccessor() throws IOException, IndexEntryConflictException {
+    provider=newProvider();
+    StoreIndexDescriptor descriptor=descriptorUnique();
+    try (IndexAccessor accessor=provider.getOnlineAccessor(descriptor,samplingConfig());IndexUpdater indexUpdater=accessor.newUpdater(IndexUpdateMode.ONLINE)){
+      Value value=someValue();
+      indexUpdater.process(IndexEntryUpdate.add(1,descriptor.schema(),value));
+      indexUpdater.process(IndexEntryUpdate.add(2,descriptor.schema(),value));
+    }
+   }
+  @Test public void getPopulationFailureMustThrowIfNoFailure(){
+    provider=newProvider();
+    IndexPopulator populator=provider.getPopulator(descriptor(),samplingConfig());
+    populator.create();
+    populator.close(true);
+    try {
+      provider.getPopulationFailure(descriptor());
+      fail("Should have failed");
+    }
+ catch (    IllegalStateException e) {
+      assertThat(e.getMessage(),Matchers.containsString(Long.toString(indexId)));
+    }
+  }
+  @Test public void getPopulationFailureMustThrowEvenIfFailureOnOtherIndex(){
+    provider=newProvider();
+    int nonFailedIndexId=NativeIndexProviderTests.indexId;
+    IndexPopulator nonFailedPopulator=provider.getPopulator(descriptor(nonFailedIndexId),samplingConfig());
+    nonFailedPopulator.create();
+    nonFailedPopulator.close(true);
+    int failedIndexId=2;
+    IndexPopulator failedPopulator=provider.getPopulator(descriptor(failedIndexId),samplingConfig());
+    failedPopulator.create();
+    failedPopulator.markAsFailed("failure");
+    failedPopulator.close(false);
+    try {
+      provider.getPopulationFailure(descriptor(nonFailedIndexId));
+      fail("Should have failed");
+    }
+ catch (    IllegalStateException e) {
+      assertThat(e.getMessage(),Matchers.containsString(Long.toString(nonFailedIndexId)));
+    }
+  }
+  @Test public void getPopulationFailureMustReturnReportedFailure(){
+    provider=newProvider();
+    IndexPopulator populator=provider.getPopulator(descriptor(),samplingConfig());
+    populator.create();
+    String failureMessage="fail";
+    populator.markAsFailed(failureMessage);
+    populator.close(false);
+    String populationFailure=provider.getPopulationFailure(descriptor());
+    assertThat(populationFailure,is(failureMessage));
+  }
+  @Test public void getPopulationFailureMustReturnReportedFailuresForDifferentIndexIds(){
+    provider=newProvider();
+    int first=1;
+    int second=2;
+    int third=3;
+    IndexPopulator firstPopulator=provider.getPopulator(descriptor(first),samplingConfig());
+    firstPopulator.create();
+    IndexPopulator secondPopulator=provider.getPopulator(descriptor(second),samplingConfig());
+    secondPopulator.create();
+    IndexPopulator thirdPopulator=provider.getPopulator(descriptor(third),samplingConfig());
+    thirdPopulator.create();
+    String firstFailure="first failure";
+    firstPopulator.markAsFailed(firstFailure);
+    firstPopulator.close(false);
+    secondPopulator.close(true);
+    String thirdFailure="third failure";
+    thirdPopulator.markAsFailed(thirdFailure);
+    thirdPopulator.close(false);
+    assertThat(provider.getPopulationFailure(descriptor(first)),is(firstFailure));
+    assertThat(provider.getPopulationFailure(descriptor(third)),is(thirdFailure));
+    try {
+      provider.getPopulationFailure(descriptor(second));
+      fail("Should have failed");
+    }
+ catch (    IllegalStateException e) {
+    }
+  }
+  @Test public void getPopulationFailureMustPersistReportedFailure(){
+    provider=newProvider();
+    IndexPopulator populator=provider.getPopulator(descriptor(),samplingConfig());
+    populator.create();
+    String failureMessage="fail";
+    populator.markAsFailed(failureMessage);
+    populator.close(false);
+    provider=newProvider();
+    String populationFailure=provider.getPopulationFailure(descriptor());
+    assertThat(populationFailure,is(failureMessage));
+  }
+  @Test public void shouldReportCorrectInitialStateIfIndexDoesntExist(){
+    provider=newProvider();
+    InternalIndexState state=provider.getInitialState(descriptor());
+    InternalIndexState expected=expectedStateOnNonExistingSubIndex();
+    assertEquals(expected,state);
+    if (InternalIndexState.POPULATING == expected) {
+      logging.assertContainsLogCallContaining("Failed to open index");
+    }
+ else {
+      logging.assertNoLogCallContaining("Failed to open index");
+    }
+  }
+  @Test public void shouldReportInitialStateAsPopulatingIfPopulationStartedButIncomplete(){
+    provider=newProvider();
+    IndexPopulator populator=provider.getPopulator(descriptor(),samplingConfig());
+    populator.create();
+    InternalIndexState state=provider.getInitialState(descriptor());
+    assertEquals(InternalIndexState.POPULATING,state);
+    populator.close(true);
+  }
+  @Test public void shouldReportInitialStateAsFailedIfMarkedAsFailed(){
+    provider=newProvider();
+    IndexPopulator populator=provider.getPopulator(descriptor(),samplingConfig());
+    populator.create();
+    populator.markAsFailed("Just some failure");
+    populator.close(false);
+    InternalIndexState state=provider.getInitialState(descriptor());
+    assertEquals(InternalIndexState.FAILED,state);
+  }
+  @Test public void shouldReportInitialStateAsOnlineIfPopulationCompletedSuccessfully(){
+    provider=newProvider();
+    IndexPopulator populator=provider.getPopulator(descriptor(),samplingConfig());
+    populator.create();
+    populator.close(true);
+    InternalIndexState state=provider.getInitialState(descriptor());
+    assertEquals(InternalIndexState.ONLINE,state);
+  }
+  protected abstract InternalIndexState expectedStateOnNonExistingSubIndex();
+  protected abstract Value someValue();
+  abstract IndexProvider newProvider(  PageCache pageCache,  FileSystemAbstraction fs,  IndexDirectoryStructure.Factory dir,  IndexProvider.Monitor monitor,  RecoveryCleanupWorkCollector collector,  boolean readOnly);
+  private IndexProvider newProvider(){
+    return newProvider(pageCache(),fs(),directoriesByProvider(baseDir()),monitor,immediate(),false);
+  }
+  private IndexProvider newReadOnlyProvider(){
+    return newProvider(pageCache(),fs(),directoriesByProvider(baseDir()),monitor,immediate(),true);
+  }
+  private IndexSamplingConfig samplingConfig(){
+    return new IndexSamplingConfig(Config.defaults());
+  }
+  private StoreIndexDescriptor descriptor(){
+    return IndexDescriptorFactory.forSchema(forLabel(labelId,propId),PROVIDER_DESCRIPTOR).withId(indexId);
+  }
+  private StoreIndexDescriptor descriptor(  long indexId){
+    return IndexDescriptorFactory.forSchema(forLabel(labelId,propId),PROVIDER_DESCRIPTOR).withId(indexId);
+  }
+  private StoreIndexDescriptor descriptorUnique(){
+    return IndexDescriptorFactory.uniqueForSchema(forLabel(labelId,propId),PROVIDER_DESCRIPTOR).withId(indexId);
+  }
+  private PageCache pageCache(){
+    return rules.pageCache();
+  }
+  private FileSystemAbstraction fs(){
+    return rules.fileSystem();
+  }
+  private File baseDir(){
+    return rules.directory().absolutePath();
+  }
+}

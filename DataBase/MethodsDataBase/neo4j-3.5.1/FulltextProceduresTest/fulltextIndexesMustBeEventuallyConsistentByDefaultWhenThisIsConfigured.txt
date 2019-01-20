@@ -1,0 +1,37 @@
+@Test public void fulltextIndexesMustBeEventuallyConsistentByDefaultWhenThisIsConfigured() throws InterruptedException {
+  builder.setConfig(FulltextConfig.eventually_consistent,Settings.TRUE);
+  db=createDatabase();
+  try (Transaction tx=db.beginTx()){
+    db.execute(format(NODE_CREATE,"node",array(LABEL.name()),array(PROP,"otherprop")));
+    db.execute(format(RELATIONSHIP_CREATE,"rel",array(REL.name()),array(PROP)));
+    tx.success();
+  }
+   awaitIndexesOnline();
+  BinaryLatch indexUpdateBlocker=new BinaryLatch();
+  db.getDependencyResolver().resolveDependency(JobScheduler.class,ONLY).schedule(Group.INDEX_UPDATING,indexUpdateBlocker::await);
+  LongHashSet nodeIds=new LongHashSet();
+  long relId;
+  try {
+    try (Transaction tx=db.beginTx()){
+      Node node1=db.createNode(LABEL);
+      node1.setProperty(PROP,"bla bla");
+      Node node2=db.createNode(LABEL);
+      node2.setProperty("otherprop","bla bla");
+      Relationship relationship=node1.createRelationshipTo(node2,REL);
+      relationship.setProperty(PROP,"bla bla");
+      nodeIds.add(node1.getId());
+      nodeIds.add(node2.getId());
+      relId=relationship.getId();
+      tx.success();
+    }
+     assertQueryFindsIds(db,true,"node","bla",new LongHashSet());
+    assertQueryFindsIds(db,false,"rel","bla",new LongHashSet());
+  }
+  finally {
+    Thread.sleep(10);
+    indexUpdateBlocker.release();
+  }
+  db.execute(AWAIT_REFRESH).close();
+  assertQueryFindsIds(db,true,"node","bla",nodeIds);
+  assertQueryFindsIds(db,false,"rel","bla",newSetWith(relId));
+}

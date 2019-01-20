@@ -1,0 +1,181 @@
+/** 
+ * Tests for the  {@link org.apache.flink.streaming.api.functions.sink.SocketClientSink}.
+ */
+@SuppressWarnings("serial") public class SocketClientSinkTest extends TestLogger {
+  private static final String TEST_MESSAGE="testSocketSinkInvoke";
+  private static final String EXCEPTION_MESSGAE="Failed to send message '" + TEST_MESSAGE + "\n'";
+  private static final String host="127.0.0.1";
+  private SerializationSchema<String> simpleSchema=new SerializationSchema<String>(){
+    @Override public byte[] serialize(    String element){
+      return element.getBytes(ConfigConstants.DEFAULT_CHARSET);
+    }
+  }
+;
+  @Test public void testSocketSink() throws Exception {
+    final ServerSocket server=new ServerSocket(0);
+    final int port=server.getLocalPort();
+    final AtomicReference<Throwable> error=new AtomicReference<Throwable>();
+    Thread sinkRunner=new Thread("Test sink runner"){
+      @Override public void run(){
+        try {
+          SocketClientSink<String> simpleSink=new SocketClientSink<>(host,port,simpleSchema,0);
+          simpleSink.open(new Configuration());
+          simpleSink.invoke(TEST_MESSAGE + '\n',SinkContextUtil.forTimestamp(0));
+          simpleSink.close();
+        }
+ catch (        Throwable t) {
+          error.set(t);
+        }
+      }
+    }
+;
+    sinkRunner.start();
+    Socket sk=server.accept();
+    BufferedReader rdr=new BufferedReader(new InputStreamReader(sk.getInputStream()));
+    String value=rdr.readLine();
+    sinkRunner.join();
+    server.close();
+    if (error.get() != null) {
+      Throwable t=error.get();
+      t.printStackTrace();
+      fail("Error in spawned thread: " + t.getMessage());
+    }
+    assertEquals(TEST_MESSAGE,value);
+  }
+  @Test public void testSinkAutoFlush() throws Exception {
+    final ServerSocket server=new ServerSocket(0);
+    final int port=server.getLocalPort();
+    final SocketClientSink<String> simpleSink=new SocketClientSink<>(host,port,simpleSchema,0,true);
+    simpleSink.open(new Configuration());
+    final AtomicReference<Throwable> error=new AtomicReference<Throwable>();
+    Thread sinkRunner=new Thread("Test sink runner"){
+      @Override public void run(){
+        try {
+          simpleSink.invoke(TEST_MESSAGE + '\n',SinkContextUtil.forTimestamp(0));
+        }
+ catch (        Throwable t) {
+          error.set(t);
+        }
+      }
+    }
+;
+    sinkRunner.start();
+    Socket sk=server.accept();
+    BufferedReader rdr=new BufferedReader(new InputStreamReader(sk.getInputStream()));
+    String value=rdr.readLine();
+    sinkRunner.join();
+    simpleSink.close();
+    server.close();
+    if (error.get() != null) {
+      Throwable t=error.get();
+      t.printStackTrace();
+      fail("Error in spawned thread: " + t.getMessage());
+    }
+    assertEquals(TEST_MESSAGE,value);
+  }
+  @Test public void testSocketSinkNoRetry() throws Exception {
+    final ServerSocket server=new ServerSocket(0);
+    final int port=server.getLocalPort();
+    try {
+      final AtomicReference<Throwable> error=new AtomicReference<Throwable>();
+      Thread serverRunner=new Thread("Test server runner"){
+        @Override public void run(){
+          try {
+            Socket sk=server.accept();
+            sk.close();
+          }
+ catch (          Throwable t) {
+            error.set(t);
+          }
+        }
+      }
+;
+      serverRunner.start();
+      SocketClientSink<String> simpleSink=new SocketClientSink<>(host,port,simpleSchema,0,true);
+      simpleSink.open(new Configuration());
+      serverRunner.join();
+      if (error.get() != null) {
+        Throwable t=error.get();
+        t.printStackTrace();
+        fail("Error in server thread: " + t.getMessage());
+      }
+      try {
+        while (true) {
+          simpleSink.invoke(TEST_MESSAGE + '\n',SinkContextUtil.forTimestamp(0));
+        }
+      }
+ catch (      IOException e) {
+        assertTrue("Wrong exception",e.getMessage().contains(EXCEPTION_MESSGAE));
+      }
+catch (      Exception e) {
+        fail("wrong exception: " + e.getClass().getName() + " - "+ e.getMessage());
+      }
+      assertEquals(0,simpleSink.getCurrentNumberOfRetries());
+    }
+  finally {
+      IOUtils.closeQuietly(server);
+    }
+  }
+  @Test public void testRetry() throws Exception {
+    final ServerSocket[] serverSocket=new ServerSocket[1];
+    final ExecutorService[] executor=new ExecutorService[1];
+    try {
+      serverSocket[0]=new ServerSocket(0);
+      executor[0]=Executors.newCachedThreadPool();
+      int port=serverSocket[0].getLocalPort();
+      Callable<Void> serverTask=new Callable<Void>(){
+        @Override public Void call() throws Exception {
+          Socket socket=serverSocket[0].accept();
+          BufferedReader reader=new BufferedReader(new InputStreamReader(socket.getInputStream()));
+          String value=reader.readLine();
+          assertEquals("0",value);
+          socket.close();
+          return null;
+        }
+      }
+;
+      Future<Void> serverFuture=executor[0].submit(serverTask);
+      final SocketClientSink<String> sink=new SocketClientSink<>(host,serverSocket[0].getLocalPort(),simpleSchema,-1,true);
+      sink.open(new Configuration());
+      sink.invoke("0\n",SinkContextUtil.forTimestamp(0));
+      serverFuture.get();
+      serverSocket[0].close();
+      assertTrue(serverSocket[0].isClosed());
+      assertEquals(0,sink.getCurrentNumberOfRetries());
+      final CountDownLatch retryLatch=new CountDownLatch(1);
+      final CountDownLatch again=new CountDownLatch(1);
+      Callable<Void> sinkTask=new Callable<Void>(){
+        @Override public Void call() throws Exception {
+          while (retryLatch.getCount() != 0) {
+            sink.invoke("1\n");
+          }
+          return null;
+        }
+      }
+;
+      Future<Void> sinkFuture=executor[0].submit(sinkTask);
+      while (sink.getCurrentNumberOfRetries() == 0) {
+        Thread.sleep(100);
+      }
+      retryLatch.countDown();
+      try {
+        serverSocket[0]=new ServerSocket(port);
+      }
+ catch (      BindException be) {
+        throw new AssumptionViolatedException("Could not bind server to previous port.",be);
+      }
+      Socket socket=serverSocket[0].accept();
+      BufferedReader reader=new BufferedReader(new InputStreamReader(socket.getInputStream()));
+      String value=reader.readLine();
+      assertEquals("1",value);
+    }
+  finally {
+      if (serverSocket[0] != null) {
+        serverSocket[0].close();
+      }
+      if (executor[0] != null) {
+        executor[0].shutdown();
+      }
+    }
+  }
+}

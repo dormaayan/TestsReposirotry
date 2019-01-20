@@ -1,0 +1,373 @@
+public class ITestWasbUriAndConfiguration extends AbstractWasbTestWithTimeout {
+  private static final int FILE_SIZE=4096;
+  private static final String PATH_DELIMITER="/";
+  protected String accountName;
+  protected String accountKey;
+  protected static Configuration conf=null;
+  private boolean runningInSASMode=false;
+  @Rule public final TemporaryFolder tempDir=new TemporaryFolder();
+  private AzureBlobStorageTestAccount testAccount;
+  @After public void tearDown() throws Exception {
+    testAccount=AzureTestUtils.cleanupTestAccount(testAccount);
+  }
+  @Before public void setMode(){
+    runningInSASMode=AzureBlobStorageTestAccount.createTestConfiguration().getBoolean(AzureNativeFileSystemStore.KEY_USE_SECURE_MODE,false);
+  }
+  private boolean validateIOStreams(  Path filePath) throws IOException {
+    FileSystem fs=testAccount.getFileSystem();
+    return validateIOStreams(fs,filePath);
+  }
+  private boolean validateIOStreams(  FileSystem fs,  Path filePath) throws IOException {
+    OutputStream outputStream=fs.create(filePath);
+    outputStream.write(new byte[FILE_SIZE]);
+    outputStream.close();
+    return (FILE_SIZE == readInputStream(fs,filePath));
+  }
+  private int readInputStream(  Path filePath) throws IOException {
+    FileSystem fs=testAccount.getFileSystem();
+    return readInputStream(fs,filePath);
+  }
+  private int readInputStream(  FileSystem fs,  Path filePath) throws IOException {
+    InputStream inputStream=fs.open(filePath);
+    int count=0;
+    while (inputStream.read() >= 0) {
+      count++;
+    }
+    inputStream.close();
+    return count;
+  }
+  @Test public void testConnectUsingKey() throws Exception {
+    testAccount=AzureBlobStorageTestAccount.create();
+    assumeNotNull(testAccount);
+    assertTrue(validateIOStreams(new Path("/wasb_scheme")));
+  }
+  @Test public void testConnectUsingSAS() throws Exception {
+    Assume.assumeFalse(runningInSASMode);
+    testAccount=AzureBlobStorageTestAccount.create("",EnumSet.of(CreateOptions.UseSas,CreateOptions.CreateContainer));
+    assumeNotNull(testAccount);
+    assertFalse(testAccount.getFileSystem().exists(new Path("/IDontExist")));
+  }
+  @Test public void testConnectUsingSASReadonly() throws Exception {
+    Assume.assumeFalse(runningInSASMode);
+    testAccount=AzureBlobStorageTestAccount.create("",EnumSet.of(CreateOptions.UseSas,CreateOptions.CreateContainer,CreateOptions.Readonly));
+    assumeNotNull(testAccount);
+    final String blobKey="blobForReadonly";
+    CloudBlobContainer container=testAccount.getRealContainer();
+    CloudBlockBlob blob=container.getBlockBlobReference(blobKey);
+    ByteArrayInputStream inputStream=new ByteArrayInputStream(new byte[]{1,2,3});
+    blob.upload(inputStream,3);
+    inputStream.close();
+    Path filePath=new Path("/" + blobKey);
+    FileSystem fs=testAccount.getFileSystem();
+    assertTrue(fs.exists(filePath));
+    byte[] obtained=new byte[3];
+    DataInputStream obtainedInputStream=fs.open(filePath);
+    obtainedInputStream.readFully(obtained);
+    obtainedInputStream.close();
+    assertEquals(3,obtained[2]);
+  }
+  @Test public void testConnectUsingAnonymous() throws Exception {
+    testAccount=AzureBlobStorageTestAccount.createAnonymous("testWasb.txt",FILE_SIZE);
+    assumeNotNull(testAccount);
+    assertEquals(FILE_SIZE,readInputStream(new Path("/testWasb.txt")));
+  }
+  @Test public void testConnectToEmulator() throws Exception {
+    testAccount=AzureBlobStorageTestAccount.createForEmulator();
+    assumeNotNull(testAccount);
+    assertTrue(validateIOStreams(new Path("/testFile")));
+  }
+  /** 
+ * Tests that we can connect to fully qualified accounts outside of blob.core.windows.net
+ */
+  @Test public void testConnectToFullyQualifiedAccountMock() throws Exception {
+    Configuration conf=new Configuration();
+    AzureBlobStorageTestAccount.setMockAccountKey(conf,"mockAccount.mock.authority.net");
+    AzureNativeFileSystemStore store=new AzureNativeFileSystemStore();
+    MockStorageInterface mockStorage=new MockStorageInterface();
+    store.setAzureStorageInteractionLayer(mockStorage);
+    NativeAzureFileSystem fs=new NativeAzureFileSystem(store);
+    fs.initialize(new URI("wasb://mockContainer@mockAccount.mock.authority.net"),conf);
+    fs.createNewFile(new Path("/x"));
+    assertTrue(mockStorage.getBackingStore().exists("http://mockAccount.mock.authority.net/mockContainer/x"));
+    fs.close();
+  }
+  public void testConnectToRoot() throws Exception {
+    final String blobPrefix=String.format("wasbtests-%s-%tQ-blob",System.getProperty("user.name"),new Date());
+    final String inblobName=blobPrefix + "_In" + ".txt";
+    final String outblobName=blobPrefix + "_Out" + ".txt";
+    testAccount=AzureBlobStorageTestAccount.createRoot(inblobName,FILE_SIZE);
+    assumeNotNull(testAccount);
+    assertEquals(FILE_SIZE,readInputStream(new Path(PATH_DELIMITER + inblobName)));
+    try {
+      FileSystem fs=testAccount.getFileSystem();
+      Path outputPath=new Path(PATH_DELIMITER + outblobName);
+      OutputStream outputStream=fs.create(outputPath);
+      fail("Expected an AzureException when writing to root folder.");
+      outputStream.write(new byte[FILE_SIZE]);
+      outputStream.close();
+    }
+ catch (    AzureException e) {
+      assertTrue(true);
+    }
+catch (    Exception e) {
+      String errMsg=String.format("Expected AzureException but got %s instead.",e);
+      assertTrue(errMsg,false);
+    }
+  }
+  public void testConnectWithThrottling() throws Exception {
+    testAccount=AzureBlobStorageTestAccount.createThrottled();
+    assertTrue(validateIOStreams(new Path("/wasb_scheme")));
+  }
+  /** 
+ * Creates a file and writes a single byte with the given value in it.
+ */
+  private static void writeSingleByte(  FileSystem fs,  Path testFile,  int toWrite) throws Exception {
+    OutputStream outputStream=fs.create(testFile);
+    outputStream.write(toWrite);
+    outputStream.close();
+  }
+  /** 
+ * Reads the file given and makes sure that it's a single-byte file with the given value in it.
+ */
+  private static void assertSingleByteValue(  FileSystem fs,  Path testFile,  int expectedValue) throws Exception {
+    InputStream inputStream=fs.open(testFile);
+    int byteRead=inputStream.read();
+    assertTrue("File unexpectedly empty: " + testFile,byteRead >= 0);
+    assertTrue("File has more than a single byte: " + testFile,inputStream.read() < 0);
+    inputStream.close();
+    assertEquals("Unxpected content in: " + testFile,expectedValue,byteRead);
+  }
+  @Test public void testMultipleContainers() throws Exception {
+    AzureBlobStorageTestAccount firstAccount=AzureBlobStorageTestAccount.create("first"), secondAccount=AzureBlobStorageTestAccount.create("second");
+    assumeNotNull(firstAccount);
+    assumeNotNull(secondAccount);
+    try {
+      FileSystem firstFs=firstAccount.getFileSystem(), secondFs=secondAccount.getFileSystem();
+      Path testFile=new Path("/testWasb");
+      assertTrue(validateIOStreams(firstFs,testFile));
+      assertTrue(validateIOStreams(secondFs,testFile));
+      writeSingleByte(firstFs,testFile,5);
+      writeSingleByte(secondFs,testFile,7);
+      assertSingleByteValue(firstFs,testFile,5);
+      assertSingleByteValue(secondFs,testFile,7);
+    }
+  finally {
+      firstAccount.cleanup();
+      secondAccount.cleanup();
+    }
+  }
+  @Test public void testDefaultKeyProvider() throws Exception {
+    Configuration conf=new Configuration();
+    String account="testacct";
+    String key="testkey";
+    conf.set(SimpleKeyProvider.KEY_ACCOUNT_KEY_PREFIX + account,key);
+    String result=AzureNativeFileSystemStore.getAccountKeyFromConfiguration(account,conf);
+    assertEquals(key,result);
+  }
+  @Test public void testCredsFromCredentialProvider() throws Exception {
+    Assume.assumeFalse(runningInSASMode);
+    String account="testacct";
+    String key="testkey";
+    final Configuration conf=new Configuration();
+    final File file=tempDir.newFile("test.jks");
+    final URI jks=ProviderUtils.nestURIForLocalJavaKeyStoreProvider(file.toURI());
+    conf.set(CredentialProviderFactory.CREDENTIAL_PROVIDER_PATH,jks.toString());
+    provisionAccountKey(conf,account,key);
+    conf.set(SimpleKeyProvider.KEY_ACCOUNT_KEY_PREFIX + account,key + "cleartext");
+    String result=AzureNativeFileSystemStore.getAccountKeyFromConfiguration(account,conf);
+    assertEquals("AccountKey incorrect.",key,result);
+  }
+  void provisionAccountKey(  final Configuration conf,  String account,  String key) throws Exception {
+    final CredentialProvider provider=CredentialProviderFactory.getProviders(conf).get(0);
+    provider.createCredentialEntry(SimpleKeyProvider.KEY_ACCOUNT_KEY_PREFIX + account,key.toCharArray());
+    provider.flush();
+  }
+  @Test public void testValidKeyProvider() throws Exception {
+    Configuration conf=new Configuration();
+    String account="testacct";
+    String key="testkey";
+    conf.set(SimpleKeyProvider.KEY_ACCOUNT_KEY_PREFIX + account,key);
+    conf.setClass("fs.azure.account.keyprovider." + account,SimpleKeyProvider.class,KeyProvider.class);
+    String result=AzureNativeFileSystemStore.getAccountKeyFromConfiguration(account,conf);
+    assertEquals(key,result);
+  }
+  @Test public void testInvalidKeyProviderNonexistantClass() throws Exception {
+    Configuration conf=new Configuration();
+    String account="testacct";
+    conf.set("fs.azure.account.keyprovider." + account,"org.apache.Nonexistant.Class");
+    try {
+      AzureNativeFileSystemStore.getAccountKeyFromConfiguration(account,conf);
+      Assert.fail("Nonexistant key provider class should have thrown a " + "KeyProviderException");
+    }
+ catch (    KeyProviderException e) {
+    }
+  }
+  @Test public void testInvalidKeyProviderWrongClass() throws Exception {
+    Configuration conf=new Configuration();
+    String account="testacct";
+    conf.set("fs.azure.account.keyprovider." + account,"java.lang.String");
+    try {
+      AzureNativeFileSystemStore.getAccountKeyFromConfiguration(account,conf);
+      Assert.fail("Key provider class that doesn't implement KeyProvider " + "should have thrown a KeyProviderException");
+    }
+ catch (    KeyProviderException e) {
+    }
+  }
+  /** 
+ * Tests the cases when the URI is specified with no authority, i.e. wasb:///path/to/file.
+ */
+  @Test public void testNoUriAuthority() throws Exception {
+    String[] wasbAliases=new String[]{"wasb","wasbs"};
+    for (    String defaultScheme : wasbAliases) {
+      for (      String wantedScheme : wasbAliases) {
+        testAccount=AzureBlobStorageTestAccount.createMock();
+        Configuration conf=testAccount.getFileSystem().getConf();
+        String authority=testAccount.getFileSystem().getUri().getAuthority();
+        URI defaultUri=new URI(defaultScheme,authority,null,null,null);
+        conf.set(FS_DEFAULT_NAME_KEY,defaultUri.toString());
+        conf.addResource("azure-test.xml");
+        URI wantedUri=new URI(wantedScheme + ":///random/path");
+        NativeAzureFileSystem obtained=(NativeAzureFileSystem)FileSystem.get(wantedUri,conf);
+        assertNotNull(obtained);
+        assertEquals(new URI(wantedScheme,authority,null,null,null),obtained.getUri());
+        Path qualified=obtained.makeQualified(new Path(wantedUri));
+        assertEquals(new URI(wantedScheme,authority,wantedUri.getPath(),null,null),qualified.toUri());
+        testAccount.cleanup();
+        FileSystem.closeAll();
+      }
+    }
+    testAccount=AzureBlobStorageTestAccount.createMock();
+    Configuration conf=testAccount.getFileSystem().getConf();
+    conf.set(FS_DEFAULT_NAME_KEY,"file:///");
+    try {
+      FileSystem.get(new URI("wasb:///random/path"),conf);
+      fail("Should've thrown.");
+    }
+ catch (    IllegalArgumentException e) {
+    }
+  }
+  @Test public void testWasbAsDefaultFileSystemHasNoPort() throws Exception {
+    try {
+      testAccount=AzureBlobStorageTestAccount.createMock();
+      Configuration conf=testAccount.getFileSystem().getConf();
+      String authority=testAccount.getFileSystem().getUri().getAuthority();
+      URI defaultUri=new URI("wasb",authority,null,null,null);
+      conf.set(FS_DEFAULT_NAME_KEY,defaultUri.toString());
+      conf.addResource("azure-test.xml");
+      FileSystem fs=FileSystem.get(conf);
+      assertTrue(fs instanceof NativeAzureFileSystem);
+      assertEquals(-1,fs.getUri().getPort());
+      AbstractFileSystem afs=FileContext.getFileContext(conf).getDefaultFileSystem();
+      assertTrue(afs instanceof Wasb);
+      assertEquals(-1,afs.getUri().getPort());
+    }
+  finally {
+      testAccount.cleanup();
+      FileSystem.closeAll();
+    }
+  }
+  /** 
+ * Tests the cases when the scheme specified is 'wasbs'.
+ */
+  @Test public void testAbstractFileSystemImplementationForWasbsScheme() throws Exception {
+    try {
+      testAccount=AzureBlobStorageTestAccount.createMock();
+      Configuration conf=testAccount.getFileSystem().getConf();
+      String authority=testAccount.getFileSystem().getUri().getAuthority();
+      URI defaultUri=new URI("wasbs",authority,null,null,null);
+      conf.set(FS_DEFAULT_NAME_KEY,defaultUri.toString());
+      conf.set("fs.AbstractFileSystem.wasbs.impl","org.apache.hadoop.fs.azure.Wasbs");
+      conf.addResource("azure-test.xml");
+      FileSystem fs=FileSystem.get(conf);
+      assertTrue(fs instanceof NativeAzureFileSystem);
+      assertEquals("wasbs",fs.getScheme());
+      AbstractFileSystem afs=FileContext.getFileContext(conf).getDefaultFileSystem();
+      assertTrue(afs instanceof Wasbs);
+      assertEquals(-1,afs.getUri().getPort());
+      assertEquals("wasbs",afs.getUri().getScheme());
+    }
+  finally {
+      testAccount.cleanup();
+      FileSystem.closeAll();
+    }
+  }
+  @Test public void testNoAbstractFileSystemImplementationSpecifiedForWasbsScheme() throws Exception {
+    try {
+      testAccount=AzureBlobStorageTestAccount.createMock();
+      Configuration conf=testAccount.getFileSystem().getConf();
+      String authority=testAccount.getFileSystem().getUri().getAuthority();
+      URI defaultUri=new URI("wasbs",authority,null,null,null);
+      conf.set(FS_DEFAULT_NAME_KEY,defaultUri.toString());
+      FileSystem fs=FileSystem.get(conf);
+      assertTrue(fs instanceof NativeAzureFileSystem);
+      assertEquals("wasbs",fs.getScheme());
+      try {
+        FileContext.getFileContext(conf).getDefaultFileSystem();
+        fail("Should've thrown.");
+      }
+ catch (      UnsupportedFileSystemException e) {
+      }
+    }
+  finally {
+      testAccount.cleanup();
+      FileSystem.closeAll();
+    }
+  }
+  @Test public void testCredentialProviderPathExclusions() throws Exception {
+    String providerPath="user:///,jceks://wasb/user/hrt_qa/sqoopdbpasswd.jceks," + "jceks://hdfs@nn1.example.com/my/path/test.jceks";
+    Configuration config=new Configuration();
+    config.set(CredentialProviderFactory.CREDENTIAL_PROVIDER_PATH,providerPath);
+    String newPath="user:///,jceks://hdfs@nn1.example.com/my/path/test.jceks";
+    excludeAndTestExpectations(config,newPath);
+  }
+  @Test public void testExcludeAllProviderTypesFromConfig() throws Exception {
+    String providerPath="jceks://wasb/tmp/test.jceks," + "jceks://wasb@/my/path/test.jceks";
+    Configuration config=new Configuration();
+    config.set(CredentialProviderFactory.CREDENTIAL_PROVIDER_PATH,providerPath);
+    String newPath=null;
+    excludeAndTestExpectations(config,newPath);
+  }
+  void excludeAndTestExpectations(  Configuration config,  String newPath) throws Exception {
+    Configuration conf=ProviderUtils.excludeIncompatibleCredentialProviders(config,NativeAzureFileSystem.class);
+    String effectivePath=conf.get(CredentialProviderFactory.CREDENTIAL_PROVIDER_PATH,null);
+    assertEquals(newPath,effectivePath);
+  }
+  @Test public void testUserAgentConfig() throws Exception {
+    try {
+      testAccount=AzureBlobStorageTestAccount.createMock();
+      Configuration conf=testAccount.getFileSystem().getConf();
+      String authority=testAccount.getFileSystem().getUri().getAuthority();
+      URI defaultUri=new URI("wasbs",authority,null,null,null);
+      conf.set(FS_DEFAULT_NAME_KEY,defaultUri.toString());
+      conf.set("fs.AbstractFileSystem.wasbs.impl","org.apache.hadoop.fs.azure.Wasbs");
+      conf.set(AzureNativeFileSystemStore.USER_AGENT_ID_KEY,"TestClient");
+      FileSystem fs=FileSystem.get(conf);
+      AbstractFileSystem afs=FileContext.getFileContext(conf).getDefaultFileSystem();
+      assertTrue(afs instanceof Wasbs);
+      assertEquals(-1,afs.getUri().getPort());
+      assertEquals("wasbs",afs.getUri().getScheme());
+    }
+  finally {
+      testAccount.cleanup();
+      FileSystem.closeAll();
+    }
+    try {
+      testAccount=AzureBlobStorageTestAccount.createMock();
+      Configuration conf=testAccount.getFileSystem().getConf();
+      String authority=testAccount.getFileSystem().getUri().getAuthority();
+      URI defaultUri=new URI("wasbs",authority,null,null,null);
+      conf.set(FS_DEFAULT_NAME_KEY,defaultUri.toString());
+      conf.set("fs.AbstractFileSystem.wasbs.impl","org.apache.hadoop.fs.azure.Wasbs");
+      conf.unset(AzureNativeFileSystemStore.USER_AGENT_ID_KEY);
+      FileSystem fs=FileSystem.get(conf);
+      AbstractFileSystem afs=FileContext.getFileContext(conf).getDefaultFileSystem();
+      assertTrue(afs instanceof Wasbs);
+      assertEquals(-1,afs.getUri().getPort());
+      assertEquals("wasbs",afs.getUri().getScheme());
+    }
+  finally {
+      testAccount.cleanup();
+      FileSystem.closeAll();
+    }
+  }
+}

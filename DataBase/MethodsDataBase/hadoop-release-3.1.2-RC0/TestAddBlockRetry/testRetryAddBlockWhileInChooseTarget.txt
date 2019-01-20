@@ -1,0 +1,44 @@
+/** 
+ * Retry addBlock() while another thread is in chooseTarget(). See HDFS-4452.
+ */
+@Test public void testRetryAddBlockWhileInChooseTarget() throws Exception {
+  final String src="/testRetryAddBlockWhileInChooseTarget";
+  final FSNamesystem ns=cluster.getNamesystem();
+  final NamenodeProtocols nn=cluster.getNameNodeRpc();
+  nn.create(src,FsPermission.getFileDefault(),"clientName",new EnumSetWritable<CreateFlag>(EnumSet.of(CreateFlag.CREATE)),true,(short)3,1024,null,null);
+  LOG.info("Starting first addBlock for " + src);
+  LocatedBlock[] onRetryBlock=new LocatedBlock[1];
+  ns.readLock();
+  FSDirWriteFileOp.ValidateAddBlockResult r;
+  FSPermissionChecker pc=Mockito.mock(FSPermissionChecker.class);
+  try {
+    r=FSDirWriteFileOp.validateAddBlock(ns,pc,src,HdfsConstants.GRANDFATHER_INODE_ID,"clientName",null,onRetryBlock);
+  }
+  finally {
+    ns.readUnlock();
+    ;
+  }
+  DatanodeStorageInfo targets[]=FSDirWriteFileOp.chooseTargetForNewBlock(ns.getBlockManager(),src,null,null,null,r);
+  assertNotNull("Targets must be generated",targets);
+  LOG.info("Starting second addBlock for " + src);
+  nn.addBlock(src,"clientName",null,null,HdfsConstants.GRANDFATHER_INODE_ID,null,null);
+  assertTrue("Penultimate block must be complete",checkFileProgress(src,false));
+  LocatedBlocks lbs=nn.getBlockLocations(src,0,Long.MAX_VALUE);
+  assertEquals("Must be one block",1,lbs.getLocatedBlocks().size());
+  LocatedBlock lb2=lbs.get(0);
+  assertEquals("Wrong replication",REPLICATION,lb2.getLocations().length);
+  ns.writeLock();
+  LocatedBlock newBlock;
+  try {
+    newBlock=FSDirWriteFileOp.storeAllocatedBlock(ns,src,HdfsConstants.GRANDFATHER_INODE_ID,"clientName",null,targets);
+  }
+  finally {
+    ns.writeUnlock();
+  }
+  assertEquals("Blocks are not equal",lb2.getBlock(),newBlock.getBlock());
+  lbs=nn.getBlockLocations(src,0,Long.MAX_VALUE);
+  assertEquals("Must be one block",1,lbs.getLocatedBlocks().size());
+  LocatedBlock lb1=lbs.get(0);
+  assertEquals("Wrong replication",REPLICATION,lb1.getLocations().length);
+  assertEquals("Blocks are not equal",lb1.getBlock(),lb2.getBlock());
+}

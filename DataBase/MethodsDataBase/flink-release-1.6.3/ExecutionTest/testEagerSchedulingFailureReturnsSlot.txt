@@ -1,0 +1,44 @@
+@Test public void testEagerSchedulingFailureReturnsSlot() throws Exception {
+  final JobVertex jobVertex=createNoOpJobVertex();
+  final JobVertexID jobVertexId=jobVertex.getID();
+  final SimpleAckingTaskManagerGateway taskManagerGateway=new SimpleAckingTaskManagerGateway();
+  final SingleSlotTestingSlotOwner slotOwner=new SingleSlotTestingSlotOwner();
+  final CompletableFuture<SlotRequestId> slotRequestIdFuture=new CompletableFuture<>();
+  final CompletableFuture<SlotRequestId> returnedSlotFuture=new CompletableFuture<>();
+  final TestingSlotProvider slotProvider=new TestingSlotProvider((  SlotRequestId slotRequestId) -> {
+    slotRequestIdFuture.complete(slotRequestId);
+    return new CompletableFuture<>();
+  }
+);
+  slotProvider.setSlotCanceller(returnedSlotFuture::complete);
+  slotOwner.getReturnedSlotFuture().thenAccept((  LogicalSlot logicalSlot) -> returnedSlotFuture.complete(logicalSlot.getSlotRequestId()));
+  ExecutionGraph executionGraph=ExecutionGraphTestUtils.createSimpleTestGraph(new JobID(),slotProvider,new NoRestartStrategy(),jobVertex);
+  ExecutionJobVertex executionJobVertex=executionGraph.getJobVertex(jobVertexId);
+  ExecutionVertex executionVertex=executionJobVertex.getTaskVertices()[0];
+  final Execution execution=executionVertex.getCurrentExecutionAttempt();
+  taskManagerGateway.setCancelConsumer(executionAttemptID -> {
+    if (execution.getAttemptId().equals(executionAttemptID)) {
+      execution.cancelingComplete();
+    }
+  }
+);
+  final ExecutorService executorService=Executors.newFixedThreadPool(1);
+  try {
+    slotRequestIdFuture.thenAcceptAsync((    SlotRequestId slotRequestId) -> {
+      final SingleLogicalSlot singleLogicalSlot=ExecutionGraphSchedulingTest.createSingleLogicalSlot(slotOwner,taskManagerGateway,slotRequestId);
+      slotProvider.complete(slotRequestId,singleLogicalSlot);
+    }
+,executorService);
+    final CompletableFuture<Void> schedulingFuture=execution.scheduleForExecution(slotProvider,false,LocationPreferenceConstraint.ANY,Collections.emptySet());
+    try {
+      schedulingFuture.get();
+      execution.cancel();
+    }
+ catch (    ExecutionException ignored) {
+    }
+    assertThat(returnedSlotFuture.get(),is(equalTo(slotRequestIdFuture.get())));
+  }
+  finally {
+    executorService.shutdownNow();
+  }
+}

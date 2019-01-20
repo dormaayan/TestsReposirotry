@@ -1,0 +1,378 @@
+public class TestAMRMClientOnRMRestart {
+  static Configuration conf=new Configuration();
+  static final int rolling_interval_sec=13;
+  static final long am_expire_ms=4000;
+  @BeforeClass public static void setup() throws Exception {
+    conf.setBoolean(CommonConfigurationKeys.HADOOP_SECURITY_TOKEN_SERVICE_USE_IP,false);
+    SecurityUtil.setConfiguration(conf);
+    conf.set(YarnConfiguration.RECOVERY_ENABLED,"true");
+    conf.set(YarnConfiguration.RM_STORE,MemoryRMStateStore.class.getName());
+    conf.setInt(YarnConfiguration.RM_AM_MAX_ATTEMPTS,YarnConfiguration.DEFAULT_RM_AM_MAX_ATTEMPTS);
+    conf.setBoolean(YarnConfiguration.RM_WORK_PRESERVING_RECOVERY_ENABLED,true);
+    conf.setLong(YarnConfiguration.RM_WORK_PRESERVING_RECOVERY_SCHEDULING_WAIT_MS,0);
+    conf.set(YarnConfiguration.RM_SCHEDULER_ADDRESS,"0.0.0.0:0");
+  }
+  @AfterClass public static void tearDown(){
+    conf.setBoolean(CommonConfigurationKeys.HADOOP_SECURITY_TOKEN_SERVICE_USE_IP,true);
+    SecurityUtil.setConfiguration(conf);
+  }
+  @Test(timeout=60000) public void testAMRMClientResendsRequestsOnRMRestart() throws Exception {
+    UserGroupInformation.setLoginUser(null);
+    MemoryRMStateStore memStore=new MemoryRMStateStore();
+    memStore.init(conf);
+    MyResourceManager rm1=new MyResourceManager(conf,memStore);
+    rm1.start();
+    RMApp app=rm1.submitApp(1024);
+    rm1.drainEvents();
+    MockNM nm1=new MockNM("h1:1234",15120,rm1.getResourceTrackerService());
+    nm1.registerNode();
+    nm1.nodeHeartbeat(true);
+    rm1.drainEvents();
+    ApplicationAttemptId appAttemptId=app.getCurrentAppAttempt().getAppAttemptId();
+    rm1.sendAMLaunched(appAttemptId);
+    rm1.drainEvents();
+    org.apache.hadoop.security.token.Token<AMRMTokenIdentifier> token=rm1.getRMContext().getRMApps().get(appAttemptId.getApplicationId()).getRMAppAttempt(appAttemptId).getAMRMToken();
+    UserGroupInformation ugi=UserGroupInformation.getCurrentUser();
+    ugi.addTokenIdentifier(token.decodeIdentifier());
+    AMRMClient<ContainerRequest> amClient=new MyAMRMClientImpl(rm1);
+    amClient.init(conf);
+    amClient.start();
+    amClient.registerApplicationMaster("Host",10000,"");
+    ContainerRequest cRequest1=createReq(1,1024,new String[]{"h1"});
+    amClient.addContainerRequest(cRequest1);
+    ContainerRequest cRequest2=createReq(1,1024,new String[]{"h1","h2"});
+    amClient.addContainerRequest(cRequest2);
+    ContainerRequest cRequest3=createReq(1,1024,new String[]{"h1"});
+    amClient.addContainerRequest(cRequest3);
+    List<String> blacklistAdditions=new ArrayList<String>();
+    List<String> blacklistRemoval=new ArrayList<String>();
+    blacklistAdditions.add("h2");
+    blacklistRemoval.add("h10");
+    amClient.updateBlacklist(blacklistAdditions,blacklistRemoval);
+    blacklistAdditions.remove("h2");
+    AllocateResponse allocateResponse=amClient.allocate(0.1f);
+    rm1.drainEvents();
+    Assert.assertEquals("No of assignments must be 0",0,allocateResponse.getAllocatedContainers().size());
+    assertAsksAndReleases(4,0,rm1);
+    assertBlacklistAdditionsAndRemovals(1,1,rm1);
+    nm1.nodeHeartbeat(true);
+    rm1.drainEvents();
+    allocateResponse=amClient.allocate(0.2f);
+    rm1.drainEvents();
+    Assert.assertEquals("No of assignments must be 0",3,allocateResponse.getAllocatedContainers().size());
+    assertAsksAndReleases(0,0,rm1);
+    assertBlacklistAdditionsAndRemovals(0,0,rm1);
+    List<Container> allocatedContainers=allocateResponse.getAllocatedContainers();
+    amClient.removeContainerRequest(cRequest1);
+    amClient.removeContainerRequest(cRequest2);
+    amClient.removeContainerRequest(cRequest3);
+    allocateResponse=amClient.allocate(0.2f);
+    rm1.drainEvents();
+    Assert.assertEquals("No of assignments must be 0",0,allocateResponse.getAllocatedContainers().size());
+    assertAsksAndReleases(4,0,rm1);
+    assertBlacklistAdditionsAndRemovals(0,0,rm1);
+    ContainerRequest cRequest4=createReq(1,1024,new String[]{"h1"});
+    amClient.addContainerRequest(cRequest4);
+    int pendingRelease=0;
+    Iterator<Container> it=allocatedContainers.iterator();
+    while (it.hasNext()) {
+      amClient.releaseAssignedContainer(it.next().getId());
+      pendingRelease++;
+      it.remove();
+      break;
+    }
+    Container container=it.next();
+    ContainerId containerId=container.getId();
+    nm1.nodeHeartbeat(containerId.getApplicationAttemptId(),containerId.getContainerId(),ContainerState.RUNNING);
+    rm1.drainEvents();
+    amClient.requestContainerUpdate(container,UpdateContainerRequest.newInstance(container.getVersion(),container.getId(),ContainerUpdateType.INCREASE_RESOURCE,Resource.newInstance(2048,1),null));
+    it.remove();
+    allocateResponse=amClient.allocate(0.3f);
+    rm1.drainEvents();
+    Assert.assertEquals("No of assignments must be 0",0,allocateResponse.getAllocatedContainers().size());
+    assertAsksAndReleases(3,pendingRelease,rm1);
+    assertChanges(1,0,rm1);
+    assertBlacklistAdditionsAndRemovals(0,0,rm1);
+    int completedContainer=allocateResponse.getCompletedContainersStatuses().size();
+    pendingRelease-=completedContainer;
+    MyResourceManager rm2=new MyResourceManager(conf,memStore);
+    rm2.start();
+    nm1.setResourceTrackerService(rm2.getResourceTrackerService());
+    ((MyAMRMClientImpl)amClient).updateRMProxy(rm2);
+    NodeHeartbeatResponse hbResponse=nm1.nodeHeartbeat(true);
+    Assert.assertEquals(NodeAction.RESYNC,hbResponse.getNodeAction());
+    nm1=new MockNM("h1:1234",10240,rm2.getResourceTrackerService());
+    NMContainerStatus containerReport=NMContainerStatus.newInstance(containerId,0,ContainerState.RUNNING,Resource.newInstance(1024,1),"recover container",0,Priority.newInstance(0),0);
+    nm1.registerNode(Collections.singletonList(containerReport),Collections.singletonList(containerId.getApplicationAttemptId().getApplicationId()));
+    nm1.nodeHeartbeat(true);
+    rm2.drainEvents();
+    blacklistAdditions.add("h3");
+    amClient.updateBlacklist(blacklistAdditions,null);
+    blacklistAdditions.remove("h3");
+    it=allocatedContainers.iterator();
+    while (it.hasNext()) {
+      amClient.releaseAssignedContainer(it.next().getId());
+      pendingRelease++;
+      it.remove();
+    }
+    ContainerRequest cRequest5=createReq(1,1024,new String[]{"h1","h2"});
+    amClient.addContainerRequest(cRequest5);
+    allocateResponse=amClient.allocate(0.3f);
+    rm2.drainEvents();
+    completedContainer=allocateResponse.getCompletedContainersStatuses().size();
+    pendingRelease-=completedContainer;
+    assertAsksAndReleases(4,pendingRelease,rm2);
+    assertChanges(1,0,rm2);
+    assertBlacklistAdditionsAndRemovals(2,0,rm2);
+    ContainerRequest cRequest6=createReq(1,1024,new String[]{"h1","h2","h3"});
+    amClient.addContainerRequest(cRequest6);
+    allocateResponse=amClient.allocate(0.5f);
+    rm2.drainEvents();
+    Assert.assertEquals("No of assignments must be 0",0,allocateResponse.getAllocatedContainers().size());
+    assertAsksAndReleases(5,0,rm2);
+    assertChanges(0,0,rm2);
+    assertBlacklistAdditionsAndRemovals(0,0,rm2);
+    int noAssignedContainer=0;
+    int count=5;
+    while (count-- > 0) {
+      nm1.nodeHeartbeat(true);
+      rm2.drainEvents();
+      allocateResponse=amClient.allocate(0.5f);
+      rm2.drainEvents();
+      noAssignedContainer+=allocateResponse.getAllocatedContainers().size();
+      if (noAssignedContainer == 3) {
+        break;
+      }
+      Thread.sleep(1000);
+    }
+    Assert.assertEquals("Number of container should be 3",3,noAssignedContainer);
+    amClient.stop();
+    rm1.stop();
+    rm2.stop();
+  }
+  @Test(timeout=60000) public void testAMRMClientForUnregisterAMOnRMRestart() throws Exception {
+    MemoryRMStateStore memStore=new MemoryRMStateStore();
+    memStore.init(conf);
+    MyResourceManager rm1=new MyResourceManager(conf,memStore);
+    rm1.start();
+    RMApp app=rm1.submitApp(1024);
+    rm1.drainEvents();
+    MockNM nm1=new MockNM("h1:1234",15120,rm1.getResourceTrackerService());
+    nm1.registerNode();
+    nm1.nodeHeartbeat(true);
+    rm1.drainEvents();
+    ApplicationAttemptId appAttemptId=app.getCurrentAppAttempt().getAppAttemptId();
+    rm1.sendAMLaunched(appAttemptId);
+    rm1.drainEvents();
+    org.apache.hadoop.security.token.Token<AMRMTokenIdentifier> token=rm1.getRMContext().getRMApps().get(appAttemptId.getApplicationId()).getRMAppAttempt(appAttemptId).getAMRMToken();
+    UserGroupInformation ugi=UserGroupInformation.getCurrentUser();
+    ugi.addTokenIdentifier(token.decodeIdentifier());
+    AMRMClient<ContainerRequest> amClient=new MyAMRMClientImpl(rm1);
+    amClient.init(conf);
+    amClient.start();
+    amClient.registerApplicationMaster("h1",10000,"");
+    amClient.allocate(0.1f);
+    MyResourceManager rm2=new MyResourceManager(conf,memStore);
+    rm2.start();
+    nm1.setResourceTrackerService(rm2.getResourceTrackerService());
+    ((MyAMRMClientImpl)amClient).updateRMProxy(rm2);
+    NodeHeartbeatResponse hbResponse=nm1.nodeHeartbeat(true);
+    Assert.assertEquals(NodeAction.RESYNC,hbResponse.getNodeAction());
+    nm1=new MockNM("h1:1234",10240,rm2.getResourceTrackerService());
+    ContainerId containerId=ContainerId.newContainerId(appAttemptId,1);
+    NMContainerStatus containerReport=NMContainerStatus.newInstance(containerId,0,ContainerState.RUNNING,Resource.newInstance(1024,1),"recover container",0,Priority.newInstance(0),0);
+    nm1.registerNode(Arrays.asList(containerReport),null);
+    nm1.nodeHeartbeat(true);
+    rm2.drainEvents();
+    amClient.unregisterApplicationMaster(FinalApplicationStatus.SUCCEEDED,null,null);
+    rm2.waitForState(appAttemptId,RMAppAttemptState.FINISHING);
+    nm1.nodeHeartbeat(appAttemptId,1,ContainerState.COMPLETE);
+    rm2.waitForState(appAttemptId,RMAppAttemptState.FINISHED);
+    rm2.waitForState(app.getApplicationId(),RMAppState.FINISHED);
+    amClient.stop();
+    rm1.stop();
+    rm2.stop();
+  }
+  @Test(timeout=30000) public void testAMRMClientOnAMRMTokenRollOverOnRMRestart() throws Exception {
+    conf.setLong(YarnConfiguration.RM_AMRM_TOKEN_MASTER_KEY_ROLLING_INTERVAL_SECS,rolling_interval_sec);
+    conf.setLong(YarnConfiguration.RM_AM_EXPIRY_INTERVAL_MS,am_expire_ms);
+    MemoryRMStateStore memStore=new MemoryRMStateStore();
+    memStore.init(conf);
+    MyResourceManager2 rm1=new MyResourceManager2(conf,memStore);
+    rm1.start();
+    Long startTime=System.currentTimeMillis();
+    RMApp app=rm1.submitApp(1024);
+    rm1.drainEvents();
+    MockNM nm1=new MockNM("h1:1234",15120,rm1.getResourceTrackerService());
+    nm1.registerNode();
+    nm1.nodeHeartbeat(true);
+    rm1.drainEvents();
+    ApplicationAttemptId appAttemptId=app.getCurrentAppAttempt().getAppAttemptId();
+    rm1.sendAMLaunched(appAttemptId);
+    rm1.drainEvents();
+    AMRMTokenSecretManager amrmTokenSecretManagerForRM1=rm1.getRMContext().getAMRMTokenSecretManager();
+    org.apache.hadoop.security.token.Token<AMRMTokenIdentifier> token=amrmTokenSecretManagerForRM1.createAndGetAMRMToken(appAttemptId);
+    UserGroupInformation ugi=UserGroupInformation.getCurrentUser();
+    ugi.addTokenIdentifier(token.decodeIdentifier());
+    AMRMClient<ContainerRequest> amClient=new MyAMRMClientImpl(rm1);
+    amClient.init(conf);
+    amClient.start();
+    amClient.registerApplicationMaster("h1",10000,"");
+    amClient.allocate(0.1f);
+    while (System.currentTimeMillis() - startTime < rolling_interval_sec * 1000) {
+      amClient.allocate(0.1f);
+      try {
+        Thread.sleep(1000);
+      }
+ catch (      InterruptedException e) {
+      }
+    }
+    Assert.assertTrue(amrmTokenSecretManagerForRM1.getMasterKey().getMasterKey().getKeyId() != token.decodeIdentifier().getKeyId());
+    amClient.allocate(0.1f);
+    org.apache.hadoop.security.token.Token<AMRMTokenIdentifier> newToken=amrmTokenSecretManagerForRM1.createAndGetAMRMToken(appAttemptId);
+    int waitCount=0;
+    while (waitCount++ <= 50) {
+      if (amrmTokenSecretManagerForRM1.getCurrnetMasterKeyData().getMasterKey().getKeyId() != token.decodeIdentifier().getKeyId()) {
+        break;
+      }
+      try {
+        amClient.allocate(0.1f);
+      }
+ catch (      Exception ex) {
+        break;
+      }
+      Thread.sleep(500);
+    }
+    Assert.assertTrue(amrmTokenSecretManagerForRM1.getNextMasterKeyData() == null);
+    Assert.assertTrue(amrmTokenSecretManagerForRM1.getCurrnetMasterKeyData().getMasterKey().getKeyId() == newToken.decodeIdentifier().getKeyId());
+    final MyResourceManager2 rm2=new MyResourceManager2(conf,memStore);
+    rm2.start();
+    nm1.setResourceTrackerService(rm2.getResourceTrackerService());
+    ((MyAMRMClientImpl)amClient).updateRMProxy(rm2);
+    AMRMTokenSecretManager amrmTokenSecretManagerForRM2=rm2.getRMContext().getAMRMTokenSecretManager();
+    Assert.assertTrue(amrmTokenSecretManagerForRM2.getCurrnetMasterKeyData().getMasterKey().getKeyId() == newToken.decodeIdentifier().getKeyId());
+    Assert.assertTrue(amrmTokenSecretManagerForRM2.getNextMasterKeyData() == null);
+    try {
+      UserGroupInformation testUser=UserGroupInformation.createRemoteUser("testUser");
+      SecurityUtil.setTokenService(token,rm2.getApplicationMasterService().getBindAddress());
+      testUser.addToken(token);
+      testUser.doAs(new PrivilegedAction<ApplicationMasterProtocol>(){
+        @Override public ApplicationMasterProtocol run(){
+          return (ApplicationMasterProtocol)YarnRPC.create(conf).getProxy(ApplicationMasterProtocol.class,rm2.getApplicationMasterService().getBindAddress(),conf);
+        }
+      }
+).allocate(Records.newRecord(AllocateRequest.class));
+      Assert.fail("The old Token should not work");
+    }
+ catch (    Exception ex) {
+      Assert.assertTrue(ex instanceof InvalidToken);
+      Assert.assertTrue(ex.getMessage().contains("Invalid AMRMToken from " + token.decodeIdentifier().getApplicationAttemptId()));
+    }
+    amClient.allocate(0.1f);
+    amClient.unregisterApplicationMaster(FinalApplicationStatus.SUCCEEDED,null,null);
+    amClient.stop();
+    rm1.stop();
+    rm2.stop();
+  }
+private static class MyFifoScheduler extends FifoScheduler {
+    public MyFifoScheduler(    RMContext rmContext){
+      super();
+      try {
+        Configuration conf=new Configuration();
+        init(conf);
+        reinitialize(conf,rmContext);
+      }
+ catch (      IOException ie) {
+        assert (false);
+      }
+    }
+    List<ResourceRequest> lastAsk=null;
+    List<ContainerId> lastRelease=null;
+    List<UpdateContainerRequest> lastIncrease=null;
+    List<UpdateContainerRequest> lastDecrease=null;
+    List<String> lastBlacklistAdditions;
+    List<String> lastBlacklistRemovals;
+    @Override public synchronized Allocation allocate(    ApplicationAttemptId applicationAttemptId,    List<ResourceRequest> ask,    List<SchedulingRequest> schedulingRequests,    List<ContainerId> release,    List<String> blacklistAdditions,    List<String> blacklistRemovals,    ContainerUpdates updateRequests){
+      List<ResourceRequest> askCopy=new ArrayList<ResourceRequest>();
+      for (      ResourceRequest req : ask) {
+        ResourceRequest reqCopy=ResourceRequest.newInstance(req.getPriority(),req.getResourceName(),req.getCapability(),req.getNumContainers(),req.getRelaxLocality());
+        askCopy.add(reqCopy);
+      }
+      lastAsk=ask;
+      lastRelease=release;
+      lastIncrease=updateRequests.getIncreaseRequests();
+      lastDecrease=updateRequests.getDecreaseRequests();
+      lastBlacklistAdditions=blacklistAdditions;
+      lastBlacklistRemovals=blacklistRemovals;
+      return super.allocate(applicationAttemptId,askCopy,schedulingRequests,release,blacklistAdditions,blacklistRemovals,updateRequests);
+    }
+  }
+private static class MyResourceManager extends MockRM {
+    private static long fakeClusterTimeStamp=System.currentTimeMillis();
+    public MyResourceManager(    Configuration conf,    RMStateStore store){
+      super(conf,store);
+    }
+    @Override public void serviceStart() throws Exception {
+      super.serviceStart();
+      MyResourceManager.setClusterTimeStamp(fakeClusterTimeStamp);
+    }
+    @Override protected EventHandler<SchedulerEvent> createSchedulerEventDispatcher(){
+      return new EventHandler<SchedulerEvent>(){
+        @Override public void handle(        SchedulerEvent event){
+          scheduler.handle(event);
+        }
+      }
+;
+    }
+    @Override protected ResourceScheduler createScheduler(){
+      return new MyFifoScheduler(this.getRMContext());
+    }
+    MyFifoScheduler getMyFifoScheduler(){
+      return (MyFifoScheduler)scheduler;
+    }
+  }
+private static class MyResourceManager2 extends MyResourceManager {
+    public MyResourceManager2(    Configuration conf,    RMStateStore store){
+      super(conf,store);
+    }
+    @Override protected ApplicationMasterService createApplicationMasterService(){
+      return new ApplicationMasterService(getRMContext(),scheduler);
+    }
+  }
+private static class MyAMRMClientImpl extends AMRMClientImpl<ContainerRequest> {
+    private MyResourceManager rm;
+    public MyAMRMClientImpl(    MyResourceManager rm){
+      this.rm=rm;
+    }
+    @Override protected void serviceInit(    Configuration conf) throws Exception {
+      super.serviceInit(conf);
+    }
+    @Override protected void serviceStart() throws Exception {
+      this.rmClient=this.rm.getApplicationMasterService();
+    }
+    @Override protected void serviceStop() throws Exception {
+      rmClient=null;
+      super.serviceStop();
+    }
+    public void updateRMProxy(    MyResourceManager rm){
+      rmClient=rm.getApplicationMasterService();
+    }
+  }
+  private static void assertBlacklistAdditionsAndRemovals(  int expectedAdditions,  int expectedRemovals,  MyResourceManager rm){
+    Assert.assertEquals(expectedAdditions,rm.getMyFifoScheduler().lastBlacklistAdditions.size());
+    Assert.assertEquals(expectedRemovals,rm.getMyFifoScheduler().lastBlacklistRemovals.size());
+  }
+  private static void assertAsksAndReleases(  int expectedAsk,  int expectedRelease,  MyResourceManager rm){
+    Assert.assertEquals(expectedAsk,rm.getMyFifoScheduler().lastAsk.size());
+    Assert.assertEquals(expectedRelease,rm.getMyFifoScheduler().lastRelease.size());
+  }
+  private static void assertChanges(  int expectedIncrease,  int expectedDecrease,  MyResourceManager rm){
+    Assert.assertEquals(expectedIncrease,rm.getMyFifoScheduler().lastIncrease.size());
+    Assert.assertEquals(expectedDecrease,rm.getMyFifoScheduler().lastDecrease.size());
+  }
+  private ContainerRequest createReq(  int priority,  int memory,  String[] hosts){
+    Resource capability=Resource.newInstance(memory,1);
+    Priority priorityOfContainer=Priority.newInstance(priority);
+    return new ContainerRequest(capability,hosts,new String[]{NetworkTopology.DEFAULT_RACK},priorityOfContainer);
+  }
+}

@@ -1,0 +1,52 @@
+@Test public void testVerifySecondaryAbilityToReadWithOnFiles() throws Exception {
+  HTU.getConfiguration().setInt(StorefileRefresherChore.REGIONSERVER_STOREFILE_REFRESH_PERIOD,0);
+  restartRegionServer();
+  try {
+    LOG.info("Opening the secondary region " + hriSecondary.getEncodedName());
+    openRegion(HTU,getRS(),hriSecondary);
+    LOG.info("Loading data to primary region");
+    for (int i=0; i < 3; ++i) {
+      HTU.loadNumericRows(table,f,i * 1000,(i + 1) * 1000);
+      HRegion region=getRS().getRegionByEncodedName(hriPrimary.getEncodedName());
+      region.flush(true);
+    }
+    HRegion primaryRegion=getRS().getRegion(hriPrimary.getEncodedName());
+    Assert.assertEquals(3,primaryRegion.getStore(f).getStorefilesCount());
+    Region secondaryRegion=getRS().getRegion(hriSecondary.getEncodedName());
+    secondaryRegion.getStore(f).refreshStoreFiles();
+    Assert.assertEquals(3,secondaryRegion.getStore(f).getStorefilesCount());
+    LOG.info("Force Major compaction on primary region " + hriPrimary);
+    primaryRegion.compact(true);
+    Assert.assertEquals(1,primaryRegion.getStore(f).getStorefilesCount());
+    List<RegionServerThread> regionServerThreads=HTU.getMiniHBaseCluster().getRegionServerThreads();
+    HRegionServer hrs=null;
+    for (    RegionServerThread rs : regionServerThreads) {
+      if (rs.getRegionServer().getOnlineRegion(primaryRegion.getRegionInfo().getRegionName()) != null) {
+        hrs=rs.getRegionServer();
+        break;
+      }
+    }
+    CompactedHFilesDischarger cleaner=new CompactedHFilesDischarger(100,null,hrs,false);
+    cleaner.chore();
+    int keys=0;
+    int sum=0;
+    for (    HStoreFile sf : ((HStore)secondaryRegion.getStore(f)).getStorefiles()) {
+      LOG.debug(Boolean.toString(getRS().getFileSystem().exists(sf.getPath())));
+      Assert.assertFalse(getRS().getFileSystem().exists(sf.getPath()));
+      HFileScanner scanner=sf.getReader().getScanner(false,false);
+      scanner.seekTo();
+      do {
+        keys++;
+        Cell cell=scanner.getCell();
+        sum+=Integer.parseInt(Bytes.toString(cell.getRowArray(),cell.getRowOffset(),cell.getRowLength()));
+      }
+ while (scanner.next());
+    }
+    Assert.assertEquals(3000,keys);
+    Assert.assertEquals(4498500,sum);
+  }
+  finally {
+    HTU.deleteNumericRows(table,HConstants.CATALOG_FAMILY,0,1000);
+    closeRegion(HTU,getRS(),hriSecondary);
+  }
+}

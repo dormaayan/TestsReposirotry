@@ -1,0 +1,49 @@
+/** 
+ * The original intention of this test was to force an abort of a region server and to make sure that the failure path in the region servers is properly evaluated. But it is difficult to ensure that the region server doesn't finish the log splitting before it aborts. Also now, there is this code path where the master will preempt the region server when master detects that the region server has aborted.
+ * @throws Exception
+ */
+@Test public void testWorkerAbort() throws Exception {
+  LOG.info("testWorkerAbort");
+  startCluster(3);
+  int numLogLines=10000;
+  SplitLogManager slm=master.getMasterWalManager().getSplitLogManager();
+  FileSystem fs=master.getMasterFileSystem().getFileSystem();
+  List<RegionServerThread> rsts=cluster.getLiveRegionServerThreads();
+  HRegionServer hrs=findRSToKill(false);
+  Path rootdir=FSUtils.getRootDir(conf);
+  final Path logDir=new Path(rootdir,AbstractFSWALProvider.getWALDirectoryName(hrs.getServerName().toString()));
+  try (ZKWatcher zkw=new ZKWatcher(conf,"table-creation",null);Table t=installTable(zkw,40)){
+    makeWAL(hrs,ProtobufUtil.getOnlineRegions(hrs.getRSRpcServices()),numLogLines,100);
+    new Thread(){
+      @Override public void run(){
+        try {
+          waitForCounter(tot_wkr_task_acquired,0,1,1000);
+        }
+ catch (        InterruptedException e) {
+        }
+        for (        RegionServerThread rst : rsts) {
+          rst.getRegionServer().abort("testing");
+          break;
+        }
+      }
+    }
+.start();
+    FileStatus[] logfiles=fs.listStatus(logDir);
+    TaskBatch batch=new TaskBatch();
+    slm.enqueueSplitTask(logfiles[0].getPath().toString(),batch);
+    long curt=System.currentTimeMillis();
+    long waitTime=80000;
+    long endt=curt + waitTime;
+    while (curt < endt) {
+      if ((tot_wkr_task_resigned.sum() + tot_wkr_task_err.sum() + tot_wkr_final_transition_failed.sum()+ tot_wkr_task_done.sum()+ tot_wkr_preempt_task.sum()) == 0) {
+        Thread.sleep(100);
+        curt=System.currentTimeMillis();
+      }
+ else {
+        assertTrue(1 <= (tot_wkr_task_resigned.sum() + tot_wkr_task_err.sum() + tot_wkr_final_transition_failed.sum()+ tot_wkr_task_done.sum()+ tot_wkr_preempt_task.sum()));
+        return;
+      }
+    }
+    fail("none of the following counters went up in " + waitTime + " milliseconds - "+ "tot_wkr_task_resigned, tot_wkr_task_err, "+ "tot_wkr_final_transition_failed, tot_wkr_task_done, "+ "tot_wkr_preempt_task");
+  }
+ }

@@ -1,0 +1,178 @@
+@Test @SuppressWarnings("unchecked") public void testFailedDirsResourceRelease() throws Exception {
+  File f=new File(basedir.toString());
+  String[] sDirs=new String[4];
+  List<Path> localDirs=new ArrayList<Path>(sDirs.length);
+  for (int i=0; i < 4; ++i) {
+    sDirs[i]=f.getAbsolutePath() + i;
+    localDirs.add(new Path(sDirs[i]));
+  }
+  List<Path> containerLocalDirs=new ArrayList<Path>(localDirs.size());
+  List<Path> appLocalDirs=new ArrayList<Path>(localDirs.size());
+  List<Path> nmLocalContainerDirs=new ArrayList<Path>(localDirs.size());
+  List<Path> nmLocalAppDirs=new ArrayList<Path>(localDirs.size());
+  conf.setStrings(YarnConfiguration.NM_LOCAL_DIRS,sDirs);
+  conf.setLong(YarnConfiguration.NM_DISK_HEALTH_CHECK_INTERVAL_MS,500);
+  LocalizerTracker mockLocallilzerTracker=mock(LocalizerTracker.class);
+  DrainDispatcher dispatcher=new DrainDispatcher();
+  dispatcher.init(conf);
+  dispatcher.start();
+  EventHandler<ApplicationEvent> applicationBus=mock(EventHandler.class);
+  dispatcher.register(ApplicationEventType.class,applicationBus);
+  EventHandler<ContainerEvent> containerBus=mock(EventHandler.class);
+  dispatcher.register(ContainerEventType.class,containerBus);
+  EventHandler<LocalizerEvent> localizerBus=mock(EventHandler.class);
+  dispatcher.register(LocalizerEventType.class,localizerBus);
+  ContainerExecutor exec=mock(ContainerExecutor.class);
+  LocalDirsHandlerService mockDirsHandler=mock(LocalDirsHandlerService.class);
+  doReturn(new ArrayList<String>(Arrays.asList(sDirs))).when(mockDirsHandler).getLocalDirsForCleanup();
+  DeletionService delService=mock(DeletionService.class);
+  ResourceLocalizationService rawService=new ResourceLocalizationService(dispatcher,exec,delService,mockDirsHandler,nmContext,metrics);
+  ResourceLocalizationService spyService=spy(rawService);
+  doReturn(mockServer).when(spyService).createServer();
+  doReturn(mockLocallilzerTracker).when(spyService).createLocalizerTracker(isA(Configuration.class));
+  doReturn(lfs).when(spyService).getLocalFileContext(isA(Configuration.class));
+  FsPermission defaultPermission=FsPermission.getDirDefault().applyUMask(lfs.getUMask());
+  FsPermission nmPermission=ResourceLocalizationService.NM_PRIVATE_PERM.applyUMask(lfs.getUMask());
+  final FileStatus fs=new FileStatus(0,true,1,0,System.currentTimeMillis(),0,defaultPermission,"","",localDirs.get(0));
+  final FileStatus nmFs=new FileStatus(0,true,1,0,System.currentTimeMillis(),0,nmPermission,"","",localDirs.get(0));
+  final String user="user0";
+  final Application app=mock(Application.class);
+  final ApplicationId appId=BuilderUtils.newApplicationId(314159265358979L,3);
+  when(app.getUser()).thenReturn(user);
+  when(app.getAppId()).thenReturn(appId);
+  when(app.toString()).thenReturn(appId.toString());
+  final Container c=getMockContainer(appId,42,user);
+  List<String> tmpDirs=mockDirsHandler.getLocalDirs();
+  for (int i=0; i < tmpDirs.size(); ++i) {
+    Path usersdir=new Path(tmpDirs.get(i),ContainerLocalizer.USERCACHE);
+    Path userdir=new Path(usersdir,user);
+    Path allAppsdir=new Path(userdir,ContainerLocalizer.APPCACHE);
+    Path appDir=new Path(allAppsdir,appId.toString());
+    Path containerDir=new Path(appDir,c.getContainerId().toString());
+    containerLocalDirs.add(containerDir);
+    appLocalDirs.add(appDir);
+    Path sysDir=new Path(tmpDirs.get(i),ResourceLocalizationService.NM_PRIVATE_DIR);
+    Path appSysDir=new Path(sysDir,appId.toString());
+    Path containerSysDir=new Path(appSysDir,c.getContainerId().toString());
+    nmLocalContainerDirs.add(containerSysDir);
+    nmLocalAppDirs.add(appSysDir);
+  }
+  try {
+    spyService.init(conf);
+    spyService.start();
+    spyService.handle(new ApplicationLocalizationEvent(LocalizationEventType.INIT_APPLICATION_RESOURCES,app));
+    dispatcher.await();
+    LocalResourcesTracker appTracker=spyService.getLocalResourcesTracker(LocalResourceVisibility.APPLICATION,user,appId);
+    LocalResourcesTracker privTracker=spyService.getLocalResourcesTracker(LocalResourceVisibility.PRIVATE,user,appId);
+    LocalResourcesTracker pubTracker=spyService.getLocalResourcesTracker(LocalResourceVisibility.PUBLIC,user,appId);
+    Random r=new Random();
+    long seed=r.nextLong();
+    r.setSeed(seed);
+    final LocalResource privResource=getPrivateMockedResource(r);
+    final LocalResourceRequest privReq=new LocalResourceRequest(privResource);
+    final LocalResource appResource=getAppMockedResource(r);
+    final LocalResourceRequest appReq=new LocalResourceRequest(appResource);
+    final LocalResource pubResource=getPublicMockedResource(r);
+    final LocalResourceRequest pubReq=new LocalResourceRequest(pubResource);
+    Map<LocalResourceVisibility,Collection<LocalResourceRequest>> req=new HashMap<LocalResourceVisibility,Collection<LocalResourceRequest>>();
+    req.put(LocalResourceVisibility.PRIVATE,Collections.singletonList(privReq));
+    req.put(LocalResourceVisibility.APPLICATION,Collections.singletonList(appReq));
+    req.put(LocalResourceVisibility.PUBLIC,Collections.singletonList(pubReq));
+    Map<LocalResourceVisibility,Collection<LocalResourceRequest>> req2=new HashMap<LocalResourceVisibility,Collection<LocalResourceRequest>>();
+    req2.put(LocalResourceVisibility.PRIVATE,Collections.singletonList(privReq));
+    spyService.handle(new ContainerLocalizationRequestEvent(c,req));
+    spyService.handle(new ContainerLocalizationRequestEvent(c,req2));
+    dispatcher.await();
+    int privRsrcCount=0;
+    for (    LocalizedResource lr : privTracker) {
+      privRsrcCount++;
+      Assert.assertEquals("Incorrect reference count",2,lr.getRefCount());
+      Assert.assertEquals(privReq,lr.getRequest());
+    }
+    Assert.assertEquals(1,privRsrcCount);
+    int appRsrcCount=0;
+    for (    LocalizedResource lr : appTracker) {
+      appRsrcCount++;
+      Assert.assertEquals("Incorrect reference count",1,lr.getRefCount());
+      Assert.assertEquals(appReq,lr.getRequest());
+    }
+    Assert.assertEquals(1,appRsrcCount);
+    int pubRsrcCount=0;
+    for (    LocalizedResource lr : pubTracker) {
+      pubRsrcCount++;
+      Assert.assertEquals("Incorrect reference count",1,lr.getRefCount());
+      Assert.assertEquals(pubReq,lr.getRequest());
+    }
+    Assert.assertEquals(1,pubRsrcCount);
+    for (int i=0; i < containerLocalDirs.size(); ++i) {
+      if (i == 2) {
+        Mockito.doThrow(new IOException()).when(spylfs).getFileStatus(eq(containerLocalDirs.get(i)));
+        Mockito.doThrow(new IOException()).when(spylfs).getFileStatus(eq(nmLocalContainerDirs.get(i)));
+      }
+ else {
+        doReturn(fs).when(spylfs).getFileStatus(eq(containerLocalDirs.get(i)));
+        doReturn(nmFs).when(spylfs).getFileStatus(eq(nmLocalContainerDirs.get(i)));
+      }
+    }
+    spyService.handle(new ContainerLocalizationCleanupEvent(c,req));
+    verify(mockLocallilzerTracker).cleanupPrivLocalizers("container_314159265358979_0003_01_000042");
+    for (int i=0; i < containerLocalDirs.size(); ++i) {
+      if (i == 2) {
+        try {
+          verify(delService,times(1)).delete(argThat(new FileDeletionMatcher(delService,user,containerLocalDirs.get(i),null)));
+          verify(delService,times(1)).delete(argThat(new FileDeletionMatcher(delService,null,nmLocalContainerDirs.get(i),null)));
+          Assert.fail("deletion attempts for invalid dirs");
+        }
+ catch (        Throwable e) {
+          continue;
+        }
+      }
+ else {
+        verify(delService,times(1)).delete(argThat(new FileDeletionMatcher(delService,user,containerLocalDirs.get(i),null)));
+        verify(delService,times(1)).delete(argThat(new FileDeletionMatcher(delService,null,nmLocalContainerDirs.get(i),null)));
+      }
+    }
+    ArgumentMatcher<ApplicationEvent> matchesAppDestroy=new ArgumentMatcher<ApplicationEvent>(){
+      @Override public boolean matches(      Object o){
+        ApplicationEvent evt=(ApplicationEvent)o;
+        return (evt.getType() == ApplicationEventType.APPLICATION_RESOURCES_CLEANEDUP) && appId == evt.getApplicationID();
+      }
+    }
+;
+    dispatcher.await();
+    for (int i=0; i < containerLocalDirs.size(); ++i) {
+      if (i == 3) {
+        Mockito.doThrow(new IOException()).when(spylfs).getFileStatus(eq(appLocalDirs.get(i)));
+        Mockito.doThrow(new UnsupportedFileSystemException("test")).when(spylfs).getFileStatus(eq(nmLocalAppDirs.get(i)));
+      }
+ else {
+        doReturn(fs).when(spylfs).getFileStatus(eq(appLocalDirs.get(i)));
+        doReturn(nmFs).when(spylfs).getFileStatus(eq(nmLocalAppDirs.get(i)));
+      }
+    }
+    LocalizationEvent destroyApp=new ApplicationLocalizationEvent(LocalizationEventType.DESTROY_APPLICATION_RESOURCES,app);
+    spyService.handle(destroyApp);
+    dispatcher.await();
+    verify(applicationBus).handle(argThat(matchesAppDestroy));
+    for (int i=0; i < containerLocalDirs.size(); ++i) {
+      if (i == 3) {
+        try {
+          verify(delService,times(1)).delete(argThat(new FileDeletionMatcher(delService,user,containerLocalDirs.get(i),null)));
+          verify(delService,times(1)).delete(argThat(new FileDeletionMatcher(delService,null,nmLocalContainerDirs.get(i),null)));
+          Assert.fail("deletion attempts for invalid dirs");
+        }
+ catch (        Throwable e) {
+          continue;
+        }
+      }
+ else {
+        verify(delService,times(1)).delete(argThat(new FileDeletionMatcher(delService,user,containerLocalDirs.get(i),null)));
+        verify(delService,times(1)).delete(argThat(new FileDeletionMatcher(delService,null,nmLocalContainerDirs.get(i),null)));
+      }
+    }
+  }
+  finally {
+    dispatcher.stop();
+    delService.stop();
+  }
+}

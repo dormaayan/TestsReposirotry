@@ -1,0 +1,90 @@
+public class GlobalModVersionTest extends TestLogger {
+  /** 
+ * Tests that failures during a global cancellation are not handed to the local failover strategy.
+ */
+  @Test public void testNoLocalFailoverWhileCancelling() throws Exception {
+    final FailoverStrategy mockStrategy=mock(FailoverStrategy.class);
+    final ExecutionGraph graph=createSampleGraph(mockStrategy);
+    final ExecutionVertex testVertex=getRandomVertex(graph);
+    graph.scheduleForExecution();
+    assertEquals(JobStatus.RUNNING,graph.getState());
+    assertEquals(1L,graph.getGlobalModVersion());
+    for (    ExecutionVertex v : graph.getVerticesTopologically().iterator().next().getTaskVertices()) {
+      final Execution exec=v.getCurrentExecutionAttempt();
+      waitUntilExecutionState(exec,ExecutionState.DEPLOYING,1000);
+      exec.switchToRunning();
+      assertEquals(ExecutionState.RUNNING,exec.getState());
+    }
+    graph.cancel();
+    assertEquals(2L,graph.getGlobalModVersion());
+    for (    ExecutionVertex v : graph.getVerticesTopologically().iterator().next().getTaskVertices()) {
+      final Execution exec=v.getCurrentExecutionAttempt();
+      assertEquals(ExecutionState.CANCELING,exec.getState());
+    }
+    testVertex.getCurrentExecutionAttempt().fail(new Exception("test exception"));
+    for (    ExecutionVertex v : graph.getVerticesTopologically().iterator().next().getTaskVertices()) {
+      final Execution exec=v.getCurrentExecutionAttempt();
+      exec.cancelingComplete();
+    }
+    assertEquals(JobStatus.CANCELED,graph.getTerminationFuture().get());
+    verify(mockStrategy,times(0)).onTaskFailure(any(Execution.class),any(Throwable.class));
+  }
+  /** 
+ * Tests that failures during a global failover are not handed to the local failover strategy.
+ */
+  @Test public void testNoLocalFailoverWhileFailing() throws Exception {
+    final FailoverStrategy mockStrategy=mock(FailoverStrategy.class);
+    final ExecutionGraph graph=createSampleGraph(mockStrategy);
+    final ExecutionVertex testVertex=getRandomVertex(graph);
+    graph.scheduleForExecution();
+    assertEquals(JobStatus.RUNNING,graph.getState());
+    for (    ExecutionVertex v : graph.getVerticesTopologically().iterator().next().getTaskVertices()) {
+      final Execution exec=v.getCurrentExecutionAttempt();
+      waitUntilExecutionState(exec,ExecutionState.DEPLOYING,1000);
+      exec.switchToRunning();
+      assertEquals(ExecutionState.RUNNING,exec.getState());
+    }
+    graph.failGlobal(new Exception("global failover"));
+    assertEquals(JobStatus.FAILING,graph.getState());
+    assertEquals(2L,graph.getGlobalModVersion());
+    graph.failGlobal(new Exception("should be ignored"));
+    assertEquals(JobStatus.FAILING,graph.getState());
+    assertEquals(2L,graph.getGlobalModVersion());
+    for (    ExecutionVertex v : graph.getVerticesTopologically().iterator().next().getTaskVertices()) {
+      final Execution exec=v.getCurrentExecutionAttempt();
+      assertEquals(ExecutionState.CANCELING,exec.getState());
+    }
+    testVertex.getCurrentExecutionAttempt().fail(new Exception("test exception"));
+    for (    ExecutionVertex v : graph.getVerticesTopologically().iterator().next().getTaskVertices()) {
+      final Execution exec=v.getCurrentExecutionAttempt();
+      exec.cancelingComplete();
+    }
+    assertEquals(JobStatus.RESTARTING,graph.getState());
+    verify(mockStrategy,times(0)).onTaskFailure(any(Execution.class),any(Throwable.class));
+  }
+  private ExecutionGraph createSampleGraph(  FailoverStrategy failoverStrategy) throws Exception {
+    final JobID jid=new JobID();
+    final int parallelism=new Random().nextInt(10) + 1;
+    final SimpleSlotProvider slotProvider=new SimpleSlotProvider(jid,parallelism);
+    final ExecutionGraph graph=new ExecutionGraph(new DummyJobInformation(jid,"test job"),TestingUtils.defaultExecutor(),TestingUtils.defaultExecutor(),Time.seconds(10),new InfiniteDelayRestartStrategy(),new CustomStrategy(failoverStrategy),slotProvider);
+    JobVertex jv=new JobVertex("test vertex");
+    jv.setInvokableClass(NoOpInvokable.class);
+    jv.setParallelism(parallelism);
+    JobGraph jg=new JobGraph(jid,"testjob",jv);
+    graph.attachJobGraph(jg.getVerticesSortedTopologicallyFromSources());
+    return graph;
+  }
+  private static ExecutionVertex getRandomVertex(  ExecutionGraph eg){
+    final ExecutionVertex[] vertices=eg.getVerticesTopologically().iterator().next().getTaskVertices();
+    return vertices[new Random().nextInt(vertices.length)];
+  }
+private static class CustomStrategy implements Factory {
+    private final FailoverStrategy failoverStrategy;
+    CustomStrategy(    FailoverStrategy failoverStrategy){
+      this.failoverStrategy=failoverStrategy;
+    }
+    @Override public FailoverStrategy create(    ExecutionGraph executionGraph){
+      return failoverStrategy;
+    }
+  }
+}

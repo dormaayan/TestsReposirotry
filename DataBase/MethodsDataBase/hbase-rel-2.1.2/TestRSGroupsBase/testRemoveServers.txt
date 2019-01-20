@@ -1,0 +1,55 @@
+@Test public void testRemoveServers() throws Exception {
+  LOG.info("testRemoveServers");
+  final RSGroupInfo newGroup=addGroup(getGroupName(name.getMethodName()),3);
+  Iterator<Address> iterator=newGroup.getServers().iterator();
+  ServerName targetServer=ServerName.parseServerName(iterator.next().toString());
+  try {
+    rsGroupAdmin.removeServers(Sets.newHashSet(targetServer.getAddress()));
+    fail("Online servers shouldn't have been successfully removed.");
+  }
+ catch (  IOException ex) {
+    String exp="Server " + targetServer.getAddress() + " is an online server, not allowed to remove.";
+    String msg="Expected '" + exp + "' in exception message: ";
+    assertTrue(msg + " " + ex.getMessage(),ex.getMessage().contains(exp));
+  }
+  assertTrue(newGroup.getServers().contains(targetServer.getAddress()));
+  NUM_DEAD_SERVERS=cluster.getClusterMetrics().getDeadServerNames().size();
+  AdminProtos.AdminService.BlockingInterface targetRS=((ClusterConnection)admin.getConnection()).getAdmin(targetServer);
+  try {
+    targetServer=ProtobufUtil.toServerName(targetRS.getServerInfo(null,GetServerInfoRequest.newBuilder().build()).getServerInfo().getServerName());
+    LOG.info("stopping server " + targetServer.getHostAndPort());
+    targetRS.stopServer(null,AdminProtos.StopServerRequest.newBuilder().setReason("Die").build());
+    NUM_DEAD_SERVERS++;
+  }
+ catch (  Exception e) {
+  }
+  TEST_UTIL.waitFor(WAIT_TIMEOUT,new Waiter.Predicate<Exception>(){
+    @Override public boolean evaluate() throws Exception {
+      return !master.getServerManager().areDeadServersInProgress() && cluster.getClusterMetrics().getDeadServerNames().size() == NUM_DEAD_SERVERS;
+    }
+  }
+);
+  try {
+    rsGroupAdmin.removeServers(Sets.newHashSet(targetServer.getAddress()));
+    fail("Dead servers shouldn't have been successfully removed.");
+  }
+ catch (  IOException ex) {
+    String exp="Server " + targetServer.getAddress() + " is on the dead servers list,"+ " Maybe it will come back again, not allowed to remove.";
+    String msg="Expected '" + exp + "' in exception message: ";
+    assertTrue(msg + " " + ex.getMessage(),ex.getMessage().contains(exp));
+  }
+  assertTrue(newGroup.getServers().contains(targetServer.getAddress()));
+  List<ServerName> serversToDecommission=new ArrayList<>();
+  targetServer=ServerName.parseServerName(iterator.next().toString());
+  targetRS=((ClusterConnection)admin.getConnection()).getAdmin(targetServer);
+  targetServer=ProtobufUtil.toServerName(targetRS.getServerInfo(null,GetServerInfoRequest.newBuilder().build()).getServerInfo().getServerName());
+  assertTrue(master.getServerManager().getOnlineServers().containsKey(targetServer));
+  serversToDecommission.add(targetServer);
+  admin.decommissionRegionServers(serversToDecommission,true);
+  assertEquals(1,admin.listDecommissionedRegionServers().size());
+  assertTrue(newGroup.getServers().contains(targetServer.getAddress()));
+  rsGroupAdmin.removeServers(Sets.newHashSet(targetServer.getAddress()));
+  Set<Address> newGroupServers=rsGroupAdmin.getRSGroupInfo(newGroup.getName()).getServers();
+  assertFalse(newGroupServers.contains(targetServer.getAddress()));
+  assertEquals(2,newGroupServers.size());
+}

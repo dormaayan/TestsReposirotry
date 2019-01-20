@@ -1,0 +1,90 @@
+@Category({MediumTests.class,ClientTests.class}) public class TestClientTimeouts {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestClientTimeouts.class);
+  private final static HBaseTestingUtility TEST_UTIL=new HBaseTestingUtility();
+  protected static int SLAVES=1;
+  /** 
+ * @throws java.lang.Exception
+ */
+  @BeforeClass public static void setUpBeforeClass() throws Exception {
+    TEST_UTIL.startMiniCluster(SLAVES);
+    TEST_UTIL.getConfiguration().set(RpcClientFactory.CUSTOM_RPC_CLIENT_IMPL_CONF_KEY,RandomTimeoutRpcClient.class.getName());
+  }
+  /** 
+ * @throws java.lang.Exception
+ */
+  @AfterClass public static void tearDownAfterClass() throws Exception {
+    TEST_UTIL.shutdownMiniCluster();
+  }
+  /** 
+ * Test that a client that fails an RPC to the master retries properly and doesn't throw any unexpected exceptions.
+ * @throws Exception
+ */
+  @Test public void testAdminTimeout() throws Exception {
+    boolean lastFailed=false;
+    int initialInvocations=RandomTimeoutBlockingRpcChannel.invokations.get();
+    RandomTimeoutRpcClient rpcClient=(RandomTimeoutRpcClient)RpcClientFactory.createClient(TEST_UTIL.getConfiguration(),TEST_UTIL.getClusterKey());
+    try {
+      for (int i=0; i < 5 || (lastFailed && i < 100); ++i) {
+        lastFailed=false;
+        Configuration conf=HBaseConfiguration.create(TEST_UTIL.getConfiguration());
+        conf.set(HConstants.HBASE_CLIENT_INSTANCE_ID,String.valueOf(-1));
+        Admin admin=null;
+        Connection connection=null;
+        try {
+          connection=ConnectionFactory.createConnection(conf);
+          admin=connection.getAdmin();
+          HBaseAdmin.available(conf);
+          admin.setBalancerRunning(false,false);
+        }
+ catch (        MasterNotRunningException ex) {
+          lastFailed=true;
+        }
+ finally {
+          if (admin != null) {
+            admin.close();
+            if (admin.getConnection().isClosed()) {
+              rpcClient=(RandomTimeoutRpcClient)RpcClientFactory.createClient(TEST_UTIL.getConfiguration(),TEST_UTIL.getClusterKey());
+            }
+          }
+          if (connection != null) {
+            connection.close();
+          }
+        }
+      }
+      assertFalse(lastFailed);
+      assertTrue(RandomTimeoutBlockingRpcChannel.invokations.get() > initialInvocations);
+    }
+  finally {
+      rpcClient.close();
+    }
+  }
+  /** 
+ * Rpc Channel implementation with RandomTimeoutBlockingRpcChannel
+ */
+public static class RandomTimeoutRpcClient extends BlockingRpcClient {
+    public RandomTimeoutRpcClient(    Configuration conf,    String clusterId,    SocketAddress localAddr,    MetricsConnection metrics){
+      super(conf,clusterId,localAddr,metrics);
+    }
+    @Override public BlockingRpcChannel createBlockingRpcChannel(    ServerName sn,    User ticket,    int rpcTimeout) throws UnknownHostException {
+      return new RandomTimeoutBlockingRpcChannel(this,sn,ticket,rpcTimeout);
+    }
+  }
+  /** 
+ * Blocking rpc channel that goes via hbase rpc.
+ */
+static class RandomTimeoutBlockingRpcChannel extends AbstractRpcClient.BlockingRpcChannelImplementation {
+    private static final Random RANDOM=new Random(System.currentTimeMillis());
+    public static final double CHANCE_OF_TIMEOUT=0.3;
+    private static AtomicInteger invokations=new AtomicInteger();
+    RandomTimeoutBlockingRpcChannel(    final BlockingRpcClient rpcClient,    final ServerName sn,    final User ticket,    final int rpcTimeout){
+      super(rpcClient,new InetSocketAddress(sn.getHostname(),sn.getPort()),ticket,rpcTimeout);
+    }
+    @Override public Message callBlockingMethod(    MethodDescriptor md,    RpcController controller,    Message param,    Message returnType) throws ServiceException {
+      invokations.getAndIncrement();
+      if (RANDOM.nextFloat() < CHANCE_OF_TIMEOUT) {
+        throw new ServiceException(new SocketTimeoutException("fake timeout"));
+      }
+      return super.callBlockingMethod(md,controller,param,returnType);
+    }
+  }
+}

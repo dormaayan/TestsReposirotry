@@ -1,0 +1,230 @@
+public class TestSchedulingRequestContainerAllocation {
+  private final int GB=1024;
+  private YarnConfiguration conf;
+  RMNodeLabelsManager mgr;
+  @Before public void setUp() throws Exception {
+    conf=new YarnConfiguration();
+    conf.setClass(YarnConfiguration.RM_SCHEDULER,CapacityScheduler.class,ResourceScheduler.class);
+    mgr=new NullRMNodeLabelsManager();
+    mgr.init(conf);
+  }
+  @Test public void testIntraAppAntiAffinity() throws Exception {
+    Configuration csConf=TestUtils.getConfigurationWithMultipleQueues(new Configuration());
+    csConf.set(YarnConfiguration.RM_PLACEMENT_CONSTRAINTS_HANDLER,YarnConfiguration.SCHEDULER_RM_PLACEMENT_CONSTRAINTS_HANDLER);
+    MockRM rm1=new MockRM(csConf){
+      @Override public RMNodeLabelsManager createNodeLabelManager(){
+        return mgr;
+      }
+    }
+;
+    rm1.getRMContext().setNodeLabelManager(mgr);
+    rm1.start();
+    MockNM[] nms=new MockNM[4];
+    RMNode[] rmNodes=new RMNode[4];
+    for (int i=0; i < 4; i++) {
+      nms[i]=rm1.registerNode("192.168.0." + i + ":1234",10 * GB);
+      rmNodes[i]=rm1.getRMContext().getRMNodes().get(nms[i].getNodeId());
+    }
+    RMApp app1=rm1.submitApp(1 * GB,"app","user",null,"c");
+    MockAM am1=MockRM.launchAndRegisterAM(app1,rm1,nms[0]);
+    am1.allocateIntraAppAntiAffinity(ResourceSizing.newInstance(10,Resource.newInstance(1024,1)),Priority.newInstance(1),1L,ImmutableSet.of("mapper"),"mapper");
+    CapacityScheduler cs=(CapacityScheduler)rm1.getResourceScheduler();
+    for (int i=0; i < 3; i++) {
+      for (int j=0; j < 4; j++) {
+        cs.handle(new NodeUpdateSchedulerEvent(rmNodes[j]));
+      }
+    }
+    FiCaSchedulerApp schedulerApp=cs.getApplicationAttempt(am1.getApplicationAttemptId());
+    Assert.assertEquals(5,schedulerApp.getLiveContainers().size());
+    am1.allocateIntraAppAntiAffinity(ResourceSizing.newInstance(10,Resource.newInstance(2048,1)),Priority.newInstance(2),1L,ImmutableSet.of("reducer"),"reducer");
+    for (int i=0; i < 3; i++) {
+      for (int j=0; j < 4; j++) {
+        cs.handle(new NodeUpdateSchedulerEvent(rmNodes[j]));
+      }
+    }
+    Assert.assertEquals(9,schedulerApp.getLiveContainers().size());
+    am1.allocateIntraAppAntiAffinity(ResourceSizing.newInstance(10,Resource.newInstance(2048,1)),Priority.newInstance(3),1L,ImmutableSet.of("reducer2"),"mapper");
+    for (int i=0; i < 3; i++) {
+      for (int j=0; j < 4; j++) {
+        cs.handle(new NodeUpdateSchedulerEvent(rmNodes[j]));
+      }
+    }
+    Assert.assertEquals(9,schedulerApp.getLiveContainers().size());
+    rm1.close();
+  }
+  @Test public void testIntraAppAntiAffinityWithMultipleTags() throws Exception {
+    Configuration csConf=TestUtils.getConfigurationWithMultipleQueues(new Configuration());
+    csConf.set(YarnConfiguration.RM_PLACEMENT_CONSTRAINTS_HANDLER,YarnConfiguration.SCHEDULER_RM_PLACEMENT_CONSTRAINTS_HANDLER);
+    MockRM rm1=new MockRM(csConf){
+      @Override public RMNodeLabelsManager createNodeLabelManager(){
+        return mgr;
+      }
+    }
+;
+    rm1.getRMContext().setNodeLabelManager(mgr);
+    rm1.start();
+    MockNM[] nms=new MockNM[4];
+    RMNode[] rmNodes=new RMNode[4];
+    for (int i=0; i < 4; i++) {
+      nms[i]=rm1.registerNode("192.168.0." + i + ":1234",10 * GB);
+      rmNodes[i]=rm1.getRMContext().getRMNodes().get(nms[i].getNodeId());
+    }
+    RMApp app1=rm1.submitApp(1 * GB,"app","user",null,"c");
+    MockAM am1=MockRM.launchAndRegisterAM(app1,rm1,nms[0]);
+    am1.allocateIntraAppAntiAffinity(ResourceSizing.newInstance(2,Resource.newInstance(1024,1)),Priority.newInstance(1),1L,ImmutableSet.of("tag_1_1","tag_1_2"),"tag_1_1","tag_1_2");
+    CapacityScheduler cs=(CapacityScheduler)rm1.getResourceScheduler();
+    for (int i=0; i < 3; i++) {
+      for (int j=0; j < 4; j++) {
+        cs.handle(new NodeUpdateSchedulerEvent(rmNodes[j]));
+      }
+    }
+    FiCaSchedulerApp schedulerApp=cs.getApplicationAttempt(am1.getApplicationAttemptId());
+    Assert.assertEquals(3,schedulerApp.getLiveContainers().size());
+    am1.allocateIntraAppAntiAffinity(ResourceSizing.newInstance(1,Resource.newInstance(1024,1)),Priority.newInstance(2),1L,ImmutableSet.of("tag_2_1","tag_2_2"),"tag_1_1","tag_1_2");
+    for (int i=0; i < 3; i++) {
+      for (int j=0; j < 4; j++) {
+        cs.handle(new NodeUpdateSchedulerEvent(rmNodes[j]));
+      }
+    }
+    Assert.assertEquals(4,schedulerApp.getLiveContainers().size());
+    am1.allocateIntraAppAntiAffinity(ResourceSizing.newInstance(1,Resource.newInstance(1024,1)),Priority.newInstance(3),1L,ImmutableSet.of("tag_3"),"tag_1_1","tag_1_2","tag_2_1","tag_2_2");
+    for (int i=0; i < 3; i++) {
+      for (int j=0; j < 4; j++) {
+        cs.handle(new NodeUpdateSchedulerEvent(rmNodes[j]));
+      }
+    }
+    Assert.assertEquals(5,schedulerApp.getLiveContainers().size());
+    rm1.close();
+  }
+  /** 
+ * This UT covers some basic end-to-end inter-app anti-affinity constraint tests. For comprehensive tests over different namespace types, see more in TestPlacementConstraintsUtil.
+ * @throws Exception
+ */
+  @Test public void testInterAppAntiAffinity() throws Exception {
+    Configuration csConf=TestUtils.getConfigurationWithMultipleQueues(new Configuration());
+    csConf.set(YarnConfiguration.RM_PLACEMENT_CONSTRAINTS_HANDLER,YarnConfiguration.SCHEDULER_RM_PLACEMENT_CONSTRAINTS_HANDLER);
+    MockRM rm1=new MockRM(csConf){
+      @Override public RMNodeLabelsManager createNodeLabelManager(){
+        return mgr;
+      }
+    }
+;
+    rm1.getRMContext().setNodeLabelManager(mgr);
+    rm1.start();
+    MockNM[] nms=new MockNM[4];
+    RMNode[] rmNodes=new RMNode[4];
+    for (int i=0; i < 4; i++) {
+      nms[i]=rm1.registerNode("192.168.0." + i + ":1234",10 * GB);
+      rmNodes[i]=rm1.getRMContext().getRMNodes().get(nms[i].getNodeId());
+    }
+    RMApp app1=rm1.submitApp(1 * GB,"app","user",null,"c");
+    MockAM am1=MockRM.launchAndRegisterAM(app1,rm1,nms[0]);
+    am1.allocateIntraAppAntiAffinity(ResourceSizing.newInstance(3,Resource.newInstance(1024,1)),Priority.newInstance(1),1L,ImmutableSet.of("mapper"),"mapper");
+    CapacityScheduler cs=(CapacityScheduler)rm1.getResourceScheduler();
+    for (int i=0; i < 3; i++) {
+      for (int j=0; j < 4; j++) {
+        cs.handle(new NodeUpdateSchedulerEvent(rmNodes[j]));
+      }
+    }
+    System.out.println("Mappers on HOST0: " + rmNodes[0].getAllocationTagsWithCount().get("mapper"));
+    System.out.println("Mappers on HOST1: " + rmNodes[1].getAllocationTagsWithCount().get("mapper"));
+    System.out.println("Mappers on HOST2: " + rmNodes[2].getAllocationTagsWithCount().get("mapper"));
+    FiCaSchedulerApp schedulerApp=cs.getApplicationAttempt(am1.getApplicationAttemptId());
+    Assert.assertEquals(4,schedulerApp.getLiveContainers().size());
+    RMApp app2=rm1.submitApp(1 * GB,"app","user",null,"c");
+    MockAM am2=MockRM.launchAndRegisterAM(app2,rm1,nms[0]);
+    TargetApplicationsNamespace.All allNs=new TargetApplicationsNamespace.All();
+    am2.allocateAppAntiAffinity(ResourceSizing.newInstance(3,Resource.newInstance(1024,1)),Priority.newInstance(1),1L,allNs.toString(),ImmutableSet.of("foo"),"mapper");
+    for (int i=0; i < 3; i++) {
+      for (int j=0; j < 4; j++) {
+        cs.handle(new NodeUpdateSchedulerEvent(rmNodes[j]));
+      }
+    }
+    FiCaSchedulerApp schedulerApp2=cs.getApplicationAttempt(am2.getApplicationAttemptId());
+    Assert.assertEquals(4,schedulerApp2.getLiveContainers().size());
+    Assert.assertTrue(schedulerApp2.getLiveContainers().stream().allMatch(rmContainer -> {
+      if (!rmContainer.getContainer().getNodeId().equals(rmNodes[0])) {
+        return !rmContainer.getAllocationTags().contains("mapper");
+      }
+      return true;
+    }
+));
+    RMApp app3=rm1.submitApp(1 * GB,"app","user",null,"c");
+    MockAM am3=MockRM.launchAndRegisterAM(app3,rm1,nms[0]);
+    am3.allocateAppAntiAffinity(ResourceSizing.newInstance(3,Resource.newInstance(1024,1)),Priority.newInstance(1),1L,allNs.toString(),ImmutableSet.of("mapper"),"mapper");
+    for (int i=0; i < 3; i++) {
+      for (int j=0; j < 4; j++) {
+        cs.handle(new NodeUpdateSchedulerEvent(rmNodes[j]));
+      }
+    }
+    FiCaSchedulerApp schedulerApp3=cs.getApplicationAttempt(am3.getApplicationAttemptId());
+    Assert.assertEquals(2,schedulerApp3.getLiveContainers().size());
+    rm1.close();
+  }
+  @Test public void testSchedulingRequestDisabledByDefault() throws Exception {
+    Configuration csConf=TestUtils.getConfigurationWithMultipleQueues(new Configuration());
+    MockRM rm1=new MockRM(csConf){
+      @Override public RMNodeLabelsManager createNodeLabelManager(){
+        return mgr;
+      }
+    }
+;
+    rm1.getRMContext().setNodeLabelManager(mgr);
+    rm1.start();
+    MockNM[] nms=new MockNM[4];
+    RMNode[] rmNodes=new RMNode[4];
+    for (int i=0; i < 4; i++) {
+      nms[i]=rm1.registerNode("192.168.0." + i + ":1234",10 * GB);
+      rmNodes[i]=rm1.getRMContext().getRMNodes().get(nms[i].getNodeId());
+    }
+    RMApp app1=rm1.submitApp(1 * GB,"app","user",null,"c");
+    MockAM am1=MockRM.launchAndRegisterAM(app1,rm1,nms[0]);
+    boolean caughtException=false;
+    try {
+      am1.allocateIntraAppAntiAffinity(ResourceSizing.newInstance(2,Resource.newInstance(1024,1)),Priority.newInstance(1),1L,ImmutableSet.of("tag_1_1","tag_1_2"),"tag_1_1","tag_1_2");
+    }
+ catch (    Exception e) {
+      caughtException=true;
+    }
+    Assert.assertTrue(caughtException);
+    rm1.close();
+  }
+  @Test public void testSchedulingRequestWithNullConstraint() throws Exception {
+    Configuration csConf=TestUtils.getConfigurationWithMultipleQueues(new Configuration());
+    csConf.set(YarnConfiguration.RM_PLACEMENT_CONSTRAINTS_HANDLER,YarnConfiguration.SCHEDULER_RM_PLACEMENT_CONSTRAINTS_HANDLER);
+    MockRM rm1=new MockRM(csConf){
+      @Override public RMNodeLabelsManager createNodeLabelManager(){
+        return mgr;
+      }
+    }
+;
+    rm1.getRMContext().setNodeLabelManager(mgr);
+    rm1.start();
+    MockNM[] nms=new MockNM[4];
+    RMNode[] rmNodes=new RMNode[4];
+    for (int i=0; i < 4; i++) {
+      nms[i]=rm1.registerNode("192.168.0." + i + ":1234",10 * GB);
+      rmNodes[i]=rm1.getRMContext().getRMNodes().get(nms[i].getNodeId());
+    }
+    RMApp app1=rm1.submitApp(1 * GB,"app","user",null,"c");
+    MockAM am1=MockRM.launchAndRegisterAM(app1,rm1,nms[0]);
+    CapacityScheduler cs=(CapacityScheduler)rm1.getResourceScheduler();
+    PlacementConstraint constraint=PlacementConstraints.targetNotIn("node",allocationTag("t1")).build();
+    SchedulingRequest sc=SchedulingRequest.newInstance(0,Priority.newInstance(1),ExecutionTypeRequest.newInstance(ExecutionType.GUARANTEED),ImmutableSet.of("t1"),ResourceSizing.newInstance(1,Resource.newInstance(1024,1)),constraint);
+    AllocateRequest request=AllocateRequest.newBuilder().schedulingRequests(ImmutableList.of(sc)).build();
+    am1.allocate(request);
+    for (int i=0; i < 4; i++) {
+      cs.handle(new NodeUpdateSchedulerEvent(rmNodes[i]));
+    }
+    FiCaSchedulerApp schedApp=cs.getApplicationAttempt(am1.getApplicationAttemptId());
+    Assert.assertEquals(2,schedApp.getLiveContainers().size());
+    sc=SchedulingRequest.newInstance(1,Priority.newInstance(1),ExecutionTypeRequest.newInstance(ExecutionType.GUARANTEED),ImmutableSet.of("t2"),ResourceSizing.newInstance(2,Resource.newInstance(1024,1)),null);
+    AllocateRequest request1=AllocateRequest.newBuilder().schedulingRequests(ImmutableList.of(sc)).build();
+    am1.allocate(request1);
+    for (int i=0; i < 4; i++) {
+      cs.handle(new NodeUpdateSchedulerEvent(rmNodes[i]));
+    }
+    Assert.assertEquals(4,schedApp.getLiveContainers().size());
+    rm1.close();
+  }
+}

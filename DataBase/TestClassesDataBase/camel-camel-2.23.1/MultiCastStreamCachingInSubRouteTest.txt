@@ -1,0 +1,63 @@
+public class MultiCastStreamCachingInSubRouteTest extends ContextTestSupport {
+  @Override protected RouteBuilder createRouteBuilder() throws Exception {
+    return new RouteBuilder(){
+      @Override public void configure() throws Exception {
+        context.setStreamCaching(true);
+        context.getStreamCachingStrategy().setEnabled(true);
+        context.getStreamCachingStrategy().setSpoolDirectory("target/camel/cache");
+        context.getStreamCachingStrategy().setSpoolThreshold(1L);
+        from("direct:start").multicast(new InternalAggregationStrategy()).to("direct:a","direct:b").end().to("mock:result");
+        from("direct:startNestedMultiCast").multicast(new InternalAggregationStrategy()).to("direct:start").end().to("mock:resultNested");
+        from("direct:a").process(new InputProcessorWithStreamCache(1)).to("mock:resulta");
+        from("direct:b").process(new InputProcessorWithStreamCache(2)).to("mock:resultb");
+      }
+    }
+;
+  }
+  @Test public void testWithAggregationStrategyAndStreamCacheInSubRoute() throws Exception {
+    MockEndpoint mock=getMockEndpoint("mock:result");
+    mock.expectedBodiesReceived("Test Message 1Test Message 2");
+    template.sendBody("direct:start","<start></start>");
+    assertMockEndpointsSatisfied();
+  }
+  @Test public void testNestedMultiCastWithCachedStreamInAggregationStrategy() throws Exception {
+    MockEndpoint mock=getMockEndpoint("mock:resultNested");
+    mock.expectedBodiesReceived("Test Message 1Test Message 2");
+    template.sendBody("direct:startNestedMultiCast","<start></start>");
+    assertMockEndpointsSatisfied();
+  }
+public static class InputProcessorWithStreamCache implements Processor {
+    private final int number;
+    public InputProcessorWithStreamCache(    int number){
+      this.number=number;
+    }
+    @Override public void process(    Exchange exchange) throws Exception {
+      CachedOutputStream cos=new CachedOutputStream(exchange);
+      String s="Test Message " + number;
+      cos.write(s.getBytes(Charset.forName("UTF-8")));
+      cos.close();
+      InputStream is=(InputStream)cos.newStreamCache();
+      exchange.getOut().setBody(is);
+    }
+  }
+public static class InternalAggregationStrategy implements AggregationStrategy {
+    @Override public Exchange aggregate(    Exchange oldExchange,    Exchange newExchange){
+      if (oldExchange == null) {
+        return newExchange;
+      }
+      try {
+        String oldBody=oldExchange.getIn().getBody(String.class);
+        String newBody=newExchange.getIn().getBody(String.class);
+        String merged=oldBody + newBody;
+        CachedOutputStream cos=new CachedOutputStream(newExchange);
+        cos.write(merged.getBytes("UTF-8"));
+        cos.close();
+        oldExchange.getIn().setBody(cos.newStreamCache());
+        return oldExchange;
+      }
+ catch (      IOException e) {
+        throw new IllegalStateException(e);
+      }
+    }
+  }
+}

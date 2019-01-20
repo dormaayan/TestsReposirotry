@@ -1,0 +1,93 @@
+public class NettyConsumerClientModeReuseChannelTest extends BaseNettyTest {
+  private final List<Channel> channels=new ArrayList<>();
+  private MyServer server;
+  public void startNettyServer() throws Exception {
+    server=new MyServer(getPort());
+    server.start();
+  }
+  public void shutdownServer(){
+    if (server != null) {
+      server.shutdown();
+    }
+  }
+  @Test public void testNettyRoute() throws Exception {
+    try {
+      startNettyServer();
+      MockEndpoint receive=context.getEndpoint("mock:receive",MockEndpoint.class);
+      receive.expectedBodiesReceived("Bye Willem");
+      context.startRoute("client");
+      receive.assertIsSatisfied();
+    }
+  finally {
+      shutdownServer();
+    }
+    assertEquals(1,channels.size());
+  }
+  @Override protected RouteBuilder createRouteBuilder() throws Exception {
+    return new RouteBuilder(){
+      @Override public void configure() throws Exception {
+        from("netty4:tcp://localhost:{{port}}?textline=true&clientMode=true&reuseChannel=true").id("client").process(new Processor(){
+          public void process(          final Exchange exchange){
+            final Channel channel=exchange.getProperty(NettyConstants.NETTY_CHANNEL,Channel.class);
+            channels.add(channel);
+            assertTrue("Should be active",channel.isActive());
+            String body=exchange.getIn().getBody(String.class);
+            exchange.getOut().setBody("Bye " + body);
+          }
+        }
+).to("mock:receive").noAutoStartup();
+      }
+    }
+;
+  }
+private static class MyServer {
+    private int port;
+    private ServerBootstrap bootstrap;
+    private Channel channel;
+    private EventLoopGroup bossGroup;
+    private EventLoopGroup workerGroup;
+    MyServer(    int port){
+      this.port=port;
+    }
+    public void start() throws Exception {
+      bossGroup=new NioEventLoopGroup(1);
+      workerGroup=new NioEventLoopGroup();
+      bootstrap=new ServerBootstrap();
+      bootstrap.group(bossGroup,workerGroup).channel(NioServerSocketChannel.class).childHandler(new ServerInitializer());
+      ChannelFuture cf=bootstrap.bind(port).sync();
+      channel=cf.channel();
+    }
+    public void shutdown(){
+      channel.disconnect();
+      bossGroup.shutdownGracefully();
+      workerGroup.shutdownGracefully();
+    }
+  }
+private static class ServerHandler extends SimpleChannelInboundHandler<String> {
+    public void channelActive(    ChannelHandlerContext ctx) throws Exception {
+      ctx.write("Willem\r\n");
+      ctx.flush();
+    }
+    @Override public void exceptionCaught(    ChannelHandlerContext ctx,    Throwable cause) throws Exception {
+      cause.printStackTrace();
+      ctx.close();
+    }
+    @Override protected void channelRead0(    ChannelHandlerContext ctx,    String msg) throws Exception {
+    }
+    public void channelReadComplete(    ChannelHandlerContext ctx) throws Exception {
+      ctx.flush();
+    }
+  }
+private static class ServerInitializer extends ChannelInitializer<SocketChannel> {
+    private static final StringDecoder DECODER=new StringDecoder();
+    private static final StringEncoder ENCODER=new StringEncoder();
+    private static final ServerHandler SERVERHANDLER=new ServerHandler();
+    @Override public void initChannel(    SocketChannel ch) throws Exception {
+      ChannelPipeline pipeline=ch.pipeline();
+      pipeline.addLast("framer",new DelimiterBasedFrameDecoder(8192,Delimiters.lineDelimiter()));
+      pipeline.addLast("decoder",DECODER);
+      pipeline.addLast("encoder",ENCODER);
+      pipeline.addLast("handler",SERVERHANDLER);
+    }
+  }
+}

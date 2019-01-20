@@ -1,0 +1,107 @@
+/** 
+ * Test minor compactions
+ */
+@Category({RegionServerTests.class,MediumTests.class}) public class TestMinorCompaction {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestMinorCompaction.class);
+  @Rule public TestName name=new TestName();
+  private static final Logger LOG=LoggerFactory.getLogger(TestMinorCompaction.class.getName());
+  private static final HBaseTestingUtility UTIL=HBaseTestingUtility.createLocalHTU();
+  protected Configuration conf=UTIL.getConfiguration();
+  private HRegion r=null;
+  private HTableDescriptor htd=null;
+  private int compactionThreshold;
+  private byte[] firstRowBytes, secondRowBytes, thirdRowBytes;
+  final private byte[] col1, col2;
+  /** 
+ * constructor 
+ */
+  public TestMinorCompaction(){
+    super();
+    conf.setInt(HConstants.HREGION_MEMSTORE_FLUSH_SIZE,1024 * 1024);
+    conf.setInt(HConstants.HREGION_MEMSTORE_BLOCK_MULTIPLIER,100);
+    compactionThreshold=conf.getInt("hbase.hstore.compactionThreshold",3);
+    firstRowBytes=START_KEY_BYTES;
+    secondRowBytes=START_KEY_BYTES.clone();
+    secondRowBytes[START_KEY_BYTES.length - 1]++;
+    thirdRowBytes=START_KEY_BYTES.clone();
+    thirdRowBytes[START_KEY_BYTES.length - 1]=(byte)(thirdRowBytes[START_KEY_BYTES.length - 1] + 2);
+    col1=Bytes.toBytes("column1");
+    col2=Bytes.toBytes("column2");
+  }
+  @Before public void setUp() throws Exception {
+    this.htd=UTIL.createTableDescriptor(name.getMethodName());
+    this.r=UTIL.createLocalHRegion(htd,null,null);
+  }
+  @After public void tearDown() throws Exception {
+    WAL wal=((HRegion)r).getWAL();
+    ((HRegion)r).close();
+    wal.close();
+  }
+  @Test public void testMinorCompactionWithDeleteRow() throws Exception {
+    Delete deleteRow=new Delete(secondRowBytes);
+    testMinorCompactionWithDelete(deleteRow);
+  }
+  @Test public void testMinorCompactionWithDeleteColumn1() throws Exception {
+    Delete dc=new Delete(secondRowBytes);
+    dc.addColumns(fam2,col2);
+    testMinorCompactionWithDelete(dc);
+  }
+  @Test public void testMinorCompactionWithDeleteColumn2() throws Exception {
+    Delete dc=new Delete(secondRowBytes);
+    dc.addColumn(fam2,col2);
+    testMinorCompactionWithDelete(dc,3);
+  }
+  @Test public void testMinorCompactionWithDeleteColumnFamily() throws Exception {
+    Delete deleteCF=new Delete(secondRowBytes);
+    deleteCF.addFamily(fam2);
+    testMinorCompactionWithDelete(deleteCF);
+  }
+  @Test public void testMinorCompactionWithDeleteVersion1() throws Exception {
+    Delete deleteVersion=new Delete(secondRowBytes);
+    deleteVersion.addColumns(fam2,col2,2);
+    testMinorCompactionWithDelete(deleteVersion,1);
+  }
+  @Test public void testMinorCompactionWithDeleteVersion2() throws Exception {
+    Delete deleteVersion=new Delete(secondRowBytes);
+    deleteVersion.addColumn(fam2,col2,1);
+    testMinorCompactionWithDelete(deleteVersion,3);
+  }
+  private void testMinorCompactionWithDelete(  Delete delete) throws Exception {
+    testMinorCompactionWithDelete(delete,0);
+  }
+  private void testMinorCompactionWithDelete(  Delete delete,  int expectedResultsAfterDelete) throws Exception {
+    Table loader=new RegionAsTable(r);
+    for (int i=0; i < compactionThreshold + 1; i++) {
+      HBaseTestCase.addContent(loader,Bytes.toString(fam1),Bytes.toString(col1),firstRowBytes,thirdRowBytes,i);
+      HBaseTestCase.addContent(loader,Bytes.toString(fam1),Bytes.toString(col2),firstRowBytes,thirdRowBytes,i);
+      HBaseTestCase.addContent(loader,Bytes.toString(fam2),Bytes.toString(col1),firstRowBytes,thirdRowBytes,i);
+      HBaseTestCase.addContent(loader,Bytes.toString(fam2),Bytes.toString(col2),firstRowBytes,thirdRowBytes,i);
+      r.flush(true);
+    }
+    Result result=r.get(new Get(firstRowBytes).addColumn(fam1,col1).setMaxVersions(100));
+    assertEquals(compactionThreshold,result.size());
+    result=r.get(new Get(secondRowBytes).addColumn(fam2,col2).setMaxVersions(100));
+    assertEquals(compactionThreshold,result.size());
+    r.delete(delete);
+    result=r.get(new Get(secondRowBytes).addColumn(fam2,col2).setMaxVersions(100));
+    assertEquals(expectedResultsAfterDelete,result.size());
+    result=r.get(new Get(firstRowBytes).addColumn(fam1,col1).setMaxVersions(100));
+    assertEquals(compactionThreshold,result.size());
+    r.flush(true);
+    result=r.get(new Get(secondRowBytes).addColumn(fam2,col2).setMaxVersions(100));
+    assertEquals(expectedResultsAfterDelete,result.size());
+    result=r.get(new Get(firstRowBytes).addColumn(fam1,col1).setMaxVersions(100));
+    assertEquals(compactionThreshold,result.size());
+    HStore store2=r.getStore(fam2);
+    int numFiles1=store2.getStorefiles().size();
+    assertTrue("Was expecting to see 4 store files",numFiles1 > compactionThreshold);
+    ((HStore)store2).compactRecentForTestingAssumingDefaultPolicy(compactionThreshold);
+    int numFiles2=store2.getStorefiles().size();
+    assertTrue("Number of store files should go down",numFiles1 > numFiles2);
+    assertTrue("Was not supposed to be a major compaction",numFiles2 > 1);
+    result=r.get(new Get(secondRowBytes).addColumn(fam2,col2).setMaxVersions(100));
+    assertEquals(expectedResultsAfterDelete,result.size());
+    result=r.get(new Get(firstRowBytes).addColumn(fam1,col1).setMaxVersions(100));
+    assertEquals(compactionThreshold,result.size());
+  }
+}

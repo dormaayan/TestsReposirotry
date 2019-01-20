@@ -1,0 +1,39 @@
+/** 
+ * Tests that a SlotPool shutdown releases all registered slots
+ */
+@Test public void testShutdownReleasesAllSlots() throws Exception {
+  final SlotPool slotPool=new SlotPool(rpcService,jobId,LocationPreferenceSchedulingStrategy.getInstance());
+  try {
+    final SlotPoolGateway slotPoolGateway=setupSlotPool(slotPool,resourceManagerGateway);
+    slotPoolGateway.registerTaskManager(taskManagerLocation.getResourceID());
+    final int numSlotOffers=2;
+    final Collection<SlotOffer> slotOffers=new ArrayList<>(numSlotOffers);
+    for (int i=0; i < numSlotOffers; i++) {
+      slotOffers.add(new SlotOffer(new AllocationID(),i,ResourceProfile.UNKNOWN));
+    }
+    final ArrayBlockingQueue<AllocationID> freedSlotQueue=new ArrayBlockingQueue<>(numSlotOffers);
+    taskManagerGateway.setFreeSlotFunction((    AllocationID allocationID,    Throwable cause) -> {
+      try {
+        freedSlotQueue.put(allocationID);
+        return CompletableFuture.completedFuture(Acknowledge.get());
+      }
+ catch (      InterruptedException e) {
+        return FutureUtils.completedExceptionally(e);
+      }
+    }
+);
+    final CompletableFuture<Collection<SlotOffer>> acceptedSlotOffersFuture=slotPoolGateway.offerSlots(taskManagerLocation,taskManagerGateway,slotOffers);
+    final Collection<SlotOffer> acceptedSlotOffers=acceptedSlotOffersFuture.get(timeout.toMilliseconds(),TimeUnit.MILLISECONDS);
+    assertThat(acceptedSlotOffers,Matchers.equalTo(slotOffers));
+    slotPool.shutDown();
+    slotPool.getTerminationFuture().get(timeout.toMilliseconds(),TimeUnit.MILLISECONDS);
+    ArrayList<AllocationID> freedSlots=new ArrayList<>(numSlotOffers);
+    while (freedSlots.size() < numSlotOffers) {
+      freedSlotQueue.drainTo(freedSlots);
+    }
+    assertThat(freedSlots,Matchers.containsInAnyOrder(slotOffers.stream().map(SlotOffer::getAllocationId).toArray()));
+  }
+  finally {
+    RpcUtils.terminateRpcEndpoint(slotPool,timeout);
+  }
+}

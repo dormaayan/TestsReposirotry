@@ -1,0 +1,125 @@
+/** 
+ * Tests for conditions that should trigger RegionServer aborts when rolling the current WAL fails.
+ */
+@Category({RegionServerTests.class,MediumTests.class}) public class TestLogRollAbort {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestLogRollAbort.class);
+  private static final Logger LOG=LoggerFactory.getLogger(AbstractTestLogRolling.class);
+  private static MiniDFSCluster dfsCluster;
+  private static Admin admin;
+  private static MiniHBaseCluster cluster;
+  protected final static HBaseTestingUtility TEST_UTIL=new HBaseTestingUtility();
+  private static final Path HBASEDIR=new Path("/hbase");
+  private static final Path HBASELOGDIR=new Path("/hbaselog");
+  private static final Path OLDLOGDIR=new Path(HBASELOGDIR,HConstants.HREGION_OLDLOGDIR_NAME);
+  @BeforeClass public static void setUpBeforeClass() throws Exception {
+    TEST_UTIL.getConfiguration().setInt("hbase.regionserver.logroll.errors.tolerated",2);
+    TEST_UTIL.getConfiguration().setInt("hbase.rpc.timeout",10 * 1000);
+    TEST_UTIL.getConfiguration().setLong("hbase.client.pause",5 * 1000);
+    TEST_UTIL.getConfiguration().setInt("dfs.namenode.heartbeat.recheck-interval",5000);
+    TEST_UTIL.getConfiguration().setInt("dfs.heartbeat.interval",1);
+    TEST_UTIL.getConfiguration().setInt("dfs.client.block.write.retries",10);
+    TEST_UTIL.getConfiguration().set(WALFactory.WAL_PROVIDER,"filesystem");
+  }
+  private Configuration conf;
+  private FileSystem fs;
+  @Before public void setUp() throws Exception {
+    TEST_UTIL.startMiniCluster(2);
+    cluster=TEST_UTIL.getHBaseCluster();
+    dfsCluster=TEST_UTIL.getDFSCluster();
+    admin=TEST_UTIL.getAdmin();
+    conf=TEST_UTIL.getConfiguration();
+    fs=TEST_UTIL.getDFSCluster().getFileSystem();
+    cluster.getMaster().balanceSwitch(false);
+    FSUtils.setRootDir(conf,HBASEDIR);
+    FSUtils.setWALRootDir(conf,HBASELOGDIR);
+  }
+  @After public void tearDown() throws Exception {
+    TEST_UTIL.shutdownMiniCluster();
+  }
+  /** 
+ * Tests that RegionServer aborts if we hit an error closing the WAL when there are unsynced WAL edits.  See HBASE-4282.
+ */
+  @Test public void testRSAbortWithUnflushedEdits() throws Exception {
+    LOG.info("Starting testRSAbortWithUnflushedEdits()");
+    TEST_UTIL.getConnection().getTable(TableName.META_TABLE_NAME).close();
+    TableName tableName=TableName.valueOf(this.getClass().getSimpleName());
+    TableDescriptor desc=TableDescriptorBuilder.newBuilder(tableName).setColumnFamily(ColumnFamilyDescriptorBuilder.of(HConstants.CATALOG_FAMILY)).build();
+    admin.createTable(desc);
+    Table table=TEST_UTIL.getConnection().getTable(tableName);
+    try {
+      HRegionServer server=TEST_UTIL.getRSForFirstRegionInTable(tableName);
+      WAL log=server.getWAL(null);
+      Put p=new Put(Bytes.toBytes("row2001"));
+      p.addColumn(HConstants.CATALOG_FAMILY,Bytes.toBytes("col"),Bytes.toBytes(2001));
+      table.put(p);
+      log.sync();
+      p=new Put(Bytes.toBytes("row2002"));
+      p.addColumn(HConstants.CATALOG_FAMILY,Bytes.toBytes("col"),Bytes.toBytes(2002));
+      table.put(p);
+      dfsCluster.restartDataNodes();
+      LOG.info("Restarted datanodes");
+      try {
+        log.rollWriter(true);
+      }
+ catch (      FailedLogCloseException flce) {
+      }
+catch (      Throwable t) {
+        LOG.error(HBaseMarkers.FATAL,"FAILED TEST: Got wrong exception",t);
+      }
+    }
+  finally {
+      table.close();
+    }
+  }
+  /** 
+ * Tests the case where a RegionServer enters a GC pause, comes back online after the master declared it dead and started to split. Want log rolling after a master split to fail. See HBASE-2312.
+ */
+  @Test public void testLogRollAfterSplitStart() throws IOException {
+    LOG.info("Verify wal roll after split starts will fail.");
+    String logName=ServerName.valueOf("testLogRollAfterSplitStart",16010,System.currentTimeMillis()).toString();
+    Path thisTestsDir=new Path(HBASELOGDIR,AbstractFSWALProvider.getWALDirectoryName(logName));
+    final WALFactory wals=new WALFactory(conf,logName);
+    try {
+      TableName tableName=TableName.valueOf(this.getClass().getName());
+      RegionInfo regionInfo=RegionInfoBuilder.newBuilder(tableName).build();
+      WAL log=wals.getWAL(regionInfo);
+      MultiVersionConcurrencyControl mvcc=new MultiVersionConcurrencyControl(1);
+      int total=20;
+      for (int i=0; i < total; i++) {
+        WALEdit kvs=new WALEdit();
+        kvs.add(new KeyValue(Bytes.toBytes(i),tableName.getName(),tableName.getName()));
+        NavigableMap<byte[],Integer> scopes=new TreeMap<>(Bytes.BYTES_COMPARATOR);
+        scopes.put(Bytes.toBytes("column"),0);
+        log.append(regionInfo,new WALKeyImpl(regionInfo.getEncodedNameAsBytes(),tableName,System.currentTimeMillis(),mvcc,scopes),kvs,true);
+      }
+      log.sync();
+      ((AbstractFSWAL<?>)log).replaceWriter(((FSHLog)log).getOldPath(),null,null);
+      Path rsSplitDir=thisTestsDir.suffix(AbstractFSWALProvider.SPLITTING_EXT);
+      if (!fs.rename(thisTestsDir,rsSplitDir)) {
+        throw new IOException("Failed fs.rename for log split: " + thisTestsDir);
+      }
+      LOG.debug("Renamed region directory: " + rsSplitDir);
+      LOG.debug("Processing the old log files.");
+      WALSplitter.split(HBASELOGDIR,rsSplitDir,OLDLOGDIR,fs,conf,wals);
+      LOG.debug("Trying to roll the WAL.");
+      try {
+        log.rollWriter();
+        Assert.fail("rollWriter() did not throw any exception.");
+      }
+ catch (      IOException ioe) {
+        if (ioe.getCause() instanceof FileNotFoundException) {
+          LOG.info("Got the expected exception: ",ioe.getCause());
+        }
+ else {
+          Assert.fail("Unexpected exception: " + ioe);
+        }
+      }
+    }
+  finally {
+      wals.close();
+      if (fs.exists(thisTestsDir)) {
+        fs.delete(thisTestsDir,true);
+      }
+    }
+  }
+}

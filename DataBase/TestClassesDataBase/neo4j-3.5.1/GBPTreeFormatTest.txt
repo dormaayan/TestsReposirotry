@@ -1,0 +1,132 @@
+@RunWith(Parameterized.class) public class GBPTreeFormatTest extends FormatCompatibilityVerifier {
+  private static final String STORE="store";
+  private static final int INITIAL_KEY_COUNT=10_000;
+  private static final String CURRENT_FIXED_SIZE_FORMAT_ZIP="current-format.zip";
+  private static final String CURRENT_DYNAMIC_SIZE_FORMAT_ZIP="current-dynamic-format.zip";
+  @Parameters public static List<Object[]> data(){
+    return asList(new Object[]{longLayout().withFixedSize(true).build(),CURRENT_FIXED_SIZE_FORMAT_ZIP},new Object[]{longLayout().withFixedSize(false).build(),CURRENT_DYNAMIC_SIZE_FORMAT_ZIP});
+  }
+  @Parameter public SimpleLongLayout layout;
+  @Parameter(1) public String zipName;
+  private final PageCacheRule pageCacheRule=new PageCacheRule();
+  private final RandomRule random=new RandomRule();
+  private final List<Long> initialKeys=initialKeys();
+  private final List<Long> keysToAdd=keysToAdd();
+  private List<Long> allKeys;
+  @Before public void setup(){
+    allKeys=new ArrayList<>();
+    allKeys.addAll(initialKeys);
+    allKeys.addAll(keysToAdd);
+    allKeys.sort(Long::compare);
+  }
+  @Rule public final RuleChain chain=RuleChain.outerRule(random).around(pageCacheRule);
+  @Override protected String zipName(){
+    return zipName;
+  }
+  @Override protected String storeFileName(){
+    return STORE;
+  }
+  @Override protected void createStoreFile(  File storeFile) throws IOException {
+    List<Long> initialKeys=initialKeys();
+    PageCache pageCache=pageCacheRule.getPageCache(globalFs.get());
+    try (GBPTree<MutableLong,MutableLong> tree=new GBPTreeBuilder<>(pageCache,storeFile,layout).build()){
+      try (Writer<MutableLong,MutableLong> writer=tree.writer()){
+        for (        Long key : initialKeys) {
+          put(writer,key);
+        }
+      }
+       tree.checkpoint(IOLimiter.UNLIMITED);
+    }
+   }
+  /** 
+ * Throws  {@link FormatViolationException} if format has changed.
+ */
+  @SuppressWarnings("EmptyTryBlock") @Override protected void verifyFormat(  File storeFile) throws IOException, FormatViolationException {
+    PageCache pageCache=pageCacheRule.getPageCache(globalFs.get());
+    try (GBPTree<MutableLong,MutableLong> ignored=new GBPTreeBuilder<>(pageCache,storeFile,layout).build()){
+    }
+ catch (    MetadataMismatchException e) {
+      throw new FormatViolationException(e);
+    }
+  }
+  @Override public void verifyContent(  File storeFile) throws IOException {
+    PageCache pageCache=pageCacheRule.getPageCache(globalFs.get());
+    try (GBPTree<MutableLong,MutableLong> tree=new GBPTreeBuilder<>(pageCache,storeFile,layout).build()){
+{
+        tree.consistencyCheck();
+        try (RawCursor<Hit<MutableLong,MutableLong>,IOException> cursor=tree.seek(layout.key(0),layout.key(Long.MAX_VALUE))){
+          for (          Long expectedKey : initialKeys) {
+            assertHit(cursor,expectedKey);
+          }
+          assertFalse(cursor.next());
+        }
+       }
+{
+        try (Writer<MutableLong,MutableLong> writer=tree.writer()){
+          while (keysToAdd.size() > 0) {
+            int next=random.nextInt(keysToAdd.size());
+            put(writer,keysToAdd.get(next));
+            keysToAdd.remove(next);
+          }
+        }
+       }
+{
+        tree.consistencyCheck();
+        try (RawCursor<Hit<MutableLong,MutableLong>,IOException> cursor=tree.seek(layout.key(0),layout.key(2 * INITIAL_KEY_COUNT))){
+          for (          Long expectedKey : allKeys) {
+            assertHit(cursor,expectedKey);
+          }
+          assertFalse(cursor.next());
+        }
+       }
+{
+        try (Writer<MutableLong,MutableLong> writer=tree.writer()){
+          int size=allKeys.size();
+          while (allKeys.size() > size / 2) {
+            int next=random.nextInt(allKeys.size());
+            MutableLong key=layout.key(allKeys.get(next));
+            writer.remove(key);
+            allKeys.remove(next);
+          }
+        }
+       }
+{
+        tree.consistencyCheck();
+        try (RawCursor<Hit<MutableLong,MutableLong>,IOException> cursor=tree.seek(layout.key(0),layout.key(2 * INITIAL_KEY_COUNT))){
+          for (          Long expectedKey : allKeys) {
+            assertHit(cursor,expectedKey);
+          }
+          assertFalse(cursor.next());
+        }
+       }
+    }
+   }
+  private static long value(  long key){
+    return key * 2;
+  }
+  private static List<Long> initialKeys(){
+    List<Long> initialKeys=new ArrayList<>();
+    for (long i=0, key=0; i < INITIAL_KEY_COUNT; i++, key+=2) {
+      initialKeys.add(key);
+    }
+    return initialKeys;
+  }
+  private static List<Long> keysToAdd(){
+    List<Long> keysToAdd=new ArrayList<>();
+    for (long i=0, key=1; i < INITIAL_KEY_COUNT; i++, key+=2) {
+      keysToAdd.add(key);
+    }
+    return keysToAdd;
+  }
+  private static void assertHit(  RawCursor<Hit<MutableLong,MutableLong>,IOException> cursor,  Long expectedKey) throws IOException {
+    assertTrue("Had no next when expecting key " + expectedKey,cursor.next());
+    Hit<MutableLong,MutableLong> hit=cursor.get();
+    assertEquals(expectedKey.longValue(),hit.key().longValue());
+    assertEquals(value(expectedKey),hit.value().longValue());
+  }
+  private void put(  Writer<MutableLong,MutableLong> writer,  long key){
+    MutableLong insertKey=layout.key(key);
+    MutableLong insertValue=layout.value(value(key));
+    writer.put(insertKey,insertValue);
+  }
+}

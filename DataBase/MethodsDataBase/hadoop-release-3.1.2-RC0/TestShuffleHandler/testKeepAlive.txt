@@ -1,0 +1,95 @@
+@Test(timeout=10000) public void testKeepAlive() throws Exception {
+  final ArrayList<Throwable> failures=new ArrayList<Throwable>(1);
+  Configuration conf=new Configuration();
+  conf.setInt(ShuffleHandler.SHUFFLE_PORT_CONFIG_KEY,0);
+  conf.setBoolean(ShuffleHandler.SHUFFLE_CONNECTION_KEEP_ALIVE_ENABLED,true);
+  conf.setInt(ShuffleHandler.SHUFFLE_CONNECTION_KEEP_ALIVE_TIME_OUT,-100);
+  final LastSocketAddress lastSocketAddress=new LastSocketAddress();
+  ShuffleHandler shuffleHandler=new ShuffleHandler(){
+    @Override protected Shuffle getShuffle(    final Configuration conf){
+      return new Shuffle(conf){
+        @Override protected MapOutputInfo getMapOutputInfo(        String mapId,        int reduce,        String jobId,        String user) throws IOException {
+          return null;
+        }
+        @Override protected void verifyRequest(        String appid,        ChannelHandlerContext ctx,        HttpRequest request,        HttpResponse response,        URL requestUri) throws IOException {
+        }
+        @Override protected void populateHeaders(        List<String> mapIds,        String jobId,        String user,        int reduce,        HttpRequest request,        HttpResponse response,        boolean keepAliveParam,        Map<String,MapOutputInfo> infoMap) throws IOException {
+          ShuffleHeader header=new ShuffleHeader("attempt_12345_1_m_1_0",5678,5678,1);
+          DataOutputBuffer dob=new DataOutputBuffer();
+          header.write(dob);
+          dob=new DataOutputBuffer();
+          for (int i=0; i < 100000; ++i) {
+            header.write(dob);
+          }
+          long contentLength=dob.getLength();
+          if (keepAliveParam) {
+            connectionKeepAliveEnabled=false;
+          }
+          super.setResponseHeaders(response,keepAliveParam,contentLength);
+        }
+        @Override protected ChannelFuture sendMapOutput(        ChannelHandlerContext ctx,        Channel ch,        String user,        String mapId,        int reduce,        MapOutputInfo info) throws IOException {
+          lastSocketAddress.setAddress(ch.getRemoteAddress());
+          HttpResponse response=new DefaultHttpResponse(HTTP_1_1,OK);
+          ShuffleHeader header=new ShuffleHeader("attempt_12345_1_m_1_0",5678,5678,1);
+          DataOutputBuffer dob=new DataOutputBuffer();
+          header.write(dob);
+          ch.write(wrappedBuffer(dob.getData(),0,dob.getLength()));
+          dob=new DataOutputBuffer();
+          for (int i=0; i < 100000; ++i) {
+            header.write(dob);
+          }
+          return ch.write(wrappedBuffer(dob.getData(),0,dob.getLength()));
+        }
+        @Override protected void sendError(        ChannelHandlerContext ctx,        HttpResponseStatus status){
+          if (failures.size() == 0) {
+            failures.add(new Error());
+            ctx.getChannel().close();
+          }
+        }
+        @Override protected void sendError(        ChannelHandlerContext ctx,        String message,        HttpResponseStatus status){
+          if (failures.size() == 0) {
+            failures.add(new Error());
+            ctx.getChannel().close();
+          }
+        }
+      }
+;
+    }
+  }
+;
+  shuffleHandler.init(conf);
+  shuffleHandler.start();
+  String shuffleBaseURL="http://127.0.0.1:" + shuffleHandler.getConfig().get(ShuffleHandler.SHUFFLE_PORT_CONFIG_KEY);
+  URL url=new URL(shuffleBaseURL + "/mapOutput?job=job_12345_1&reduce=1&" + "map=attempt_12345_1_m_1_0");
+  HttpURLConnection conn=(HttpURLConnection)url.openConnection();
+  conn.setRequestProperty(ShuffleHeader.HTTP_HEADER_NAME,ShuffleHeader.DEFAULT_HTTP_HEADER_NAME);
+  conn.setRequestProperty(ShuffleHeader.HTTP_HEADER_VERSION,ShuffleHeader.DEFAULT_HTTP_HEADER_VERSION);
+  conn.connect();
+  DataInputStream input=new DataInputStream(conn.getInputStream());
+  Assert.assertEquals(HttpHeader.KEEP_ALIVE.asString(),conn.getHeaderField(HttpHeader.CONNECTION.asString()));
+  Assert.assertEquals("timeout=1",conn.getHeaderField(HttpHeader.KEEP_ALIVE.asString()));
+  Assert.assertEquals(HttpURLConnection.HTTP_OK,conn.getResponseCode());
+  ShuffleHeader header=new ShuffleHeader();
+  header.readFields(input);
+  byte[] buffer=new byte[1024];
+  while (input.read(buffer) != -1) {
+  }
+  SocketAddress firstAddress=lastSocketAddress.getSocketAddres();
+  input.close();
+  url=new URL(shuffleBaseURL + "/mapOutput?job=job_12345_1&reduce=1&" + "map=attempt_12345_1_m_1_0&keepAlive=true");
+  conn=(HttpURLConnection)url.openConnection();
+  conn.setRequestProperty(ShuffleHeader.HTTP_HEADER_NAME,ShuffleHeader.DEFAULT_HTTP_HEADER_NAME);
+  conn.setRequestProperty(ShuffleHeader.HTTP_HEADER_VERSION,ShuffleHeader.DEFAULT_HTTP_HEADER_VERSION);
+  conn.connect();
+  input=new DataInputStream(conn.getInputStream());
+  Assert.assertEquals(HttpHeader.KEEP_ALIVE.asString(),conn.getHeaderField(HttpHeader.CONNECTION.asString()));
+  Assert.assertEquals("timeout=1",conn.getHeaderField(HttpHeader.KEEP_ALIVE.asString()));
+  Assert.assertEquals(HttpURLConnection.HTTP_OK,conn.getResponseCode());
+  header=new ShuffleHeader();
+  header.readFields(input);
+  input.close();
+  SocketAddress secondAddress=lastSocketAddress.getSocketAddres();
+  Assert.assertNotNull("Initial shuffle address should not be null",firstAddress);
+  Assert.assertNotNull("Keep-Alive shuffle address should not be null",secondAddress);
+  Assert.assertEquals("Initial shuffle address and keep-alive shuffle " + "address should be the same",firstAddress,secondAddress);
+}

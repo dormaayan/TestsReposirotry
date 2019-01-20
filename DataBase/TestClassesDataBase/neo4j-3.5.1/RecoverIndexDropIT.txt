@@ -1,0 +1,77 @@
+/** 
+ * Issue came up when observing that recovering an INDEX DROP command didn't actually call  {@link IndexProxy#drop()}, and actually did nothing to that  {@link IndexProxy} except removing it from its {@link IndexMap}. This would have  {@link IndexingService} forget about that index and at shutdown not call {@link IndexProxy#close()}, resulting in open page cache files, for any page cache mapped native index files. This would be a problem if the INDEX DROP command was present in the transaction log, but the db had been killed before the command had been applied and so the files would still remain, and not be dropped either when that command was recovered.
+ */
+public class RecoverIndexDropIT {
+  private static final String KEY="key";
+  @Rule public final DefaultFileSystemRule fs=new DefaultFileSystemRule();
+  @Rule public final TestDirectory directory=TestDirectory.testDirectory(fs);
+  @Test public void shouldDropIndexOnRecovery() throws IOException {
+    CommittedTransactionRepresentation dropTransaction=prepareDropTransaction();
+    File storeDir=directory.databaseDir();
+    GraphDatabaseService db=new TestGraphDatabaseFactory().newEmbeddedDatabase(storeDir);
+    createIndex(db);
+    db.shutdown();
+    appendDropTransactionToTransactionLog(directory.databaseDir(),dropTransaction);
+    Monitors monitors=new Monitors();
+    AssertRecoveryIsPerformed recoveryMonitor=new AssertRecoveryIsPerformed();
+    monitors.addMonitorListener(recoveryMonitor);
+    db=new TestGraphDatabaseFactory().setMonitors(monitors).newEmbeddedDatabase(storeDir);
+    try {
+      assertTrue(recoveryMonitor.recoveryWasPerformed);
+      try (Transaction tx=db.beginTx()){
+        assertEquals(0,count(db.schema().getIndexes()));
+        tx.success();
+      }
+     }
+  finally {
+      db.shutdown();
+    }
+  }
+  private static IndexDefinition createIndex(  GraphDatabaseService db){
+    try (Transaction tx=db.beginTx()){
+      IndexDefinition index=db.schema().indexFor(LABEL_ONE).on(KEY).create();
+      tx.success();
+      return index;
+    }
+   }
+  private void appendDropTransactionToTransactionLog(  File databaseDirectory,  CommittedTransactionRepresentation dropTransaction) throws IOException {
+    LogFiles logFiles=LogFilesBuilder.logFilesBasedOnlyBuilder(databaseDirectory,fs).build();
+    File logFile=logFiles.getLogFileForVersion(logFiles.getHighestLogVersion());
+    StoreChannel writeStoreChannel=fs.open(logFile,OpenMode.READ_WRITE);
+    writeStoreChannel.position(writeStoreChannel.size());
+    try (PhysicalFlushableChannel writeChannel=new PhysicalFlushableChannel(writeStoreChannel)){
+      new LogEntryWriter(writeChannel).serialize(dropTransaction);
+    }
+   }
+  private CommittedTransactionRepresentation prepareDropTransaction() throws IOException {
+    GraphDatabaseAPI db=(GraphDatabaseAPI)new TestGraphDatabaseFactory().newEmbeddedDatabase(directory.directory("preparation"));
+    try {
+      IndexDefinition index;
+      index=createIndex(db);
+      try (Transaction tx=db.beginTx()){
+        index.drop();
+        tx.success();
+      }
+       return extractLastTransaction(db);
+    }
+  finally {
+      db.shutdown();
+    }
+  }
+  private static CommittedTransactionRepresentation extractLastTransaction(  GraphDatabaseAPI db) throws IOException {
+    LogicalTransactionStore txStore=db.getDependencyResolver().resolveDependency(LogicalTransactionStore.class);
+    CommittedTransactionRepresentation transaction=null;
+    try (TransactionCursor cursor=txStore.getTransactions(TransactionIdStore.BASE_TX_ID + 1)){
+      while (cursor.next()) {
+        transaction=cursor.get();
+      }
+    }
+     return transaction;
+  }
+private static class AssertRecoveryIsPerformed implements RecoveryMonitor {
+    boolean recoveryWasPerformed;
+    @Override public void recoveryRequired(    LogPosition recoveryPosition){
+      recoveryWasPerformed=true;
+    }
+  }
+}

@@ -1,0 +1,51 @@
+/** 
+ * Tests for the RocksIteratorWrapper.
+ */
+public class RocksDBRocksIteratorForKeysWrapperTest {
+  @Rule public final TemporaryFolder tmp=new TemporaryFolder();
+  @Test public void testIterator() throws Exception {
+    testIteratorHelper(IntSerializer.INSTANCE,StringSerializer.INSTANCE,128,i -> i);
+    testIteratorHelper(StringSerializer.INSTANCE,StringSerializer.INSTANCE,128,i -> String.valueOf(i));
+    testIteratorHelper(IntSerializer.INSTANCE,StringSerializer.INSTANCE,256,i -> i);
+    testIteratorHelper(StringSerializer.INSTANCE,StringSerializer.INSTANCE,256,i -> String.valueOf(i));
+  }
+  <K>void testIteratorHelper(  TypeSerializer<K> keySerializer,  TypeSerializer namespaceSerializer,  int maxKeyGroupNumber,  Function<Integer,K> getKeyFunc) throws Exception {
+    String testStateName="aha";
+    String namespace="ns";
+    String dbPath=tmp.newFolder().getAbsolutePath();
+    String checkpointPath=tmp.newFolder().toURI().toString();
+    RocksDBStateBackend backend=new RocksDBStateBackend(new FsStateBackend(checkpointPath),true);
+    backend.setDbStoragePath(dbPath);
+    Environment env=new DummyEnvironment("TestTask",1,0);
+    RocksDBKeyedStateBackend<K> keyedStateBackend=(RocksDBKeyedStateBackend<K>)backend.createKeyedStateBackend(env,new JobID(),"Test",keySerializer,maxKeyGroupNumber,new KeyGroupRange(0,maxKeyGroupNumber - 1),mock(TaskKvStateRegistry.class));
+    try {
+      keyedStateBackend.restore(null);
+      ValueState<String> testState=keyedStateBackend.getPartitionedState(namespace,namespaceSerializer,new ValueStateDescriptor<String>(testStateName,String.class));
+      for (int i=0; i < 1000; ++i) {
+        keyedStateBackend.setCurrentKey(getKeyFunc.apply(i));
+        testState.update(String.valueOf(i));
+      }
+      ByteArrayOutputStreamWithPos outputStream=new ByteArrayOutputStreamWithPos(8);
+      boolean ambiguousKeyPossible=RocksDBKeySerializationUtils.isAmbiguousKeyPossible(keySerializer,namespaceSerializer);
+      RocksDBKeySerializationUtils.writeNameSpace(namespace,namespaceSerializer,outputStream,new DataOutputViewStreamWrapper(outputStream),ambiguousKeyPossible);
+      byte[] nameSpaceBytes=outputStream.toByteArray();
+      try (ColumnFamilyHandle handle=keyedStateBackend.getColumnFamilyHandle(testStateName);RocksIteratorWrapper iterator=RocksDBKeyedStateBackend.getRocksIterator(keyedStateBackend.db,handle);RocksDBKeyedStateBackend.RocksIteratorForKeysWrapper<K> iteratorWrapper=new RocksDBKeyedStateBackend.RocksIteratorForKeysWrapper<>(iterator,testStateName,keySerializer,keyedStateBackend.getKeyGroupPrefixBytes(),ambiguousKeyPossible,nameSpaceBytes)){
+        iterator.seekToFirst();
+        List<Integer> fetchedKeys=new ArrayList<>(1000);
+        while (iteratorWrapper.hasNext()) {
+          fetchedKeys.add(Integer.parseInt(iteratorWrapper.next().toString()));
+        }
+        fetchedKeys.sort(Comparator.comparingInt(a -> a));
+        Assert.assertEquals(1000,fetchedKeys.size());
+        for (int i=0; i < 1000; ++i) {
+          Assert.assertEquals(i,fetchedKeys.get(i).intValue());
+        }
+      }
+     }
+  finally {
+      if (keyedStateBackend != null) {
+        keyedStateBackend.dispose();
+      }
+    }
+  }
+}

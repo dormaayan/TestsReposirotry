@@ -1,0 +1,82 @@
+@ThreadLeakScope(ThreadLeakScope.Scope.NONE) public class HighDFWordsPrunerTest extends MahoutTestCase {
+  private static final int NUM_DOCS=100;
+  private static final String[] HIGH_DF_WORDS={"has","which","what","srtyui"};
+  private Configuration conf;
+  private Path inputPath;
+  @Override @Before public void setUp() throws Exception {
+    super.setUp();
+    conf=getConfiguration();
+    inputPath=getTestTempFilePath("documents/docs.file");
+    FileSystem fs=FileSystem.get(inputPath.toUri(),conf);
+    SequenceFile.Writer writer=new SequenceFile.Writer(fs,conf,inputPath,Text.class,Text.class);
+    RandomDocumentGenerator gen=new RandomDocumentGenerator();
+    for (int i=0; i < NUM_DOCS; i++) {
+      writer.append(new Text("Document::ID::" + i),new Text(enhanceWithHighDFWords(gen.getRandomDocument())));
+    }
+    writer.close();
+  }
+  private static String enhanceWithHighDFWords(  String initialDoc){
+    StringBuilder sb=new StringBuilder(initialDoc);
+    for (    String word : HIGH_DF_WORDS) {
+      sb.append(' ').append(word);
+    }
+    return sb.toString();
+  }
+  @Test public void testHighDFWordsPreserving() throws Exception {
+    runTest(false);
+  }
+  @Test public void testHighDFWordsPruning() throws Exception {
+    runTest(true);
+  }
+  private void runTest(  boolean prune) throws Exception {
+    Path outputPath=getTestTempFilePath("output");
+    List<String> argList=Lists.newLinkedList();
+    argList.add("-i");
+    argList.add(inputPath.toString());
+    argList.add("-o");
+    argList.add(outputPath.toString());
+    if (prune) {
+      argList.add("-xs");
+      argList.add("3");
+    }
+ else {
+      argList.add("--maxDFPercent");
+      argList.add("100");
+    }
+    argList.add("-seq");
+    argList.add("-nv");
+    String[] args=argList.toArray(new String[argList.size()]);
+    ToolRunner.run(conf,new SparseVectorsFromSequenceFiles(),args);
+    Path dictionary=new Path(outputPath,"dictionary.file-0");
+    Path tfVectors=new Path(outputPath,"tf-vectors");
+    Path tfidfVectors=new Path(outputPath,"tfidf-vectors");
+    int[] highDFWordsDictionaryIndices=getHighDFWordsDictionaryIndices(dictionary);
+    validateVectors(tfVectors,highDFWordsDictionaryIndices,prune);
+    validateVectors(tfidfVectors,highDFWordsDictionaryIndices,prune);
+  }
+  private int[] getHighDFWordsDictionaryIndices(  Path dictionaryPath){
+    int[] highDFWordsDictionaryIndices=new int[HIGH_DF_WORDS.length];
+    List<String> highDFWordsList=Arrays.asList(HIGH_DF_WORDS);
+    for (    Pair<Text,IntWritable> record : new SequenceFileDirIterable<Text,IntWritable>(dictionaryPath,PathType.GLOB,null,null,true,conf)) {
+      int index=highDFWordsList.indexOf(record.getFirst().toString());
+      if (index > -1) {
+        highDFWordsDictionaryIndices[index]=record.getSecond().get();
+      }
+    }
+    return highDFWordsDictionaryIndices;
+  }
+  private void validateVectors(  Path vectorPath,  int[] highDFWordsDictionaryIndices,  boolean prune) throws Exception {
+    assertTrue("Path does not exist",vectorPath.getFileSystem(conf).exists(vectorPath));
+    for (    VectorWritable value : new SequenceFileDirValueIterable<VectorWritable>(vectorPath,PathType.LIST,PathFilters.partFilter(),null,true,conf)) {
+      Vector v=((NamedVector)value.get()).getDelegate();
+      for (int i=0; i < highDFWordsDictionaryIndices.length; i++) {
+        if (prune) {
+          assertEquals("Found vector for which word '" + HIGH_DF_WORDS[i] + "' is not pruned",0.0,v.get(highDFWordsDictionaryIndices[i]),0.0);
+        }
+ else {
+          assertTrue("Found vector for which word '" + HIGH_DF_WORDS[i] + "' is pruned, and shouldn't have been",v.get(highDFWordsDictionaryIndices[i]) != 0.0);
+        }
+      }
+    }
+  }
+}

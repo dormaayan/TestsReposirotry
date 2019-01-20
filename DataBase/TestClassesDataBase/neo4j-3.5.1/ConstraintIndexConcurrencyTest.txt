@@ -1,0 +1,45 @@
+public class ConstraintIndexConcurrencyTest {
+  @Rule public final DatabaseRule db=new ImpermanentDatabaseRule();
+  @Rule public final ThreadingRule threads=new ThreadingRule();
+  @Test public void shouldNotAllowConcurrentViolationOfConstraint() throws Exception {
+    GraphDatabaseAPI graphDb=db.getGraphDatabaseAPI();
+    Supplier<KernelTransaction> ktxSupplier=() -> graphDb.getDependencyResolver().resolveDependency(ThreadToStatementContextBridge.class).getKernelTransactionBoundToThisThread(true);
+    Label label=label("Foo");
+    String propertyKey="bar";
+    String conflictingValue="baz";
+    try (Transaction tx=graphDb.beginTx()){
+      graphDb.schema().constraintFor(label).assertPropertyIsUnique(propertyKey).create();
+      tx.success();
+    }
+     try (Transaction tx=graphDb.beginTx()){
+      KernelTransaction ktx=ktxSupplier.get();
+      int labelId=ktx.tokenRead().nodeLabel(label.name());
+      int propertyKeyId=ktx.tokenRead().propertyKey(propertyKey);
+      IndexDescriptor index=TestIndexDescriptorFactory.uniqueForLabel(labelId,propertyKeyId);
+      Read read=ktx.dataRead();
+      try (NodeValueIndexCursor cursor=ktx.cursors().allocateNodeValueIndexCursor()){
+        read.nodeIndexSeek(ktx.schemaRead().index(labelId,propertyKeyId),cursor,IndexOrder.NONE,false,IndexQuery.exact(index.schema().getPropertyId(),"The value is irrelevant, we just want to perform some sort of lookup against this " + "index"));
+      }
+       threads.execute(db -> {
+        try (Transaction transaction=db.beginTx()){
+          db.createNode(label).setProperty(propertyKey,conflictingValue);
+          transaction.success();
+        }
+         return null;
+      }
+,graphDb).get();
+      long node=ktx.dataWrite().nodeCreate();
+      ktx.dataWrite().nodeAddLabel(node,labelId);
+      try {
+        ktx.dataWrite().nodeSetProperty(node,propertyKeyId,Values.of(conflictingValue));
+        fail("exception expected");
+      }
+ catch (      UniquePropertyValueValidationException e) {
+        assertEquals(ConstraintDescriptorFactory.uniqueForLabel(labelId,propertyKeyId),e.constraint());
+        IndexEntryConflictException conflict=Iterators.single(e.conflicts().iterator());
+        assertEquals(Values.stringValue(conflictingValue),conflict.getSinglePropertyValue());
+      }
+      tx.success();
+    }
+   }
+}

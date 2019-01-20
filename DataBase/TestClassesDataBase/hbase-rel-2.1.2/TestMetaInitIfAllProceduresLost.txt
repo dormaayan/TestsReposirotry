@@ -1,0 +1,50 @@
+@Category({MasterTests.class,MediumTests.class}) public class TestMetaInitIfAllProceduresLost {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestMetaInitIfAllProceduresLost.class);
+  private static final Logger LOG=LoggerFactory.getLogger(TestMetaInitIfAllProceduresLost.class);
+  protected static final HBaseTestingUtility UTIL=new HBaseTestingUtility();
+  @BeforeClass public static void setupCluster() throws Exception {
+    UTIL.startMiniCluster(3);
+  }
+  @AfterClass public static void cleanupTest() throws Exception {
+    try {
+      UTIL.shutdownMiniCluster();
+    }
+ catch (    Exception e) {
+      LOG.warn("failure shutting down cluster",e);
+    }
+  }
+  @Test public void test() throws Exception {
+    for (    JVMClusterUtil.RegionServerThread rst : UTIL.getMiniHBaseCluster().getRegionServerThreads()) {
+      rst.getRegionServer().abort("killAll");
+    }
+    UTIL.waitFor(30000,() -> UTIL.getMiniHBaseCluster().getMaster().getMasterWalManager().getLiveServersFromWALDir().size() == 0);
+    Thread.sleep(1000);
+    Path procedureWals=new Path(UTIL.getMiniHBaseCluster().getMaster().getMasterFileSystem().getRootDir(),MASTER_PROCEDURE_LOGDIR);
+    UTIL.getMiniHBaseCluster().killAll();
+    for (    FileStatus file : UTIL.getTestFileSystem().listStatus(procedureWals)) {
+      LOG.info("removing " + file);
+      UTIL.getTestFileSystem().delete(file.getPath());
+    }
+    UTIL.getMiniHBaseCluster().startMaster();
+    UTIL.getMiniHBaseCluster().startRegionServer();
+    UTIL.getMiniHBaseCluster().startRegionServer();
+    UTIL.getMiniHBaseCluster().startRegionServer();
+    ScheduledExecutorService scheduler=Executors.newScheduledThreadPool(1);
+    final HMaster master=UTIL.getHBaseCluster().getMaster();
+    final AssignmentManager am=master.getAssignmentManager();
+    final AssignProcedure ap=am.createAssignProcedure(RegionInfoBuilder.FIRST_META_REGIONINFO);
+    scheduler.schedule(() -> master.getMasterProcedureExecutor().submitProcedure(ap),10,TimeUnit.SECONDS);
+    scheduler.schedule(() -> {
+      List<RegionInfo> ris=am.getRegionStates().getRegionsOfTable(TableName.NAMESPACE_TABLE_NAME);
+      if (ris.isEmpty()) {
+        throw new RuntimeException("No namespace regions found!");
+      }
+      for (      RegionInfo ri : ris) {
+        AssignProcedure riap=am.createAssignProcedure(ri);
+        master.getMasterProcedureExecutor().submitProcedure(riap);
+      }
+    }
+,20,TimeUnit.SECONDS);
+    UTIL.waitFor(180000,() -> UTIL.getMiniHBaseCluster().getMaster() != null && UTIL.getMiniHBaseCluster().getMaster().isInitialized());
+  }
+}

@@ -1,0 +1,39 @@
+@Test(timeout=300000) public void testNameNodePrunesUnreportedStorages() throws Exception {
+  Configuration conf=new HdfsConfiguration();
+  MiniDFSCluster cluster=new MiniDFSCluster.Builder(conf).numDataNodes(1).storagesPerDatanode(2).build();
+  try {
+    cluster.waitActive();
+    DFSTestUtil.createFile(cluster.getFileSystem(),new Path("file1"),102400,102400,102400,(short)1,0x1BAD5EE);
+    DFSTestUtil.createFile(cluster.getFileSystem(),new Path("file2"),102400,102400,102400,(short)1,0x1BAD5EED);
+    DataNode dn=cluster.getDataNodes().get(0);
+    BlockManager bm=cluster.getNameNode().getNamesystem().getBlockManager();
+    DatanodeDescriptor dnDescriptor=bm.getDatanodeManager().getDatanode(cluster.getDataNodes().get(0).getDatanodeUuid());
+    DatanodeStorageInfo[] dnStoragesInfosBeforeRestart=dnDescriptor.getStorageInfos();
+    Collection<String> oldDirs=new ArrayList<String>(dn.getConf().getTrimmedStringCollection(DFSConfigKeys.DFS_DATANODE_DATA_DIR_KEY));
+    String newDirs=oldDirs.iterator().next();
+    conf.set(DFSConfigKeys.DFS_DATANODE_DATA_DIR_KEY,newDirs);
+    cluster.stopDataNode(0);
+    cluster.startDataNodes(conf,1,false,null,null);
+    dn=cluster.getDataNodes().get(0);
+    cluster.waitActive();
+    assertArrayEquals(dnStoragesInfosBeforeRestart,dnDescriptor.getStorageInfos());
+    int numFailedStoragesWithBlocks=0;
+    DatanodeStorageInfo failedStorageInfo=null;
+    for (    DatanodeStorageInfo dnStorageInfo : dnDescriptor.getStorageInfos()) {
+      if (dnStorageInfo.areBlocksOnFailedStorage()) {
+        numFailedStoragesWithBlocks++;
+        failedStorageInfo=dnStorageInfo;
+      }
+    }
+    assertEquals(1,numFailedStoragesWithBlocks);
+    bm.getDatanodeManager().getHeartbeatManager().heartbeatCheck();
+    assertTrue(!failedStorageInfo.areBlocksOnFailedStorage());
+    cluster.triggerHeartbeats();
+    assertEquals(DataNode.getStorageLocations(dn.getConf()).size(),dnDescriptor.getStorageInfos().length);
+  }
+  finally {
+    if (cluster != null) {
+      cluster.shutdown();
+    }
+  }
+}

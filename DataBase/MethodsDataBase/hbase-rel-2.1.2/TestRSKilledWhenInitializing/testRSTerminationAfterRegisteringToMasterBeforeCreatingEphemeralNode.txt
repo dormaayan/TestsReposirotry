@@ -1,0 +1,60 @@
+/** 
+ * Test verifies whether a region server is removed from online servers list in master if it went down after registering with master. Test will TIMEOUT if an error!!!!
+ * @throws Exception
+ */
+@Test public void testRSTerminationAfterRegisteringToMasterBeforeCreatingEphemeralNode() throws Exception {
+  Configuration conf=HBaseConfiguration.create();
+  conf.setInt(ServerManager.WAIT_ON_REGIONSERVERS_MINTOSTART,1);
+  final HBaseTestingUtility TEST_UTIL=new HBaseTestingUtility(conf);
+  TEST_UTIL.startMiniDFSCluster(3);
+  TEST_UTIL.startMiniZKCluster();
+  TEST_UTIL.createRootDir();
+  final LocalHBaseCluster cluster=new LocalHBaseCluster(conf,NUM_MASTERS,NUM_RS,HMaster.class,RegisterAndDieRegionServer.class);
+  final MasterThread master=startMaster(cluster.getMasters().get(0));
+  try {
+    for (int i=0; i < NUM_RS; i++) {
+      cluster.getRegionServers().get(i).start();
+    }
+    int expectedTotalRegionServers=NUM_RS + (LoadBalancer.isTablesOnMaster(conf) ? 1 : 0);
+    List<ServerName> onlineServersList=null;
+    do {
+      onlineServersList=master.getMaster().getServerManager().getOnlineServersList();
+    }
+ while (onlineServersList.size() < expectedTotalRegionServers);
+    while (killedRS.get() == null) {
+      Threads.sleep(1);
+    }
+    while (cluster.getLiveRegionServers().size() >= expectedTotalRegionServers) {
+      Threads.sleep(1);
+    }
+    while (!master.getMaster().isInitialized()) {
+      Threads.sleep(1);
+    }
+    assertTrue(master.getMaster().getServerManager().isServerOnline(killedRS.get()));
+    Map<RegionInfo,ServerName> assignments=null;
+    do {
+      assignments=master.getMaster().getAssignmentManager().getRegionStates().getRegionAssignments();
+    }
+ while (assignments == null || assignments.size() < 2);
+    RegionInfo hri=null;
+    for (    Map.Entry<RegionInfo,ServerName> e : assignments.entrySet()) {
+      if (e.getKey().isMetaRegion())       continue;
+      hri=e.getKey();
+      break;
+    }
+    assertEquals(expectedTotalRegionServers,master.getMaster().getServerManager().getOnlineServersList().size());
+    LOG.info("Move " + hri.getEncodedName() + " to "+ killedRS.get());
+    master.getMaster().move(hri.getEncodedNameAsBytes(),Bytes.toBytes(killedRS.get().toString()));
+    while (onlineServersList.size() > (NUM_RS + 1)) {
+      Thread.sleep(100);
+      onlineServersList=master.getMaster().getServerManager().getOnlineServersList();
+    }
+  }
+  finally {
+    cluster.shutdown();
+    cluster.join();
+    TEST_UTIL.shutdownMiniDFSCluster();
+    TEST_UTIL.shutdownMiniZKCluster();
+    TEST_UTIL.cleanupTestDir();
+  }
+}

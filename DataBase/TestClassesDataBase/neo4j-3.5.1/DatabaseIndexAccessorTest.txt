@@ -1,0 +1,164 @@
+@RunWith(Parameterized.class) public class DatabaseIndexAccessorTest {
+  public static final int PROP_ID=1;
+  @Rule public final ThreadingRule threading=new ThreadingRule();
+  @ClassRule public static final EphemeralFileSystemRule fileSystemRule=new EphemeralFileSystemRule();
+  @Parameterized.Parameter(0) public IndexDescriptor index;
+  @Parameterized.Parameter(1) public IOFunction<DirectoryFactory,LuceneIndexAccessor> accessorFactory;
+  private LuceneIndexAccessor accessor;
+  private final long nodeId=1;
+  private final long nodeId2=2;
+  private final Object value="value";
+  private final Object value2=40;
+  private DirectoryFactory.InMemoryDirectoryFactory dirFactory;
+  private static final IndexDescriptor GENERAL_INDEX=TestIndexDescriptorFactory.forLabel(0,PROP_ID);
+  private static final IndexDescriptor UNIQUE_INDEX=TestIndexDescriptorFactory.uniqueForLabel(1,PROP_ID);
+  private static final Config CONFIG=Config.defaults();
+  @Parameterized.Parameters(name="{0}") public static Collection<Object[]> implementations(){
+    final File dir=new File("dir");
+    return Arrays.asList(arg(GENERAL_INDEX,dirFactory1 -> {
+      SchemaIndex index=LuceneSchemaIndexBuilder.create(GENERAL_INDEX,CONFIG).withFileSystem(fileSystemRule.get()).withDirectoryFactory(dirFactory1).withIndexRootFolder(new File(dir,"1")).build();
+      index.create();
+      index.open();
+      return new LuceneIndexAccessor(index,GENERAL_INDEX);
+    }
+),arg(UNIQUE_INDEX,dirFactory1 -> {
+      SchemaIndex index=LuceneSchemaIndexBuilder.create(UNIQUE_INDEX,CONFIG).withFileSystem(fileSystemRule.get()).withDirectoryFactory(dirFactory1).withIndexRootFolder(new File(dir,"testIndex")).build();
+      index.create();
+      index.open();
+      return new LuceneIndexAccessor(index,UNIQUE_INDEX);
+    }
+));
+  }
+  private static Object[] arg(  IndexDescriptor index,  IOFunction<DirectoryFactory,LuceneIndexAccessor> foo){
+    return new Object[]{index,foo};
+  }
+  @Before public void before() throws IOException {
+    dirFactory=new DirectoryFactory.InMemoryDirectoryFactory();
+    accessor=accessorFactory.apply(dirFactory);
+  }
+  @After public void after() throws IOException {
+    accessor.close();
+    dirFactory.close();
+  }
+  @Test public void indexReaderShouldSupportScan() throws Exception {
+    updateAndCommit(asList(add(nodeId,value),add(nodeId2,value2)));
+    IndexReader reader=accessor.newReader();
+    LongIterator results=reader.query(IndexQuery.exists(PROP_ID));
+    assertEquals(asSet(nodeId,nodeId2),PrimitiveLongCollections.toSet(results));
+    assertEquals(asSet(nodeId),PrimitiveLongCollections.toSet(reader.query(exact(PROP_ID,value))));
+    reader.close();
+  }
+  @Test public void indexStringRangeQuery() throws Exception {
+    updateAndCommit(asList(add(PROP_ID,"A"),add(2,"B"),add(3,"C"),add(4,"")));
+    IndexReader reader=accessor.newReader();
+    LongIterator rangeFromBInclusive=reader.query(range(PROP_ID,"B",true,null,false));
+    assertThat(PrimitiveLongCollections.asArray(rangeFromBInclusive),LongArrayMatcher.of(2,3));
+    LongIterator rangeFromANonInclusive=reader.query(range(PROP_ID,"A",false,null,false));
+    assertThat(PrimitiveLongCollections.asArray(rangeFromANonInclusive),LongArrayMatcher.of(2,3));
+    LongIterator emptyLowInclusive=reader.query(range(PROP_ID,"",true,null,false));
+    assertThat(PrimitiveLongCollections.asArray(emptyLowInclusive),LongArrayMatcher.of(PROP_ID,2,3,4));
+    LongIterator emptyUpperNonInclusive=reader.query(range(PROP_ID,"B",true,"",false));
+    assertThat(PrimitiveLongCollections.asArray(emptyUpperNonInclusive),LongArrayMatcher.emptyArrayMatcher());
+    LongIterator emptyInterval=reader.query(range(PROP_ID,"",true,"",true));
+    assertThat(PrimitiveLongCollections.asArray(emptyInterval),LongArrayMatcher.of(4));
+    LongIterator emptyAllNonInclusive=reader.query(range(PROP_ID,"",false,null,false));
+    assertThat(PrimitiveLongCollections.asArray(emptyAllNonInclusive),LongArrayMatcher.of(PROP_ID,2,3));
+    LongIterator nullNonInclusive=reader.query(range(PROP_ID,(String)null,false,null,false));
+    assertThat(PrimitiveLongCollections.asArray(nullNonInclusive),LongArrayMatcher.of(PROP_ID,2,3,4));
+    LongIterator nullInclusive=reader.query(range(PROP_ID,(String)null,false,null,false));
+    assertThat(PrimitiveLongCollections.asArray(nullInclusive),LongArrayMatcher.of(PROP_ID,2,3,4));
+  }
+  @Test public void indexNumberRangeQuery() throws Exception {
+    updateAndCommit(asList(add(1,1),add(2,2),add(3,3),add(4,4),add(5,Double.NaN)));
+    IndexReader reader=accessor.newReader();
+    LongIterator rangeTwoThree=reader.query(range(PROP_ID,2,true,3,true));
+    assertThat(PrimitiveLongCollections.asArray(rangeTwoThree),LongArrayMatcher.of(2,3));
+    LongIterator infiniteMaxRange=reader.query(range(PROP_ID,2,true,Long.MAX_VALUE,true));
+    assertThat(PrimitiveLongCollections.asArray(infiniteMaxRange),LongArrayMatcher.of(2,3,4));
+    LongIterator infiniteMinRange=reader.query(range(PROP_ID,Long.MIN_VALUE,true,3,true));
+    assertThat(PrimitiveLongCollections.asArray(infiniteMinRange),LongArrayMatcher.of(PROP_ID,2,3));
+    LongIterator maxNanInterval=reader.query(range(PROP_ID,3,true,Double.NaN,true));
+    assertThat(PrimitiveLongCollections.asArray(maxNanInterval),LongArrayMatcher.of(3,4,5));
+    LongIterator minNanInterval=reader.query(range(PROP_ID,Double.NaN,true,5,true));
+    assertThat(PrimitiveLongCollections.asArray(minNanInterval),LongArrayMatcher.emptyArrayMatcher());
+    LongIterator nanInterval=reader.query(range(PROP_ID,Double.NaN,true,Double.NaN,true));
+    assertThat(PrimitiveLongCollections.asArray(nanInterval),LongArrayMatcher.of(5));
+  }
+  @Test public void indexReaderShouldHonorRepeatableReads() throws Exception {
+    updateAndCommit(asList(add(nodeId,value)));
+    IndexReader reader=accessor.newReader();
+    updateAndCommit(asList(remove(nodeId,value)));
+    assertEquals(asSet(nodeId),PrimitiveLongCollections.toSet(reader.query(exact(PROP_ID,value))));
+    reader.close();
+  }
+  @Test public void multipleIndexReadersFromDifferentPointsInTimeCanSeeDifferentResults() throws Exception {
+    updateAndCommit(asList(add(nodeId,value)));
+    IndexReader firstReader=accessor.newReader();
+    updateAndCommit(asList(add(nodeId2,value2)));
+    IndexReader secondReader=accessor.newReader();
+    assertEquals(asSet(nodeId),PrimitiveLongCollections.toSet(firstReader.query(exact(PROP_ID,value))));
+    assertEquals(asSet(),PrimitiveLongCollections.toSet(firstReader.query(exact(PROP_ID,value2))));
+    assertEquals(asSet(nodeId),PrimitiveLongCollections.toSet(secondReader.query(exact(PROP_ID,value))));
+    assertEquals(asSet(nodeId2),PrimitiveLongCollections.toSet(secondReader.query(exact(PROP_ID,value2))));
+    firstReader.close();
+    secondReader.close();
+  }
+  @Test public void canAddNewData() throws Exception {
+    updateAndCommit(asList(add(nodeId,value),add(nodeId2,value2)));
+    IndexReader reader=accessor.newReader();
+    assertEquals(asSet(nodeId),PrimitiveLongCollections.toSet(reader.query(exact(PROP_ID,value))));
+    reader.close();
+  }
+  @Test public void canChangeExistingData() throws Exception {
+    updateAndCommit(asList(add(nodeId,value)));
+    updateAndCommit(asList(change(nodeId,value,value2)));
+    IndexReader reader=accessor.newReader();
+    assertEquals(asSet(nodeId),PrimitiveLongCollections.toSet(reader.query(exact(PROP_ID,value2))));
+    assertEquals(emptySet(),PrimitiveLongCollections.toSet(reader.query(exact(PROP_ID,value))));
+    reader.close();
+  }
+  @Test public void canRemoveExistingData() throws Exception {
+    updateAndCommit(asList(add(nodeId,value),add(nodeId2,value2)));
+    updateAndCommit(asList(remove(nodeId,value)));
+    IndexReader reader=accessor.newReader();
+    assertEquals(asSet(nodeId2),PrimitiveLongCollections.toSet(reader.query(exact(PROP_ID,value2))));
+    assertEquals(asSet(),PrimitiveLongCollections.toSet(reader.query(exact(PROP_ID,value))));
+    reader.close();
+  }
+  @Test public void shouldStopSamplingWhenIndexIsDropped() throws Exception {
+    updateAndCommit(asList(add(nodeId,value),add(nodeId2,value2)));
+    IndexReader indexReader=accessor.newReader();
+    IndexSampler indexSampler=indexReader.createSampler();
+    Future<Void> drop=threading.executeAndAwait((IOFunction<Void,Void>)nothing -> {
+      accessor.drop();
+      return nothing;
+    }
+,null,waitingWhileIn(TaskCoordinator.class,"awaitCompletion"),3,SECONDS);
+    try (IndexReader reader=indexReader){
+      indexSampler.sampleIndex();
+      fail("expected exception");
+    }
+ catch (    IndexNotFoundKernelException e) {
+      assertEquals("Index dropped while sampling.",e.getMessage());
+    }
+ finally {
+      drop.get();
+    }
+  }
+  private IndexEntryUpdate<?> add(  long nodeId,  Object value){
+    return IndexQueryHelper.add(nodeId,index.schema(),value);
+  }
+  private IndexEntryUpdate<?> remove(  long nodeId,  Object value){
+    return IndexQueryHelper.remove(nodeId,index.schema(),value);
+  }
+  private IndexEntryUpdate<?> change(  long nodeId,  Object valueBefore,  Object valueAfter){
+    return IndexQueryHelper.change(nodeId,index.schema(),valueBefore,valueAfter);
+  }
+  private void updateAndCommit(  List<IndexEntryUpdate<?>> nodePropertyUpdates) throws IOException, IndexEntryConflictException {
+    try (IndexUpdater updater=accessor.newUpdater(IndexUpdateMode.ONLINE)){
+      for (      IndexEntryUpdate<?> update : nodePropertyUpdates) {
+        updater.process(update);
+      }
+    }
+   }
+}

@@ -1,0 +1,397 @@
+/** 
+ * Integration test for triggering and resuming from savepoints.
+ */
+@SuppressWarnings("serial") public class SavepointITCase extends TestLogger {
+  private static final Logger LOG=LoggerFactory.getLogger(SavepointITCase.class);
+  @Rule public final TemporaryFolder folder=new TemporaryFolder();
+  /** 
+ * Triggers a savepoint for a job that uses the FsStateBackend. We expect that all checkpoint files are written to a new savepoint directory. <ol> <li>Submit job, wait for some progress</li> <li>Trigger savepoint and verify that savepoint has been created</li> <li>Shut down the cluster, re-submit the job from the savepoint, verify that the initial state has been reset, and all tasks are running again</li> <li>Cancel job, dispose the savepoint, and verify that everything has been cleaned up</li> </ol>
+ */
+  @Test public void testTriggerSavepointAndResumeWithFileBasedCheckpoints() throws Exception {
+    final int numTaskManagers=2;
+    final int numSlotsPerTaskManager=2;
+    final int parallelism=numTaskManagers * numSlotsPerTaskManager;
+    final File testRoot=folder.newFolder();
+    Configuration config=new Configuration();
+    final File checkpointDir=new File(testRoot,"checkpoints");
+    final File savepointRootDir=new File(testRoot,"savepoints");
+    if (!checkpointDir.mkdir() || !savepointRootDir.mkdirs()) {
+      fail("Test setup failed: failed to create temporary directories.");
+    }
+    config.setString(CheckpointingOptions.STATE_BACKEND,"filesystem");
+    config.setString(CheckpointingOptions.CHECKPOINTS_DIRECTORY,checkpointDir.toURI().toString());
+    config.setInteger(CheckpointingOptions.FS_SMALL_FILE_THRESHOLD,0);
+    config.setString(CheckpointingOptions.SAVEPOINT_DIRECTORY,savepointRootDir.toURI().toString());
+    MiniClusterResourceFactory clusterFactory=new MiniClusterResourceFactory(numTaskManagers,numSlotsPerTaskManager,config);
+    String savepointPath=submitJobAndGetVerifiedSavepoint(clusterFactory,parallelism);
+    restoreJobAndVerifyState(savepointPath,clusterFactory,parallelism);
+  }
+  private String submitJobAndGetVerifiedSavepoint(  MiniClusterResourceFactory clusterFactory,  int parallelism) throws Exception {
+    final JobGraph jobGraph=createJobGraph(parallelism,0,1000);
+    final JobID jobId=jobGraph.getJobID();
+    StatefulCounter.resetForTest(parallelism);
+    MiniClusterResource cluster=clusterFactory.get();
+    cluster.before();
+    ClusterClient<?> client=cluster.getClusterClient();
+    try {
+      client.setDetached(true);
+      client.submitJob(jobGraph,SavepointITCase.class.getClassLoader());
+      StatefulCounter.getProgressLatch().await();
+      String savepointPath=client.triggerSavepoint(jobId,null).get();
+      File savepointDir=new File(new URI(savepointPath));
+      assertTrue("Savepoint directory does not exist.",savepointDir.exists());
+      assertTrue("Savepoint did not create self-contained directory.",savepointDir.isDirectory());
+      File[] savepointFiles=savepointDir.listFiles();
+      if (savepointFiles != null) {
+        String errMsg="Did not write expected number of savepoint/checkpoint files to directory: " + Arrays.toString(savepointFiles);
+        assertEquals(errMsg,1 + parallelism,savepointFiles.length);
+      }
+ else {
+        fail(String.format("Returned savepoint path (%s) is not valid.",savepointPath));
+      }
+      return savepointPath;
+    }
+  finally {
+      cluster.after();
+      StatefulCounter.resetForTest(parallelism);
+    }
+  }
+  private void restoreJobAndVerifyState(  String savepointPath,  MiniClusterResourceFactory clusterFactory,  int parallelism) throws Exception {
+    final JobGraph jobGraph=createJobGraph(parallelism,0,1000);
+    jobGraph.setSavepointRestoreSettings(SavepointRestoreSettings.forPath(savepointPath));
+    final JobID jobId=jobGraph.getJobID();
+    StatefulCounter.resetForTest(parallelism);
+    MiniClusterResource cluster=clusterFactory.get();
+    cluster.before();
+    ClusterClient<?> client=cluster.getClusterClient();
+    try {
+      client.setDetached(true);
+      client.submitJob(jobGraph,SavepointITCase.class.getClassLoader());
+      StatefulCounter.getRestoreLatch().await();
+      StatefulCounter.getProgressLatch().await();
+      client.cancel(jobId);
+      FutureUtils.retrySuccesfulWithDelay(() -> client.getJobStatus(jobId),Time.milliseconds(50),Deadline.now().plus(Duration.ofSeconds(30)),status -> status == JobStatus.CANCELED,TestingUtils.defaultScheduledExecutor());
+      client.disposeSavepoint(savepointPath).get();
+      assertFalse("Savepoint not properly cleaned up.",new File(savepointPath).exists());
+    }
+  finally {
+      cluster.after();
+      StatefulCounter.resetForTest(parallelism);
+    }
+  }
+  @Test public void testSubmitWithUnknownSavepointPath() throws Exception {
+    int numTaskManagers=1;
+    int numSlotsPerTaskManager=1;
+    int parallelism=numTaskManagers * numSlotsPerTaskManager;
+    final File tmpDir=folder.newFolder();
+    final File savepointDir=new File(tmpDir,"savepoints");
+    final Configuration config=new Configuration();
+    config.setString(CheckpointingOptions.SAVEPOINT_DIRECTORY,savepointDir.toURI().toString());
+    MiniClusterResource cluster=new MiniClusterResource(new MiniClusterResourceConfiguration.Builder().setConfiguration(config).setNumberTaskManagers(numTaskManagers).setNumberSlotsPerTaskManager(numSlotsPerTaskManager).build());
+    cluster.before();
+    ClusterClient<?> client=cluster.getClusterClient();
+    try {
+      int numberOfRetries=1000;
+      final JobGraph jobGraph=createJobGraph(parallelism,numberOfRetries,3600000);
+      jobGraph.setSavepointRestoreSettings(SavepointRestoreSettings.forPath("unknown path"));
+      assertEquals("unknown path",jobGraph.getSavepointRestoreSettings().getRestorePath());
+      LOG.info("Submitting job " + jobGraph.getJobID() + " in detached mode.");
+      try {
+        client.setDetached(false);
+        client.submitJob(jobGraph,SavepointITCase.class.getClassLoader());
+      }
+ catch (      Exception e) {
+        Optional<JobExecutionException> expectedJobExecutionException=ExceptionUtils.findThrowable(e,JobExecutionException.class);
+        Optional<FileNotFoundException> expectedFileNotFoundException=ExceptionUtils.findThrowable(e,FileNotFoundException.class);
+        if (!(expectedJobExecutionException.isPresent() && expectedFileNotFoundException.isPresent())) {
+          throw e;
+        }
+      }
+    }
+  finally {
+      cluster.after();
+    }
+  }
+  /** 
+ * FLINK-5985 <p>This test ensures we can restore from a savepoint under modifications to the job graph that only concern stateless operators.
+ */
+  @Test public void testCanRestoreWithModifiedStatelessOperators() throws Exception {
+    int numTaskManagers=2;
+    int numSlotsPerTaskManager=2;
+    int parallelism=2;
+    final Deadline deadline=Deadline.now().plus(Duration.ofMinutes(5));
+    final File tmpDir=folder.newFolder();
+    final File savepointDir=new File(tmpDir,"savepoints");
+    final Configuration config=new Configuration();
+    config.setString(CheckpointingOptions.SAVEPOINT_DIRECTORY,savepointDir.toURI().toString());
+    String savepointPath;
+    LOG.info("Flink configuration: " + config + ".");
+    MiniClusterResource cluster=new MiniClusterResource(new MiniClusterResourceConfiguration.Builder().setConfiguration(config).setNumberTaskManagers(numTaskManagers).setNumberSlotsPerTaskManager(numSlotsPerTaskManager).build());
+    LOG.info("Shutting down Flink cluster.");
+    cluster.before();
+    ClusterClient<?> client=cluster.getClusterClient();
+    try {
+      final StatefulCounter statefulCounter=new StatefulCounter();
+      StatefulCounter.resetForTest(parallelism);
+      StreamExecutionEnvironment env=StreamExecutionEnvironment.getExecutionEnvironment();
+      env.setParallelism(parallelism);
+      env.addSource(new InfiniteTestSource()).shuffle().map(value -> 4 * value).shuffle().map(statefulCounter).uid("statefulCounter").shuffle().map(value -> 2 * value).addSink(new DiscardingSink<>());
+      JobGraph originalJobGraph=env.getStreamGraph().getJobGraph();
+      client.setDetached(true);
+      JobSubmissionResult submissionResult=client.submitJob(originalJobGraph,SavepointITCase.class.getClassLoader());
+      JobID jobID=submissionResult.getJobID();
+      StatefulCounter.getProgressLatch().await(deadline.timeLeft().toMillis(),TimeUnit.MILLISECONDS);
+      savepointPath=client.triggerSavepoint(jobID,null).get();
+      LOG.info("Retrieved savepoint: " + savepointPath + ".");
+    }
+  finally {
+      LOG.info("Shutting down Flink cluster.");
+      cluster.after();
+    }
+    cluster=new MiniClusterResource(new MiniClusterResourceConfiguration.Builder().setConfiguration(config).setNumberTaskManagers(numTaskManagers).setNumberSlotsPerTaskManager(numSlotsPerTaskManager).build());
+    LOG.info("Restarting Flink cluster.");
+    cluster.before();
+    client=cluster.getClusterClient();
+    try {
+      StatefulCounter.resetForTest(parallelism);
+      StreamExecutionEnvironment env=StreamExecutionEnvironment.getExecutionEnvironment();
+      env.setParallelism(parallelism);
+      env.addSource(new InfiniteTestSource()).shuffle().map(new StatefulCounter()).uid("statefulCounter").shuffle().map(value -> value).addSink(new DiscardingSink<>());
+      JobGraph modifiedJobGraph=env.getStreamGraph().getJobGraph();
+      modifiedJobGraph.setSavepointRestoreSettings(SavepointRestoreSettings.forPath(savepointPath));
+      LOG.info("Resubmitting job " + modifiedJobGraph.getJobID() + " with "+ "savepoint path "+ savepointPath+ " in detached mode.");
+      client.setDetached(true);
+      client.submitJob(modifiedJobGraph,SavepointITCase.class.getClassLoader());
+      StatefulCounter.getRestoreLatch().await(deadline.timeLeft().toMillis(),TimeUnit.MILLISECONDS);
+      StatefulCounter.getProgressLatch().await(deadline.timeLeft().toMillis(),TimeUnit.MILLISECONDS);
+    }
+  finally {
+      cluster.after();
+    }
+  }
+  /** 
+ * Creates a streaming JobGraph from the StreamEnvironment.
+ */
+  private JobGraph createJobGraph(  int parallelism,  int numberOfRetries,  long restartDelay){
+    StreamExecutionEnvironment env=StreamExecutionEnvironment.getExecutionEnvironment();
+    env.setParallelism(parallelism);
+    env.disableOperatorChaining();
+    env.getConfig().setRestartStrategy(RestartStrategies.fixedDelayRestart(numberOfRetries,restartDelay));
+    env.getConfig().disableSysoutLogging();
+    DataStream<Integer> stream=env.addSource(new InfiniteTestSource()).shuffle().map(new StatefulCounter());
+    stream.addSink(new DiscardingSink<>());
+    return env.getStreamGraph().getJobGraph();
+  }
+private static class InfiniteTestSource implements SourceFunction<Integer> {
+    private static final long serialVersionUID=1L;
+    private volatile boolean running=true;
+    @Override public void run(    SourceContext<Integer> ctx) throws Exception {
+      while (running) {
+synchronized (ctx.getCheckpointLock()) {
+          ctx.collect(1);
+        }
+        Thread.sleep(1);
+      }
+    }
+    @Override public void cancel(){
+      running=false;
+    }
+  }
+private static class StatefulCounter extends RichMapFunction<Integer,Integer> implements ListCheckpointed<byte[]> {
+    private static volatile CountDownLatch progressLatch=new CountDownLatch(0);
+    private static volatile CountDownLatch restoreLatch=new CountDownLatch(0);
+    private int numCollectedElements=0;
+    private static final long serialVersionUID=7317800376639115920L;
+    private byte[] data;
+    @Override public void open(    Configuration parameters) throws Exception {
+      if (data == null) {
+        Random rand=new Random(getRuntimeContext().getIndexOfThisSubtask());
+        data=new byte[CheckpointingOptions.FS_SMALL_FILE_THRESHOLD.defaultValue() + 1];
+        rand.nextBytes(data);
+      }
+    }
+    @Override public Integer map(    Integer value) throws Exception {
+      for (int i=0; i < data.length; i++) {
+        data[i]+=1;
+      }
+      if (numCollectedElements++ > 10) {
+        progressLatch.countDown();
+      }
+      return value;
+    }
+    @Override public List<byte[]> snapshotState(    long checkpointId,    long timestamp) throws Exception {
+      return Collections.singletonList(data);
+    }
+    @Override public void restoreState(    List<byte[]> state) throws Exception {
+      if (state.isEmpty() || state.size() > 1) {
+        throw new RuntimeException("Test failed due to unexpected recovered state size " + state.size());
+      }
+      this.data=state.get(0);
+      restoreLatch.countDown();
+    }
+    static CountDownLatch getProgressLatch(){
+      return progressLatch;
+    }
+    static CountDownLatch getRestoreLatch(){
+      return restoreLatch;
+    }
+    static void resetForTest(    int parallelism){
+      progressLatch=new CountDownLatch(parallelism);
+      restoreLatch=new CountDownLatch(parallelism);
+    }
+  }
+  private static final int ITER_TEST_PARALLELISM=1;
+  private static OneShotLatch[] iterTestSnapshotWait=new OneShotLatch[ITER_TEST_PARALLELISM];
+  private static OneShotLatch[] iterTestRestoreWait=new OneShotLatch[ITER_TEST_PARALLELISM];
+  private static int[] iterTestCheckpointVerify=new int[ITER_TEST_PARALLELISM];
+  @Test public void testSavepointForJobWithIteration() throws Exception {
+    for (int i=0; i < ITER_TEST_PARALLELISM; ++i) {
+      iterTestSnapshotWait[i]=new OneShotLatch();
+      iterTestRestoreWait[i]=new OneShotLatch();
+      iterTestCheckpointVerify[i]=0;
+    }
+    TemporaryFolder folder=new TemporaryFolder();
+    folder.create();
+    final File tmpDir=folder.newFolder();
+    final StreamExecutionEnvironment env=StreamExecutionEnvironment.getExecutionEnvironment();
+    final IntegerStreamSource source=new IntegerStreamSource();
+    IterativeStream<Integer> iteration=env.addSource(source).flatMap(new RichFlatMapFunction<Integer,Integer>(){
+      private static final long serialVersionUID=1L;
+      @Override public void flatMap(      Integer in,      Collector<Integer> clctr) throws Exception {
+        clctr.collect(in);
+      }
+    }
+).setParallelism(ITER_TEST_PARALLELISM).keyBy(new KeySelector<Integer,Object>(){
+      private static final long serialVersionUID=1L;
+      @Override public Object getKey(      Integer value) throws Exception {
+        return value;
+      }
+    }
+).flatMap(new DuplicateFilter()).setParallelism(ITER_TEST_PARALLELISM).iterate();
+    DataStream<Integer> iterationBody=iteration.map(new MapFunction<Integer,Integer>(){
+      private static final long serialVersionUID=1L;
+      @Override public Integer map(      Integer value) throws Exception {
+        return value;
+      }
+    }
+).setParallelism(ITER_TEST_PARALLELISM);
+    iteration.closeWith(iterationBody);
+    StreamGraph streamGraph=env.getStreamGraph();
+    streamGraph.setJobName("Test");
+    JobGraph jobGraph=streamGraph.getJobGraph();
+    Configuration config=new Configuration();
+    config.addAll(jobGraph.getJobConfiguration());
+    config.setString(TaskManagerOptions.MANAGED_MEMORY_SIZE,"0");
+    final File checkpointDir=new File(tmpDir,"checkpoints");
+    final File savepointDir=new File(tmpDir,"savepoints");
+    if (!checkpointDir.mkdir() || !savepointDir.mkdirs()) {
+      fail("Test setup failed: failed to create temporary directories.");
+    }
+    config.setString(CheckpointingOptions.STATE_BACKEND,"filesystem");
+    config.setString(CheckpointingOptions.CHECKPOINTS_DIRECTORY,checkpointDir.toURI().toString());
+    config.setInteger(CheckpointingOptions.FS_SMALL_FILE_THRESHOLD,0);
+    config.setString(CheckpointingOptions.SAVEPOINT_DIRECTORY,savepointDir.toURI().toString());
+    MiniClusterResource cluster=new MiniClusterResource(new MiniClusterResourceConfiguration.Builder().setConfiguration(config).setNumberTaskManagers(1).setNumberSlotsPerTaskManager(2 * jobGraph.getMaximumParallelism()).build());
+    cluster.before();
+    ClusterClient<?> client=cluster.getClusterClient();
+    String savepointPath=null;
+    try {
+      client.setDetached(true);
+      client.submitJob(jobGraph,SavepointITCase.class.getClassLoader());
+      for (      OneShotLatch latch : iterTestSnapshotWait) {
+        latch.await();
+      }
+      savepointPath=client.triggerSavepoint(jobGraph.getJobID(),null).get();
+      client.cancel(jobGraph.getJobID());
+      while (!client.getJobStatus(jobGraph.getJobID()).get().isGloballyTerminalState()) {
+        Thread.sleep(100);
+      }
+      jobGraph=streamGraph.getJobGraph();
+      jobGraph.setSavepointRestoreSettings(SavepointRestoreSettings.forPath(savepointPath));
+      client.setDetached(true);
+      client.submitJob(jobGraph,SavepointITCase.class.getClassLoader());
+      for (      OneShotLatch latch : iterTestRestoreWait) {
+        latch.await();
+      }
+      client.cancel(jobGraph.getJobID());
+      while (!client.getJobStatus(jobGraph.getJobID()).get().isGloballyTerminalState()) {
+        Thread.sleep(100);
+      }
+    }
+  finally {
+      if (null != savepointPath) {
+        client.disposeSavepoint(savepointPath);
+      }
+      cluster.after();
+    }
+  }
+private static final class IntegerStreamSource extends RichSourceFunction<Integer> implements ListCheckpointed<Integer> {
+    private static final long serialVersionUID=1L;
+    private volatile boolean running;
+    private volatile boolean isRestored;
+    private int emittedCount;
+    public IntegerStreamSource(){
+      this.running=true;
+      this.isRestored=false;
+      this.emittedCount=0;
+    }
+    @Override public void run(    SourceContext<Integer> ctx) throws Exception {
+      while (running) {
+synchronized (ctx.getCheckpointLock()) {
+          ctx.collect(emittedCount);
+        }
+        if (emittedCount < 100) {
+          ++emittedCount;
+        }
+ else {
+          emittedCount=0;
+        }
+        Thread.sleep(1);
+      }
+    }
+    @Override public void cancel(){
+      running=false;
+    }
+    @Override public List<Integer> snapshotState(    long checkpointId,    long timestamp) throws Exception {
+      iterTestCheckpointVerify[getRuntimeContext().getIndexOfThisSubtask()]=emittedCount;
+      return Collections.singletonList(emittedCount);
+    }
+    @Override public void restoreState(    List<Integer> state) throws Exception {
+      if (!state.isEmpty()) {
+        this.emittedCount=state.get(0);
+      }
+      Assert.assertEquals(iterTestCheckpointVerify[getRuntimeContext().getIndexOfThisSubtask()],emittedCount);
+      iterTestRestoreWait[getRuntimeContext().getIndexOfThisSubtask()].trigger();
+    }
+  }
+private static class DuplicateFilter extends RichFlatMapFunction<Integer,Integer> {
+    static final ValueStateDescriptor<Boolean> DESCRIPTOR=new ValueStateDescriptor<>("seen",Boolean.class,false);
+    private static final long serialVersionUID=1L;
+    private ValueState<Boolean> operatorState;
+    @Override public void open(    Configuration configuration){
+      operatorState=this.getRuntimeContext().getState(DESCRIPTOR);
+    }
+    @Override public void flatMap(    Integer value,    Collector<Integer> out) throws Exception {
+      if (!operatorState.value()) {
+        out.collect(value);
+        operatorState.update(true);
+      }
+      if (30 == value) {
+        iterTestSnapshotWait[getRuntimeContext().getIndexOfThisSubtask()].trigger();
+      }
+    }
+  }
+private static class MiniClusterResourceFactory {
+    private final int numTaskManagers;
+    private final int numSlotsPerTaskManager;
+    private final Configuration config;
+    private MiniClusterResourceFactory(    int numTaskManagers,    int numSlotsPerTaskManager,    Configuration config){
+      this.numTaskManagers=numTaskManagers;
+      this.numSlotsPerTaskManager=numSlotsPerTaskManager;
+      this.config=config;
+    }
+    MiniClusterResource get(){
+      return new MiniClusterResource(new MiniClusterResourceConfiguration.Builder().setConfiguration(config).setNumberTaskManagers(numTaskManagers).setNumberSlotsPerTaskManager(numSlotsPerTaskManager).build());
+    }
+  }
+}

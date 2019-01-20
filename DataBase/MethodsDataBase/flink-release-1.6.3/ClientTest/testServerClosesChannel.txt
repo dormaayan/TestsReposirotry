@@ -1,0 +1,64 @@
+/** 
+ * Tests that a server channel close, closes the connection and removes it from the established connections.
+ */
+@Test public void testServerClosesChannel() throws Exception {
+  Deadline deadline=TEST_TIMEOUT.fromNow();
+  AtomicKvStateRequestStats stats=new AtomicKvStateRequestStats();
+  final MessageSerializer<KvStateInternalRequest,KvStateResponse> serializer=new MessageSerializer<>(new KvStateInternalRequest.KvStateInternalRequestDeserializer(),new KvStateResponse.KvStateResponseDeserializer());
+  Client<KvStateInternalRequest,KvStateResponse> client=null;
+  Channel serverChannel=null;
+  try {
+    client=new Client<>("Test Client",1,serializer,stats);
+    final AtomicBoolean received=new AtomicBoolean();
+    final AtomicReference<Channel> channel=new AtomicReference<>();
+    serverChannel=createServerChannel(new ChannelInboundHandlerAdapter(){
+      @Override public void channelActive(      ChannelHandlerContext ctx) throws Exception {
+        channel.set(ctx.channel());
+      }
+      @Override public void channelRead(      ChannelHandlerContext ctx,      Object msg) throws Exception {
+        received.set(true);
+      }
+    }
+);
+    InetSocketAddress serverAddress=getKvStateServerAddress(serverChannel);
+    KvStateInternalRequest request=new KvStateInternalRequest(new KvStateID(),new byte[0]);
+    Future<KvStateResponse> future=client.sendRequest(serverAddress,request);
+    while (!received.get() && deadline.hasTimeLeft()) {
+      Thread.sleep(50L);
+    }
+    assertTrue("Receive timed out",received.get());
+    assertEquals(1,stats.getNumConnections());
+    channel.get().close().await(deadline.timeLeft().toMillis(),TimeUnit.MILLISECONDS);
+    try {
+      future.get(deadline.timeLeft().toMillis(),TimeUnit.MILLISECONDS);
+      fail("Did not throw expected server failure");
+    }
+ catch (    ExecutionException e) {
+      if (!(e.getCause() instanceof ClosedChannelException)) {
+        fail("Did not throw expected Exception");
+      }
+    }
+    assertEquals(0L,stats.getNumConnections());
+    while (deadline.hasTimeLeft() && (stats.getNumSuccessful() != 0L || stats.getNumFailed() != 1L)) {
+      Thread.sleep(100L);
+    }
+    assertEquals(1L,stats.getNumRequests());
+    assertEquals(0L,stats.getNumSuccessful());
+    assertEquals(1L,stats.getNumFailed());
+  }
+  finally {
+    if (client != null) {
+      try {
+        client.shutdown().get(10L,TimeUnit.SECONDS);
+      }
+ catch (      Exception e) {
+        e.printStackTrace();
+      }
+      Assert.assertTrue(client.isEventGroupShutdown());
+    }
+    if (serverChannel != null) {
+      serverChannel.close();
+    }
+    assertEquals("Channel leak",0L,stats.getNumConnections());
+  }
+}

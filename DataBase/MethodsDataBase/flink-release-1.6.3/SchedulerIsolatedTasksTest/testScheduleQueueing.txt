@@ -1,0 +1,56 @@
+@Test public void testScheduleQueueing() throws Exception {
+  final int NUM_INSTANCES=50;
+  final int NUM_SLOTS_PER_INSTANCE=3;
+  final int NUM_TASKS_TO_SCHEDULE=2000;
+  for (int i=0; i < NUM_INSTANCES; i++) {
+    testingSlotProvider.addTaskManager((int)(Math.random() * NUM_SLOTS_PER_INSTANCE) + 1);
+  }
+  final int totalSlots=testingSlotProvider.getNumberOfAvailableSlots();
+  List<CompletableFuture<LogicalSlot>> allAllocatedSlots=new ArrayList<>();
+  final Set<LogicalSlot> toRelease=new HashSet<>();
+  final AtomicBoolean errored=new AtomicBoolean(false);
+  Runnable disposer=new Runnable(){
+    @Override public void run(){
+      try {
+        int recycled=0;
+        while (recycled < NUM_TASKS_TO_SCHEDULE) {
+synchronized (toRelease) {
+            while (toRelease.isEmpty()) {
+              toRelease.wait();
+            }
+            Iterator<LogicalSlot> iter=toRelease.iterator();
+            LogicalSlot next=iter.next();
+            iter.remove();
+            next.releaseSlot();
+            recycled++;
+          }
+        }
+      }
+ catch (      Throwable t) {
+        errored.set(true);
+      }
+    }
+  }
+;
+  Thread disposeThread=new Thread(disposer);
+  disposeThread.start();
+  for (int i=0; i < NUM_TASKS_TO_SCHEDULE; i++) {
+    CompletableFuture<LogicalSlot> future=testingSlotProvider.allocateSlot(new ScheduledUnit(getDummyTask()),true,SlotProfile.noRequirements(),TestingUtils.infiniteTime());
+    future.thenAcceptAsync((    LogicalSlot slot) -> {
+synchronized (toRelease) {
+        toRelease.add(slot);
+        toRelease.notifyAll();
+      }
+    }
+,TestingUtils.defaultExecutionContext());
+    allAllocatedSlots.add(future);
+  }
+  disposeThread.join();
+  assertFalse("The slot releasing thread caused an error.",errored.get());
+  List<LogicalSlot> slotsAfter=new ArrayList<>();
+  for (  CompletableFuture<LogicalSlot> future : allAllocatedSlots) {
+    slotsAfter.add(future.get());
+  }
+  assertTrue(areAllDistinct(slotsAfter.toArray()));
+  assertEquals("All slots should be available.",totalSlots,testingSlotProvider.getNumberOfAvailableSlots());
+}

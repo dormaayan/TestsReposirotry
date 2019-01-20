@@ -1,0 +1,75 @@
+@Test public void registerUnregisterWithConcurrentTransactions() throws Exception {
+  ExecutorService executor=Executors.newFixedThreadPool(2);
+  AtomicInteger runningCounter=new AtomicInteger();
+  AtomicInteger doneCounter=new AtomicInteger();
+  BinaryLatch startLatch=new BinaryLatch();
+  RelationshipType relationshipType=RelationshipType.withName("REL");
+  CountingTransactionEventHandler[] handlers=new CountingTransactionEventHandler[20];
+  for (int i=0; i < handlers.length; i++) {
+    handlers[i]=new CountingTransactionEventHandler();
+  }
+  long relNodeId;
+  try (Transaction tx=db.beginTx()){
+    relNodeId=db.createNode().getId();
+    tx.success();
+  }
+   Future<?> nodeCreator=executor.submit(() -> {
+    try {
+      runningCounter.incrementAndGet();
+      startLatch.await();
+      for (int i=0; i < 2_000; i++) {
+        try (Transaction tx=db.beginTx()){
+          db.createNode();
+          if (ThreadLocalRandom.current().nextBoolean()) {
+            tx.success();
+          }
+        }
+       }
+    }
+  finally {
+      doneCounter.incrementAndGet();
+    }
+  }
+);
+  Future<?> relationshipCreator=executor.submit(() -> {
+    try {
+      runningCounter.incrementAndGet();
+      startLatch.await();
+      for (int i=0; i < 1_000; i++) {
+        try (Transaction tx=db.beginTx()){
+          Node relNode=db.getNodeById(relNodeId);
+          relNode.createRelationshipTo(relNode,relationshipType);
+          if (ThreadLocalRandom.current().nextBoolean()) {
+            tx.success();
+          }
+        }
+       }
+    }
+  finally {
+      doneCounter.incrementAndGet();
+    }
+  }
+);
+  while (runningCounter.get() < 2) {
+    Thread.yield();
+  }
+  int i=0;
+  db.registerTransactionEventHandler(handlers[i]);
+  CountingTransactionEventHandler currentlyRegistered=handlers[i];
+  i++;
+  startLatch.release();
+  while (doneCounter.get() < 2) {
+    db.registerTransactionEventHandler(handlers[i]);
+    i++;
+    if (i == handlers.length) {
+      i=0;
+    }
+    db.unregisterTransactionEventHandler(currentlyRegistered);
+    currentlyRegistered=handlers[i];
+  }
+  nodeCreator.get();
+  relationshipCreator.get();
+  for (  CountingTransactionEventHandler handler : handlers) {
+    assertEquals(0,handler.get());
+  }
+}

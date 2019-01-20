@@ -1,0 +1,86 @@
+@Category({RPCTests.class,LargeTests.class}) public class TestMasterFifoRpcScheduler {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestMasterFifoRpcScheduler.class);
+  private static final Logger LOG=LoggerFactory.getLogger(TestMasterFifoRpcScheduler.class);
+  private static final String REGION_SERVER_REPORT="RegionServerReport";
+  private static final String OTHER="Other";
+  private static HBaseTestingUtility TEST_UTIL=new HBaseTestingUtility();
+  @BeforeClass public static void setupBeforeClass() throws Exception {
+    Configuration conf=TEST_UTIL.getConfiguration();
+    conf.set(RSRpcServices.MASTER_RPC_SCHEDULER_FACTORY_CLASS,"org.apache.hadoop.hbase.regionserver.MasterFifoRpcSchedulerFactory");
+    conf.setInt(HConstants.REGION_SERVER_HANDLER_COUNT,5);
+    conf.setInt(MasterFifoRpcScheduler.MASTER_SERVER_REPORT_HANDLER_COUNT,2);
+    TEST_UTIL.startMiniCluster();
+  }
+  @AfterClass public static void tearDownAfterClass() throws Exception {
+    TEST_UTIL.shutdownMiniCluster();
+  }
+  @Test public void testMasterRpcScheduler(){
+    HMaster master=TEST_UTIL.getHBaseCluster().getMaster();
+    MasterRpcServices masterRpcServices=master.getMasterRpcServices();
+    RpcScheduler masterRpcScheduler=masterRpcServices.getRpcScheduler();
+    Assert.assertTrue(masterRpcScheduler instanceof MasterFifoRpcScheduler);
+  }
+  @Test public void testCallQueueInfo() throws Exception {
+    Configuration conf=HBaseConfiguration.create();
+    AtomicInteger callExecutionCount=new AtomicInteger(0);
+    RpcScheduler scheduler=new MockMasterFifoRpcScheduler(conf,2,1);
+    scheduler.start();
+    int totalCallMethods=30;
+    int unableToDispatch=0;
+    for (int i=totalCallMethods; i > 0; i--) {
+      CallRunner task=createMockTask(callExecutionCount,i < 20);
+      if (!scheduler.dispatch(task)) {
+        unableToDispatch++;
+      }
+      Thread.sleep(10);
+    }
+    CallQueueInfo callQueueInfo=scheduler.getCallQueueInfo();
+    int executionCount=callExecutionCount.get();
+    String expectedQueueName="Master Fifo Queue";
+    assertEquals(1,callQueueInfo.getCallQueueNames().size());
+    long callQueueSize=0;
+    for (    String queueName : callQueueInfo.getCallQueueNames()) {
+      assertEquals(expectedQueueName,queueName);
+      Set<String> methodNames=callQueueInfo.getCalledMethodNames(queueName);
+      if (methodNames.size() == 2) {
+        assertTrue(methodNames.contains(REGION_SERVER_REPORT));
+        assertTrue(methodNames.contains(OTHER));
+      }
+      for (      String methodName : callQueueInfo.getCalledMethodNames(queueName)) {
+        callQueueSize+=callQueueInfo.getCallMethodCount(queueName,methodName);
+      }
+    }
+    assertEquals(totalCallMethods - unableToDispatch,callQueueSize + executionCount);
+    scheduler.stop();
+  }
+  private CallRunner createMockTask(  AtomicInteger callExecutionCount,  boolean isRegionServerReportTask){
+    CallRunner task=mock(CallRunner.class);
+    ServerCall call=mock(ServerCall.class);
+    when(task.getRpcCall()).thenReturn(call);
+    when(call.getHeader()).thenReturn(RPCProtos.RequestHeader.newBuilder().setMethodName(isRegionServerReportTask ? REGION_SERVER_REPORT : OTHER).build());
+    doAnswer(new Answer<Void>(){
+      @Override public Void answer(      InvocationOnMock invocation) throws Throwable {
+        callExecutionCount.incrementAndGet();
+        Thread.sleep(1000);
+        return null;
+      }
+    }
+).when(task).run();
+    return task;
+  }
+private static class MockMasterFifoRpcScheduler extends MasterFifoRpcScheduler {
+    public MockMasterFifoRpcScheduler(    Configuration conf,    int callHandlerCount,    int rsReportHandlerCount){
+      super(conf,callHandlerCount,rsReportHandlerCount);
+    }
+    /** 
+ * Override this method because we can't mock a Descriptors.MethodDescriptor
+ */
+    @Override protected String getCallMethod(    final CallRunner task){
+      RpcCall call=task.getRpcCall();
+      if (call.getHeader() != null) {
+        return call.getHeader().getMethodName();
+      }
+      return null;
+    }
+  }
+}

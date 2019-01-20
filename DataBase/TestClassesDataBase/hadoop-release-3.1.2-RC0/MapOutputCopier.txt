@@ -1,0 +1,73 @@
+/** 
+ * Implementation of map output copier(that avoids sorting) on the map side. It maintains keys in the input order within each partition created for reducers.
+ */
+static class MapOutputCopier<K,V> implements MapOutputCollector<K,V> {
+  private static final int BUF_SIZE=128 * 1024;
+  private MapTask mapTask;
+  private JobConf jobConf;
+  private TaskReporter reporter;
+  private int numberOfPartitions;
+  private Class<K> keyClass;
+  private Class<V> valueClass;
+  private KeyValueWriter<K,V> recordWriters[];
+  private ByteArrayOutputStream outStreams[];
+  public MapOutputCopier(){
+  }
+  @SuppressWarnings("unchecked") public void init(  MapOutputCollector.Context context) throws IOException, ClassNotFoundException {
+    this.mapTask=context.getMapTask();
+    this.jobConf=context.getJobConf();
+    this.reporter=context.getReporter();
+    numberOfPartitions=jobConf.getNumReduceTasks();
+    keyClass=(Class<K>)jobConf.getMapOutputKeyClass();
+    valueClass=(Class<V>)jobConf.getMapOutputValueClass();
+    recordWriters=new KeyValueWriter[numberOfPartitions];
+    outStreams=new ByteArrayOutputStream[numberOfPartitions];
+    for (int i=0; i < numberOfPartitions; i++) {
+      outStreams[i]=new ByteArrayOutputStream();
+      recordWriters[i]=new KeyValueWriter<K,V>(jobConf,outStreams[i],keyClass,valueClass);
+    }
+  }
+  public synchronized void collect(  K key,  V value,  int partitionNumber) throws IOException, InterruptedException {
+    if (partitionNumber >= 0 && partitionNumber < numberOfPartitions) {
+      recordWriters[partitionNumber].write(key,value);
+    }
+ else {
+      throw new IOException("Invalid partition number: " + partitionNumber);
+    }
+    reporter.progress();
+  }
+  public void close() throws IOException, InterruptedException {
+    long totalSize=0;
+    for (int i=0; i < numberOfPartitions; i++) {
+      recordWriters[i].close();
+      outStreams[i].close();
+      totalSize+=outStreams[i].size();
+    }
+    MapOutputFile mapOutputFile=mapTask.getMapOutputFile();
+    Path finalOutput=mapOutputFile.getOutputFileForWrite(totalSize);
+    Path indexPath=mapOutputFile.getOutputIndexFileForWrite(numberOfPartitions * mapTask.MAP_OUTPUT_INDEX_RECORD_LENGTH);
+    copyPartitions(finalOutput,indexPath);
+  }
+  public void flush() throws IOException, InterruptedException, ClassNotFoundException {
+  }
+  private void copyPartitions(  Path mapOutputPath,  Path indexPath) throws IOException {
+    FileSystem localFs=FileSystem.getLocal(jobConf);
+    FileSystem rfs=((LocalFileSystem)localFs).getRaw();
+    FSDataOutputStream rawOutput=rfs.create(mapOutputPath,true,BUF_SIZE);
+    SpillRecord spillRecord=new SpillRecord(numberOfPartitions);
+    IndexRecord indexRecord=new IndexRecord();
+    for (int i=0; i < numberOfPartitions; i++) {
+      indexRecord.startOffset=rawOutput.getPos();
+      byte buffer[]=outStreams[i].toByteArray();
+      IFileOutputStream checksumOutput=new IFileOutputStream(rawOutput);
+      checksumOutput.write(buffer);
+      checksumOutput.finish();
+      indexRecord.rawLength=(long)buffer.length;
+      indexRecord.partLength=rawOutput.getPos() - indexRecord.startOffset;
+      spillRecord.putIndex(indexRecord,i);
+      reporter.progress();
+    }
+    rawOutput.close();
+    spillRecord.writeToFile(indexPath,jobConf);
+  }
+}

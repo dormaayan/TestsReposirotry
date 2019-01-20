@@ -1,0 +1,69 @@
+@Category({LargeTests.class}) public class TestSettingTimeoutOnBlockingPoint {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestSettingTimeoutOnBlockingPoint.class);
+  private final static HBaseTestingUtility TEST_UTIL=new HBaseTestingUtility();
+  private static final byte[] FAM=Bytes.toBytes("f");
+  private static final byte[] ROW1=Bytes.toBytes("row1");
+  private static final byte[] ROW2=Bytes.toBytes("row2");
+  @Rule public TestName testName=new TestName();
+  @BeforeClass public static void setUpBeforeClass() throws Exception {
+    TEST_UTIL.getConfiguration().setBoolean(HConstants.STATUS_PUBLISHED,true);
+    TEST_UTIL.getConfiguration().setInt(HConstants.HBASE_CLIENT_RETRIES_NUMBER,1);
+    TEST_UTIL.getConfiguration().setInt(HConstants.REGION_SERVER_HANDLER_COUNT,2);
+    TEST_UTIL.startMiniCluster(2);
+  }
+  @AfterClass public static void setUpAfterClass() throws Exception {
+    TEST_UTIL.shutdownMiniCluster();
+  }
+public static class SleepCoprocessor implements RegionCoprocessor, RegionObserver {
+    public static final int SLEEP_TIME=10000;
+    @Override public Optional<RegionObserver> getRegionObserver(){
+      return Optional.of(this);
+    }
+    @Override public Result preIncrementAfterRowLock(    final ObserverContext<RegionCoprocessorEnvironment> e,    final Increment increment) throws IOException {
+      Threads.sleep(SLEEP_TIME);
+      return null;
+    }
+  }
+  @Test public void testRowLock() throws IOException {
+    TableName tableName=TableName.valueOf(testName.getMethodName());
+    HTableDescriptor hdt=TEST_UTIL.createTableDescriptor(tableName);
+    hdt.addCoprocessor(SleepCoprocessor.class.getName());
+    TEST_UTIL.createTable(hdt,new byte[][]{FAM},TEST_UTIL.getConfiguration());
+    Thread incrementThread=new Thread(() -> {
+      try {
+        try (Table table=TEST_UTIL.getConnection().getTable(tableName)){
+          table.incrementColumnValue(ROW1,FAM,FAM,1);
+        }
+       }
+ catch (      IOException e) {
+        Assert.fail(e.getMessage());
+      }
+    }
+);
+    Thread getThread=new Thread(() -> {
+      try {
+        try (Table table=TEST_UTIL.getConnection().getTable(tableName)){
+          table.setRpcTimeout(1000);
+          Delete delete=new Delete(ROW1);
+          table.delete(delete);
+        }
+       }
+ catch (      IOException e) {
+        Assert.fail(e.getMessage());
+      }
+    }
+);
+    incrementThread.start();
+    Threads.sleep(1000);
+    getThread.start();
+    Threads.sleep(2000);
+    try (Table table=TEST_UTIL.getConnection().getTable(tableName)){
+      table.setRpcTimeout(1000);
+      table.get(new Get(ROW2));
+    }
+  finally {
+      incrementThread.interrupt();
+      getThread.interrupt();
+    }
+  }
+}

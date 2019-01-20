@@ -1,0 +1,60 @@
+@Test public void testHFileEncryption() throws Exception {
+  RedundantKVGenerator generator=new RedundantKVGenerator();
+  List<KeyValue> testKvs=generator.generateTestKeyValues(1000);
+  Configuration conf=TEST_UTIL.getConfiguration();
+  CacheConfig cacheConf=new CacheConfig(conf);
+  for (  DataBlockEncoding encoding : DataBlockEncoding.values()) {
+    for (    Compression.Algorithm compression : TestHFileBlock.COMPRESSION_ALGORITHMS) {
+      HFileContext fileContext=new HFileContextBuilder().withBlockSize(4096).withEncryptionContext(cryptoContext).withCompression(compression).withDataBlockEncoding(encoding).build();
+      LOG.info("Writing with " + fileContext);
+      Path path=new Path(TEST_UTIL.getDataTestDir(),TEST_UTIL.getRandomUUID().toString() + ".hfile");
+      FSDataOutputStream out=fs.create(path);
+      HFile.Writer writer=HFile.getWriterFactory(conf,cacheConf).withOutputStream(out).withFileContext(fileContext).create();
+      try {
+        for (        KeyValue kv : testKvs) {
+          writer.append(kv);
+        }
+      }
+  finally {
+        writer.close();
+        out.close();
+      }
+      LOG.info("Reading with " + fileContext);
+      int i=0;
+      HFileScanner scanner=null;
+      HFile.Reader reader=HFile.createReader(fs,path,cacheConf,true,conf);
+      try {
+        reader.loadFileInfo();
+        FixedFileTrailer trailer=reader.getTrailer();
+        assertNotNull(trailer.getEncryptionKey());
+        scanner=reader.getScanner(false,false);
+        assertTrue("Initial seekTo failed",scanner.seekTo());
+        do {
+          Cell kv=scanner.getCell();
+          assertTrue("Read back an unexpected or invalid KV",testKvs.contains(KeyValueUtil.ensureKeyValue(kv)));
+          i++;
+        }
+ while (scanner.next());
+      }
+  finally {
+        reader.close();
+        scanner.close();
+      }
+      assertEquals("Did not read back as many KVs as written",i,testKvs.size());
+      LOG.info("Random seeking with " + fileContext);
+      reader=HFile.createReader(fs,path,cacheConf,true,conf);
+      try {
+        scanner=reader.getScanner(false,true);
+        assertTrue("Initial seekTo failed",scanner.seekTo());
+        for (i=0; i < 100; i++) {
+          KeyValue kv=testKvs.get(RNG.nextInt(testKvs.size()));
+          assertEquals("Unable to find KV as expected: " + kv,0,scanner.seekTo(kv));
+        }
+      }
+  finally {
+        scanner.close();
+        reader.close();
+      }
+    }
+  }
+}

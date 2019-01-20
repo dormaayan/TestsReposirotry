@@ -1,0 +1,169 @@
+@Category({MasterTests.class,SmallTests.class}) public class TestProcedureBypass {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestProcedureBypass.class);
+  private static final Logger LOG=LoggerFactory.getLogger(TestProcedureBypass.class);
+  private static final int PROCEDURE_EXECUTOR_SLOTS=1;
+  private static TestProcEnv procEnv;
+  private static ProcedureStore procStore;
+  private static ProcedureExecutor<TestProcEnv> procExecutor;
+  private static HBaseCommonTestingUtility htu;
+  private static FileSystem fs;
+  private static Path testDir;
+  private static Path logDir;
+private static class TestProcEnv {
+  }
+  @BeforeClass public static void setUp() throws Exception {
+    htu=new HBaseCommonTestingUtility();
+    procEnv=new TestProcEnv();
+    testDir=htu.getDataTestDir();
+    fs=testDir.getFileSystem(htu.getConfiguration());
+    assertTrue(testDir.depth() > 1);
+    logDir=new Path(testDir,"proc-logs");
+    procStore=ProcedureTestingUtility.createWalStore(htu.getConfiguration(),logDir);
+    procExecutor=new ProcedureExecutor<>(htu.getConfiguration(),procEnv,procStore);
+    procStore.start(PROCEDURE_EXECUTOR_SLOTS);
+    ProcedureTestingUtility.initAndStartWorkers(procExecutor,PROCEDURE_EXECUTOR_SLOTS,0,false,true);
+  }
+  @Test public void testBypassSuspendProcedure() throws Exception {
+    final SuspendProcedure proc=new SuspendProcedure();
+    long id=procExecutor.submitProcedure(proc);
+    Thread.sleep(500);
+    assertTrue(procExecutor.bypassProcedure(id,30000,false,false));
+    htu.waitFor(5000,() -> proc.isSuccess() && proc.isBypass());
+    LOG.info("{} finished",proc);
+  }
+  @Test public void testStuckProcedure() throws Exception {
+    final StuckProcedure proc=new StuckProcedure();
+    long id=procExecutor.submitProcedure(proc);
+    Thread.sleep(500);
+    assertTrue(procExecutor.bypassProcedure(id,1000,true,false));
+    ProcedureTestingUtility.restart(procExecutor);
+    htu.waitFor(5000,() -> proc.isSuccess() && proc.isBypass());
+    LOG.info("{} finished",proc);
+  }
+  @Test public void testBypassingProcedureWithParent() throws Exception {
+    final RootProcedure proc=new RootProcedure();
+    long rootId=procExecutor.submitProcedure(proc);
+    htu.waitFor(5000,() -> procExecutor.getProcedures().stream().filter(p -> p.getParentProcId() == rootId).collect(Collectors.toList()).size() > 0);
+    SuspendProcedure suspendProcedure=(SuspendProcedure)procExecutor.getProcedures().stream().filter(p -> p.getParentProcId() == rootId).collect(Collectors.toList()).get(0);
+    assertTrue(procExecutor.bypassProcedure(suspendProcedure.getProcId(),1000,false,false));
+    htu.waitFor(5000,() -> proc.isSuccess() && proc.isBypass());
+    LOG.info("{} finished",proc);
+  }
+  @Test public void testBypassingProcedureWithParentRecursive() throws Exception {
+    final RootProcedure proc=new RootProcedure();
+    long rootId=procExecutor.submitProcedure(proc);
+    htu.waitFor(5000,() -> procExecutor.getProcedures().stream().filter(p -> p.getParentProcId() == rootId).collect(Collectors.toList()).size() > 0);
+    SuspendProcedure suspendProcedure=(SuspendProcedure)procExecutor.getProcedures().stream().filter(p -> p.getParentProcId() == rootId).collect(Collectors.toList()).get(0);
+    assertTrue(procExecutor.bypassProcedure(rootId,1000,false,true));
+    htu.waitFor(5000,() -> proc.isSuccess() && proc.isBypass());
+    LOG.info("{} finished",proc);
+  }
+  @Test public void testBypassingStuckStateMachineProcedure() throws Exception {
+    final StuckStateMachineProcedure proc=new StuckStateMachineProcedure(procEnv,StuckStateMachineState.START);
+    long id=procExecutor.submitProcedure(proc);
+    Thread.sleep(500);
+    assertFalse(procExecutor.bypassProcedure(id,1000,false,false));
+    assertTrue(procExecutor.bypassProcedure(id,1000,true,false));
+    htu.waitFor(5000,() -> proc.isSuccess() && proc.isBypass());
+    LOG.info("{} finished",proc);
+  }
+  @Test public void testBypassingWaitingTimeoutProcedures() throws Exception {
+    final WaitingTimeoutProcedure proc=new WaitingTimeoutProcedure();
+    long id=procExecutor.submitProcedure(proc);
+    Thread.sleep(500);
+    assertTrue(procExecutor.bypassProcedure(id,1000,true,false));
+    htu.waitFor(5000,() -> proc.isSuccess() && proc.isBypass());
+    LOG.info("{} finished",proc);
+  }
+  @AfterClass public static void tearDown() throws Exception {
+    procExecutor.stop();
+    procStore.stop(false);
+    procExecutor.join();
+  }
+public static class SuspendProcedure extends ProcedureTestingUtility.NoopProcedure<TestProcEnv> {
+    public SuspendProcedure(){
+      super();
+    }
+    @Override protected Procedure[] execute(    final TestProcEnv env) throws ProcedureSuspendedException {
+      throw new ProcedureSuspendedException();
+    }
+  }
+public static class StuckProcedure extends ProcedureTestingUtility.NoopProcedure<TestProcEnv> {
+    public StuckProcedure(){
+      super();
+    }
+    @Override protected Procedure[] execute(    final TestProcEnv env){
+      try {
+        Thread.sleep(Long.MAX_VALUE);
+      }
+ catch (      Throwable t) {
+        LOG.debug("Sleep is interrupted.",t);
+      }
+      return null;
+    }
+  }
+public static class WaitingTimeoutProcedure extends ProcedureTestingUtility.NoopProcedure<TestProcEnv> {
+    public WaitingTimeoutProcedure(){
+      super();
+    }
+    @Override protected Procedure[] execute(    final TestProcEnv env) throws ProcedureSuspendedException {
+      setTimeout(50000);
+      setState(ProcedureProtos.ProcedureState.WAITING_TIMEOUT);
+      skipPersistence();
+      throw new ProcedureSuspendedException();
+    }
+    @Override protected synchronized boolean setTimeoutFailure(    TestProcEnv env){
+      setState(ProcedureProtos.ProcedureState.RUNNABLE);
+      procExecutor.getScheduler().addFront(this);
+      return false;
+    }
+  }
+public static class RootProcedure extends ProcedureTestingUtility.NoopProcedure<TestProcEnv> {
+    private boolean childSpwaned=false;
+    public RootProcedure(){
+      super();
+    }
+    @Override protected Procedure[] execute(    final TestProcEnv env) throws ProcedureSuspendedException {
+      if (!childSpwaned) {
+        childSpwaned=true;
+        return new Procedure[]{new SuspendProcedure()};
+      }
+ else {
+        return null;
+      }
+    }
+  }
+  public enum StuckStateMachineState {  START,   THEN,   END}
+public static class StuckStateMachineProcedure extends ProcedureTestingUtility.NoopStateMachineProcedure<TestProcEnv,StuckStateMachineState> {
+    private AtomicBoolean stop=new AtomicBoolean(false);
+    public StuckStateMachineProcedure(){
+      super();
+    }
+    public StuckStateMachineProcedure(    TestProcEnv env,    StuckStateMachineState initialState){
+      super(env,initialState);
+    }
+    @Override protected Flow executeFromState(    TestProcEnv env,    StuckStateMachineState tState) throws ProcedureSuspendedException, ProcedureYieldException, InterruptedException {
+switch (tState) {
+case START:
+        LOG.info("PHASE 1: START");
+      setNextState(StuckStateMachineState.THEN);
+    return Flow.HAS_MORE_STATE;
+case THEN:
+  if (stop.get()) {
+    setNextState(StuckStateMachineState.END);
+  }
+return Flow.HAS_MORE_STATE;
+case END:
+return Flow.NO_MORE_STATE;
+default :
+throw new UnsupportedOperationException("unhandled state=" + tState);
+}
+}
+@Override protected StuckStateMachineState getState(int stateId){
+return StuckStateMachineState.values()[stateId];
+}
+@Override protected int getStateId(StuckStateMachineState tState){
+return tState.ordinal();
+}
+}
+}

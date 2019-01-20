@@ -1,0 +1,179 @@
+/** 
+ * Tests for  {@link Component}.
+ */
+public class TestComponent {
+  static final Logger LOG=Logger.getLogger(TestComponent.class);
+  @Rule public ServiceTestUtils.ServiceFSWatcher rule=new ServiceTestUtils.ServiceFSWatcher();
+  @Test public void testComponentUpgrade() throws Exception {
+    ServiceContext context=createTestContext(rule,"testComponentUpgrade");
+    Component comp=context.scheduler.getAllComponents().entrySet().iterator().next().getValue();
+    ComponentEvent upgradeEvent=new ComponentEvent(comp.getName(),ComponentEventType.UPGRADE);
+    comp.handle(upgradeEvent);
+    Assert.assertEquals("component not in need upgrade state",ComponentState.NEEDS_UPGRADE,comp.getComponentSpec().getState());
+  }
+  @Test public void testCheckState() throws Exception {
+    String serviceName="testCheckState";
+    ServiceContext context=createTestContext(rule,serviceName);
+    Component comp=context.scheduler.getAllComponents().entrySet().iterator().next().getValue();
+    comp.handle(new ComponentEvent(comp.getName(),ComponentEventType.UPGRADE).setTargetSpec(createSpecWithEnv(serviceName,comp.getName(),"key1","val1")).setUpgradeVersion("v2"));
+    comp.getUpgradeStatus().decContainersThatNeedUpgrade();
+    comp.handle(new ComponentEvent(comp.getName(),ComponentEventType.CHECK_STABLE));
+    Assert.assertEquals("component not in need upgrade state",ComponentState.NEEDS_UPGRADE,comp.getComponentSpec().getState());
+    comp.getUpgradeStatus().decContainersThatNeedUpgrade();
+    comp.handle(new ComponentEvent(comp.getName(),ComponentEventType.CHECK_STABLE));
+    Assert.assertEquals("component not in stable state",ComponentState.STABLE,comp.getComponentSpec().getState());
+    Assert.assertEquals("component did not upgrade successfully","val1",comp.getComponentSpec().getConfiguration().getEnv("key1"));
+  }
+  @Test public void testContainerCompletedWhenUpgrading() throws Exception {
+    String serviceName="testContainerCompletedWhenUpgrading";
+    MockRunningServiceContext context=createTestContext(rule,serviceName);
+    Component comp=context.scheduler.getAllComponents().entrySet().iterator().next().getValue();
+    comp.handle(new ComponentEvent(comp.getName(),ComponentEventType.UPGRADE).setTargetSpec(createSpecWithEnv(serviceName,comp.getName(),"key1","val1")).setUpgradeVersion("v2"));
+    comp.getAllComponentInstances().forEach(instance -> instance.handle(new ComponentInstanceEvent(instance.getContainer().getId(),ComponentInstanceEventType.UPGRADE)));
+    for (    ComponentInstance instance : comp.getAllComponentInstances()) {
+      ComponentEvent stopEvent=new ComponentEvent(comp.getName(),ComponentEventType.CONTAINER_COMPLETED).setInstance(instance).setContainerId(instance.getContainer().getId());
+      comp.handle(stopEvent);
+      instance.handle(new ComponentInstanceEvent(instance.getContainer().getId(),STOP));
+    }
+    comp.handle(new ComponentEvent(comp.getName(),ComponentEventType.CHECK_STABLE));
+    Assert.assertEquals("component not in needs upgrade state",ComponentState.NEEDS_UPGRADE,comp.getComponentSpec().getState());
+  }
+  @Test public void testCancelUpgrade() throws Exception {
+    ServiceContext context=createTestContext(rule,"testCancelUpgrade");
+    Component comp=context.scheduler.getAllComponents().entrySet().iterator().next().getValue();
+    ComponentEvent upgradeEvent=new ComponentEvent(comp.getName(),ComponentEventType.CANCEL_UPGRADE);
+    comp.handle(upgradeEvent);
+    Assert.assertEquals("component not in need upgrade state",ComponentState.NEEDS_UPGRADE,comp.getComponentSpec().getState());
+    Assert.assertEquals(org.apache.hadoop.yarn.service.component.ComponentState.CANCEL_UPGRADING,comp.getState());
+  }
+  @Test public void testContainerCompletedCancelUpgrade() throws Exception {
+    String serviceName="testContainerCompletedCancelUpgrade";
+    MockRunningServiceContext context=createTestContext(rule,serviceName);
+    Component comp=context.scheduler.getAllComponents().entrySet().iterator().next().getValue();
+    comp.handle(new ComponentEvent(comp.getName(),ComponentEventType.UPGRADE).setTargetSpec(createSpecWithEnv(serviceName,comp.getName(),"key1","val1")).setUpgradeVersion("v2"));
+    comp.getAllComponentInstances().forEach(instance -> instance.handle(new ComponentInstanceEvent(instance.getContainer().getId(),ComponentInstanceEventType.UPGRADE)));
+    for (    ComponentInstance instance : comp.getAllComponentInstances()) {
+      instance.handle(new ComponentInstanceEvent(instance.getContainer().getId(),START));
+      instance.handle(new ComponentInstanceEvent(instance.getContainer().getId(),BECOME_READY));
+    }
+    comp.handle(new ComponentEvent(comp.getName(),ComponentEventType.CANCEL_UPGRADE).setTargetSpec(createSpecWithEnv(serviceName,comp.getName(),"key1","val0")).setUpgradeVersion("v1"));
+    comp.getAllComponentInstances().forEach(instance -> instance.handle(new ComponentInstanceEvent(instance.getContainer().getId(),ComponentInstanceEventType.CANCEL_UPGRADE)));
+    Iterator<ComponentInstance> iter=comp.getAllComponentInstances().iterator();
+    ComponentInstance instance1=iter.next();
+    ComponentEvent stopEvent=new ComponentEvent(comp.getName(),ComponentEventType.CONTAINER_COMPLETED).setInstance(instance1).setContainerId(instance1.getContainer().getId());
+    comp.handle(stopEvent);
+    instance1.handle(new ComponentInstanceEvent(instance1.getContainer().getId(),STOP));
+    Assert.assertEquals(org.apache.hadoop.yarn.service.component.ComponentState.CANCEL_UPGRADING,comp.getState());
+    comp.handle(new ComponentEvent(comp.getName(),ComponentEventType.CHECK_STABLE));
+    Assert.assertEquals("component not in needs upgrade state",ComponentState.NEEDS_UPGRADE,comp.getComponentSpec().getState());
+    Assert.assertEquals(org.apache.hadoop.yarn.service.component.ComponentState.CANCEL_UPGRADING,comp.getState());
+    ComponentInstance instance2=iter.next();
+    instance2.handle(new ComponentInstanceEvent(instance2.getContainer().getId(),ComponentInstanceEventType.START));
+    instance2.handle(new ComponentInstanceEvent(instance2.getContainer().getId(),ComponentInstanceEventType.BECOME_READY));
+    comp.handle(new ComponentEvent(comp.getName(),ComponentEventType.CHECK_STABLE));
+    Assert.assertEquals("component not in flexing state",ComponentState.FLEXING,comp.getComponentSpec().getState());
+    context.assignNewContainer(context.attemptId,10,comp);
+    comp.handle(new ComponentEvent(comp.getName(),ComponentEventType.CHECK_STABLE));
+    Assert.assertEquals("component not in stable state",ComponentState.STABLE,comp.getComponentSpec().getState());
+    Assert.assertEquals("cancel upgrade failed","val0",comp.getComponentSpec().getConfiguration().getEnv("key1"));
+  }
+  @Test public void testCancelUpgradeSuccessWhileUpgrading() throws Exception {
+    String serviceName="testCancelUpgradeWhileUpgrading";
+    MockRunningServiceContext context=createTestContext(rule,serviceName);
+    Component comp=context.scheduler.getAllComponents().entrySet().iterator().next().getValue();
+    cancelUpgradeWhileUpgrading(context,comp);
+    for (    ComponentInstance instance : comp.getAllComponentInstances()) {
+      instance.handle(new ComponentInstanceEvent(instance.getContainer().getId(),ComponentInstanceEventType.START));
+      instance.handle(new ComponentInstanceEvent(instance.getContainer().getId(),ComponentInstanceEventType.BECOME_READY));
+    }
+    comp.handle(new ComponentEvent(comp.getName(),ComponentEventType.CHECK_STABLE));
+    Assert.assertEquals("component not in stable state",ComponentState.STABLE,comp.getComponentSpec().getState());
+    Assert.assertEquals("cancel upgrade failed","val0",comp.getComponentSpec().getConfiguration().getEnv("key1"));
+  }
+  @Test public void testCancelUpgradeFailureWhileUpgrading() throws Exception {
+    String serviceName="testCancelUpgradeFailureWhileUpgrading";
+    MockRunningServiceContext context=createTestContext(rule,serviceName);
+    Component comp=context.scheduler.getAllComponents().entrySet().iterator().next().getValue();
+    cancelUpgradeWhileUpgrading(context,comp);
+    for (    ComponentInstance instance : comp.getAllComponentInstances()) {
+      instance.handle(new ComponentInstanceEvent(instance.getContainer().getId(),ComponentInstanceEventType.STOP));
+    }
+    comp.handle(new ComponentEvent(comp.getName(),ComponentEventType.CHECK_STABLE));
+    Assert.assertEquals("component not in flexing state",ComponentState.FLEXING,comp.getComponentSpec().getState());
+    for (    ComponentInstance instance : comp.getAllComponentInstances()) {
+      context.assignNewContainer(context.attemptId,10,comp);
+    }
+    comp.handle(new ComponentEvent(comp.getName(),ComponentEventType.CHECK_STABLE));
+    Assert.assertEquals("component not in stable state",ComponentState.STABLE,comp.getComponentSpec().getState());
+    Assert.assertEquals("cancel upgrade failed","val0",comp.getComponentSpec().getConfiguration().getEnv("key1"));
+  }
+  private void cancelUpgradeWhileUpgrading(  MockRunningServiceContext context,  Component comp) throws Exception {
+    comp.handle(new ComponentEvent(comp.getName(),ComponentEventType.UPGRADE).setTargetSpec(createSpecWithEnv(context.service.getName(),comp.getName(),"key1","val1")).setUpgradeVersion("v0"));
+    Iterator<ComponentInstance> iter=comp.getAllComponentInstances().iterator();
+    ComponentInstance instance1=iter.next();
+    instance1.handle(new ComponentInstanceEvent(instance1.getContainer().getId(),ComponentInstanceEventType.UPGRADE));
+    comp.handle(new ComponentEvent(comp.getName(),ComponentEventType.CANCEL_UPGRADE).setTargetSpec(createSpecWithEnv(context.service.getName(),comp.getName(),"key1","val0")).setUpgradeVersion("v0"));
+    comp.getAllComponentInstances().forEach(instance -> instance.handle(new ComponentInstanceEvent(instance.getContainer().getId(),ComponentInstanceEventType.CANCEL_UPGRADE)));
+    comp.handle(new ComponentEvent(comp.getName(),ComponentEventType.CONTAINER_COMPLETED).setInstance(instance1).setContainerId(instance1.getContainer().getId()));
+    instance1.handle(new ComponentInstanceEvent(instance1.getContainer().getId(),STOP));
+    Assert.assertEquals(org.apache.hadoop.yarn.service.component.ComponentState.CANCEL_UPGRADING,comp.getState());
+    comp.handle(new ComponentEvent(comp.getName(),ComponentEventType.CHECK_STABLE));
+    Assert.assertEquals("component not in needs upgrade state",ComponentState.NEEDS_UPGRADE,comp.getComponentSpec().getState());
+    Assert.assertEquals(org.apache.hadoop.yarn.service.component.ComponentState.CANCEL_UPGRADING,comp.getState());
+  }
+  @Test public void testComponentStateReachesStableStateWithTerminatingComponents() throws Exception {
+    final String serviceName="testComponentStateUpdatesWithTerminatingComponents";
+    Service testService=ServiceTestUtils.createTerminatingJobExample(serviceName);
+    TestServiceManager.createDef(serviceName,testService);
+    ServiceContext context=new MockRunningServiceContext(rule,testService);
+    for (    Component comp : context.scheduler.getAllComponents().values()) {
+      Iterator<ComponentInstance> instanceIter=comp.getAllComponentInstances().iterator();
+      ComponentInstance componentInstance=instanceIter.next();
+      Container instanceContainer=componentInstance.getContainer();
+      Assert.assertEquals(0,comp.getNumSucceededInstances());
+      Assert.assertEquals(0,comp.getNumFailedInstances());
+      Assert.assertEquals(2,comp.getNumRunningInstances());
+      Assert.assertEquals(2,comp.getNumReadyInstances());
+      Assert.assertEquals(0,comp.getPendingInstances().size());
+      ContainerStatus containerStatus=ContainerStatus.newInstance(instanceContainer.getId(),org.apache.hadoop.yarn.api.records.ContainerState.COMPLETE,"successful",0);
+      comp.handle(new ComponentEvent(comp.getName(),ComponentEventType.CONTAINER_COMPLETED).setStatus(containerStatus).setContainerId(instanceContainer.getId()));
+      componentInstance.handle(new ComponentInstanceEvent(componentInstance.getContainer().getId(),ComponentInstanceEventType.STOP).setStatus(containerStatus));
+      Assert.assertEquals(1,comp.getNumSucceededInstances());
+      Assert.assertEquals(0,comp.getNumFailedInstances());
+      Assert.assertEquals(1,comp.getNumRunningInstances());
+      Assert.assertEquals(1,comp.getNumReadyInstances());
+      Assert.assertEquals(0,comp.getPendingInstances().size());
+      org.apache.hadoop.yarn.service.component.ComponentState componentState=Component.checkIfStable(comp);
+      Assert.assertEquals(org.apache.hadoop.yarn.service.component.ComponentState.STABLE,componentState);
+    }
+  }
+  @Test public void testComponentStateUpdatesWithTerminatingComponents() throws Exception {
+    final String serviceName="testComponentStateUpdatesWithTerminatingComponents";
+    Service testService=ServiceTestUtils.createTerminatingJobExample(serviceName);
+    TestServiceManager.createDef(serviceName,testService);
+    ServiceContext context=new MockRunningServiceContext(rule,testService);
+    for (    Component comp : context.scheduler.getAllComponents().values()) {
+      Iterator<ComponentInstance> instanceIter=comp.getAllComponentInstances().iterator();
+      while (instanceIter.hasNext()) {
+        ComponentInstance componentInstance=instanceIter.next();
+        Container instanceContainer=componentInstance.getContainer();
+        ContainerStatus containerStatus=ContainerStatus.newInstance(instanceContainer.getId(),org.apache.hadoop.yarn.api.records.ContainerState.COMPLETE,"successful",0);
+        comp.handle(new ComponentEvent(comp.getName(),ComponentEventType.CONTAINER_COMPLETED).setStatus(containerStatus).setContainerId(instanceContainer.getId()));
+        componentInstance.handle(new ComponentInstanceEvent(componentInstance.getContainer().getId(),ComponentInstanceEventType.STOP).setStatus(containerStatus));
+      }
+      ComponentState componentState=comp.getComponentSpec().getState();
+      Assert.assertEquals(ComponentState.SUCCEEDED,componentState);
+    }
+    ServiceState serviceState=testService.getState();
+    Assert.assertEquals(ServiceState.SUCCEEDED,serviceState);
+  }
+  private static org.apache.hadoop.yarn.service.api.records.Component createSpecWithEnv(  String serviceName,  String compName,  String key,  String val){
+    Service service=TestServiceManager.createBaseDef(serviceName);
+    org.apache.hadoop.yarn.service.api.records.Component spec=service.getComponent(compName);
+    spec.getConfiguration().getEnv().put(key,val);
+    return spec;
+  }
+  public static MockRunningServiceContext createTestContext(  ServiceTestUtils.ServiceFSWatcher fsWatcher,  String serviceName) throws Exception {
+    return new MockRunningServiceContext(fsWatcher,TestServiceManager.createBaseDef(serviceName));
+  }
+}

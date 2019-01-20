@@ -1,0 +1,70 @@
+@Test public void testSubmitAndExecuteTask() throws IOException {
+  new JavaTestKit(system){
+{
+      ActorGateway taskManager=null;
+      final ActorGateway jobManager=TestingUtils.createForwardingActor(system,getTestActor(),HighAvailabilityServices.DEFAULT_LEADER_ID,Option.<String>empty());
+      highAvailabilityServices.setJobMasterLeaderRetriever(HighAvailabilityServices.DEFAULT_JOB_ID,new StandaloneLeaderRetrievalService(jobManager.path(),jobManager.leaderSessionID()));
+      try {
+        taskManager=TestingUtils.createTaskManager(system,highAvailabilityServices,new Configuration(),true,false);
+        final ActorGateway tm=taskManager;
+        new Within(d){
+          @Override protected void run(){
+            expectMsgClass(RegistrationMessages.RegisterTaskManager.class);
+            final InstanceID iid=new InstanceID();
+            assertEquals(tm.actor(),getLastSender());
+            tm.tell(new RegistrationMessages.AcknowledgeRegistration(iid,12345),jobManager);
+          }
+        }
+;
+        final JobID jid=new JobID();
+        final JobVertexID vid=new JobVertexID();
+        final ExecutionAttemptID eid=new ExecutionAttemptID();
+        final SerializedValue<ExecutionConfig> executionConfig=new SerializedValue<>(new ExecutionConfig());
+        final TaskDeploymentDescriptor tdd=createTaskDeploymentDescriptor(jid,"TestJob",vid,eid,executionConfig,"TestTask",7,2,7,0,new Configuration(),new Configuration(),TestInvokableCorrect.class.getName(),Collections.<ResultPartitionDeploymentDescriptor>emptyList(),Collections.<InputGateDeploymentDescriptor>emptyList(),new ArrayList<PermanentBlobKey>(),Collections.emptyList(),0);
+        new Within(d){
+          @Override protected void run(){
+            tm.tell(new SubmitTask(tdd),jobManager);
+            long deadline=System.currentTimeMillis() + 10000;
+            do {
+              Object message=receiveOne(d);
+              if (message.equals(Acknowledge.get())) {
+                break;
+              }
+            }
+ while (System.currentTimeMillis() < deadline);
+            Object toRunning=new TaskMessages.UpdateTaskExecutionState(new TaskExecutionState(jid,eid,ExecutionState.RUNNING));
+            Object toFinished=new TaskMessages.UpdateTaskExecutionState(new TaskExecutionState(jid,eid,ExecutionState.FINISHED));
+            deadline=System.currentTimeMillis() + 10000;
+            do {
+              Object message=receiveOne(d);
+              if (message.equals(toRunning)) {
+                break;
+              }
+ else               if (!(message instanceof TaskManagerMessages.Heartbeat)) {
+                fail("Unexpected message: " + message);
+              }
+            }
+ while (System.currentTimeMillis() < deadline);
+            deadline=System.currentTimeMillis() + 10000;
+            do {
+              Object message=receiveOne(d);
+              if (message.equals(toFinished)) {
+                break;
+              }
+ else               if (!(message instanceof TaskManagerMessages.Heartbeat)) {
+                fail("Unexpected message: " + message);
+              }
+            }
+ while (System.currentTimeMillis() < deadline);
+          }
+        }
+;
+      }
+  finally {
+        TestingUtils.stopActor(taskManager);
+        TestingUtils.stopActor(jobManager);
+      }
+    }
+  }
+;
+}

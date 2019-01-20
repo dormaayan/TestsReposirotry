@@ -1,0 +1,375 @@
+public class TestBlockTokenWithDFS {
+  protected static int BLOCK_SIZE=1024;
+  protected static int FILE_SIZE=2 * BLOCK_SIZE;
+  private static final String FILE_TO_READ="/fileToRead.dat";
+  private static final String FILE_TO_WRITE="/fileToWrite.dat";
+  private static final String FILE_TO_APPEND="/fileToAppend.dat";
+{
+    GenericTestUtils.setLogLevel(DFSClient.LOG,Level.ALL);
+  }
+  public static byte[] generateBytes(  int fileSize){
+    Random r=new Random();
+    byte[] rawData=new byte[fileSize];
+    r.nextBytes(rawData);
+    return rawData;
+  }
+  private void createFile(  FileSystem fs,  Path filename,  byte[] expected) throws IOException {
+    FSDataOutputStream out=fs.create(filename);
+    out.write(expected);
+    out.close();
+  }
+  private boolean checkFile1(  FSDataInputStream in,  byte[] expected){
+    byte[] toRead=new byte[expected.length];
+    int totalRead=0;
+    int nRead=0;
+    try {
+      while ((nRead=in.read(toRead,totalRead,toRead.length - totalRead)) > 0) {
+        totalRead+=nRead;
+      }
+    }
+ catch (    IOException e) {
+      return false;
+    }
+    assertEquals("Cannot read file.",toRead.length,totalRead);
+    return checkFile(toRead,expected);
+  }
+  private boolean checkFile2(  FSDataInputStream in,  byte[] expected){
+    byte[] toRead=new byte[expected.length];
+    try {
+      assertEquals("Cannot read file",toRead.length,in.read(0,toRead,0,toRead.length));
+    }
+ catch (    IOException e) {
+      return false;
+    }
+    return checkFile(toRead,expected);
+  }
+  private boolean checkFile(  byte[] fileToCheck,  byte[] expected){
+    if (fileToCheck.length != expected.length) {
+      return false;
+    }
+    for (int i=0; i < fileToCheck.length; i++) {
+      if (fileToCheck[i] != expected[i]) {
+        return false;
+      }
+    }
+    return true;
+  }
+  private static FSDataOutputStream writeFile(  FileSystem fileSys,  Path name,  short repl,  long blockSize) throws IOException {
+    FSDataOutputStream stm=fileSys.create(name,true,fileSys.getConf().getInt(CommonConfigurationKeys.IO_FILE_BUFFER_SIZE_KEY,4096),repl,blockSize);
+    return stm;
+  }
+  protected void tryRead(  final Configuration conf,  LocatedBlock lblock,  boolean shouldSucceed){
+    InetSocketAddress targetAddr=null;
+    IOException ioe=null;
+    BlockReader blockReader=null;
+    ExtendedBlock block=lblock.getBlock();
+    try {
+      DatanodeInfo[] nodes=lblock.getLocations();
+      targetAddr=NetUtils.createSocketAddr(nodes[0].getXferAddr());
+      blockReader=new BlockReaderFactory(new DfsClientConf(conf)).setFileName(BlockReaderFactory.getFileName(targetAddr,"test-blockpoolid",block.getBlockId())).setBlock(block).setBlockToken(lblock.getBlockToken()).setInetSocketAddress(targetAddr).setStartOffset(0).setLength(0).setVerifyChecksum(true).setClientName("TestBlockTokenWithDFS").setDatanodeInfo(nodes[0]).setCachingStrategy(CachingStrategy.newDefaultStrategy()).setClientCacheContext(ClientContext.getFromConf(conf)).setConfiguration(conf).setRemotePeerFactory(new RemotePeerFactory(){
+        @Override public Peer newConnectedPeer(        InetSocketAddress addr,        Token<BlockTokenIdentifier> blockToken,        DatanodeID datanodeId) throws IOException {
+          Peer peer=null;
+          Socket sock=NetUtils.getDefaultSocketFactory(conf).createSocket();
+          try {
+            sock.connect(addr,HdfsConstants.READ_TIMEOUT);
+            sock.setSoTimeout(HdfsConstants.READ_TIMEOUT);
+            peer=DFSUtilClient.peerFromSocket(sock);
+          }
+  finally {
+            if (peer == null) {
+              IOUtils.closeSocket(sock);
+            }
+          }
+          return peer;
+        }
+      }
+).build();
+    }
+ catch (    IOException ex) {
+      ioe=ex;
+    }
+ finally {
+      if (blockReader != null) {
+        try {
+          blockReader.close();
+        }
+ catch (        IOException e) {
+          throw new RuntimeException(e);
+        }
+      }
+    }
+    if (shouldSucceed) {
+      Assert.assertNotNull("OP_READ_BLOCK: access token is invalid, " + "when it is expected to be valid",blockReader);
+    }
+ else {
+      Assert.assertNotNull("OP_READ_BLOCK: access token is valid, " + "when it is expected to be invalid",ioe);
+      Assert.assertTrue("OP_READ_BLOCK failed due to reasons other than access token: ",ioe instanceof InvalidBlockTokenException);
+    }
+  }
+  protected Configuration getConf(  int numDataNodes){
+    Configuration conf=new Configuration();
+    conf.setBoolean(DFSConfigKeys.DFS_BLOCK_ACCESS_TOKEN_ENABLE_KEY,true);
+    conf.setLong(DFSConfigKeys.DFS_BLOCK_SIZE_KEY,BLOCK_SIZE);
+    conf.setInt("io.bytes.per.checksum",BLOCK_SIZE);
+    conf.setInt(DFSConfigKeys.DFS_HEARTBEAT_INTERVAL_KEY,1);
+    conf.setInt(DFSConfigKeys.DFS_REPLICATION_KEY,numDataNodes);
+    conf.setInt(IPC_CLIENT_CONNECT_MAX_RETRIES_KEY,0);
+    conf.setInt(HdfsClientConfigKeys.Retry.WINDOW_BASE_KEY,10);
+    return conf;
+  }
+  /** 
+ * testing that APPEND operation can handle token expiration when re-establishing pipeline is needed
+ */
+  @Test public void testAppend() throws Exception {
+    MiniDFSCluster cluster=null;
+    int numDataNodes=2;
+    Configuration conf=getConf(numDataNodes);
+    try {
+      cluster=new MiniDFSCluster.Builder(conf).numDataNodes(numDataNodes).build();
+      cluster.waitActive();
+      assertEquals(numDataNodes,cluster.getDataNodes().size());
+      final NameNode nn=cluster.getNameNode();
+      final BlockManager bm=nn.getNamesystem().getBlockManager();
+      final BlockTokenSecretManager sm=bm.getBlockTokenSecretManager();
+      SecurityTestUtil.setBlockTokenLifetime(sm,1000L);
+      Path fileToAppend=new Path(FILE_TO_APPEND);
+      FileSystem fs=cluster.getFileSystem();
+      byte[] expected=generateBytes(FILE_SIZE);
+      FSDataOutputStream stm=writeFile(fs,fileToAppend,(short)numDataNodes,BLOCK_SIZE);
+      stm.write(expected,0,1);
+      stm.close();
+      stm=fs.append(fileToAppend);
+      int mid=expected.length - 1;
+      stm.write(expected,1,mid - 1);
+      stm.hflush();
+      Token<BlockTokenIdentifier> token=DFSTestUtil.getBlockToken(stm);
+      while (!SecurityTestUtil.isBlockTokenExpired(token)) {
+        try {
+          Thread.sleep(10);
+        }
+ catch (        InterruptedException ignored) {
+        }
+      }
+      cluster.stopDataNode(0);
+      stm.write(expected,mid,expected.length - mid);
+      stm.close();
+      FSDataInputStream in5=fs.open(fileToAppend);
+      assertTrue(checkFile1(in5,expected));
+    }
+  finally {
+      if (cluster != null) {
+        cluster.shutdown();
+      }
+    }
+  }
+  /** 
+ * testing that WRITE operation can handle token expiration when re-establishing pipeline is needed
+ */
+  @Test public void testWrite() throws Exception {
+    MiniDFSCluster cluster=null;
+    int numDataNodes=2;
+    Configuration conf=getConf(numDataNodes);
+    try {
+      cluster=new MiniDFSCluster.Builder(conf).numDataNodes(numDataNodes).build();
+      cluster.waitActive();
+      assertEquals(numDataNodes,cluster.getDataNodes().size());
+      final NameNode nn=cluster.getNameNode();
+      final BlockManager bm=nn.getNamesystem().getBlockManager();
+      final BlockTokenSecretManager sm=bm.getBlockTokenSecretManager();
+      SecurityTestUtil.setBlockTokenLifetime(sm,1000L);
+      Path fileToWrite=new Path(FILE_TO_WRITE);
+      FileSystem fs=cluster.getFileSystem();
+      byte[] expected=generateBytes(FILE_SIZE);
+      FSDataOutputStream stm=writeFile(fs,fileToWrite,(short)numDataNodes,BLOCK_SIZE);
+      int mid=expected.length - 1;
+      stm.write(expected,0,mid);
+      stm.hflush();
+      Token<BlockTokenIdentifier> token=DFSTestUtil.getBlockToken(stm);
+      while (!SecurityTestUtil.isBlockTokenExpired(token)) {
+        try {
+          Thread.sleep(10);
+        }
+ catch (        InterruptedException ignored) {
+        }
+      }
+      cluster.stopDataNode(0);
+      stm.write(expected,mid,expected.length - mid);
+      stm.close();
+      FSDataInputStream in4=fs.open(fileToWrite);
+      assertTrue(checkFile1(in4,expected));
+    }
+  finally {
+      if (cluster != null) {
+        cluster.shutdown();
+      }
+    }
+  }
+  @Test public void testRead() throws Exception {
+    MiniDFSCluster cluster=null;
+    int numDataNodes=2;
+    Configuration conf=getConf(numDataNodes);
+    try {
+      cluster=new MiniDFSCluster.Builder(conf).nameNodePort(ServerSocketUtil.getPort(18020,100)).nameNodeHttpPort(ServerSocketUtil.getPort(19870,100)).numDataNodes(numDataNodes).build();
+      cluster.waitActive();
+      assertEquals(numDataNodes,cluster.getDataNodes().size());
+      doTestRead(conf,cluster,false);
+    }
+  finally {
+      if (cluster != null) {
+        cluster.shutdown();
+      }
+    }
+  }
+  protected void doTestRead(  Configuration conf,  MiniDFSCluster cluster,  boolean isStriped) throws Exception {
+    final int numDataNodes=cluster.getDataNodes().size();
+    final NameNode nn=cluster.getNameNode();
+    final NamenodeProtocols nnProto=nn.getRpcServer();
+    final BlockManager bm=nn.getNamesystem().getBlockManager();
+    final BlockTokenSecretManager sm=bm.getBlockTokenSecretManager();
+    SecurityTestUtil.setBlockTokenLifetime(sm,1000L);
+    Path fileToRead=new Path(FILE_TO_READ);
+    FileSystem fs=cluster.getFileSystem();
+    byte[] expected=generateBytes(FILE_SIZE);
+    createFile(fs,fileToRead,expected);
+    FSDataInputStream in1=fs.open(fileToRead);
+    assertTrue(checkFile1(in1,expected));
+    FSDataInputStream in2=fs.open(fileToRead);
+    assertTrue(checkFile1(in2,expected));
+    FSDataInputStream in3=fs.open(fileToRead);
+    assertTrue(checkFile2(in3,expected));
+    DFSClient client=null;
+    try {
+      client=new DFSClient(new InetSocketAddress("localhost",cluster.getNameNodePort()),conf);
+    }
+  finally {
+      if (client != null)       client.close();
+    }
+    List<LocatedBlock> locatedBlocks=nnProto.getBlockLocations(FILE_TO_READ,0,FILE_SIZE).getLocatedBlocks();
+    LocatedBlock lblock=locatedBlocks.get(0);
+    assertFalse(isBlockTokenExpired(lblock));
+    tryRead(conf,lblock,true);
+    while (!isBlockTokenExpired(lblock)) {
+      try {
+        Thread.sleep(10);
+      }
+ catch (      InterruptedException ignored) {
+      }
+    }
+    assertTrue(isBlockTokenExpired(lblock));
+    tryRead(conf,lblock,false);
+    bm.setBlockToken(lblock,BlockTokenIdentifier.AccessMode.READ);
+    tryRead(conf,lblock,true);
+    long rightId=lblock.getBlock().getBlockId();
+    long wrongId=rightId + 1;
+    lblock.getBlock().setBlockId(wrongId);
+    bm.setBlockToken(lblock,BlockTokenIdentifier.AccessMode.READ);
+    lblock.getBlock().setBlockId(rightId);
+    tryRead(conf,lblock,false);
+    bm.setBlockToken(lblock,BlockTokenIdentifier.AccessMode.WRITE);
+    tryRead(conf,lblock,false);
+    SecurityTestUtil.setBlockTokenLifetime(sm,600 * 1000L);
+    List<LocatedBlock> lblocks=DFSTestUtil.getAllBlocks(in1);
+    for (    LocatedBlock blk : lblocks) {
+      assertTrue(isBlockTokenExpired(blk));
+    }
+    in1.seek(0);
+    assertTrue(checkFile1(in1,expected));
+    List<LocatedBlock> lblocks2=DFSTestUtil.getAllBlocks(in2);
+    for (    LocatedBlock blk : lblocks2) {
+      assertTrue(isBlockTokenExpired(blk));
+    }
+    if (isStriped) {
+      in2.seek(0);
+    }
+ else {
+      assertTrue(in2.seekToNewSource(0));
+    }
+    assertTrue(checkFile1(in2,expected));
+    List<LocatedBlock> lblocks3=DFSTestUtil.getAllBlocks(in3);
+    for (    LocatedBlock blk : lblocks3) {
+      assertTrue(isBlockTokenExpired(blk));
+    }
+    assertTrue(checkFile2(in3,expected));
+    assertTrue(cluster.restartDataNodes(true));
+    cluster.waitActive();
+    assertEquals(numDataNodes,cluster.getDataNodes().size());
+    cluster.shutdownNameNode(0);
+    lblocks=DFSTestUtil.getAllBlocks(in1);
+    for (    LocatedBlock blk : lblocks) {
+      assertFalse(isBlockTokenExpired(blk));
+    }
+    in1.seek(0);
+    assertTrue(checkFile1(in1,expected));
+    lblocks2=DFSTestUtil.getAllBlocks(in2);
+    for (    LocatedBlock blk : lblocks2) {
+      assertFalse(isBlockTokenExpired(blk));
+    }
+    if (isStriped) {
+      in2.seek(0);
+    }
+ else {
+      in2.seekToNewSource(0);
+    }
+    assertTrue(checkFile1(in2,expected));
+    lblocks3=DFSTestUtil.getAllBlocks(in3);
+    for (    LocatedBlock blk : lblocks3) {
+      assertFalse(isBlockTokenExpired(blk));
+    }
+    assertTrue(checkFile2(in3,expected));
+    cluster.restartNameNode(0);
+    cluster.shutdownNameNode(0);
+    in1.seek(0);
+    assertTrue(checkFile1(in1,expected));
+    if (isStriped) {
+      in2.seek(0);
+    }
+ else {
+      in2.seekToNewSource(0);
+    }
+    assertTrue(checkFile1(in2,expected));
+    assertTrue(checkFile2(in3,expected));
+    cluster.restartNameNode(0);
+    assertTrue(cluster.restartDataNodes(true));
+    cluster.waitActive();
+    assertEquals(numDataNodes,cluster.getDataNodes().size());
+    cluster.shutdownNameNode(0);
+    in1.seek(0);
+    assertFalse(checkFile1(in1,expected));
+    assertFalse(checkFile2(in3,expected));
+    cluster.restartNameNode(0);
+    in1.seek(0);
+    assertTrue(checkFile1(in1,expected));
+    if (isStriped) {
+      in2.seek(0);
+    }
+ else {
+      in2.seekToNewSource(0);
+    }
+    assertTrue(checkFile1(in2,expected));
+    assertTrue(checkFile2(in3,expected));
+    assertTrue(cluster.restartDataNodes(false));
+    cluster.waitActive();
+    assertEquals(numDataNodes,cluster.getDataNodes().size());
+    in1.seek(0);
+    assertTrue(checkFile1(in1,expected));
+    if (isStriped) {
+      in2.seek(0);
+    }
+ else {
+      in2.seekToNewSource(0);
+    }
+    assertTrue(checkFile1(in2,expected));
+    assertTrue(checkFile2(in3,expected));
+  }
+  /** 
+ * Integration testing of access token, involving NN, DN, and Balancer
+ */
+  @Test public void testEnd2End() throws Exception {
+    Configuration conf=new Configuration();
+    conf.setBoolean(DFSConfigKeys.DFS_BLOCK_ACCESS_TOKEN_ENABLE_KEY,true);
+    new TestBalancer().integrationTest(conf);
+  }
+  protected boolean isBlockTokenExpired(  LocatedBlock lb) throws IOException {
+    return SecurityTestUtil.isBlockTokenExpired(lb.getBlockToken());
+  }
+}

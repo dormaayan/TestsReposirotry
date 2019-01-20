@@ -1,0 +1,84 @@
+public class MasterEndpointFailoverTest {
+  private static final transient Logger LOG=LoggerFactory.getLogger(MasterEndpointFailoverTest.class);
+  protected ProducerTemplate template;
+  protected CamelContext producerContext;
+  protected CamelContext consumerContext1;
+  protected CamelContext consumerContext2;
+  protected MockEndpoint result1Endpoint;
+  protected MockEndpoint result2Endpoint;
+  protected AtomicInteger messageCounter=new AtomicInteger(1);
+  protected ZKServerFactoryBean serverFactoryBean=new ZKServerFactoryBean();
+  protected CuratorFactoryBean zkClientBean=new CuratorFactoryBean();
+  @Before public void beforeRun() throws Exception {
+    System.out.println("Starting ZK server!");
+    serverFactoryBean.setPort(9004);
+    serverFactoryBean.afterPropertiesSet();
+    zkClientBean.setConnectString("localhost:9004");
+    CuratorFramework client=zkClientBean.getObject();
+    SimpleRegistry registry=new SimpleRegistry();
+    registry.put("curator",client);
+    producerContext=new DefaultCamelContext(registry);
+    producerContext.addRoutes(new RouteBuilder(){
+      @Override public void configure() throws Exception {
+        from("direct:start").to("vm:start");
+      }
+    }
+);
+    template=producerContext.createProducerTemplate();
+    consumerContext1=new DefaultCamelContext(registry);
+    consumerContext1.addRoutes(new RouteBuilder(){
+      @Override public void configure() throws Exception {
+        from("zookeeper-master:MasterEndpointFailoverTest:vm:start").to("log:result1").to("mock:result1");
+      }
+    }
+);
+    consumerContext2=new DefaultCamelContext(registry);
+    consumerContext2.addRoutes(new RouteBuilder(){
+      @Override public void configure() throws Exception {
+        from("zookeeper-master:MasterEndpointFailoverTest:vm:start").to("log:result2").to("mock:result2");
+      }
+    }
+);
+    ServiceHelper.startServices(consumerContext1);
+    ServiceHelper.startServices(producerContext);
+    result1Endpoint=consumerContext1.getEndpoint("mock:result1",MockEndpoint.class);
+    result2Endpoint=consumerContext2.getEndpoint("mock:result2",MockEndpoint.class);
+  }
+  @After public void afterRun() throws Exception {
+    ServiceHelper.stopServices(consumerContext1);
+    ServiceHelper.stopServices(consumerContext2);
+    ServiceHelper.stopServices(producerContext);
+    zkClientBean.destroy();
+    serverFactoryBean.destroy();
+  }
+  @Test public void testEndpoint() throws Exception {
+    System.out.println("Starting consumerContext1");
+    ServiceHelper.startServices(consumerContext1);
+    assertMessageReceived(result1Endpoint,result2Endpoint);
+    System.out.println("Starting consumerContext2");
+    ServiceHelper.startServices(consumerContext2);
+    assertMessageReceivedLoop(result1Endpoint,result2Endpoint,3);
+    System.out.println("Stopping consumerContext1");
+    ServiceHelper.stopService(consumerContext1);
+    assertMessageReceivedLoop(result2Endpoint,result1Endpoint,3);
+  }
+  protected void assertMessageReceivedLoop(  MockEndpoint masterEndpoint,  MockEndpoint standbyEndpoint,  int count) throws Exception {
+    for (int i=0; i < count; i++) {
+      Thread.sleep(1000);
+      assertMessageReceived(masterEndpoint,standbyEndpoint);
+    }
+  }
+  protected void assertMessageReceived(  MockEndpoint masterEndpoint,  MockEndpoint standbyEndpoint) throws InterruptedException {
+    masterEndpoint.reset();
+    standbyEndpoint.reset();
+    String expectedBody=createNextExpectedBody();
+    masterEndpoint.expectedBodiesReceived(expectedBody);
+    standbyEndpoint.expectedMessageCount(0);
+    template.sendBody("direct:start",expectedBody);
+    LOG.info("Expecting master: " + masterEndpoint + " and standby: "+ standbyEndpoint);
+    MockEndpoint.assertIsSatisfied(masterEndpoint,standbyEndpoint);
+  }
+  protected String createNextExpectedBody(){
+    return "body:" + messageCounter.incrementAndGet();
+  }
+}

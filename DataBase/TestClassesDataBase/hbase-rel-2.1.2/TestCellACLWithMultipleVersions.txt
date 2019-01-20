@@ -1,0 +1,695 @@
+@Category({SecurityTests.class,MediumTests.class}) public class TestCellACLWithMultipleVersions extends SecureTestUtil {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestCellACLWithMultipleVersions.class);
+  private static final Logger LOG=LoggerFactory.getLogger(TestCellACLWithMultipleVersions.class);
+  @Rule public TestTableName TEST_TABLE=new TestTableName();
+  private static final HBaseTestingUtility TEST_UTIL=new HBaseTestingUtility();
+  private static final byte[] TEST_FAMILY1=Bytes.toBytes("f1");
+  private static final byte[] TEST_FAMILY2=Bytes.toBytes("f2");
+  private static final byte[] TEST_ROW=Bytes.toBytes("cellpermtest");
+  private static final byte[] TEST_Q1=Bytes.toBytes("q1");
+  private static final byte[] TEST_Q2=Bytes.toBytes("q2");
+  private static final byte[] ZERO=Bytes.toBytes(0L);
+  private static final byte[] ONE=Bytes.toBytes(1L);
+  private static final byte[] TWO=Bytes.toBytes(2L);
+  private static Configuration conf;
+  private static final String GROUP="group";
+  private static User GROUP_USER;
+  private static User USER_OWNER;
+  private static User USER_OTHER;
+  private static User USER_OTHER2;
+  private static String[] usersAndGroups;
+  @BeforeClass public static void setupBeforeClass() throws Exception {
+    conf=TEST_UTIL.getConfiguration();
+    enableSecurity(conf);
+    verifyConfiguration(conf);
+    conf.setBoolean(AccessControlConstants.CF_ATTRIBUTE_EARLY_OUT,false);
+    TEST_UTIL.startMiniCluster();
+    MasterCoprocessorHost cpHost=TEST_UTIL.getMiniHBaseCluster().getMaster().getMasterCoprocessorHost();
+    cpHost.load(AccessController.class,Coprocessor.PRIORITY_HIGHEST,conf);
+    AccessController ac=cpHost.findCoprocessor(AccessController.class);
+    cpHost.createEnvironment(ac,Coprocessor.PRIORITY_HIGHEST,1,conf);
+    RegionServerCoprocessorHost rsHost=TEST_UTIL.getMiniHBaseCluster().getRegionServer(0).getRegionServerCoprocessorHost();
+    rsHost.createEnvironment(ac,Coprocessor.PRIORITY_HIGHEST,1,conf);
+    TEST_UTIL.waitTableEnabled(AccessControlLists.ACL_TABLE_NAME);
+    USER_OWNER=User.createUserForTesting(conf,"owner",new String[0]);
+    USER_OTHER=User.createUserForTesting(conf,"other",new String[0]);
+    USER_OTHER2=User.createUserForTesting(conf,"other2",new String[0]);
+    GROUP_USER=User.createUserForTesting(conf,"group_user",new String[]{GROUP});
+    usersAndGroups=new String[]{USER_OTHER.getShortName(),AuthUtil.toGroupEntry(GROUP)};
+  }
+  @AfterClass public static void tearDownAfterClass() throws Exception {
+    TEST_UTIL.shutdownMiniCluster();
+  }
+  @Before public void setUp() throws Exception {
+    HTableDescriptor htd=new HTableDescriptor(TEST_TABLE.getTableName());
+    HColumnDescriptor hcd=new HColumnDescriptor(TEST_FAMILY1);
+    hcd.setMaxVersions(4);
+    htd.setOwner(USER_OWNER);
+    htd.addFamily(hcd);
+    hcd=new HColumnDescriptor(TEST_FAMILY2);
+    hcd.setMaxVersions(4);
+    htd.setOwner(USER_OWNER);
+    htd.addFamily(hcd);
+    try (Connection connection=ConnectionFactory.createConnection(TEST_UTIL.getConfiguration())){
+      try (Admin admin=connection.getAdmin()){
+        admin.createTable(htd,new byte[][]{Bytes.toBytes("s")});
+      }
+     }
+     TEST_UTIL.waitTableEnabled(TEST_TABLE.getTableName());
+    LOG.info("Sleeping a second because of HBASE-12581");
+    Threads.sleep(1000);
+  }
+  @Test public void testCellPermissionwithVersions() throws Exception {
+    final Map<String,Permission> writePerms=prepareCellPermissions(usersAndGroups,Action.WRITE);
+    final Map<String,Permission> readPerms=prepareCellPermissions(usersAndGroups,Action.READ);
+    verifyAllowed(new AccessTestAction(){
+      @Override public Object run() throws Exception {
+        try (Connection connection=ConnectionFactory.createConnection(conf);Table t=connection.getTable(TEST_TABLE.getTableName())){
+          Put p;
+          p=new Put(TEST_ROW).addColumn(TEST_FAMILY1,TEST_Q1,ZERO);
+          p.setACL(writePerms);
+          t.put(p);
+          p=new Put(TEST_ROW).addColumn(TEST_FAMILY1,TEST_Q1,ZERO);
+          p.setACL(readPerms);
+          t.put(p);
+          p=new Put(TEST_ROW).addColumn(TEST_FAMILY1,TEST_Q1,ZERO);
+          p.setACL(writePerms);
+          t.put(p);
+          p=new Put(TEST_ROW).addColumn(TEST_FAMILY1,TEST_Q1,ZERO);
+          p.setACL(readPerms);
+          t.put(p);
+          p=new Put(TEST_ROW).addColumn(TEST_FAMILY1,TEST_Q1,ZERO);
+          p.setACL(writePerms);
+          t.put(p);
+        }
+         return null;
+      }
+    }
+,USER_OWNER);
+    AccessTestAction getQ1=new AccessTestAction(){
+      @Override public Object run() throws Exception {
+        Get get=new Get(TEST_ROW);
+        get.setMaxVersions(10);
+        try (Connection connection=ConnectionFactory.createConnection(conf);Table t=connection.getTable(TEST_TABLE.getTableName())){
+          return t.get(get).listCells();
+        }
+       }
+    }
+;
+    AccessTestAction get2=new AccessTestAction(){
+      @Override public Object run() throws Exception {
+        Get get=new Get(TEST_ROW);
+        get.setMaxVersions(10);
+        try (Connection connection=ConnectionFactory.createConnection(conf);Table t=connection.getTable(TEST_TABLE.getTableName())){
+          return t.get(get).listCells();
+        }
+       }
+    }
+;
+    verifyAllowed(GROUP_USER,getQ1,2);
+    verifyAllowed(USER_OTHER,getQ1,2);
+    verifyAllowed(new AccessTestAction(){
+      @Override public Object run() throws Exception {
+        try (Connection connection=ConnectionFactory.createConnection(conf);Table t=connection.getTable(TEST_TABLE.getTableName())){
+          Put p;
+          p=new Put(TEST_ROW).addColumn(TEST_FAMILY1,TEST_Q1,ZERO);
+          p.setACL(writePerms);
+          t.put(p);
+          p=new Put(TEST_ROW).addColumn(TEST_FAMILY1,TEST_Q1,ZERO);
+          p.setACL(readPerms);
+          t.put(p);
+          p=new Put(TEST_ROW).addColumn(TEST_FAMILY1,TEST_Q1,ZERO);
+          p.setACL(writePerms);
+          t.put(p);
+        }
+         return null;
+      }
+    }
+,USER_OWNER);
+    verifyAllowed(USER_OTHER,get2,1);
+    verifyAllowed(GROUP_USER,get2,1);
+  }
+  private Map<String,Permission> prepareCellPermissions(  String[] users,  Action... action){
+    Map<String,Permission> perms=new HashMap<>(2);
+    for (    String user : users) {
+      perms.put(user,new Permission(action));
+    }
+    return perms;
+  }
+  @Test public void testCellPermissionsWithDeleteMutipleVersions() throws Exception {
+    final byte[] TEST_ROW1=Bytes.toBytes("r1");
+    final byte[] TEST_ROW2=Bytes.toBytes("r2");
+    final byte[] TEST_Q1=Bytes.toBytes("q1");
+    final byte[] TEST_Q2=Bytes.toBytes("q2");
+    final byte[] ZERO=Bytes.toBytes(0L);
+    final User user1=User.createUserForTesting(conf,"user1",new String[0]);
+    final User user2=User.createUserForTesting(conf,"user2",new String[0]);
+    verifyAllowed(new AccessTestAction(){
+      @Override public Object run() throws Exception {
+        try (Connection connection=ConnectionFactory.createConnection(conf)){
+          try (Table t=connection.getTable(TEST_TABLE.getTableName())){
+            Put p=new Put(TEST_ROW1);
+            p.addColumn(TEST_FAMILY1,TEST_Q1,ZERO);
+            p.addColumn(TEST_FAMILY1,TEST_Q2,ZERO);
+            p.setACL(user1.getShortName(),new Permission(Permission.Action.READ,Permission.Action.WRITE));
+            t.put(p);
+            p=new Put(TEST_ROW2);
+            p.addColumn(TEST_FAMILY1,TEST_Q1,ZERO);
+            p.addColumn(TEST_FAMILY1,TEST_Q2,ZERO);
+            p.setACL(user1.getShortName(),new Permission(Permission.Action.READ,Permission.Action.WRITE));
+            t.put(p);
+          }
+         }
+         return null;
+      }
+    }
+,USER_OWNER);
+    verifyAllowed(new AccessTestAction(){
+      @Override public Object run() throws Exception {
+        try (Connection connection=ConnectionFactory.createConnection(conf)){
+          try (Table t=connection.getTable(TEST_TABLE.getTableName())){
+            Put p=new Put(TEST_ROW1);
+            p.addColumn(TEST_FAMILY1,TEST_Q1,ZERO);
+            p.addColumn(TEST_FAMILY1,TEST_Q2,ZERO);
+            Map<String,Permission> perms=prepareCellPermissions(new String[]{user1.getShortName(),user2.getShortName(),AuthUtil.toGroupEntry(GROUP)},Action.READ,Action.WRITE);
+            p.setACL(perms);
+            t.put(p);
+            p=new Put(TEST_ROW2);
+            p.addColumn(TEST_FAMILY1,TEST_Q1,ZERO);
+            p.addColumn(TEST_FAMILY1,TEST_Q2,ZERO);
+            p.setACL(perms);
+            t.put(p);
+          }
+         }
+         return null;
+      }
+    }
+,user1);
+    user1.runAs(new PrivilegedExceptionAction<Void>(){
+      @Override public Void run() throws Exception {
+        try (Connection connection=ConnectionFactory.createConnection(conf)){
+          try (Table t=connection.getTable(TEST_TABLE.getTableName())){
+            Delete d=new Delete(TEST_ROW1);
+            d.addColumns(TEST_FAMILY1,TEST_Q1);
+            d.addColumns(TEST_FAMILY1,TEST_Q2);
+            t.delete(d);
+          }
+         }
+         return null;
+      }
+    }
+);
+    verifyUserDeniedForDeleteMultipleVersions(user2,TEST_ROW2,TEST_Q1,TEST_Q2);
+    verifyUserDeniedForDeleteMultipleVersions(GROUP_USER,TEST_ROW2,TEST_Q1,TEST_Q2);
+    user1.runAs(new PrivilegedExceptionAction<Void>(){
+      @Override public Void run() throws Exception {
+        try (Connection connection=ConnectionFactory.createConnection(conf)){
+          try (Table t=connection.getTable(TEST_TABLE.getTableName())){
+            Delete d=new Delete(TEST_ROW2);
+            d.addFamily(TEST_FAMILY1);
+            t.delete(d);
+          }
+         }
+         return null;
+      }
+    }
+);
+  }
+  private void verifyUserDeniedForDeleteMultipleVersions(  final User user,  final byte[] row,  final byte[] q1,  final byte[] q2) throws IOException, InterruptedException {
+    user.runAs(new PrivilegedExceptionAction<Void>(){
+      @Override public Void run() throws Exception {
+        try (Connection connection=ConnectionFactory.createConnection(conf)){
+          try (Table t=connection.getTable(TEST_TABLE.getTableName())){
+            Delete d=new Delete(row);
+            d.addColumns(TEST_FAMILY1,q1);
+            d.addColumns(TEST_FAMILY1,q2);
+            t.delete(d);
+            fail(user.getShortName() + " should not be allowed to delete the row");
+          }
+ catch (          Exception e) {
+          }
+        }
+         return null;
+      }
+    }
+);
+  }
+  @Test public void testDeleteWithFutureTimestamp() throws Exception {
+    verifyAllowed(new AccessTestAction(){
+      @Override public Object run() throws Exception {
+        try (Connection connection=ConnectionFactory.createConnection(conf)){
+          try (Table t=connection.getTable(TEST_TABLE.getTableName())){
+            Put p=new Put(TEST_ROW).addColumn(TEST_FAMILY1,TEST_Q2,ONE);
+            Map<String,Permission> readAndWritePerms=prepareCellPermissions(usersAndGroups,Action.READ,Action.WRITE);
+            p.setACL(readAndWritePerms);
+            t.put(p);
+            p=new Put(TEST_ROW).addColumn(TEST_FAMILY2,TEST_Q2,ONE);
+            p.setACL(readAndWritePerms);
+            t.put(p);
+            LOG.info("Stored at current time");
+            p=new Put(TEST_ROW).addColumn(TEST_FAMILY1,TEST_Q1,EnvironmentEdgeManager.currentTime() + 1000000,ZERO);
+            p.setACL(prepareCellPermissions(new String[]{USER_OTHER.getShortName(),AuthUtil.toGroupEntry(GROUP)},Action.READ));
+            t.put(p);
+          }
+         }
+         return null;
+      }
+    }
+,USER_OWNER);
+    AccessTestAction getQ1=new AccessTestAction(){
+      @Override public Object run() throws Exception {
+        Get get=new Get(TEST_ROW).addColumn(TEST_FAMILY1,TEST_Q1);
+        try (Connection connection=ConnectionFactory.createConnection(conf)){
+          try (Table t=connection.getTable(TEST_TABLE.getTableName())){
+            return t.get(get).listCells();
+          }
+         }
+       }
+    }
+;
+    AccessTestAction getQ2=new AccessTestAction(){
+      @Override public Object run() throws Exception {
+        Get get=new Get(TEST_ROW).addColumn(TEST_FAMILY1,TEST_Q2);
+        try (Connection connection=ConnectionFactory.createConnection(conf)){
+          try (Table t=connection.getTable(TEST_TABLE.getTableName())){
+            return t.get(get).listCells();
+          }
+         }
+       }
+    }
+;
+    verifyAllowed(getQ1,USER_OWNER,USER_OTHER,GROUP_USER);
+    verifyAllowed(getQ2,USER_OWNER,USER_OTHER,GROUP_USER);
+    AccessTestAction deleteFamily1=getDeleteFamilyAction(TEST_FAMILY1);
+    AccessTestAction deleteFamily2=getDeleteFamilyAction(TEST_FAMILY2);
+    verifyAllowed(deleteFamily1,USER_OTHER);
+    verifyAllowed(deleteFamily2,GROUP_USER);
+    verifyAllowed(getQ1,USER_OWNER,USER_OTHER,GROUP_USER);
+    verifyIfNull(getQ2,USER_OTHER,GROUP_USER);
+  }
+  private AccessTestAction getDeleteFamilyAction(  final byte[] fam){
+    AccessTestAction deleteFamilyAction=new AccessTestAction(){
+      @Override public Object run() throws Exception {
+        Delete delete=new Delete(TEST_ROW).addFamily(fam);
+        try (Connection connection=ConnectionFactory.createConnection(conf)){
+          try (Table t=connection.getTable(TEST_TABLE.getTableName())){
+            t.delete(delete);
+          }
+         }
+         return null;
+      }
+    }
+;
+    return deleteFamilyAction;
+  }
+  @Test public void testCellPermissionsWithDeleteWithUserTs() throws Exception {
+    USER_OWNER.runAs(new AccessTestAction(){
+      @Override public Object run() throws Exception {
+        try (Connection connection=ConnectionFactory.createConnection(conf)){
+          try (Table t=connection.getTable(TEST_TABLE.getTableName())){
+            Put p=new Put(TEST_ROW);
+            p.addColumn(TEST_FAMILY1,TEST_Q1,123L,ZERO);
+            p.addColumn(TEST_FAMILY1,TEST_Q2,123L,ZERO);
+            p.setACL(prepareCellPermissions(new String[]{USER_OTHER.getShortName(),AuthUtil.toGroupEntry(GROUP),USER_OTHER2.getShortName()},Permission.Action.READ,Permission.Action.WRITE));
+            t.put(p);
+            p=new Put(TEST_ROW);
+            p.addColumn(TEST_FAMILY1,TEST_Q1,125L,ONE);
+            p.addColumn(TEST_FAMILY1,TEST_Q2,125L,ONE);
+            p.setACL(prepareCellPermissions(new String[]{USER_OTHER.getShortName(),AuthUtil.toGroupEntry(GROUP)},Action.READ,Action.WRITE));
+            t.put(p);
+            p=new Put(TEST_ROW);
+            p.addColumn(TEST_FAMILY1,TEST_Q1,127L,TWO);
+            p.addColumn(TEST_FAMILY1,TEST_Q2,127L,TWO);
+            p.setACL(prepareCellPermissions(new String[]{USER_OTHER.getShortName(),AuthUtil.toGroupEntry(GROUP)},Action.READ,Action.WRITE));
+            t.put(p);
+            return null;
+          }
+         }
+       }
+    }
+);
+    USER_OTHER2.runAs(new AccessTestAction(){
+      @Override public Object run() throws Exception {
+        try (Connection connection=ConnectionFactory.createConnection(conf)){
+          try (Table t=connection.getTable(TEST_TABLE.getTableName())){
+            Delete d=new Delete(TEST_ROW,124L);
+            d.addColumns(TEST_FAMILY1,TEST_Q1);
+            t.delete(d);
+          }
+         }
+         return null;
+      }
+    }
+);
+    USER_OTHER2.runAs(new AccessTestAction(){
+      @Override public Object run() throws Exception {
+        try (Connection connection=ConnectionFactory.createConnection(conf)){
+          try (Table t=connection.getTable(TEST_TABLE.getTableName())){
+            Delete d=new Delete(TEST_ROW);
+            d.addColumns(TEST_FAMILY1,TEST_Q2,124L);
+            t.delete(d);
+          }
+         }
+         return null;
+      }
+    }
+);
+  }
+  @Test public void testCellPermissionsWithDeleteExactVersion() throws Exception {
+    final byte[] TEST_ROW1=Bytes.toBytes("r1");
+    final byte[] TEST_Q1=Bytes.toBytes("q1");
+    final byte[] TEST_Q2=Bytes.toBytes("q2");
+    final byte[] ZERO=Bytes.toBytes(0L);
+    final User user1=User.createUserForTesting(conf,"user1",new String[0]);
+    final User user2=User.createUserForTesting(conf,"user2",new String[0]);
+    verifyAllowed(new AccessTestAction(){
+      @Override public Object run() throws Exception {
+        try (Connection connection=ConnectionFactory.createConnection(conf)){
+          try (Table t=connection.getTable(TEST_TABLE.getTableName())){
+            Map<String,Permission> permsU1andOwner=prepareCellPermissions(new String[]{user1.getShortName(),USER_OWNER.getShortName()},Action.READ,Action.WRITE);
+            Map<String,Permission> permsU2andGUandOwner=prepareCellPermissions(new String[]{user2.getShortName(),AuthUtil.toGroupEntry(GROUP),USER_OWNER.getShortName()},Action.READ,Action.WRITE);
+            Put p=new Put(TEST_ROW1);
+            p.addColumn(TEST_FAMILY1,TEST_Q1,123,ZERO);
+            p.setACL(permsU1andOwner);
+            t.put(p);
+            p=new Put(TEST_ROW1);
+            p.addColumn(TEST_FAMILY1,TEST_Q2,123,ZERO);
+            p.setACL(permsU2andGUandOwner);
+            t.put(p);
+            p=new Put(TEST_ROW1);
+            p.addColumn(TEST_FAMILY2,TEST_Q1,123,ZERO);
+            p.addColumn(TEST_FAMILY2,TEST_Q2,123,ZERO);
+            p.setACL(permsU2andGUandOwner);
+            t.put(p);
+            p=new Put(TEST_ROW1);
+            p.addColumn(TEST_FAMILY2,TEST_Q1,125,ZERO);
+            p.addColumn(TEST_FAMILY2,TEST_Q2,125,ZERO);
+            p.setACL(permsU1andOwner);
+            t.put(p);
+            p=new Put(TEST_ROW1);
+            p.addColumn(TEST_FAMILY1,TEST_Q1,127,ZERO);
+            p.setACL(permsU2andGUandOwner);
+            t.put(p);
+            p=new Put(TEST_ROW1);
+            p.addColumn(TEST_FAMILY1,TEST_Q2,127,ZERO);
+            p.setACL(permsU1andOwner);
+            t.put(p);
+            p=new Put(TEST_ROW1);
+            p.addColumn(TEST_FAMILY2,TEST_Q1,129,ZERO);
+            p.addColumn(TEST_FAMILY2,TEST_Q2,129,ZERO);
+            p.setACL(permsU1andOwner);
+            t.put(p);
+          }
+         }
+         return null;
+      }
+    }
+,USER_OWNER);
+    user1.runAs(new PrivilegedExceptionAction<Void>(){
+      @Override public Void run() throws Exception {
+        try (Connection connection=ConnectionFactory.createConnection(conf)){
+          try (Table t=connection.getTable(TEST_TABLE.getTableName())){
+            Delete d=new Delete(TEST_ROW1);
+            d.addColumn(TEST_FAMILY1,TEST_Q1,123);
+            d.addColumn(TEST_FAMILY1,TEST_Q2);
+            d.addFamilyVersion(TEST_FAMILY2,125);
+            t.delete(d);
+          }
+         }
+         return null;
+      }
+    }
+);
+    verifyUserDeniedForDeleteExactVersion(user2,TEST_ROW1,TEST_Q1,TEST_Q2);
+    verifyUserDeniedForDeleteExactVersion(GROUP_USER,TEST_ROW1,TEST_Q1,TEST_Q2);
+  }
+  private void verifyUserDeniedForDeleteExactVersion(  final User user,  final byte[] row,  final byte[] q1,  final byte[] q2) throws IOException, InterruptedException {
+    user.runAs(new PrivilegedExceptionAction<Void>(){
+      @Override public Void run() throws Exception {
+        try (Connection connection=ConnectionFactory.createConnection(conf)){
+          try (Table t=connection.getTable(TEST_TABLE.getTableName())){
+            Delete d=new Delete(row,127);
+            d.addColumns(TEST_FAMILY1,q1);
+            d.addColumns(TEST_FAMILY1,q2);
+            d.addFamily(TEST_FAMILY2,129);
+            t.delete(d);
+            fail(user.getShortName() + " can not do the delete");
+          }
+ catch (          Exception e) {
+          }
+        }
+         return null;
+      }
+    }
+);
+  }
+  @Test public void testCellPermissionsForIncrementWithMultipleVersions() throws Exception {
+    final byte[] TEST_ROW1=Bytes.toBytes("r1");
+    final byte[] TEST_Q1=Bytes.toBytes("q1");
+    final byte[] TEST_Q2=Bytes.toBytes("q2");
+    final byte[] ZERO=Bytes.toBytes(0L);
+    final User user1=User.createUserForTesting(conf,"user1",new String[0]);
+    final User user2=User.createUserForTesting(conf,"user2",new String[0]);
+    verifyAllowed(new AccessTestAction(){
+      @Override public Object run() throws Exception {
+        try (Connection connection=ConnectionFactory.createConnection(conf)){
+          try (Table t=connection.getTable(TEST_TABLE.getTableName())){
+            Map<String,Permission> permsU1andOwner=prepareCellPermissions(new String[]{user1.getShortName(),USER_OWNER.getShortName()},Action.READ,Action.WRITE);
+            Map<String,Permission> permsU2andGUandOwner=prepareCellPermissions(new String[]{user2.getShortName(),AuthUtil.toGroupEntry(GROUP),USER_OWNER.getShortName()},Action.READ,Action.WRITE);
+            Put p=new Put(TEST_ROW1);
+            p.addColumn(TEST_FAMILY1,TEST_Q1,123,ZERO);
+            p.setACL(permsU1andOwner);
+            t.put(p);
+            p=new Put(TEST_ROW1);
+            p.addColumn(TEST_FAMILY1,TEST_Q2,123,ZERO);
+            p.setACL(permsU2andGUandOwner);
+            t.put(p);
+            p=new Put(TEST_ROW1);
+            p.addColumn(TEST_FAMILY1,TEST_Q1,127,ZERO);
+            p.setACL(permsU2andGUandOwner);
+            t.put(p);
+            p=new Put(TEST_ROW1);
+            p.addColumn(TEST_FAMILY1,TEST_Q2,127,ZERO);
+            p.setACL(permsU1andOwner);
+            t.put(p);
+          }
+         }
+         return null;
+      }
+    }
+,USER_OWNER);
+    user1.runAs(new PrivilegedExceptionAction<Void>(){
+      @Override public Void run() throws Exception {
+        try (Connection connection=ConnectionFactory.createConnection(conf)){
+          try (Table t=connection.getTable(TEST_TABLE.getTableName())){
+            Increment inc=new Increment(TEST_ROW1);
+            inc.setTimeRange(0,123);
+            inc.addColumn(TEST_FAMILY1,TEST_Q1,2L);
+            t.increment(inc);
+            t.incrementColumnValue(TEST_ROW1,TEST_FAMILY1,TEST_Q2,1L);
+          }
+         }
+         return null;
+      }
+    }
+);
+    verifyUserDeniedForIncrementMultipleVersions(user2,TEST_ROW1,TEST_Q2);
+    verifyUserDeniedForIncrementMultipleVersions(GROUP_USER,TEST_ROW1,TEST_Q2);
+  }
+  private void verifyUserDeniedForIncrementMultipleVersions(  final User user,  final byte[] row,  final byte[] q1) throws IOException, InterruptedException {
+    user.runAs(new PrivilegedExceptionAction<Void>(){
+      @Override public Void run() throws Exception {
+        try (Connection connection=ConnectionFactory.createConnection(conf)){
+          try (Table t=connection.getTable(TEST_TABLE.getTableName())){
+            Increment inc=new Increment(row);
+            inc.setTimeRange(0,127);
+            inc.addColumn(TEST_FAMILY1,q1,2L);
+            t.increment(inc);
+            fail(user.getShortName() + " cannot do the increment.");
+          }
+ catch (          Exception e) {
+          }
+        }
+         return null;
+      }
+    }
+);
+  }
+  @Test public void testCellPermissionsForPutWithMultipleVersions() throws Exception {
+    final byte[] TEST_ROW1=Bytes.toBytes("r1");
+    final byte[] TEST_Q1=Bytes.toBytes("q1");
+    final byte[] TEST_Q2=Bytes.toBytes("q2");
+    final byte[] ZERO=Bytes.toBytes(0L);
+    final User user1=User.createUserForTesting(conf,"user1",new String[0]);
+    final User user2=User.createUserForTesting(conf,"user2",new String[0]);
+    verifyAllowed(new AccessTestAction(){
+      @Override public Object run() throws Exception {
+        try (Connection connection=ConnectionFactory.createConnection(conf)){
+          try (Table t=connection.getTable(TEST_TABLE.getTableName())){
+            Map<String,Permission> permsU1andOwner=prepareCellPermissions(new String[]{user1.getShortName(),USER_OWNER.getShortName()},Action.READ,Action.WRITE);
+            Map<String,Permission> permsU2andGUandOwner=prepareCellPermissions(new String[]{user1.getShortName(),AuthUtil.toGroupEntry(GROUP),USER_OWNER.getShortName()},Action.READ,Action.WRITE);
+            permsU2andGUandOwner.put(user2.getShortName(),new Permission(Permission.Action.READ,Permission.Action.WRITE));
+            permsU2andGUandOwner.put(USER_OWNER.getShortName(),new Permission(Permission.Action.READ,Permission.Action.WRITE));
+            Put p=new Put(TEST_ROW1);
+            p.addColumn(TEST_FAMILY1,TEST_Q1,123,ZERO);
+            p.setACL(permsU1andOwner);
+            t.put(p);
+            p=new Put(TEST_ROW1);
+            p.addColumn(TEST_FAMILY1,TEST_Q2,123,ZERO);
+            p.setACL(permsU2andGUandOwner);
+            t.put(p);
+            p=new Put(TEST_ROW1);
+            p.addColumn(TEST_FAMILY1,TEST_Q1,127,ZERO);
+            p.setACL(permsU2andGUandOwner);
+            t.put(p);
+            p=new Put(TEST_ROW1);
+            p.addColumn(TEST_FAMILY1,TEST_Q2,127,ZERO);
+            p.setACL(permsU1andOwner);
+            t.put(p);
+          }
+         }
+         return null;
+      }
+    }
+,USER_OWNER);
+    user1.runAs(new PrivilegedExceptionAction<Void>(){
+      @Override public Void run() throws Exception {
+        try (Connection connection=ConnectionFactory.createConnection(conf)){
+          try (Table t=connection.getTable(TEST_TABLE.getTableName())){
+            Put p=new Put(TEST_ROW1);
+            p.addColumn(TEST_FAMILY1,TEST_Q1,125,ZERO);
+            p.addColumn(TEST_FAMILY1,TEST_Q2,ZERO);
+            p.setACL(user2.getShortName(),new Permission(Permission.Action.READ,Permission.Action.WRITE));
+            t.put(p);
+          }
+         }
+         return null;
+      }
+    }
+);
+    verifyUserDeniedForPutMultipleVersions(user2,TEST_ROW1,TEST_Q1,TEST_Q2,ZERO);
+    verifyUserDeniedForPutMultipleVersions(GROUP_USER,TEST_ROW1,TEST_Q1,TEST_Q2,ZERO);
+  }
+  private void verifyUserDeniedForPutMultipleVersions(  final User user,  final byte[] row,  final byte[] q1,  final byte[] q2,  final byte[] value) throws IOException, InterruptedException {
+    user.runAs(new PrivilegedExceptionAction<Void>(){
+      @Override public Void run() throws Exception {
+        try (Connection connection=ConnectionFactory.createConnection(conf)){
+          try (Table t=connection.getTable(TEST_TABLE.getTableName())){
+            Put p=new Put(row);
+            p.addColumn(TEST_FAMILY1,q1,124,value);
+            p.addColumn(TEST_FAMILY1,q2,value);
+            t.put(p);
+            fail(user.getShortName() + " cannot do the put.");
+          }
+ catch (          Exception e) {
+          }
+        }
+         return null;
+      }
+    }
+);
+  }
+  @Test public void testCellPermissionsForCheckAndDelete() throws Exception {
+    final byte[] TEST_ROW1=Bytes.toBytes("r1");
+    final byte[] TEST_Q3=Bytes.toBytes("q3");
+    final byte[] ZERO=Bytes.toBytes(0L);
+    final User user1=User.createUserForTesting(conf,"user1",new String[0]);
+    final User user2=User.createUserForTesting(conf,"user2",new String[0]);
+    verifyAllowed(new AccessTestAction(){
+      @Override public Object run() throws Exception {
+        try (Connection connection=ConnectionFactory.createConnection(conf)){
+          try (Table t=connection.getTable(TEST_TABLE.getTableName())){
+            Map<String,Permission> permsU1andOwner=prepareCellPermissions(new String[]{user1.getShortName(),USER_OWNER.getShortName()},Action.READ,Action.WRITE);
+            Map<String,Permission> permsU1andU2andGUandOwner=prepareCellPermissions(new String[]{user1.getShortName(),user2.getShortName(),AuthUtil.toGroupEntry(GROUP),USER_OWNER.getShortName()},Action.READ,Action.WRITE);
+            Map<String,Permission> permsU1_U2andGU=prepareCellPermissions(new String[]{user1.getShortName(),user2.getShortName(),AuthUtil.toGroupEntry(GROUP)},Action.READ,Action.WRITE);
+            Put p=new Put(TEST_ROW1);
+            p.addColumn(TEST_FAMILY1,TEST_Q1,120,ZERO);
+            p.addColumn(TEST_FAMILY1,TEST_Q2,120,ZERO);
+            p.addColumn(TEST_FAMILY1,TEST_Q3,120,ZERO);
+            p.setACL(permsU1andU2andGUandOwner);
+            t.put(p);
+            p=new Put(TEST_ROW1);
+            p.addColumn(TEST_FAMILY1,TEST_Q1,123,ZERO);
+            p.addColumn(TEST_FAMILY1,TEST_Q2,123,ZERO);
+            p.addColumn(TEST_FAMILY1,TEST_Q3,123,ZERO);
+            p.setACL(permsU1andOwner);
+            t.put(p);
+            p=new Put(TEST_ROW1);
+            p.addColumn(TEST_FAMILY1,TEST_Q1,127,ZERO);
+            p.setACL(permsU1_U2andGU);
+            t.put(p);
+            p=new Put(TEST_ROW1);
+            p.addColumn(TEST_FAMILY1,TEST_Q2,127,ZERO);
+            p.setACL(user2.getShortName(),new Permission(Permission.Action.READ));
+            t.put(p);
+            p=new Put(TEST_ROW1);
+            p.addColumn(TEST_FAMILY1,TEST_Q3,127,ZERO);
+            p.setACL(AuthUtil.toGroupEntry(GROUP),new Permission(Permission.Action.READ));
+            t.put(p);
+          }
+         }
+         return null;
+      }
+    }
+,USER_OWNER);
+    user1.runAs(new PrivilegedExceptionAction<Void>(){
+      @Override public Void run() throws Exception {
+        try (Connection connection=ConnectionFactory.createConnection(conf)){
+          try (Table t=connection.getTable(TEST_TABLE.getTableName())){
+            Delete d=new Delete(TEST_ROW1);
+            d.addColumns(TEST_FAMILY1,TEST_Q1,120);
+            t.checkAndMutate(TEST_ROW1,TEST_FAMILY1).qualifier(TEST_Q1).ifEquals(ZERO).thenDelete(d);
+          }
+         }
+         return null;
+      }
+    }
+);
+    verifyUserDeniedForCheckAndDelete(user2,TEST_ROW1,ZERO);
+    verifyUserDeniedForCheckAndDelete(GROUP_USER,TEST_ROW1,ZERO);
+    verifyUserAllowedforCheckAndDelete(user2,TEST_ROW1,TEST_Q2,ZERO);
+    verifyUserAllowedforCheckAndDelete(GROUP_USER,TEST_ROW1,TEST_Q3,ZERO);
+  }
+  private void verifyUserAllowedforCheckAndDelete(  final User user,  final byte[] row,  final byte[] q1,  final byte[] value) throws IOException, InterruptedException {
+    user.runAs(new PrivilegedExceptionAction<Void>(){
+      @Override public Void run() throws Exception {
+        try (Connection connection=ConnectionFactory.createConnection(conf)){
+          try (Table t=connection.getTable(TEST_TABLE.getTableName())){
+            Delete d=new Delete(row);
+            d.addColumn(TEST_FAMILY1,q1,120);
+            t.checkAndMutate(row,TEST_FAMILY1).qualifier(q1).ifEquals(value).thenDelete(d);
+          }
+         }
+         return null;
+      }
+    }
+);
+  }
+  private void verifyUserDeniedForCheckAndDelete(  final User user,  final byte[] row,  final byte[] value) throws IOException, InterruptedException {
+    user.runAs(new PrivilegedExceptionAction<Void>(){
+      @Override public Void run() throws Exception {
+        try (Connection connection=ConnectionFactory.createConnection(conf)){
+          try (Table t=connection.getTable(TEST_TABLE.getTableName())){
+            Delete d=new Delete(row);
+            d.addColumns(TEST_FAMILY1,TEST_Q1);
+            t.checkAndMutate(row,TEST_FAMILY1).qualifier(TEST_Q1).ifEquals(value).thenDelete(d);
+            fail(user.getShortName() + " should not be allowed to do checkAndDelete");
+          }
+ catch (          Exception e) {
+          }
+        }
+         return null;
+      }
+    }
+);
+  }
+  @After public void tearDown() throws Exception {
+    try {
+      TEST_UTIL.deleteTable(TEST_TABLE.getTableName());
+    }
+ catch (    TableNotFoundException ex) {
+      LOG.info("Test deleted table " + TEST_TABLE.getTableName());
+    }
+    assertEquals(0,AccessControlLists.getTablePermissions(conf,TEST_TABLE.getTableName()).size());
+  }
+}

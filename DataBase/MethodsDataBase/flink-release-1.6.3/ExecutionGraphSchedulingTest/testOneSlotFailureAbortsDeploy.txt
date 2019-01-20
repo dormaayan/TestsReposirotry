@@ -1,0 +1,50 @@
+/** 
+ * This test verifies that if one slot future fails, the deployment will be aborted.
+ */
+@Test public void testOneSlotFailureAbortsDeploy() throws Exception {
+  final int parallelism=6;
+  final JobVertex sourceVertex=new JobVertex("source");
+  sourceVertex.setParallelism(parallelism);
+  sourceVertex.setInvokableClass(NoOpInvokable.class);
+  final JobVertex targetVertex=new JobVertex("target");
+  targetVertex.setParallelism(parallelism);
+  targetVertex.setInvokableClass(NoOpInvokable.class);
+  targetVertex.connectNewDataSetAsInput(sourceVertex,DistributionPattern.POINTWISE,ResultPartitionType.PIPELINED);
+  final JobID jobId=new JobID();
+  final JobGraph jobGraph=new JobGraph(jobId,"test",sourceVertex,targetVertex);
+  final TaskManagerGateway taskManager=mock(TaskManagerGateway.class);
+  final BlockingQueue<AllocationID> returnedSlots=new ArrayBlockingQueue<>(parallelism);
+  final TestingSlotOwner slotOwner=new TestingSlotOwner();
+  slotOwner.setReturnAllocatedSlotConsumer((  LogicalSlot logicalSlot) -> returnedSlots.offer(logicalSlot.getAllocationId()));
+  final SimpleSlot[] sourceSlots=new SimpleSlot[parallelism];
+  final SimpleSlot[] targetSlots=new SimpleSlot[parallelism];
+  @SuppressWarnings({"unchecked","rawtypes"}) final CompletableFuture<LogicalSlot>[] sourceFutures=new CompletableFuture[parallelism];
+  @SuppressWarnings({"unchecked","rawtypes"}) final CompletableFuture<LogicalSlot>[] targetFutures=new CompletableFuture[parallelism];
+  for (int i=0; i < parallelism; i++) {
+    sourceSlots[i]=createSlot(taskManager,jobId,slotOwner);
+    targetSlots[i]=createSlot(taskManager,jobId,slotOwner);
+    sourceFutures[i]=new CompletableFuture<>();
+    targetFutures[i]=new CompletableFuture<>();
+  }
+  ProgrammedSlotProvider slotProvider=new ProgrammedSlotProvider(parallelism);
+  slotProvider.addSlots(sourceVertex.getID(),sourceFutures);
+  slotProvider.addSlots(targetVertex.getID(),targetFutures);
+  final ExecutionGraph eg=createExecutionGraph(jobGraph,slotProvider);
+  for (int i=0; i < parallelism; i+=2) {
+    sourceFutures[i].complete(sourceSlots[i]);
+    targetFutures[i].complete(targetSlots[i]);
+  }
+  eg.setScheduleMode(ScheduleMode.EAGER);
+  eg.setQueuedSchedulingAllowed(true);
+  eg.scheduleForExecution();
+  sourceFutures[1].completeExceptionally(new TestRuntimeException());
+  eg.getTerminationFuture().get(2000,TimeUnit.MILLISECONDS);
+  for (int i=0; i < parallelism; i++) {
+    returnedSlots.poll(2000L,TimeUnit.MILLISECONDS);
+  }
+  verify(taskManager,times(0)).submitTask(any(TaskDeploymentDescriptor.class),any(Time.class));
+  for (int i=0; i < parallelism; i+=2) {
+    assertTrue(sourceSlots[i].isCanceled());
+    assertTrue(targetSlots[i].isCanceled());
+  }
+}

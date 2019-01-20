@@ -1,0 +1,69 @@
+/** 
+ * Tests to verify that there is no race condition with two things running in parallel: recycling exclusive buffers and recycling external buffers to the buffer pool while the recycling of the exclusive buffer triggers recycling a floating buffer (FLINK-9676).
+ */
+@Test public void testConcurrentRecycleAndRelease2() throws Exception {
+  final int retries=1_000;
+  final int numExclusiveBuffers=2;
+  final int numFloatingBuffers=2;
+  final int numTotalBuffers=numExclusiveBuffers + numFloatingBuffers;
+  final NetworkBufferPool networkBufferPool=new NetworkBufferPool(numTotalBuffers,32);
+  final ExecutorService executor=Executors.newFixedThreadPool(2);
+  final SingleInputGate inputGate=createSingleInputGate();
+  final RemoteInputChannel inputChannel=createRemoteInputChannel(inputGate);
+  inputGate.setInputChannel(inputChannel.partitionId.getPartitionId(),inputChannel);
+  Throwable thrown=null;
+  try {
+    final BufferPool bufferPool=networkBufferPool.createBufferPool(numFloatingBuffers,numFloatingBuffers);
+    inputGate.setBufferPool(bufferPool);
+    inputGate.assignExclusiveSegments(networkBufferPool,numExclusiveBuffers);
+    inputChannel.requestSubpartition(0);
+    final Callable<Void> bufferPoolInteractionsTask=() -> {
+      for (int i=0; i < retries; ++i) {
+        Buffer buffer=bufferPool.requestBufferBlocking();
+        buffer.recycleBuffer();
+      }
+      return null;
+    }
+;
+    final Callable<Void> channelInteractionsTask=() -> {
+      ArrayList<Buffer> exclusiveBuffers=new ArrayList<>(numExclusiveBuffers);
+      ArrayList<Buffer> floatingBuffers=new ArrayList<>(numExclusiveBuffers);
+      try {
+        for (int i=0; i < retries; ++i) {
+          for (int j=0; j < numTotalBuffers; ++j) {
+            Buffer buffer=inputChannel.requestBuffer();
+            if (buffer == null) {
+              break;
+            }
+ else {
+              if (buffer.getRecycler() == inputChannel) {
+                exclusiveBuffers.add(buffer);
+              }
+ else {
+                floatingBuffers.add(buffer);
+              }
+            }
+          }
+          floatingBuffers.forEach(Buffer::recycleBuffer);
+          floatingBuffers.clear();
+          assertEquals(numExclusiveBuffers,exclusiveBuffers.size());
+          inputChannel.onSenderBacklog(0);
+          exclusiveBuffers.forEach(Buffer::recycleBuffer);
+          exclusiveBuffers.clear();
+        }
+      }
+  finally {
+        inputChannel.releaseAllResources();
+      }
+      return null;
+    }
+;
+    submitTasksAndWaitForResults(executor,new Callable[]{bufferPoolInteractionsTask,channelInteractionsTask});
+  }
+ catch (  Throwable t) {
+    thrown=t;
+  }
+ finally {
+    cleanup(networkBufferPool,executor,null,thrown,inputChannel);
+  }
+}

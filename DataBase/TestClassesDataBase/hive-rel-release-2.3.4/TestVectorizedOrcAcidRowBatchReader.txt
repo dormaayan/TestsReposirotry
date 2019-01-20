@@ -1,0 +1,150 @@
+/** 
+ * This class tests the VectorizedOrcAcidRowBatchReader by creating an actual split and a set of delete delta files. The split is on an insert delta and there are multiple delete deltas with interleaving list of record ids that get deleted. Correctness is tested by validating that the correct set of record ids are returned in sorted order for valid transactions only.
+ */
+public class TestVectorizedOrcAcidRowBatchReader {
+  private static final long NUM_ROWID_PER_OTID=15000L;
+  private static final long NUM_OTID=10L;
+  private JobConf conf;
+  private FileSystem fs;
+  private Path root;
+static class DummyRow {
+    LongWritable field;
+    RecordIdentifier ROW__ID;
+    DummyRow(    long val){
+      field=new LongWritable(val);
+      ROW__ID=null;
+    }
+    DummyRow(    long val,    long rowId,    long origTxn,    int bucket){
+      field=new LongWritable(val);
+      ROW__ID=new RecordIdentifier(origTxn,bucket,rowId);
+    }
+    static String getColumnNamesProperty(){
+      return "field";
+    }
+    static String getColumnTypesProperty(){
+      return "bigint";
+    }
+  }
+  @Before public void setup() throws Exception {
+    conf=new JobConf();
+    conf.set("bucket_count","1");
+    conf.set(hive_metastoreConstants.TABLE_IS_TRANSACTIONAL,"true");
+    conf.setBoolean(HiveConf.ConfVars.HIVE_TRANSACTIONAL_TABLE_SCAN.varname,true);
+    conf.set(hive_metastoreConstants.TABLE_TRANSACTIONAL_PROPERTIES,"default");
+    conf.setInt(HiveConf.ConfVars.HIVE_TXN_OPERATIONAL_PROPERTIES.varname,AcidUtils.AcidOperationalProperties.getDefault().toInt());
+    conf.set(IOConstants.SCHEMA_EVOLUTION_COLUMNS,DummyRow.getColumnNamesProperty());
+    conf.set(IOConstants.SCHEMA_EVOLUTION_COLUMNS_TYPES,DummyRow.getColumnTypesProperty());
+    conf.setBoolean(HiveConf.ConfVars.HIVE_VECTORIZATION_ENABLED.varname,true);
+    conf.set(HiveConf.ConfVars.HIVE_ORC_SPLIT_STRATEGY.varname,"BI");
+    fs=FileSystem.getLocal(conf);
+    Path workDir=new Path(System.getProperty("test.tmp.dir","target" + File.separator + "test"+ File.separator+ "tmp"));
+    root=new Path(workDir,"TestVectorizedOrcAcidRowBatch.testDump");
+    fs.delete(root,true);
+    ObjectInspector inspector;
+synchronized (TestOrcFile.class) {
+      inspector=ObjectInspectorFactory.getReflectionObjectInspector(DummyRow.class,ObjectInspectorFactory.ObjectInspectorOptions.JAVA);
+    }
+    int bucket=0;
+    AcidOutputFormat.Options options=new AcidOutputFormat.Options(conf).filesystem(fs).bucket(bucket).writingBase(false).minimumTransactionId(1).maximumTransactionId(NUM_OTID).inspector(inspector).reporter(Reporter.NULL).recordIdColumn(1).finalDestination(root);
+    RecordUpdater updater=new OrcRecordUpdater(root,options);
+    for (long i=1; i <= NUM_OTID; ++i) {
+      for (long j=0; j < NUM_ROWID_PER_OTID; ++j) {
+        long payload=(i - 1) * NUM_ROWID_PER_OTID + j;
+        updater.insert(i,new DummyRow(payload,j,i,bucket));
+      }
+    }
+    updater.close(false);
+    long currTxnId=NUM_OTID + 1;
+    options.minimumTransactionId(currTxnId).maximumTransactionId(currTxnId);
+    updater=new OrcRecordUpdater(root,options);
+    for (long i=1; i <= NUM_OTID; ++i) {
+      for (long j=0; j < NUM_ROWID_PER_OTID; j+=1) {
+        if (j % 2 == 0 && j % 3 != 0) {
+          updater.delete(currTxnId,new DummyRow(-1,j,i,bucket));
+        }
+      }
+    }
+    updater.close(false);
+    currTxnId=NUM_OTID + 2;
+    options.minimumTransactionId(currTxnId).maximumTransactionId(currTxnId);
+    updater=new OrcRecordUpdater(root,options);
+    for (long i=1; i <= NUM_OTID; ++i) {
+      for (long j=0; j < NUM_ROWID_PER_OTID; j+=1) {
+        if (j % 2 != 0 && j % 3 == 0) {
+          updater.delete(currTxnId,new DummyRow(-1,j,i,bucket));
+        }
+      }
+    }
+    updater.close(false);
+    currTxnId=NUM_OTID + 3;
+    options.minimumTransactionId(currTxnId).maximumTransactionId(currTxnId);
+    updater=new OrcRecordUpdater(root,options);
+    for (long i=1; i <= NUM_OTID; ++i) {
+      for (long j=0; j < NUM_ROWID_PER_OTID; j+=1) {
+        if (j % 2 == 0 && j % 3 == 0) {
+          updater.delete(currTxnId,new DummyRow(-1,j,i,bucket));
+        }
+      }
+    }
+    updater.close(false);
+  }
+  private List<OrcSplit> getSplits() throws Exception {
+    conf.setInt(HiveConf.ConfVars.HIVE_TXN_OPERATIONAL_PROPERTIES.varname,AcidUtils.AcidOperationalProperties.getDefault().toInt());
+    OrcInputFormat.Context context=new OrcInputFormat.Context(conf);
+    OrcInputFormat.FileGenerator gen=new OrcInputFormat.FileGenerator(context,fs,root,false,null);
+    OrcInputFormat.AcidDirInfo adi=gen.call();
+    List<OrcInputFormat.SplitStrategy<?>> splitStrategies=OrcInputFormat.determineSplitStrategies(null,context,adi.fs,adi.splitPath,adi.acidInfo,adi.baseFiles,adi.parsedDeltas,null,null,true);
+    assertEquals(1,splitStrategies.size());
+    List<OrcSplit> splits=((OrcInputFormat.ACIDSplitStrategy)splitStrategies.get(0)).getSplits();
+    assertEquals(1,splits.size());
+    assertEquals("file://" + root.toUri().toString() + File.separator+ "delta_0000001_0000010_0000/bucket_00000",splits.get(0).getPath().toUri().toString());
+    assertFalse(splits.get(0).isOriginal());
+    return splits;
+  }
+  @Test public void testVectorizedOrcAcidRowBatchReader() throws Exception {
+    testVectorizedOrcAcidRowBatchReader(ColumnizedDeleteEventRegistry.class.getName());
+    int oldValue=conf.getInt(HiveConf.ConfVars.HIVE_TRANSACTIONAL_NUM_EVENTS_IN_MEMORY.varname,1000000);
+    conf.setInt(HiveConf.ConfVars.HIVE_TRANSACTIONAL_NUM_EVENTS_IN_MEMORY.varname,1000);
+    testVectorizedOrcAcidRowBatchReader(SortMergedDeleteEventRegistry.class.getName());
+    conf.setInt(HiveConf.ConfVars.HIVE_TRANSACTIONAL_NUM_EVENTS_IN_MEMORY.varname,oldValue);
+  }
+  private void testVectorizedOrcAcidRowBatchReader(  String deleteEventRegistry) throws Exception {
+    List<OrcSplit> splits=getSplits();
+    conf.set(ValidTxnList.VALID_TXNS_KEY,"14:1:1:5");
+    VectorizedOrcAcidRowBatchReader vectorizedReader=new VectorizedOrcAcidRowBatchReader(splits.get(0),conf,Reporter.NULL);
+    if (deleteEventRegistry.equals(ColumnizedDeleteEventRegistry.class.getName())) {
+      assertTrue(vectorizedReader.getDeleteEventRegistry() instanceof ColumnizedDeleteEventRegistry);
+    }
+    if (deleteEventRegistry.equals(SortMergedDeleteEventRegistry.class.getName())) {
+      assertTrue(vectorizedReader.getDeleteEventRegistry() instanceof SortMergedDeleteEventRegistry);
+    }
+    TypeDescription schema=OrcInputFormat.getDesiredRowTypeDescr(conf,true,Integer.MAX_VALUE);
+    VectorizedRowBatch vectorizedRowBatch=schema.createRowBatch();
+    vectorizedRowBatch.setPartitionInfo(1,0);
+    long previousPayload=Long.MIN_VALUE;
+    while (vectorizedReader.next(null,vectorizedRowBatch)) {
+      assertTrue(vectorizedRowBatch.selectedInUse);
+      LongColumnVector col=(LongColumnVector)vectorizedRowBatch.cols[0];
+      for (int i=0; i < vectorizedRowBatch.size; ++i) {
+        int idx=vectorizedRowBatch.selected[i];
+        long payload=col.vector[idx];
+        long otid=(payload / NUM_ROWID_PER_OTID) + 1;
+        long rowId=payload % NUM_ROWID_PER_OTID;
+        assertFalse(rowId % 2 == 0 || rowId % 3 == 0);
+        assertTrue(otid != 5);
+        assertTrue(payload > previousPayload);
+        previousPayload=payload;
+      }
+    }
+  }
+  @Test public void testCanCreateVectorizedAcidRowBatchReaderOnSplit() throws Exception {
+    OrcSplit mockSplit=Mockito.mock(OrcSplit.class);
+    conf.setInt(HiveConf.ConfVars.HIVE_TXN_OPERATIONAL_PROPERTIES.varname,AcidUtils.AcidOperationalProperties.getLegacy().toInt());
+    assertFalse(VectorizedOrcAcidRowBatchReader.canCreateVectorizedAcidRowBatchReaderOnSplit(conf,mockSplit));
+    conf.setInt(HiveConf.ConfVars.HIVE_TXN_OPERATIONAL_PROPERTIES.varname,AcidUtils.AcidOperationalProperties.getDefault().toInt());
+    Mockito.when(mockSplit.isOriginal()).thenReturn(true);
+    assertFalse(VectorizedOrcAcidRowBatchReader.canCreateVectorizedAcidRowBatchReaderOnSplit(conf,mockSplit));
+    Mockito.when(mockSplit.isOriginal()).thenReturn(false);
+    assertTrue(VectorizedOrcAcidRowBatchReader.canCreateVectorizedAcidRowBatchReaderOnSplit(conf,mockSplit));
+  }
+}

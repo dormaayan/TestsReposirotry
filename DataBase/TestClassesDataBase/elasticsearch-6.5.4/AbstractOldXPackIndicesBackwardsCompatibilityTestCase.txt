@@ -1,0 +1,110 @@
+/** 
+ * Base class for tests against clusters coming from old versions of xpack and Elasticsearch.
+ */
+@ESIntegTestCase.ClusterScope(scope=ESIntegTestCase.Scope.TEST,numDataNodes=0,numClientNodes=0) public abstract class AbstractOldXPackIndicesBackwardsCompatibilityTestCase extends SecurityIntegTestCase {
+  /** 
+ * Set to true when it is ok to start a node. We don't want to start nodes at unexpected times.
+ */
+  private boolean okToStartNode=false;
+  private List<String> dataFiles;
+  @Override protected final boolean ignoreExternalCluster(){
+    return true;
+  }
+  @Override protected boolean shouldAssertXPackIsInstalled(){
+    return false;
+  }
+  @Override protected void ensureClusterSizeConsistency(){
+  }
+  @Override protected void ensureClusterStateConsistency() throws IOException {
+  }
+  @Before public final void initIndexesList() throws Exception {
+    dataFiles=loadDataFilesList("x-pack",getBwcIndicesPath());
+  }
+  @Override public Settings nodeSettings(  int ord){
+    if (false == okToStartNode) {
+      throw new IllegalStateException("Starting nodes must only happen in setupCluster");
+    }
+    return Settings.builder().put(super.nodeSettings(ord)).put(ThrottlingAllocationDecider.CLUSTER_ROUTING_ALLOCATION_NODE_CONCURRENT_INCOMING_RECOVERIES_SETTING.getKey(),30).put(ThrottlingAllocationDecider.CLUSTER_ROUTING_ALLOCATION_NODE_CONCURRENT_OUTGOING_RECOVERIES_SETTING.getKey(),30).build();
+  }
+  @Override protected int maxNumberOfNodes(){
+    try {
+      return SecurityIntegTestCase.defaultMaxNumberOfNodes() + loadDataFilesList("x-pack",getBwcIndicesPath()).size();
+    }
+ catch (    IOException e) {
+      throw new RuntimeException("couldn't enumerate bwc indices",e);
+    }
+  }
+  public void testAllVersionsTested() throws Exception {
+    SortedSet<String> expectedVersions=new TreeSet<>();
+    for (    Version v : VersionUtils.allReleasedVersions()) {
+      if (v.isRelease()) {
+        expectedVersions.add("x-pack-" + v.toString() + ".zip");
+      }
+    }
+    expectedVersions.removeAll(dataFiles);
+    if (expectedVersions.isEmpty() == false) {
+      StringBuilder msg=new StringBuilder("Old index tests are missing indexes:");
+      for (      String expected : expectedVersions) {
+        msg.append("\n" + expected);
+      }
+      fail(msg.toString());
+    }
+  }
+  public void testOldIndexes() throws Exception {
+    assertSecurityIndexActive();
+    Collections.shuffle(dataFiles,random());
+    for (    String dataFile : dataFiles) {
+      Version version=Version.fromString(dataFile.replace("x-pack-","").replace(".zip",""));
+      long clusterStartTime=System.nanoTime();
+      setupCluster(dataFile);
+      ensureYellow();
+      long testStartTime=System.nanoTime();
+      try {
+        checkVersion(version);
+      }
+ catch (      Throwable t) {
+        throw new AssertionError("Failed while checking [" + version + "]",t);
+      }
+      logger.info("--> Done testing [{}]. Setting up cluster took [{}] millis and testing took [{}] millis",version,TimeUnit.NANOSECONDS.toMillis(testStartTime - clusterStartTime),TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - testStartTime));
+    }
+  }
+  /** 
+ * Actually test this version.
+ */
+  protected abstract void checkVersion(  Version version) throws Exception ;
+  private void setupCluster(  String pathToZipFile) throws Exception {
+    while (internalCluster().size() > 0) {
+      internalCluster().stopRandomNode(s -> true);
+    }
+    Path dataPath=createTempDir();
+    Settings.Builder nodeSettings=Settings.builder().put("path.data",dataPath.toAbsolutePath());
+    Path backwardsIndex=getBwcIndicesPath().resolve(pathToZipFile);
+    try (InputStream stream=Files.newInputStream(backwardsIndex)){
+      logger.info("unzipping {}",backwardsIndex.toString());
+      TestUtil.unzip(stream,dataPath);
+      try (Stream<Path> unzippedFiles=Files.list(dataPath.resolve("data"))){
+        Path dataDir=unzippedFiles.findFirst().get();
+        int zipIndex=pathToZipFile.indexOf(".zip");
+        Version version=Version.fromString(pathToZipFile.substring("x-pack-".length(),zipIndex));
+        if (version.before(Version.V_5_0_0_alpha1)) {
+          dataDir=dataDir.resolve("nodes");
+        }
+        copyIndex(logger,dataDir,"nodes",dataPath);
+      }
+       IOUtils.rm(dataPath.resolve("data"));
+    }
+     assertTrue(Files.exists(dataPath));
+    Path[] list=FileSystemUtils.files(dataPath);
+    if (list.length != 1) {
+      throw new IllegalStateException("Backwards index must contain exactly one node");
+    }
+    logger.info("--> Data path for importing node: {}",dataPath);
+    okToStartNode=true;
+    String importingNodeName=internalCluster().startNode(nodeSettings.build());
+    okToStartNode=false;
+    Path[] nodePaths=internalCluster().getInstance(NodeEnvironment.class,importingNodeName).nodeDataPaths();
+    assertEquals(1,nodePaths.length);
+    PutLicenseResponse putLicenseResponse=client().execute(PutLicenseAction.INSTANCE,new PutLicenseRequest().license(TestUtils.generateSignedLicense("platinum",TimeValue.timeValueHours(24L)))).get();
+    assertAcked(putLicenseResponse);
+  }
+}

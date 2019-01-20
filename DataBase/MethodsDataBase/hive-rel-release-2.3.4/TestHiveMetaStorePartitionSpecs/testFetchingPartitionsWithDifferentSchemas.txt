@@ -1,0 +1,69 @@
+/** 
+ * Test to confirm that Partition-grouping behaves correctly when Table-schemas evolve. Partitions must be grouped by location and schema.
+ */
+@Test public void testFetchingPartitionsWithDifferentSchemas(){
+  try {
+    HiveMetaStoreClient hmsc=new HiveMetaStoreClient(hiveConf);
+    clearAndRecreateDB(hmsc);
+    createTable(hmsc,true);
+    Table table=hmsc.getTable(dbName,tableName);
+    populatePartitions(hmsc,table,Arrays.asList("isLocatedInTablePath","isLocatedOutsideTablePath"));
+    List<FieldSchema> fields=table.getSd().getCols();
+    fields.add(new FieldSchema("goo","string","Entirely new column. Doesn't apply to older partitions."));
+    table.getSd().setCols(fields);
+    hmsc.alter_table(dbName,tableName,table);
+    table=hmsc.getTable(dbName,tableName);
+    Assert.assertEquals("Unexpected number of table columns.",3,table.getSd().getColsSize());
+    populatePartitions(hmsc,table,Arrays.asList("hasNewColumn"));
+    PartitionSpecProxy partitionSpecProxy=hmsc.listPartitionSpecs(dbName,tableName,-1);
+    Assert.assertEquals("Unexpected number of partitions.",nDates * 3,partitionSpecProxy.size());
+    Assert.assertTrue("Unexpected type of PartitionSpecProxy.",partitionSpecProxy instanceof CompositePartitionSpecProxy);
+    CompositePartitionSpecProxy compositePartitionSpecProxy=(CompositePartitionSpecProxy)partitionSpecProxy;
+    List<PartitionSpec> partitionSpecs=compositePartitionSpecProxy.toPartitionSpec();
+    Assert.assertTrue("PartitionSpec[0] should have been a SharedSDPartitionSpec.",partitionSpecs.get(0).isSetSharedSDPartitionSpec());
+    Assert.assertEquals("PartitionSpec[0] should use the table-path as the common root location. ",table.getSd().getLocation(),partitionSpecs.get(0).getRootPath());
+    Assert.assertTrue("PartitionSpec[1] should have been a SharedSDPartitionSpec.",partitionSpecs.get(1).isSetSharedSDPartitionSpec());
+    Assert.assertEquals("PartitionSpec[1] should use the table-path as the common root location. ",table.getSd().getLocation(),partitionSpecs.get(1).getRootPath());
+    Assert.assertTrue("PartitionSpec[2] should have been a ListComposingPartitionSpec.",partitionSpecs.get(2).isSetPartitionList());
+    PartitionSpecProxy.PartitionIterator iterator=partitionSpecProxy.getPartitionIterator();
+    Map<String,List<Partition>> blurbToPartitionList=new HashMap<String,List<Partition>>(3);
+    while (iterator.hasNext()) {
+      Partition partition=iterator.next();
+      String blurb=partition.getValues().get(1);
+      if (!blurbToPartitionList.containsKey(blurb)) {
+        blurbToPartitionList.put(blurb,new ArrayList<Partition>(nDates));
+      }
+      blurbToPartitionList.get(blurb).add(partition);
+    }
+    for (    Partition partition : blurbToPartitionList.get("isLocatedOutsideTablePath")) {
+      Assert.assertEquals("Unexpected number of columns.",2,partition.getSd().getCols().size());
+      Assert.assertEquals("Unexpected first column.","foo",partition.getSd().getCols().get(0).getName());
+      Assert.assertEquals("Unexpected second column.","bar",partition.getSd().getCols().get(1).getName());
+      String partitionLocation=partition.getSd().getLocation();
+      String tableLocation=table.getSd().getLocation();
+      Assert.assertTrue("Unexpected partition location: " + partitionLocation + ". "+ "Partition should have been outside table location: "+ tableLocation,!partitionLocation.startsWith(tableLocation));
+    }
+    for (    Partition partition : blurbToPartitionList.get("isLocatedInTablePath")) {
+      Assert.assertEquals("Unexpected number of columns.",2,partition.getSd().getCols().size());
+      Assert.assertEquals("Unexpected first column.","foo",partition.getSd().getCols().get(0).getName());
+      Assert.assertEquals("Unexpected second column.","bar",partition.getSd().getCols().get(1).getName());
+      String partitionLocation=partition.getSd().getLocation();
+      String tableLocation=table.getSd().getLocation();
+      Assert.assertTrue("Unexpected partition location: " + partitionLocation + ". "+ "Partition should have been within table location: "+ tableLocation,partitionLocation.startsWith(tableLocation));
+    }
+    for (    Partition partition : blurbToPartitionList.get("hasNewColumn")) {
+      Assert.assertEquals("Unexpected number of columns.",3,partition.getSd().getCols().size());
+      Assert.assertEquals("Unexpected first column.","foo",partition.getSd().getCols().get(0).getName());
+      Assert.assertEquals("Unexpected second column.","bar",partition.getSd().getCols().get(1).getName());
+      Assert.assertEquals("Unexpected third column.","goo",partition.getSd().getCols().get(2).getName());
+      String partitionLocation=partition.getSd().getLocation();
+      String tableLocation=table.getSd().getLocation();
+      Assert.assertTrue("Unexpected partition location: " + partitionLocation + ". "+ "Partition should have been within table location: "+ tableLocation,partitionLocation.startsWith(tableLocation));
+    }
+  }
+ catch (  Throwable t) {
+    LOG.error("Unexpected Exception!",t);
+    t.printStackTrace();
+    Assert.assertTrue("Unexpected Exception!",false);
+  }
+}

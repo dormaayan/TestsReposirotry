@@ -1,0 +1,49 @@
+/** 
+ * Test write a file, verifies and closes it. Then a couple of random blocks is removed and BlockReport is forced; the FSNamesystem is pushed to recalculate required DN's activities such as replications and so on. The number of missing and under-replicated blocks should be the same in case of a single-DN cluster.
+ * @throws IOException in case of errors
+ */
+@Test(timeout=300000) public void blockReport_02() throws IOException {
+  final String METHOD_NAME=GenericTestUtils.getMethodName();
+  LOG.info("Running test " + METHOD_NAME);
+  Path filePath=new Path("/" + METHOD_NAME + ".dat");
+  DFSTestUtil.createFile(fs,filePath,FILE_SIZE,REPL_FACTOR,rand.nextLong());
+  File dataDir=new File(cluster.getDataDirectory());
+  assertTrue(dataDir.isDirectory());
+  List<ExtendedBlock> blocks2Remove=new ArrayList<ExtendedBlock>();
+  List<Integer> removedIndex=new ArrayList<Integer>();
+  List<LocatedBlock> lBlocks=cluster.getNameNodeRpc().getBlockLocations(filePath.toString(),FILE_START,FILE_SIZE).getLocatedBlocks();
+  while (removedIndex.size() != 2) {
+    int newRemoveIndex=rand.nextInt(lBlocks.size());
+    if (!removedIndex.contains(newRemoveIndex))     removedIndex.add(newRemoveIndex);
+  }
+  for (  Integer aRemovedIndex : removedIndex) {
+    blocks2Remove.add(lBlocks.get(aRemovedIndex).getBlock());
+  }
+  if (LOG.isDebugEnabled()) {
+    LOG.debug("Number of blocks allocated " + lBlocks.size());
+  }
+  final DataNode dn0=cluster.getDataNodes().get(DN_N0);
+  for (  ExtendedBlock b : blocks2Remove) {
+    if (LOG.isDebugEnabled()) {
+      LOG.debug("Removing the block " + b.getBlockName());
+    }
+    for (    File f : findAllFiles(dataDir,new MyFileFilter(b.getBlockName(),true))) {
+      DataNodeTestUtils.getFSDataset(dn0).unfinalizeBlock(b);
+      if (!f.delete()) {
+        LOG.warn("Couldn't delete " + b.getBlockName());
+      }
+ else {
+        LOG.debug("Deleted file " + f.toString());
+      }
+    }
+  }
+  waitTil(TimeUnit.SECONDS.toMillis(DN_RESCAN_EXTRA_WAIT));
+  String poolId=cluster.getNamesystem().getBlockPoolId();
+  DatanodeRegistration dnR=dn0.getDNRegistrationForBP(poolId);
+  StorageBlockReport[] reports=getBlockReports(dn0,poolId,false,false);
+  sendBlockReports(dnR,poolId,reports);
+  BlockManagerTestUtil.getComputedDatanodeWork(cluster.getNamesystem().getBlockManager());
+  printStats();
+  assertEquals("Wrong number of MissingBlocks is found",blocks2Remove.size(),cluster.getNamesystem().getMissingBlocksCount());
+  assertEquals("Wrong number of UnderReplicatedBlocks is found",blocks2Remove.size(),cluster.getNamesystem().getUnderReplicatedBlocks());
+}

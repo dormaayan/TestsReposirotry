@@ -1,0 +1,77 @@
+public class TransportActivateWatchActionTests extends ESTestCase {
+  private TransportActivateWatchAction action;
+  private Watch watch=new WatchExecutionContextMockBuilder("watch_id").buildMock().watch();
+  private ThreadContext threadContext=new ThreadContext(Settings.EMPTY);
+  private TriggerService triggerService=mock(TriggerService.class);
+  private ClusterService clusterService=mock(ClusterService.class);
+  @Before public void setupAction() throws Exception {
+    ThreadPool threadPool=mock(ThreadPool.class);
+    when(threadPool.getThreadContext()).thenReturn(threadContext);
+    TransportService transportService=mock(TransportService.class);
+    WatchParser parser=mock(WatchParser.class);
+    when(parser.parseWithSecrets(eq("watch_id"),eq(true),anyObject(),anyObject(),anyObject())).thenReturn(watch);
+    Client client=mock(Client.class);
+    when(client.threadPool()).thenReturn(threadPool);
+    doAnswer(invocation -> {
+      UpdateRequest request=(UpdateRequest)invocation.getArguments()[0];
+      ActionListener<UpdateResponse> listener=(ActionListener)invocation.getArguments()[1];
+      ShardId shardId=new ShardId(new Index(Watch.INDEX,"uuid"),0);
+      listener.onResponse(new UpdateResponse(shardId,request.type(),request.id(),request.version(),DocWriteResponse.Result.UPDATED));
+      return null;
+    }
+).when(client).update(any(),any());
+    doAnswer(invocation -> {
+      GetRequest request=(GetRequest)invocation.getArguments()[0];
+      ActionListener<GetResponse> listener=(ActionListener)invocation.getArguments()[1];
+      GetResult getResult=new GetResult(request.index(),request.type(),request.id(),request.version(),true,null,Collections.emptyMap());
+      listener.onResponse(new GetResponse(getResult));
+      return null;
+    }
+).when(client).get(any(),any());
+    action=new TransportActivateWatchAction(Settings.EMPTY,transportService,threadPool,new ActionFilters(Collections.emptySet()),new IndexNameExpressionResolver(Settings.EMPTY),new ClockMock(),new XPackLicenseState(Settings.EMPTY),parser,clusterService,client,triggerService);
+  }
+  public void testWatchesAreNotTriggeredWhenDistributed() throws Exception {
+    boolean watchActivated=randomBoolean();
+    ActivateWatchRequest request=new ActivateWatchRequest("watch_id",watchActivated);
+    ActionListener<ActivateWatchResponse> listener=PlainActionFuture.newFuture();
+    ClusterState clusterState=ClusterState.builder(new ClusterName("my_cluster")).nodes(DiscoveryNodes.builder().masterNodeId("node_1").localNodeId(randomFrom("node_1","node_2")).add(newNode("node_1",Version.CURRENT)).add(newNode("node_2",Version.CURRENT))).build();
+    when(clusterService.state()).thenReturn(clusterState);
+    mockWatchStatus(watchActivated);
+    action.masterOperation(request,clusterState,listener);
+    verifyNoMoreInteractions(triggerService);
+  }
+  public void testWatchesAreNotTriggeredOnNonMasterWhenNotDistributed() throws Exception {
+    boolean watchActivated=randomBoolean();
+    ActivateWatchRequest request=new ActivateWatchRequest("watch_id",watchActivated);
+    ActionListener<ActivateWatchResponse> listener=PlainActionFuture.newFuture();
+    ClusterState clusterState=ClusterState.builder(new ClusterName("my_cluster")).nodes(DiscoveryNodes.builder().masterNodeId("node_2").localNodeId("node_1").add(newNode("node_1",Version.CURRENT)).add(newNode("node_2",Version.V_5_6_10))).build();
+    when(clusterService.state()).thenReturn(clusterState);
+    mockWatchStatus(watchActivated);
+    action.masterOperation(request,clusterState,listener);
+    verifyNoMoreInteractions(triggerService);
+  }
+  public void testWatchesAreTriggeredOnMasterWhenNotDistributed() throws Exception {
+    boolean watchActivated=randomBoolean();
+    ActivateWatchRequest request=new ActivateWatchRequest("watch_id",watchActivated);
+    ActionListener<ActivateWatchResponse> listener=PlainActionFuture.newFuture();
+    ClusterState clusterState=ClusterState.builder(new ClusterName("my_cluster")).nodes(DiscoveryNodes.builder().masterNodeId("node_1").localNodeId("node_1").add(newNode("node_1",Version.CURRENT)).add(newNode("node_2",Version.V_5_6_10))).build();
+    when(clusterService.state()).thenReturn(clusterState);
+    mockWatchStatus(watchActivated);
+    action.masterOperation(request,clusterState,listener);
+    if (watchActivated) {
+      verify(triggerService).add(eq(watch));
+    }
+ else {
+      verify(triggerService).remove(eq("watch_id"));
+    }
+  }
+  private void mockWatchStatus(  boolean active){
+    WatchStatus status=mock(WatchStatus.class);
+    WatchStatus.State state=new WatchStatus.State(active,DateTime.now(DateTimeZone.UTC));
+    when(status.state()).thenReturn(state);
+    when(watch.status()).thenReturn(status);
+  }
+  private static DiscoveryNode newNode(  String nodeId,  Version version){
+    return new DiscoveryNode(nodeId,ESTestCase.buildNewFakeTransportAddress(),Collections.emptyMap(),new HashSet<>(asList(DiscoveryNode.Role.values())),version);
+  }
+}

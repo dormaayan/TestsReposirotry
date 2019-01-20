@@ -1,0 +1,83 @@
+public class TestXSRFFilter {
+  private static MiniHS2 miniHS2=null;
+  private static String dataFileDir;
+  private static Path kvDataFilePath;
+  private static final String tmpDir=System.getProperty("test.tmp.dir");
+  private Connection hs2Conn=null;
+  @BeforeClass public static void beforeClass() throws IOException {
+    MiniHS2.cleanupLocalDir();
+  }
+  @AfterClass public static void afterClass() throws IOException {
+    MiniHS2.cleanupLocalDir();
+  }
+  private void initHS2(  boolean enableXSRFFilter) throws Exception {
+    Class.forName(MiniHS2.getJdbcDriverName());
+    HiveConf conf=new HiveConf();
+    conf.setBoolVar(ConfVars.HIVE_SUPPORT_CONCURRENCY,false);
+    miniHS2=new MiniHS2.Builder().withConf(conf).cleanupLocalDirOnStartup(false).build();
+    dataFileDir=conf.get("test.data.files").replace('\\','/').replace("c:","");
+    kvDataFilePath=new Path(dataFileDir,"kv1.txt");
+    Map<String,String> confOverlay=new HashMap<String,String>();
+    confOverlay.put(ConfVars.HIVE_SERVER2_XSRF_FILTER_ENABLED.varname,String.valueOf(enableXSRFFilter));
+    confOverlay.put(ConfVars.HIVE_SERVER2_TRANSPORT_MODE.varname,"http");
+    miniHS2.start(confOverlay);
+  }
+  private Connection getConnection(  String jdbcURL,  String user,  String pwd) throws SQLException {
+    Connection conn=DriverManager.getConnection(jdbcURL,user,pwd);
+    conn.createStatement().execute("set hive.support.concurrency = false");
+    return conn;
+  }
+  @After public void tearDownHS2() throws Exception {
+    if (hs2Conn != null) {
+      hs2Conn.close();
+      hs2Conn=null;
+    }
+    if ((miniHS2 != null) && miniHS2.isStarted()) {
+      miniHS2.stop();
+      miniHS2=null;
+    }
+  }
+  @Test public void testFilterDisabledNoInjection() throws Exception {
+    runTest(false,false);
+  }
+  @Test public void testFilterDisabledWithInjection() throws Exception {
+    runTest(false,true);
+  }
+  @Test public void testFilterEnabledWithInjection() throws Exception {
+    runTest(true,true);
+  }
+  @Test public void testFilterEnabledNoInjection() throws Exception {
+    runTest(true,false);
+  }
+  private void runTest(  boolean filterEnabled,  boolean injectionEnabled) throws Exception {
+    boolean exceptionExpected=filterEnabled && (!injectionEnabled);
+    initHS2(filterEnabled);
+    XsrfHttpRequestInterceptor.enableHeaderInjection(injectionEnabled);
+    Exception e=null;
+    try {
+      runBasicCommands();
+    }
+ catch (    Exception thrown) {
+      e=thrown;
+    }
+    if (exceptionExpected) {
+      assertNotNull(e);
+    }
+ else {
+      assertEquals(null,e);
+    }
+  }
+  private void runBasicCommands() throws Exception {
+    hs2Conn=getConnection(miniHS2.getJdbcURL(),System.getProperty("user.name"),"bar");
+    String tableName="testTab1";
+    Statement stmt=hs2Conn.createStatement();
+    stmt.execute("DROP TABLE IF EXISTS " + tableName);
+    stmt.execute("CREATE TABLE " + tableName + " (under_col INT COMMENT 'the under column', value STRING) COMMENT ' test table'");
+    stmt.execute("load data local inpath '" + kvDataFilePath.toString() + "' into table "+ tableName);
+    ResultSet res=stmt.executeQuery("SELECT * FROM " + tableName);
+    assertTrue(res.next());
+    assertEquals("val_238",res.getString(2));
+    res.close();
+    stmt.close();
+  }
+}

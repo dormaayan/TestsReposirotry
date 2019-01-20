@@ -1,0 +1,34 @@
+@Test public void testDuplicateCancel() throws Exception {
+  NettyServerAndClient serverAndClient=null;
+  try {
+    final TestPooledBufferProvider outboundBuffers=new TestPooledBufferProvider(16);
+    ResultPartitionManager partitions=mock(ResultPartitionManager.class);
+    ResultPartitionID pid=new ResultPartitionID();
+    final CountDownLatch sync=new CountDownLatch(1);
+    final ResultSubpartitionView view=spy(new InfiniteSubpartitionView(outboundBuffers,sync));
+    when(partitions.createSubpartitionView(eq(pid),eq(0),any(BufferAvailabilityListener.class))).thenAnswer(new Answer<ResultSubpartitionView>(){
+      @Override public ResultSubpartitionView answer(      InvocationOnMock invocationOnMock) throws Throwable {
+        BufferAvailabilityListener listener=(BufferAvailabilityListener)invocationOnMock.getArguments()[2];
+        listener.notifyDataAvailable();
+        return view;
+      }
+    }
+);
+    NettyProtocol protocol=new NettyProtocol(partitions,mock(TaskEventDispatcher.class),true);
+    serverAndClient=initServerAndClient(protocol);
+    Channel ch=connect(serverAndClient);
+    InputChannelID inputChannelId=new InputChannelID();
+    ch.writeAndFlush(new PartitionRequest(pid,0,inputChannelId,Integer.MAX_VALUE)).await();
+    if (!sync.await(TestingUtils.TESTING_DURATION().toMillis(),TimeUnit.MILLISECONDS)) {
+      fail("Timed out after waiting for " + TestingUtils.TESTING_DURATION().toMillis() + " ms to be notified about cancelled partition.");
+    }
+    ch.writeAndFlush(new CancelPartitionRequest(inputChannelId)).await();
+    ch.close();
+    NettyTestUtil.awaitClose(ch);
+    verify(view,times(1)).releaseAllResources();
+    verify(view,times(0)).notifySubpartitionConsumed();
+  }
+  finally {
+    shutdown(serverAndClient);
+  }
+}

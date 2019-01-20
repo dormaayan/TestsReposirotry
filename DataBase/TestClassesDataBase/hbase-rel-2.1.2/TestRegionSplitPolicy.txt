@@ -1,0 +1,213 @@
+@Category({RegionServerTests.class,SmallTests.class}) public class TestRegionSplitPolicy {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestRegionSplitPolicy.class);
+  private Configuration conf;
+  private HTableDescriptor htd;
+  private HRegion mockRegion;
+  private List<HStore> stores;
+  private static final TableName TABLENAME=TableName.valueOf("t");
+  @Rule public TestName name=new TestName();
+  @Before public void setupMocks(){
+    conf=HBaseConfiguration.create();
+    HRegionInfo hri=new HRegionInfo(TABLENAME);
+    htd=new HTableDescriptor(TABLENAME);
+    mockRegion=Mockito.mock(HRegion.class);
+    Mockito.doReturn(htd).when(mockRegion).getTableDescriptor();
+    Mockito.doReturn(hri).when(mockRegion).getRegionInfo();
+    stores=new ArrayList<>();
+    Mockito.doReturn(stores).when(mockRegion).getStores();
+  }
+  @Test public void testForceSplitRegionWithReference() throws IOException {
+    htd.setMaxFileSize(1024L);
+    HStore mockStore=Mockito.mock(HStore.class);
+    Mockito.doReturn(2000L).when(mockStore).getSize();
+    Mockito.doReturn(false).when(mockStore).canSplit();
+    stores.add(mockStore);
+    conf.set(HConstants.HBASE_REGION_SPLIT_POLICY_KEY,ConstantSizeRegionSplitPolicy.class.getName());
+    ConstantSizeRegionSplitPolicy policy=(ConstantSizeRegionSplitPolicy)RegionSplitPolicy.create(mockRegion,conf);
+    assertFalse(policy.shouldSplit());
+    Mockito.doReturn(true).when(mockRegion).shouldForceSplit();
+    assertFalse(policy.shouldSplit());
+    Mockito.doReturn(false).when(mockRegion).shouldForceSplit();
+    conf.set(HConstants.HBASE_REGION_SPLIT_POLICY_KEY,IncreasingToUpperBoundRegionSplitPolicy.class.getName());
+    policy=(IncreasingToUpperBoundRegionSplitPolicy)RegionSplitPolicy.create(mockRegion,conf);
+    assertFalse(policy.shouldSplit());
+    Mockito.doReturn(true).when(mockRegion).shouldForceSplit();
+    assertFalse(policy.shouldSplit());
+  }
+  @Test public void testIncreasingToUpperBoundRegionSplitPolicy() throws IOException {
+    conf.set(HConstants.HBASE_REGION_SPLIT_POLICY_KEY,IncreasingToUpperBoundRegionSplitPolicy.class.getName());
+    RegionServerServices rss=Mockito.mock(RegionServerServices.class);
+    final List<HRegion> regions=new ArrayList<>();
+    Mockito.doReturn(regions).when(rss).getRegions(TABLENAME);
+    Mockito.when(mockRegion.getRegionServerServices()).thenReturn(rss);
+    long maxSplitSize=1024L;
+    htd.setMaxFileSize(maxSplitSize);
+    long flushSize=maxSplitSize / 8;
+    conf.setLong(HConstants.HREGION_MEMSTORE_FLUSH_SIZE,flushSize);
+    htd.setMemStoreFlushSize(flushSize);
+    IncreasingToUpperBoundRegionSplitPolicy policy=(IncreasingToUpperBoundRegionSplitPolicy)RegionSplitPolicy.create(mockRegion,conf);
+    doConstantSizePolicyTests(policy);
+    HStore mockStore=Mockito.mock(HStore.class);
+    Mockito.doReturn(2000L).when(mockStore).getSize();
+    Mockito.doReturn(true).when(mockStore).canSplit();
+    stores.add(mockStore);
+    assertTrue(policy.shouldSplit());
+    regions.add(mockRegion);
+    Mockito.doReturn(flushSize).when(mockStore).getSize();
+    assertFalse(policy.shouldSplit());
+    Mockito.doReturn(flushSize * 2 + 1).when(mockStore).getSize();
+    assertTrue(policy.shouldSplit());
+    regions.add(mockRegion);
+    assertFalse(policy.shouldSplit());
+    Mockito.doReturn((long)(maxSplitSize * 1.25 + 1)).when(mockStore).getSize();
+    assertTrue(policy.shouldSplit());
+    assertWithinJitter(maxSplitSize,policy.getSizeToCheck(1000));
+    assertWithinJitter(maxSplitSize,policy.getSizeToCheck(0));
+  }
+  @Test public void testBusyRegionSplitPolicy() throws Exception {
+    conf.set(HConstants.HBASE_REGION_SPLIT_POLICY_KEY,BusyRegionSplitPolicy.class.getName());
+    conf.setLong("hbase.busy.policy.minAge",1000000L);
+    conf.setFloat("hbase.busy.policy.blockedRequests",0.1f);
+    RegionServerServices rss=Mockito.mock(RegionServerServices.class);
+    final List<HRegion> regions=new ArrayList<>();
+    Mockito.doReturn(regions).when(rss).getRegions(TABLENAME);
+    Mockito.when(mockRegion.getRegionServerServices()).thenReturn(rss);
+    Mockito.when(mockRegion.getBlockedRequestsCount()).thenReturn(0L);
+    Mockito.when(mockRegion.getWriteRequestsCount()).thenReturn(0L);
+    BusyRegionSplitPolicy policy=(BusyRegionSplitPolicy)RegionSplitPolicy.create(mockRegion,conf);
+    Mockito.when(mockRegion.getBlockedRequestsCount()).thenReturn(10L);
+    Mockito.when(mockRegion.getWriteRequestsCount()).thenReturn(10L);
+    assertFalse(policy.shouldSplit());
+    conf.setLong("hbase.busy.policy.minAge",0L);
+    conf.setLong("hbase.busy.policy.aggWindow",500L);
+    policy=(BusyRegionSplitPolicy)RegionSplitPolicy.create(mockRegion,conf);
+    long start=EnvironmentEdgeManager.currentTime();
+    Mockito.when(mockRegion.getBlockedRequestsCount()).thenReturn(10L);
+    Mockito.when(mockRegion.getWriteRequestsCount()).thenReturn(20L);
+    Thread.sleep(300);
+    assertFalse(policy.shouldSplit());
+    Mockito.when(mockRegion.getBlockedRequestsCount()).thenReturn(12L);
+    Mockito.when(mockRegion.getWriteRequestsCount()).thenReturn(30L);
+    Thread.sleep(2);
+    if (EnvironmentEdgeManager.currentTime() - start < 500) {
+      assertFalse(policy.shouldSplit());
+    }
+    Mockito.when(mockRegion.getBlockedRequestsCount()).thenReturn(14L);
+    Mockito.when(mockRegion.getWriteRequestsCount()).thenReturn(40L);
+    Thread.sleep(200);
+    assertTrue(policy.shouldSplit());
+  }
+  private void assertWithinJitter(  long maxSplitSize,  long sizeToCheck){
+    assertTrue("Size greater than lower bound of jitter",(long)(maxSplitSize * 0.75) <= sizeToCheck);
+    assertTrue("Size less than upper bound of jitter",(long)(maxSplitSize * 1.25) >= sizeToCheck);
+  }
+  @Test public void testCreateDefault() throws IOException {
+    conf.setLong(HConstants.HREGION_MAX_FILESIZE,1234L);
+    ConstantSizeRegionSplitPolicy policy=(ConstantSizeRegionSplitPolicy)RegionSplitPolicy.create(mockRegion,conf);
+    assertWithinJitter(1234L,policy.getDesiredMaxFileSize());
+    htd.setMaxFileSize(9999L);
+    policy=(ConstantSizeRegionSplitPolicy)RegionSplitPolicy.create(mockRegion,conf);
+    assertWithinJitter(9999L,policy.getDesiredMaxFileSize());
+  }
+  /** 
+ * Test setting up a customized split policy
+ */
+  @Test public void testCustomPolicy() throws IOException {
+    HTableDescriptor myHtd=new HTableDescriptor(TableName.valueOf(name.getMethodName()));
+    myHtd.setValue(HTableDescriptor.SPLIT_POLICY,KeyPrefixRegionSplitPolicy.class.getName());
+    myHtd.setValue(KeyPrefixRegionSplitPolicy.PREFIX_LENGTH_KEY,String.valueOf(2));
+    HRegion myMockRegion=Mockito.mock(HRegion.class);
+    Mockito.doReturn(myHtd).when(myMockRegion).getTableDescriptor();
+    Mockito.doReturn(stores).when(myMockRegion).getStores();
+    HStore mockStore=Mockito.mock(HStore.class);
+    Mockito.doReturn(2000L).when(mockStore).getSize();
+    Mockito.doReturn(true).when(mockStore).canSplit();
+    Mockito.doReturn(Optional.of(Bytes.toBytes("abcd"))).when(mockStore).getSplitPoint();
+    stores.add(mockStore);
+    KeyPrefixRegionSplitPolicy policy=(KeyPrefixRegionSplitPolicy)RegionSplitPolicy.create(myMockRegion,conf);
+    assertEquals("ab",Bytes.toString(policy.getSplitPoint()));
+    Mockito.doReturn(true).when(myMockRegion).shouldForceSplit();
+    Mockito.doReturn(Bytes.toBytes("efgh")).when(myMockRegion).getExplicitSplitPoint();
+    policy=(KeyPrefixRegionSplitPolicy)RegionSplitPolicy.create(myMockRegion,conf);
+    assertEquals("ef",Bytes.toString(policy.getSplitPoint()));
+  }
+  @Test public void testConstantSizePolicy() throws IOException {
+    htd.setMaxFileSize(1024L);
+    ConstantSizeRegionSplitPolicy policy=(ConstantSizeRegionSplitPolicy)RegionSplitPolicy.create(mockRegion,conf);
+    doConstantSizePolicyTests(policy);
+  }
+  /** 
+ * Run through tests for a ConstantSizeRegionSplitPolicy
+ * @param policy
+ */
+  private void doConstantSizePolicyTests(  final ConstantSizeRegionSplitPolicy policy){
+    assertFalse(policy.shouldSplit());
+    HStore mockStore=Mockito.mock(HStore.class);
+    Mockito.doReturn(2000L).when(mockStore).getSize();
+    Mockito.doReturn(true).when(mockStore).canSplit();
+    stores.add(mockStore);
+    assertTrue(policy.shouldSplit());
+    Mockito.doReturn(false).when(mockStore).canSplit();
+    assertFalse(policy.shouldSplit());
+    Mockito.doReturn(true).when(mockStore).canSplit();
+    Mockito.doReturn(true).when(mockRegion).shouldForceSplit();
+    Mockito.doReturn(100L).when(mockStore).getSize();
+    assertTrue(policy.shouldSplit());
+    Mockito.doReturn(false).when(mockRegion).shouldForceSplit();
+    assertFalse(policy.shouldSplit());
+    stores.clear();
+  }
+  @Test public void testGetSplitPoint() throws IOException {
+    ConstantSizeRegionSplitPolicy policy=(ConstantSizeRegionSplitPolicy)RegionSplitPolicy.create(mockRegion,conf);
+    assertFalse(policy.shouldSplit());
+    assertNull(policy.getSplitPoint());
+    HStore mockStore=Mockito.mock(HStore.class);
+    Mockito.doReturn(2000L).when(mockStore).getSize();
+    Mockito.doReturn(true).when(mockStore).canSplit();
+    Mockito.doReturn(Optional.of(Bytes.toBytes("store 1 split"))).when(mockStore).getSplitPoint();
+    stores.add(mockStore);
+    assertEquals("store 1 split",Bytes.toString(policy.getSplitPoint()));
+    HStore mockStore2=Mockito.mock(HStore.class);
+    Mockito.doReturn(4000L).when(mockStore2).getSize();
+    Mockito.doReturn(true).when(mockStore2).canSplit();
+    Mockito.doReturn(Optional.of(Bytes.toBytes("store 2 split"))).when(mockStore2).getSplitPoint();
+    stores.add(mockStore2);
+    assertEquals("store 2 split",Bytes.toString(policy.getSplitPoint()));
+  }
+  @Test public void testDelimitedKeyPrefixRegionSplitPolicy() throws IOException {
+    HTableDescriptor myHtd=new HTableDescriptor(TableName.valueOf(name.getMethodName()));
+    myHtd.setValue(HTableDescriptor.SPLIT_POLICY,DelimitedKeyPrefixRegionSplitPolicy.class.getName());
+    myHtd.setValue(DelimitedKeyPrefixRegionSplitPolicy.DELIMITER_KEY,",");
+    HRegion myMockRegion=Mockito.mock(HRegion.class);
+    Mockito.doReturn(myHtd).when(myMockRegion).getTableDescriptor();
+    Mockito.doReturn(stores).when(myMockRegion).getStores();
+    HStore mockStore=Mockito.mock(HStore.class);
+    Mockito.doReturn(2000L).when(mockStore).getSize();
+    Mockito.doReturn(true).when(mockStore).canSplit();
+    Mockito.doReturn(Optional.of(Bytes.toBytes("ab,cd"))).when(mockStore).getSplitPoint();
+    stores.add(mockStore);
+    DelimitedKeyPrefixRegionSplitPolicy policy=(DelimitedKeyPrefixRegionSplitPolicy)RegionSplitPolicy.create(myMockRegion,conf);
+    assertEquals("ab",Bytes.toString(policy.getSplitPoint()));
+    Mockito.doReturn(true).when(myMockRegion).shouldForceSplit();
+    Mockito.doReturn(Bytes.toBytes("efg,h")).when(myMockRegion).getExplicitSplitPoint();
+    policy=(DelimitedKeyPrefixRegionSplitPolicy)RegionSplitPolicy.create(myMockRegion,conf);
+    assertEquals("efg",Bytes.toString(policy.getSplitPoint()));
+    Mockito.doReturn(Bytes.toBytes("ijk")).when(myMockRegion).getExplicitSplitPoint();
+    assertEquals("ijk",Bytes.toString(policy.getSplitPoint()));
+  }
+  @Test public void testConstantSizePolicyWithJitter() throws IOException {
+    conf.set(HConstants.HBASE_REGION_SPLIT_POLICY_KEY,ConstantSizeRegionSplitPolicy.class.getName());
+    htd.setMaxFileSize(Long.MAX_VALUE);
+    boolean positiveJitter=false;
+    ConstantSizeRegionSplitPolicy policy=null;
+    while (!positiveJitter) {
+      policy=(ConstantSizeRegionSplitPolicy)RegionSplitPolicy.create(mockRegion,conf);
+      positiveJitter=policy.positiveJitterRate();
+    }
+    HStore mockStore=Mockito.mock(HStore.class);
+    Mockito.doReturn(2000L).when(mockStore).getSize();
+    Mockito.doReturn(true).when(mockStore).canSplit();
+    stores.add(mockStore);
+    assertFalse(policy.shouldSplit());
+  }
+}

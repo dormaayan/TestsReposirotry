@@ -1,0 +1,57 @@
+/** 
+ * FLINK-5985 <p>This test ensures we can restore from a savepoint under modifications to the job graph that only concern stateless operators.
+ */
+@Test public void testCanRestoreWithModifiedStatelessOperators() throws Exception {
+  int numTaskManagers=2;
+  int numSlotsPerTaskManager=2;
+  int parallelism=2;
+  final Deadline deadline=Deadline.now().plus(Duration.ofMinutes(5));
+  final File tmpDir=folder.newFolder();
+  final File savepointDir=new File(tmpDir,"savepoints");
+  final Configuration config=new Configuration();
+  config.setString(CheckpointingOptions.SAVEPOINT_DIRECTORY,savepointDir.toURI().toString());
+  String savepointPath;
+  LOG.info("Flink configuration: " + config + ".");
+  MiniClusterResource cluster=new MiniClusterResource(new MiniClusterResourceConfiguration.Builder().setConfiguration(config).setNumberTaskManagers(numTaskManagers).setNumberSlotsPerTaskManager(numSlotsPerTaskManager).build());
+  LOG.info("Shutting down Flink cluster.");
+  cluster.before();
+  ClusterClient<?> client=cluster.getClusterClient();
+  try {
+    final StatefulCounter statefulCounter=new StatefulCounter();
+    StatefulCounter.resetForTest(parallelism);
+    StreamExecutionEnvironment env=StreamExecutionEnvironment.getExecutionEnvironment();
+    env.setParallelism(parallelism);
+    env.addSource(new InfiniteTestSource()).shuffle().map(value -> 4 * value).shuffle().map(statefulCounter).uid("statefulCounter").shuffle().map(value -> 2 * value).addSink(new DiscardingSink<>());
+    JobGraph originalJobGraph=env.getStreamGraph().getJobGraph();
+    client.setDetached(true);
+    JobSubmissionResult submissionResult=client.submitJob(originalJobGraph,SavepointITCase.class.getClassLoader());
+    JobID jobID=submissionResult.getJobID();
+    StatefulCounter.getProgressLatch().await(deadline.timeLeft().toMillis(),TimeUnit.MILLISECONDS);
+    savepointPath=client.triggerSavepoint(jobID,null).get();
+    LOG.info("Retrieved savepoint: " + savepointPath + ".");
+  }
+  finally {
+    LOG.info("Shutting down Flink cluster.");
+    cluster.after();
+  }
+  cluster=new MiniClusterResource(new MiniClusterResourceConfiguration.Builder().setConfiguration(config).setNumberTaskManagers(numTaskManagers).setNumberSlotsPerTaskManager(numSlotsPerTaskManager).build());
+  LOG.info("Restarting Flink cluster.");
+  cluster.before();
+  client=cluster.getClusterClient();
+  try {
+    StatefulCounter.resetForTest(parallelism);
+    StreamExecutionEnvironment env=StreamExecutionEnvironment.getExecutionEnvironment();
+    env.setParallelism(parallelism);
+    env.addSource(new InfiniteTestSource()).shuffle().map(new StatefulCounter()).uid("statefulCounter").shuffle().map(value -> value).addSink(new DiscardingSink<>());
+    JobGraph modifiedJobGraph=env.getStreamGraph().getJobGraph();
+    modifiedJobGraph.setSavepointRestoreSettings(SavepointRestoreSettings.forPath(savepointPath));
+    LOG.info("Resubmitting job " + modifiedJobGraph.getJobID() + " with "+ "savepoint path "+ savepointPath+ " in detached mode.");
+    client.setDetached(true);
+    client.submitJob(modifiedJobGraph,SavepointITCase.class.getClassLoader());
+    StatefulCounter.getRestoreLatch().await(deadline.timeLeft().toMillis(),TimeUnit.MILLISECONDS);
+    StatefulCounter.getProgressLatch().await(deadline.timeLeft().toMillis(),TimeUnit.MILLISECONDS);
+  }
+  finally {
+    cluster.after();
+  }
+}

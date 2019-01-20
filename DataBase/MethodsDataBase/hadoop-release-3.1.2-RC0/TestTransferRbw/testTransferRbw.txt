@@ -1,0 +1,53 @@
+@Test public void testTransferRbw() throws Exception {
+  final HdfsConfiguration conf=new HdfsConfiguration();
+  final MiniDFSCluster cluster=new MiniDFSCluster.Builder(conf).numDataNodes(REPLICATION).build();
+  try {
+    cluster.waitActive();
+    final DistributedFileSystem fs=cluster.getFileSystem();
+    final Path p=new Path("/foo");
+    final int size=(1 << 16) + RAN.nextInt(1 << 16);
+    LOG.info("size = " + size);
+    final FSDataOutputStream out=fs.create(p,REPLICATION);
+    final byte[] bytes=new byte[1024];
+    for (int remaining=size; remaining > 0; ) {
+      RAN.nextBytes(bytes);
+      final int len=bytes.length < remaining ? bytes.length : remaining;
+      out.write(bytes,0,len);
+      out.hflush();
+      remaining-=len;
+    }
+    final ReplicaBeingWritten oldrbw;
+    final DataNode newnode;
+    final DatanodeInfo newnodeinfo;
+    final String bpid=cluster.getNamesystem().getBlockPoolId();
+{
+      final DataNode oldnode=cluster.getDataNodes().get(0);
+      oldrbw=getRbw(oldnode,bpid);
+      LOG.info("oldrbw = " + oldrbw);
+      cluster.startDataNodes(conf,1,true,null,null);
+      newnode=cluster.getDataNodes().get(REPLICATION);
+      final DatanodeInfo oldnodeinfo;
+{
+        final DatanodeInfo[] datatnodeinfos=cluster.getNameNodeRpc().getDatanodeReport(DatanodeReportType.LIVE);
+        Assert.assertEquals(2,datatnodeinfos.length);
+        int i=0;
+        for (DatanodeRegistration dnReg=newnode.getDNRegistrationForBP(bpid); i < datatnodeinfos.length && !datatnodeinfos[i].equals(dnReg); i++)         ;
+        Assert.assertTrue(i < datatnodeinfos.length);
+        newnodeinfo=datatnodeinfos[i];
+        oldnodeinfo=datatnodeinfos[1 - i];
+      }
+      final ExtendedBlock b=new ExtendedBlock(bpid,oldrbw.getBlockId(),oldrbw.getBytesAcked(),oldrbw.getGenerationStamp());
+      final BlockOpResponseProto s=DFSTestUtil.transferRbw(b,DFSClientAdapter.getDFSClient(fs),oldnodeinfo,newnodeinfo);
+      Assert.assertEquals(Status.SUCCESS,s.getStatus());
+    }
+    final ReplicaBeingWritten newrbw=getRbw(newnode,bpid);
+    LOG.info("newrbw = " + newrbw);
+    Assert.assertEquals(oldrbw.getBlockId(),newrbw.getBlockId());
+    Assert.assertEquals(oldrbw.getGenerationStamp(),newrbw.getGenerationStamp());
+    Assert.assertEquals(oldrbw.getVisibleLength(),newrbw.getVisibleLength());
+    LOG.info("DONE");
+  }
+  finally {
+    cluster.shutdown();
+  }
+}

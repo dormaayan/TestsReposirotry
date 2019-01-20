@@ -1,0 +1,44 @@
+/** 
+ * Testcase for HBASE-20742
+ */
+@Category({RegionServerTests.class,MediumTests.class}) public class TestRegionServerCrashDisableWAL {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestRegionServerCrashDisableWAL.class);
+  private static final HBaseTestingUtility UTIL=new HBaseTestingUtility();
+  private static TableName TABLE_NAME=TableName.valueOf("test");
+  private static byte[] CF=Bytes.toBytes("cf");
+  private static byte[] CQ=Bytes.toBytes("cq");
+  @BeforeClass public static void setUp() throws Exception {
+    UTIL.getConfiguration().setInt(ServerManager.WAIT_ON_REGIONSERVERS_MINTOSTART,1);
+    UTIL.getConfiguration().setBoolean("hbase.regionserver.hlog.enabled",false);
+    UTIL.startMiniCluster(2);
+    UTIL.createTable(TABLE_NAME,CF);
+    UTIL.waitTableAvailable(TABLE_NAME);
+    HRegionServer rs=UTIL.getRSForFirstRegionInTable(TABLE_NAME);
+    if (!rs.getRegions(TableName.META_TABLE_NAME).isEmpty()) {
+      HRegionServer rs1=UTIL.getOtherRegionServer(rs);
+      UTIL.moveRegionAndWait(UTIL.getMiniHBaseCluster().getRegions(TABLE_NAME).get(0).getRegionInfo(),rs1.getServerName());
+    }
+    UTIL.getAdmin().balancerSwitch(false,true);
+  }
+  @AfterClass public static void tearDown() throws Exception {
+    UTIL.shutdownMiniCluster();
+  }
+  @Test public void test() throws InterruptedException, IOException {
+    HMaster master=UTIL.getMiniHBaseCluster().stopMaster(0).getMaster();
+    UTIL.waitFor(30000,() -> !master.isAlive());
+    RegionServerThread thread=null;
+    for (    RegionServerThread t : UTIL.getMiniHBaseCluster().getRegionServerThreads()) {
+      if (!t.getRegionServer().getRegions(TABLE_NAME).isEmpty()) {
+        thread=t;
+        break;
+      }
+    }
+    thread.getRegionServer().abort("For testing");
+    thread.join();
+    UTIL.getMiniHBaseCluster().startMaster();
+    try (Table table=UTIL.getConnection().getTableBuilder(TABLE_NAME,null).setOperationTimeout(30000).build()){
+      table.put(new Put(Bytes.toBytes(1)).addColumn(CF,CQ,Bytes.toBytes(1)));
+      assertEquals(1,Bytes.toInt(table.get(new Get(Bytes.toBytes(1))).getValue(CF,CQ)));
+    }
+   }
+}

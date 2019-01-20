@@ -1,0 +1,57 @@
+@Test void concurrentPositionedVectoredReadsAndWritesMustNotInterfere() throws Exception {
+  File file=file("file");
+  PageSwapperFactory factory=createSwapperFactory();
+  final PageSwapper swapper=createSwapperAndFile(factory,file,4);
+  final int pageCount=100;
+  final int iterations=20000;
+  final CountDownLatch startLatch=new CountDownLatch(1);
+  long output=createPage(4);
+  for (int i=0; i < pageCount; i++) {
+    putInt(output,0,i + 1);
+    write(swapper,i,output);
+  }
+  Callable<Void> work=() -> {
+    ThreadLocalRandom rng=ThreadLocalRandom.current();
+    long[] pages=new long[10];
+    for (int i=0; i < pages.length; i++) {
+      pages[i]=createPage(4);
+    }
+    startLatch.await();
+    for (int i=0; i < iterations; i++) {
+      long startFilePageId=rng.nextLong(0,pageCount - pages.length);
+      if (rng.nextBoolean()) {
+        long bytesRead=read(swapper,startFilePageId,pages,0,pages.length);
+        assertThat(bytesRead,is(pages.length * 4L));
+        for (int j=0; j < pages.length; j++) {
+          int expectedValue=(int)(1 + j + startFilePageId);
+          int actualValue=getInt(pages[j],0);
+          assertThat(actualValue,is(expectedValue));
+        }
+      }
+ else {
+        for (int j=0; j < pages.length; j++) {
+          int value=(int)(1 + j + startFilePageId);
+          putInt(pages[j],0,value);
+        }
+        assertThat(write(swapper,startFilePageId,pages,0,pages.length),is(pages.length * 4L));
+      }
+    }
+    return null;
+  }
+;
+  int threads=8;
+  ExecutorService executor=Executors.newFixedThreadPool(threads,r -> {
+    Thread thread=Executors.defaultThreadFactory().newThread(r);
+    thread.setDaemon(true);
+    return thread;
+  }
+);
+  List<Future<Void>> futures=new ArrayList<>(threads);
+  for (int i=0; i < threads; i++) {
+    futures.add(executor.submit(work));
+  }
+  startLatch.countDown();
+  for (  Future<Void> future : futures) {
+    future.get();
+  }
+}

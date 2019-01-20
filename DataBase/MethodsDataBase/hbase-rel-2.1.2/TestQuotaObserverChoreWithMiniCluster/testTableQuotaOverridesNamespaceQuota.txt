@@ -1,0 +1,75 @@
+@Test public void testTableQuotaOverridesNamespaceQuota() throws Exception {
+  final String namespace=testName.getMethodName();
+  final Admin admin=TEST_UTIL.getAdmin();
+  try {
+    admin.getNamespaceDescriptor(namespace);
+  }
+ catch (  NamespaceNotFoundException e) {
+    NamespaceDescriptor desc=NamespaceDescriptor.create(namespace).build();
+    admin.createNamespace(desc);
+  }
+  TableName tn1=helper.createTableWithRegions(namespace,5);
+  TableName tn2=helper.createTableWithRegions(namespace,5);
+  final long namespaceSizeLimit=3L * SpaceQuotaHelperForTests.ONE_MEGABYTE;
+  final SpaceViolationPolicy namespaceViolationPolicy=SpaceViolationPolicy.DISABLE;
+  QuotaSettings namespaceSettings=QuotaSettingsFactory.limitNamespaceSpace(namespace,namespaceSizeLimit,namespaceViolationPolicy);
+  admin.setQuota(namespaceSettings);
+  helper.writeData(tn1,2L * SpaceQuotaHelperForTests.ONE_MEGABYTE);
+  admin.flush(tn1);
+  Map<TableName,SpaceQuotaSnapshot> snapshots=snapshotNotifier.copySnapshots();
+  for (int i=0; i < 5; i++) {
+    assertEquals("Should not see any quota violations after writing 2MB of data: " + snapshots,0,numSnapshotsInViolation(snapshots));
+    try {
+      Thread.sleep(DEFAULT_WAIT_MILLIS);
+    }
+ catch (    InterruptedException e) {
+      LOG.debug("Interrupted while sleeping.",e);
+    }
+    snapshots=snapshotNotifier.copySnapshots();
+  }
+  helper.writeData(tn2,2L * SpaceQuotaHelperForTests.ONE_MEGABYTE);
+  admin.flush(tn2);
+  snapshots=snapshotNotifier.copySnapshots();
+  while (numSnapshotsInViolation(snapshots) < 2) {
+    LOG.debug("Saw fewer violations than desired (expected 2): " + snapshots + ". Current reports: "+ master.getMasterQuotaManager().snapshotRegionSizes());
+    try {
+      Thread.sleep(DEFAULT_WAIT_MILLIS);
+    }
+ catch (    InterruptedException e) {
+      LOG.debug("Interrupted while sleeping.",e);
+      Thread.currentThread().interrupt();
+    }
+    snapshots=snapshotNotifier.copySnapshots();
+  }
+  SpaceQuotaSnapshot actualPolicyTN1=snapshots.get(tn1);
+  assertNotNull("Expected to see violation policy for tn1",actualPolicyTN1);
+  assertEquals(namespaceViolationPolicy,actualPolicyTN1.getQuotaStatus().getPolicy());
+  SpaceQuotaSnapshot actualPolicyTN2=snapshots.get(tn2);
+  assertNotNull("Expected to see violation policy for tn2",actualPolicyTN2);
+  assertEquals(namespaceViolationPolicy,actualPolicyTN2.getQuotaStatus().getPolicy());
+  final long tableSizeLimit=SpaceQuotaHelperForTests.ONE_MEGABYTE;
+  final SpaceViolationPolicy tableViolationPolicy=SpaceViolationPolicy.NO_INSERTS;
+  QuotaSettings tableSettings=QuotaSettingsFactory.limitTableSpace(tn1,tableSizeLimit,tableViolationPolicy);
+  admin.setQuota(tableSettings);
+  while (true) {
+    snapshots=snapshotNotifier.copySnapshots();
+    SpaceQuotaSnapshot actualTableSnapshot=snapshots.get(tn1);
+    assertNotNull("Violation policy should never be null",actualTableSnapshot);
+    if (tableViolationPolicy != actualTableSnapshot.getQuotaStatus().getPolicy()) {
+      LOG.debug("Saw unexpected table violation policy, waiting and re-checking.");
+      try {
+        Thread.sleep(DEFAULT_WAIT_MILLIS);
+      }
+ catch (      InterruptedException e) {
+        LOG.debug("Interrupted while sleeping");
+        Thread.currentThread().interrupt();
+      }
+      continue;
+    }
+    assertEquals(tableViolationPolicy,actualTableSnapshot.getQuotaStatus().getPolicy());
+    break;
+  }
+  actualPolicyTN2=snapshots.get(tn2);
+  assertNotNull("Expected to see violation policy for tn2",actualPolicyTN2);
+  assertEquals(namespaceViolationPolicy,actualPolicyTN2.getQuotaStatus().getPolicy());
+}

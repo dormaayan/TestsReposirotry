@@ -1,0 +1,68 @@
+public class StoreFactoryTest {
+  private final PageCacheRule pageCacheRule=new PageCacheRule();
+  private final EphemeralFileSystemRule fsRule=new EphemeralFileSystemRule();
+  private final TestDirectory testDirectory=TestDirectory.testDirectory(fsRule);
+  @Rule public final RuleChain ruleChain=RuleChain.outerRule(fsRule).around(testDirectory).around(pageCacheRule);
+  private NeoStores neoStores;
+  private IdGeneratorFactory idGeneratorFactory;
+  private PageCache pageCache;
+  @Before public void setUp(){
+    FileSystemAbstraction fs=fsRule.get();
+    pageCache=pageCacheRule.getPageCache(fs);
+    idGeneratorFactory=new DefaultIdGeneratorFactory(fs);
+  }
+  private StoreFactory storeFactory(  Config config,  OpenOption... openOptions){
+    LogProvider logProvider=NullLogProvider.getInstance();
+    DatabaseLayout databaseLayout=testDirectory.databaseLayout();
+    RecordFormats recordFormats=selectForStoreOrConfig(config,databaseLayout,fsRule,pageCache,logProvider);
+    return new StoreFactory(databaseLayout,config,idGeneratorFactory,pageCache,fsRule.get(),recordFormats,logProvider,EmptyVersionContextSupplier.EMPTY,openOptions);
+  }
+  @After public void tearDown(){
+    if (neoStores != null) {
+      neoStores.close();
+    }
+  }
+  @Test public void shouldHaveSameCreationTimeAndUpgradeTimeOnStartup(){
+    neoStores=storeFactory(Config.defaults()).openAllNeoStores(true);
+    MetaDataStore metaDataStore=neoStores.getMetaDataStore();
+    assertThat(metaDataStore.getUpgradeTime(),equalTo(metaDataStore.getCreationTime()));
+  }
+  @Test public void shouldHaveSameCommittedTransactionAndUpgradeTransactionOnStartup(){
+    neoStores=storeFactory(Config.defaults()).openAllNeoStores(true);
+    MetaDataStore metaDataStore=neoStores.getMetaDataStore();
+    assertEquals(metaDataStore.getUpgradeTransaction(),metaDataStore.getLastCommittedTransaction());
+  }
+  @Test public void shouldHaveSpecificCountsTrackerForReadOnlyDatabase() throws IOException {
+    StoreFactory readOnlyStoreFactory=storeFactory(Config.defaults(GraphDatabaseSettings.read_only,Settings.TRUE));
+    neoStores=readOnlyStoreFactory.openAllNeoStores(true);
+    long lastClosedTransactionId=neoStores.getMetaDataStore().getLastClosedTransactionId();
+    assertEquals(-1,neoStores.getCounts().rotate(lastClosedTransactionId));
+  }
+  @Test(expected=StoreNotFoundException.class) public void shouldThrowWhenOpeningNonExistingNeoStores(){
+    try (NeoStores neoStores=storeFactory(Config.defaults()).openAllNeoStores()){
+      neoStores.getMetaDataStore();
+    }
+   }
+  @Test public void shouldDelegateDeletionOptionToStores(){
+    StoreFactory storeFactory=storeFactory(Config.defaults(),DELETE_ON_CLOSE);
+    neoStores=storeFactory.openAllNeoStores(true);
+    assertTrue(fsRule.get().listFiles(testDirectory.databaseDir()).length >= StoreType.values().length);
+    neoStores.close();
+    assertEquals(0,fsRule.get().listFiles(testDirectory.databaseDir()).length);
+  }
+  @Test public void shouldHandleStoreConsistingOfOneEmptyFile() throws Exception {
+    StoreFactory storeFactory=storeFactory(Config.defaults());
+    FileSystemAbstraction fs=fsRule.get();
+    fs.create(testDirectory.databaseLayout().file("neostore.nodestore.db.labels"));
+    storeFactory.openAllNeoStores(true).close();
+  }
+  @Test public void shouldCompleteInitializationOfStoresWithIncompleteHeaders() throws Exception {
+    StoreFactory storeFactory=storeFactory(Config.defaults());
+    storeFactory.openAllNeoStores(true).close();
+    FileSystemAbstraction fs=fsRule.get();
+    for (    File f : fs.listFiles(testDirectory.databaseDir())) {
+      fs.truncate(f,0);
+    }
+    storeFactory.openAllNeoStores(true).close();
+  }
+}

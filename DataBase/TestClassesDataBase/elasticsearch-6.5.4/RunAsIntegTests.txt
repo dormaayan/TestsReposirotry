@@ -1,0 +1,153 @@
+public class RunAsIntegTests extends SecurityIntegTestCase {
+  private static final String RUN_AS_USER="run_as_user";
+  private static final String TRANSPORT_CLIENT_USER="transport_user";
+  private static final String ROLES="run_as_role:\n" + "  run_as: [ '" + SecuritySettingsSource.TEST_USER_NAME + "', 'idontexist' ]\n";
+  private static boolean runAsHasSuperUserRole;
+  @BeforeClass public static void configureRunAsHasSuperUserRole(){
+    runAsHasSuperUserRole=randomBoolean();
+  }
+  @Override public Settings nodeSettings(  int nodeOrdinal){
+    return Settings.builder().put(super.nodeSettings(nodeOrdinal)).put(NetworkModule.HTTP_ENABLED.getKey(),true).build();
+  }
+  @Override public String configRoles(){
+    return ROLES + super.configRoles();
+  }
+  @Override public String configUsers(){
+    return super.configUsers() + RUN_AS_USER + ":"+ SecuritySettingsSource.TEST_PASSWORD_HASHED+ "\n"+ TRANSPORT_CLIENT_USER+ ":"+ SecuritySettingsSource.TEST_PASSWORD_HASHED+ "\n";
+  }
+  @Override public String configUsersRoles(){
+    String roles=super.configUsersRoles() + "run_as_role:" + RUN_AS_USER+ "\n"+ "transport_client:"+ TRANSPORT_CLIENT_USER;
+    if (runAsHasSuperUserRole) {
+      roles=roles + "\n" + "superuser:"+ RUN_AS_USER;
+    }
+    return roles;
+  }
+  @Override protected boolean transportSSLEnabled(){
+    return false;
+  }
+  public void testUserImpersonation() throws Exception {
+    try (TransportClient client=getTransportClient(Settings.builder().put(SecurityField.USER_SETTING.getKey(),TRANSPORT_CLIENT_USER + ":" + SecuritySettingsSourceField.TEST_PASSWORD).build())){
+      assertBusy(() -> assertThat(client.connectedNodes().size(),greaterThan(0)));
+      try {
+        client.admin().cluster().prepareHealth().get();
+        fail("the client user should not have privileges to get the health");
+      }
+ catch (      ElasticsearchSecurityException e) {
+        assertThat(e.getMessage(),containsString("unauthorized"));
+      }
+      try {
+        Map<String,String> headers=Collections.singletonMap(AuthenticationServiceField.RUN_AS_USER_HEADER,SecuritySettingsSource.TEST_USER_NAME);
+        client.filterWithHeader(headers).admin().cluster().prepareHealth().get();
+        fail("run as should be unauthorized for the transport client user");
+      }
+ catch (      ElasticsearchSecurityException e) {
+        assertThat(e.getMessage(),containsString("unauthorized"));
+        assertThat(e.getMessage(),containsString("run as"));
+      }
+      Map<String,String> headers=new HashMap<>();
+      headers.put("Authorization",UsernamePasswordToken.basicAuthHeaderValue(RUN_AS_USER,new SecureString(SecuritySettingsSourceField.TEST_PASSWORD.toCharArray())));
+      headers.put(AuthenticationServiceField.RUN_AS_USER_HEADER,SecuritySettingsSource.TEST_USER_NAME);
+      ClusterHealthResponse response=client.filterWithHeader(headers).admin().cluster().prepareHealth().get();
+      assertThat(response.isTimedOut(),is(false));
+    }
+   }
+  public void testUserImpersonationUsingHttp() throws Exception {
+    try {
+      Request request=new Request("GET","/_nodes");
+      RequestOptions.Builder options=request.getOptions().toBuilder();
+      options.addHeader("Authorization",UsernamePasswordToken.basicAuthHeaderValue(TRANSPORT_CLIENT_USER,TEST_PASSWORD_SECURE_STRING));
+      options.addHeader(AuthenticationServiceField.RUN_AS_USER_HEADER,SecuritySettingsSource.TEST_USER_NAME);
+      request.setOptions(options);
+      getRestClient().performRequest(request);
+      fail("request should have failed");
+    }
+ catch (    ResponseException e) {
+      assertThat(e.getResponse().getStatusLine().getStatusCode(),is(403));
+    }
+    if (runAsHasSuperUserRole == false) {
+      try {
+        Request request=new Request("GET","/_nodes");
+        RequestOptions.Builder options=request.getOptions().toBuilder();
+        options.addHeader("Authorization",UsernamePasswordToken.basicAuthHeaderValue(RUN_AS_USER,TEST_PASSWORD_SECURE_STRING));
+        request.setOptions(options);
+        getRestClient().performRequest(request);
+        fail("request should have failed");
+      }
+ catch (      ResponseException e) {
+        assertThat(e.getResponse().getStatusLine().getStatusCode(),is(403));
+      }
+    }
+    getRestClient().performRequest(requestForUserRunAsUser(SecuritySettingsSource.TEST_USER_NAME));
+  }
+  public void testEmptyUserImpersonationHeader() throws Exception {
+    try (TransportClient client=getTransportClient(Settings.builder().put(SecurityField.USER_SETTING.getKey(),TRANSPORT_CLIENT_USER + ":" + SecuritySettingsSourceField.TEST_PASSWORD).build())){
+      awaitBusy(() -> {
+        return client.connectedNodes().size() > 0;
+      }
+);
+      try {
+        Map<String,String> headers=new HashMap<>();
+        headers.put("Authorization",UsernamePasswordToken.basicAuthHeaderValue(RUN_AS_USER,new SecureString(SecuritySettingsSourceField.TEST_PASSWORD.toCharArray())));
+        headers.put(AuthenticationServiceField.RUN_AS_USER_HEADER,"");
+        client.filterWithHeader(headers).admin().cluster().prepareHealth().get();
+        fail("run as header should not be allowed to be empty");
+      }
+ catch (      ElasticsearchSecurityException e) {
+        assertThat(e.getMessage(),containsString("unable to authenticate"));
+      }
+    }
+   }
+  public void testEmptyHeaderUsingHttp() throws Exception {
+    try {
+      getRestClient().performRequest(requestForUserRunAsUser(""));
+      fail("request should have failed");
+    }
+ catch (    ResponseException e) {
+      assertThat(e.getResponse().getStatusLine().getStatusCode(),is(401));
+    }
+  }
+  public void testNonExistentRunAsUser() throws Exception {
+    try (TransportClient client=getTransportClient(Settings.builder().put(SecurityField.USER_SETTING.getKey(),TRANSPORT_CLIENT_USER + ":" + SecuritySettingsSourceField.TEST_PASSWORD).build())){
+      awaitBusy(() -> {
+        return client.connectedNodes().size() > 0;
+      }
+);
+      try {
+        Map<String,String> headers=new HashMap<>();
+        headers.put("Authorization",UsernamePasswordToken.basicAuthHeaderValue(RUN_AS_USER,new SecureString(SecuritySettingsSourceField.TEST_PASSWORD.toCharArray())));
+        headers.put(AuthenticationServiceField.RUN_AS_USER_HEADER,"idontexist");
+        client.filterWithHeader(headers).admin().cluster().prepareHealth().get();
+        fail("run as header should not accept non-existent users");
+      }
+ catch (      ElasticsearchSecurityException e) {
+        assertThat(e.getMessage(),containsString("unauthorized"));
+      }
+    }
+   }
+  public void testNonExistentRunAsUserUsingHttp() throws Exception {
+    try {
+      getRestClient().performRequest(requestForUserRunAsUser("idontexist"));
+      fail("request should have failed");
+    }
+ catch (    ResponseException e) {
+      assertThat(e.getResponse().getStatusLine().getStatusCode(),is(403));
+    }
+  }
+  private static Request requestForUserRunAsUser(  String user){
+    Request request=new Request("GET","/_nodes");
+    RequestOptions.Builder options=request.getOptions().toBuilder();
+    options.addHeader("Authorization",UsernamePasswordToken.basicAuthHeaderValue(RUN_AS_USER,TEST_PASSWORD_SECURE_STRING));
+    options.addHeader(AuthenticationServiceField.RUN_AS_USER_HEADER,user);
+    request.setOptions(options);
+    return request;
+  }
+  TransportClient getTransportClient(  Settings extraSettings){
+    NodesInfoResponse nodeInfos=client().admin().cluster().prepareNodesInfo().get();
+    List<NodeInfo> nodes=nodeInfos.getNodes();
+    assertTrue(nodes.isEmpty() == false);
+    TransportAddress publishAddress=randomFrom(nodes).getTransport().address().publishAddress();
+    String clusterName=nodeInfos.getClusterName().value();
+    Settings settings=Settings.builder().put(extraSettings).put("cluster.name",clusterName).build();
+    return new TestXPackTransportClient(settings,LocalStateSecurity.class).addTransportAddress(publishAddress);
+  }
+}

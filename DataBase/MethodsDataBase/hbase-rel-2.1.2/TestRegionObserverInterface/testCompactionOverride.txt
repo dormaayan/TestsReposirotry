@@ -1,0 +1,63 @@
+/** 
+ * Tests overriding compaction handling via coprocessor hooks
+ * @throws Exception
+ */
+@Test public void testCompactionOverride() throws Exception {
+  final TableName compactTable=TableName.valueOf(name.getMethodName());
+  Admin admin=util.getAdmin();
+  if (admin.tableExists(compactTable)) {
+    admin.disableTable(compactTable);
+    admin.deleteTable(compactTable);
+  }
+  HTableDescriptor htd=new HTableDescriptor(compactTable);
+  htd.addFamily(new HColumnDescriptor(A));
+  htd.addCoprocessor(EvenOnlyCompactor.class.getName());
+  admin.createTable(htd);
+  Table table=util.getConnection().getTable(compactTable);
+  for (long i=1; i <= 10; i++) {
+    byte[] iBytes=Bytes.toBytes(i);
+    Put put=new Put(iBytes);
+    put.setDurability(Durability.SKIP_WAL);
+    put.addColumn(A,A,iBytes);
+    table.put(put);
+  }
+  HRegion firstRegion=cluster.getRegions(compactTable).get(0);
+  Coprocessor cp=firstRegion.getCoprocessorHost().findCoprocessor(EvenOnlyCompactor.class);
+  assertNotNull("EvenOnlyCompactor coprocessor should be loaded",cp);
+  EvenOnlyCompactor compactor=(EvenOnlyCompactor)cp;
+  long ts=System.currentTimeMillis();
+  admin.flush(compactTable);
+  for (int i=0; i < 10; i++) {
+    if (compactor.lastFlush >= ts) {
+      break;
+    }
+    Thread.sleep(1000);
+  }
+  assertTrue("Flush didn't complete",compactor.lastFlush >= ts);
+  LOG.debug("Flush complete");
+  ts=compactor.lastFlush;
+  admin.majorCompact(compactTable);
+  for (int i=0; i < 30; i++) {
+    if (compactor.lastCompaction >= ts) {
+      break;
+    }
+    Thread.sleep(1000);
+  }
+  LOG.debug("Last compaction was at " + compactor.lastCompaction);
+  assertTrue("Compaction didn't complete",compactor.lastCompaction >= ts);
+  ResultScanner scanner=table.getScanner(new Scan());
+  try {
+    for (long i=2; i <= 10; i+=2) {
+      Result r=scanner.next();
+      assertNotNull(r);
+      assertFalse(r.isEmpty());
+      byte[] iBytes=Bytes.toBytes(i);
+      assertArrayEquals("Row should be " + i,r.getRow(),iBytes);
+      assertArrayEquals("Value should be " + i,r.getValue(A,A),iBytes);
+    }
+  }
+  finally {
+    scanner.close();
+  }
+  table.close();
+}

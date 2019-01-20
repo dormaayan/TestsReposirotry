@@ -1,0 +1,91 @@
+public class DataAndSchemaTransactionSeparationIT {
+  @Rule public final DatabaseRule db=new ImpermanentDatabaseRule();
+  private static Function<GraphDatabaseService,Void> expectFailureAfterSchemaOperation(  final Function<GraphDatabaseService,?> function){
+    return graphDb -> {
+      graphDb.schema().indexFor(label("Label1")).on("key1").create();
+      try {
+        function.apply(graphDb);
+        fail("expected exception");
+      }
+ catch (      Exception e) {
+        assertEquals("Cannot perform data updates in a transaction that has performed schema updates.",e.getMessage());
+      }
+      return null;
+    }
+;
+  }
+  private static Function<GraphDatabaseService,Void> succeedAfterSchemaOperation(  final Function<GraphDatabaseService,?> function){
+    return graphDb -> {
+      graphDb.schema().indexFor(label("Label1")).on("key1").create();
+      function.apply(graphDb);
+      return null;
+    }
+;
+  }
+  @Test public void shouldNotAllowNodeCreationInSchemaTransaction(){
+    db.executeAndRollback(expectFailureAfterSchemaOperation(createNode()));
+  }
+  @Test public void shouldNotAllowRelationshipCreationInSchemaTransaction(){
+    final Pair<Node,Node> nodes=db.executeAndCommit(aPairOfNodes());
+    db.executeAndRollback(expectFailureAfterSchemaOperation(relate(nodes)));
+  }
+  @Test @SuppressWarnings("unchecked") public void shouldNotAllowPropertyWritesInSchemaTransaction(){
+    Pair<Node,Node> nodes=db.executeAndCommit(aPairOfNodes());
+    Relationship relationship=db.executeAndCommit(relate(nodes));
+    for (    Function<GraphDatabaseService,?> operation : new Function[]{propertyWrite(Node.class,nodes.first(),"key1","value1"),propertyWrite(Relationship.class,relationship,"key1","value1")}) {
+      db.executeAndRollback(expectFailureAfterSchemaOperation(operation));
+    }
+  }
+  @Test @SuppressWarnings("unchecked") public void shouldAllowPropertyReadsInSchemaTransaction(){
+    Pair<Node,Node> nodes=db.executeAndCommit(aPairOfNodes());
+    Relationship relationship=db.executeAndCommit(relate(nodes));
+    db.executeAndCommit(propertyWrite(Node.class,nodes.first(),"key1","value1"));
+    db.executeAndCommit(propertyWrite(Relationship.class,relationship,"key1","value1"));
+    for (    Function<GraphDatabaseService,?> operation : new Function[]{propertyRead(Node.class,nodes.first(),"key1"),propertyRead(Relationship.class,relationship,"key1")}) {
+      db.executeAndRollback(succeedAfterSchemaOperation(operation));
+    }
+  }
+  private static Function<GraphDatabaseService,Node> createNode(){
+    return GraphDatabaseService::createNode;
+  }
+  private static <T extends PropertyContainer>Function<GraphDatabaseService,Object> propertyRead(  Class<T> type,  final T entity,  final String key){
+    return new FailureRewrite<Object>(type.getSimpleName() + ".getProperty()"){
+      @Override Object perform(      GraphDatabaseService graphDb){
+        return entity.getProperty(key);
+      }
+    }
+;
+  }
+  private static <T extends PropertyContainer>Function<GraphDatabaseService,Void> propertyWrite(  Class<T> type,  final T entity,  final String key,  final Object value){
+    return new FailureRewrite<Void>(type.getSimpleName() + ".setProperty()"){
+      @Override Void perform(      GraphDatabaseService graphDb){
+        entity.setProperty(key,value);
+        return null;
+      }
+    }
+;
+  }
+  private static Function<GraphDatabaseService,Pair<Node,Node>> aPairOfNodes(){
+    return graphDb -> Pair.of(graphDb.createNode(),graphDb.createNode());
+  }
+  private static Function<GraphDatabaseService,Relationship> relate(  final Pair<Node,Node> nodes){
+    return graphDb -> nodes.first().createRelationshipTo(nodes.other(),withName("RELATED"));
+  }
+private abstract static class FailureRewrite<T> implements Function<GraphDatabaseService,T> {
+    private final String message;
+    FailureRewrite(    String message){
+      this.message=message;
+    }
+    @Override public T apply(    GraphDatabaseService graphDb){
+      try {
+        return perform(graphDb);
+      }
+ catch (      AssertionError e) {
+        AssertionError error=new AssertionError(message + ": " + e.getMessage());
+        error.setStackTrace(e.getStackTrace());
+        throw error;
+      }
+    }
+    abstract T perform(    GraphDatabaseService graphDb);
+  }
+}

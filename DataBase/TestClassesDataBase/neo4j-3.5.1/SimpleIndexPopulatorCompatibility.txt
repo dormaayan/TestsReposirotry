@@ -1,0 +1,162 @@
+@Ignore("Not a test. This is a compatibility suite that provides test cases for verifying" + " IndexProvider implementations. Each index provider that is to be tested by this suite" + " must create their own test class extending IndexProviderCompatibilityTestSuite."+ " The @Ignore annotation doesn't prevent these tests to run, it rather removes some annoying"+ " errors or warnings in some IDEs about test classes needing a public zero-arg constructor.") public class SimpleIndexPopulatorCompatibility extends IndexProviderCompatibilityTestSuite.Compatibility {
+  public SimpleIndexPopulatorCompatibility(  IndexProviderCompatibilityTestSuite testSuite,  IndexDescriptor descriptor){
+    super(testSuite,descriptor);
+  }
+  final IndexSamplingConfig indexSamplingConfig=new IndexSamplingConfig(Config.defaults());
+  @Test public void shouldStorePopulationFailedForRetrievalFromProviderLater() throws Exception {
+    String failure="The contrived failure";
+    IndexSamplingConfig indexSamplingConfig=new IndexSamplingConfig(Config.defaults());
+    withPopulator(indexProvider.getPopulator(descriptor,indexSamplingConfig),p -> p.markAsFailed(failure),false);
+    assertThat(indexProvider.getPopulationFailure(descriptor),containsString(failure));
+  }
+  @Test public void shouldReportInitialStateAsFailedIfPopulationFailed() throws Exception {
+    IndexSamplingConfig indexSamplingConfig=new IndexSamplingConfig(Config.defaults());
+    withPopulator(indexProvider.getPopulator(descriptor,indexSamplingConfig),p -> {
+      String failure="The contrived failure";
+      p.markAsFailed(failure);
+      p.close(false);
+      assertEquals(FAILED,indexProvider.getInitialState(descriptor));
+    }
+,false);
+  }
+  @Test public void shouldBeAbleToDropAClosedIndexPopulator() throws Exception {
+    IndexSamplingConfig indexSamplingConfig=new IndexSamplingConfig(Config.defaults());
+    final IndexPopulator p=indexProvider.getPopulator(descriptor,indexSamplingConfig);
+    p.close(false);
+    p.drop();
+  }
+  @Test public void shouldApplyUpdatesIdempotently() throws Exception {
+    IndexSamplingConfig indexSamplingConfig=new IndexSamplingConfig(Config.defaults());
+    final Value propertyValue=Values.of("value1");
+    withPopulator(indexProvider.getPopulator(descriptor,indexSamplingConfig),p -> {
+      long nodeId=1;
+      IndexEntryUpdate<SchemaDescriptor> update=add(nodeId,descriptor.schema(),propertyValue);
+      p.add(singletonList(update));
+      try (IndexUpdater updater=p.newPopulatingUpdater((node,propertyId) -> propertyValue)){
+        updater.process(update);
+      }
+     }
+);
+    try (IndexAccessor accessor=indexProvider.getOnlineAccessor(descriptor,indexSamplingConfig)){
+      try (IndexReader reader=new QueryResultComparingIndexReader(accessor.newReader())){
+        int propertyKeyId=descriptor.schema().getPropertyId();
+        LongIterator nodes=reader.query(IndexQuery.exact(propertyKeyId,propertyValue));
+        assertEquals(asSet(1L),PrimitiveLongCollections.toSet(nodes));
+      }
+     }
+   }
+  @Test public void shouldPopulateWithAllValues() throws Exception {
+    withPopulator(indexProvider.getPopulator(descriptor,indexSamplingConfig),p -> p.add(updates(valueSet1)));
+    assertHasAllValues(valueSet1);
+  }
+  @Test public void shouldUpdateWithAllValuesDuringPopulation() throws Exception {
+    withPopulator(indexProvider.getPopulator(descriptor,indexSamplingConfig),p -> {
+      try (IndexUpdater updater=p.newPopulatingUpdater(this::valueSet1Lookup)){
+        for (        NodeAndValue entry : valueSet1) {
+          updater.process(add(entry.nodeId,descriptor.schema(),entry.value));
+        }
+      }
+     }
+);
+    assertHasAllValues(valueSet1);
+  }
+  @Test public void shouldPopulateAndUpdate() throws Exception {
+    withPopulator(indexProvider.getPopulator(descriptor,indexSamplingConfig),p -> p.add(updates(valueSet1)));
+    try (IndexAccessor accessor=indexProvider.getOnlineAccessor(descriptor,indexSamplingConfig)){
+      try (IndexUpdater updater=accessor.newUpdater(IndexUpdateMode.ONLINE)){
+        List<IndexEntryUpdate<?>> updates=updates(valueSet2);
+        for (        IndexEntryUpdate<?> update : updates) {
+          updater.process(update);
+        }
+      }
+       try (IndexReader reader=new QueryResultComparingIndexReader(accessor.newReader())){
+        int propertyKeyId=descriptor.schema().getPropertyId();
+        for (        NodeAndValue entry : Iterables.concat(valueSet1,valueSet2)) {
+          NodeValueIterator nodes=new NodeValueIterator();
+          reader.query(nodes,IndexOrder.NONE,false,IndexQuery.exact(propertyKeyId,entry.value));
+          assertEquals(entry.nodeId,nodes.next());
+          assertFalse(nodes.hasNext());
+        }
+      }
+     }
+   }
+  private Value valueSet1Lookup(  long nodeId,  int propertyId){
+    for (    NodeAndValue x : valueSet1) {
+      if (x.nodeId == nodeId) {
+        return x.value;
+      }
+    }
+    return Values.NO_VALUE;
+  }
+  private void assertHasAllValues(  List<NodeAndValue> values) throws IOException, IndexNotApplicableKernelException {
+    try (IndexAccessor accessor=indexProvider.getOnlineAccessor(descriptor,indexSamplingConfig)){
+      try (IndexReader reader=new QueryResultComparingIndexReader(accessor.newReader())){
+        int propertyKeyId=descriptor.schema().getPropertyId();
+        for (        NodeAndValue entry : values) {
+          NodeValueIterator nodes=new NodeValueIterator();
+          reader.query(nodes,IndexOrder.NONE,false,IndexQuery.exact(propertyKeyId,entry.value));
+          assertEquals(entry.nodeId,nodes.next());
+          assertFalse(nodes.hasNext());
+        }
+      }
+     }
+   }
+@Ignore("Not a test. This is a compatibility suite") public static class General extends SimpleIndexPopulatorCompatibility {
+    public General(    IndexProviderCompatibilityTestSuite testSuite){
+      super(testSuite,TestIndexDescriptorFactory.forLabel(1000,100));
+    }
+    @Test public void shouldProvidePopulatorThatAcceptsDuplicateEntries() throws Exception {
+      long offset=valueSet1.size();
+      withPopulator(indexProvider.getPopulator(descriptor,indexSamplingConfig),p -> {
+        p.add(updates(valueSet1,0));
+        p.add(updates(valueSet1,offset));
+      }
+);
+      try (IndexAccessor accessor=indexProvider.getOnlineAccessor(descriptor,indexSamplingConfig)){
+        try (IndexReader reader=new QueryResultComparingIndexReader(accessor.newReader())){
+          int propertyKeyId=descriptor.schema().getPropertyId();
+          for (          NodeAndValue entry : valueSet1) {
+            NodeValueIterator nodes=new NodeValueIterator();
+            reader.query(nodes,IndexOrder.NONE,false,IndexQuery.exact(propertyKeyId,entry.value));
+            assertEquals(entry.value.toString(),asSet(entry.nodeId,entry.nodeId + offset),PrimitiveLongCollections.toSet(nodes));
+          }
+        }
+       }
+     }
+  }
+@Ignore("Not a test. This is a compatibility suite") public static class Unique extends SimpleIndexPopulatorCompatibility {
+    public Unique(    IndexProviderCompatibilityTestSuite testSuite){
+      super(testSuite,TestIndexDescriptorFactory.uniqueForLabel(1000,100));
+    }
+    /** 
+ * This is also checked by the UniqueConstraintCompatibility test, only not on this abstraction level.
+ */
+    @Test public void shouldProvidePopulatorThatEnforcesUniqueConstraints() throws Exception {
+      Value value=Values.of("value1");
+      int nodeId1=1;
+      int nodeId2=2;
+      withPopulator(indexProvider.getPopulator(descriptor,indexSamplingConfig),p -> {
+        try {
+          p.add(Arrays.asList(add(nodeId1,descriptor.schema(),value),add(nodeId2,descriptor.schema(),value)));
+          TestNodePropertyAccessor propertyAccessor=new TestNodePropertyAccessor(nodeId1,descriptor.schema(),value);
+          propertyAccessor.addNode(nodeId2,descriptor.schema(),value);
+          p.verifyDeferredConstraints(propertyAccessor);
+          fail("expected exception");
+        }
+ catch (        Exception e) {
+          Throwable root=Exceptions.rootCause(e);
+          if (root instanceof IndexEntryConflictException) {
+            IndexEntryConflictException conflict=(IndexEntryConflictException)root;
+            assertEquals(nodeId1,conflict.getExistingNodeId());
+            assertEquals(ValueTuple.of(value),conflict.getPropertyValues());
+            assertEquals(nodeId2,conflict.getAddedNodeId());
+          }
+ else {
+            throw e;
+          }
+        }
+      }
+);
+    }
+  }
+}

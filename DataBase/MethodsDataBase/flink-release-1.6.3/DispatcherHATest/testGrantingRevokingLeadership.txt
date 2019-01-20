@@ -1,0 +1,29 @@
+/** 
+ * Tests that interleaved granting and revoking of the leadership won't interfere with the job recovery and the resulting internal state of the Dispatcher.
+ */
+@Test public void testGrantingRevokingLeadership() throws Exception {
+  final TestingHighAvailabilityServices highAvailabilityServices=new TestingHighAvailabilityServices();
+  final JobGraph nonEmptyJobGraph=createNonEmptyJobGraph();
+  final SubmittedJobGraph submittedJobGraph=new SubmittedJobGraph(nonEmptyJobGraph,null);
+  final OneShotLatch enterGetJobIdsLatch=new OneShotLatch();
+  final OneShotLatch proceedGetJobIdsLatch=new OneShotLatch();
+  highAvailabilityServices.setSubmittedJobGraphStore(new BlockingSubmittedJobGraphStore(submittedJobGraph,enterGetJobIdsLatch,proceedGetJobIdsLatch));
+  final TestingLeaderElectionService dispatcherLeaderElectionService=new TestingLeaderElectionService();
+  highAvailabilityServices.setDispatcherLeaderElectionService(dispatcherLeaderElectionService);
+  final BlockingQueue<DispatcherId> fencingTokens=new ArrayBlockingQueue<>(2);
+  final HATestingDispatcher dispatcher=createHADispatcher(highAvailabilityServices,fencingTokens);
+  dispatcher.start();
+  try {
+    final UUID leaderId=UUID.randomUUID();
+    dispatcherLeaderElectionService.isLeader(leaderId);
+    dispatcherLeaderElectionService.notLeader();
+    final DispatcherId firstFencingToken=fencingTokens.take();
+    assertThat(firstFencingToken,equalTo(NULL_FENCING_TOKEN));
+    enterGetJobIdsLatch.await();
+    proceedGetJobIdsLatch.trigger();
+    assertThat(dispatcher.getNumberJobs(timeout).get(),is(0));
+  }
+  finally {
+    RpcUtils.terminateRpcEndpoint(dispatcher,timeout);
+  }
+}

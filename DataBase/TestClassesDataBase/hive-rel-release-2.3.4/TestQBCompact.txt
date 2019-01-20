@@ -1,0 +1,75 @@
+/** 
+ * Tests for parsing and semantic analysis of ALTER TABLE ... compact.
+ */
+public class TestQBCompact {
+  static QueryState queryState;
+  static HiveConf conf;
+  @BeforeClass public static void init() throws Exception {
+    queryState=new QueryState(null);
+    conf=queryState.getConf();
+    conf.setVar(HiveConf.ConfVars.HIVE_AUTHORIZATION_MANAGER,"org.apache.hadoop.hive.ql.security.authorization.plugin.sqlstd.SQLStdHiveAuthorizerFactory");
+    SessionState.start(conf);
+    Hive h=Hive.get(conf);
+    List<String> cols=new ArrayList<String>();
+    cols.add("a");
+    List<String> partCols=new ArrayList<String>();
+    partCols.add("ds");
+    h.createTable("foo",cols,partCols,OrcInputFormat.class,OrcOutputFormat.class);
+    Table t=h.getTable("foo");
+    Map<String,String> partSpec=new HashMap<String,String>();
+    partSpec.put("ds","today");
+    h.createPartition(t,partSpec);
+  }
+  @AfterClass public static void deInit() throws Exception {
+    Hive h=Hive.get(conf);
+    h.dropTable("foo");
+  }
+  private AlterTableSimpleDesc parseAndAnalyze(  String query) throws Exception {
+    ParseDriver hd=new ParseDriver();
+    ASTNode head=(ASTNode)hd.parse(query).getChild(0);
+    BaseSemanticAnalyzer a=SemanticAnalyzerFactory.get(queryState,head);
+    a.analyze(head,new Context(conf));
+    List<Task<? extends Serializable>> roots=a.getRootTasks();
+    Assert.assertEquals(1,roots.size());
+    return ((DDLWork)roots.get(0).getWork()).getAlterTblSimpleDesc();
+  }
+  @Test public void testNonPartitionedTable() throws Exception {
+    boolean sawException=false;
+    AlterTableSimpleDesc desc=parseAndAnalyze("alter table foo compact 'major'");
+    Assert.assertEquals("major",desc.getCompactionType());
+    Assert.assertEquals("default.foo",desc.getTableName());
+  }
+  @Test public void testBogusLevel() throws Exception {
+    boolean sawException=false;
+    try {
+      parseAndAnalyze("alter table foo partition(ds = 'today') compact 'bogus'");
+    }
+ catch (    SemanticException e) {
+      sawException=true;
+      Assert.assertEquals(ErrorMsg.INVALID_COMPACTION_TYPE.getMsg(),e.getMessage());
+    }
+    Assert.assertTrue(sawException);
+  }
+  @Test public void testMajor() throws Exception {
+    AlterTableSimpleDesc desc=parseAndAnalyze("alter table foo partition(ds = 'today') compact 'major'");
+    Assert.assertEquals("major",desc.getCompactionType());
+    Assert.assertEquals("default.foo",desc.getTableName());
+    HashMap<String,String> parts=desc.getPartSpec();
+    Assert.assertEquals(1,parts.size());
+    Assert.assertEquals("today",parts.get("ds"));
+  }
+  @Test public void testMinor() throws Exception {
+    AlterTableSimpleDesc desc=parseAndAnalyze("alter table foo partition(ds = 'today') compact 'minor'");
+    Assert.assertEquals("minor",desc.getCompactionType());
+    Assert.assertEquals("default.foo",desc.getTableName());
+    HashMap<String,String> parts=desc.getPartSpec();
+    Assert.assertEquals(1,parts.size());
+    Assert.assertEquals("today",parts.get("ds"));
+  }
+  @Test public void showCompactions() throws Exception {
+    parseAndAnalyze("show compactions");
+  }
+  @Test public void showTxns() throws Exception {
+    parseAndAnalyze("show transactions");
+  }
+}

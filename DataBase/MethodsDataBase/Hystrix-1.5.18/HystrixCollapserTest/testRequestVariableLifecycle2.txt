@@ -1,0 +1,55 @@
+@Test public void testRequestVariableLifecycle2() throws Exception {
+  final HystrixRequestContext reqContext=HystrixRequestContext.initializeContext();
+  final TestCollapserTimer timer=new TestCollapserTimer();
+  final ConcurrentLinkedQueue<Future<String>> responses=new ConcurrentLinkedQueue<Future<String>>();
+  ConcurrentLinkedQueue<Thread> threads=new ConcurrentLinkedQueue<Thread>();
+  for (int t=0; t < 5; t++) {
+    final int outerLoop=t;
+    Thread th=new Thread(new HystrixContextRunnable(HystrixPlugins.getInstance().getConcurrencyStrategy(),new Runnable(){
+      @Override public void run(){
+        for (int i=0; i < 100; i++) {
+          int uniqueInt=(outerLoop * 100) + i;
+          responses.add(new TestRequestCollapser(timer,uniqueInt).queue());
+        }
+      }
+    }
+));
+    threads.add(th);
+    th.start();
+  }
+  for (  Thread th : threads) {
+    th.join();
+  }
+  assertEquals(500,responses.size());
+  for (  Future<String> f : responses) {
+    assertFalse(f.isDone());
+  }
+  timer.incrementTime(5);
+  HystrixCollapser<List<String>,String,String> collapser1=new TestRequestCollapser(timer,2);
+  Future<String> response2=collapser1.queue();
+  timer.incrementTime(8);
+  Future<String> response3=new TestRequestCollapser(timer,3).queue();
+  timer.incrementTime(6);
+  Future<String> response4=new TestRequestCollapser(timer,4).queue();
+  timer.incrementTime(8);
+  Future<String> response5=new TestRequestCollapser(timer,5).queue();
+  timer.incrementTime(10);
+  for (  Future<String> f : responses) {
+    f.get(1000,TimeUnit.MILLISECONDS);
+  }
+  assertEquals("2",response2.get(1000,TimeUnit.MILLISECONDS));
+  assertEquals("3",response3.get(1000,TimeUnit.MILLISECONDS));
+  assertEquals("4",response4.get(1000,TimeUnit.MILLISECONDS));
+  assertEquals("5",response5.get(1000,TimeUnit.MILLISECONDS));
+  for (  TestCollapserTimer.ATask t : timer.tasks) {
+    assertEquals(3,t.task.count.get());
+  }
+  Iterator<HystrixInvokableInfo<?>> cmdIterator=HystrixRequestLog.getCurrentRequest().getAllExecutedCommands().iterator();
+  assertEquals(500,cmdIterator.next().getNumberCollapsed());
+  assertEquals(2,cmdIterator.next().getNumberCollapsed());
+  assertEquals(1,cmdIterator.next().getNumberCollapsed());
+  HystrixRequestVariableHolder<RequestCollapser<?,?,?>> rv=RequestCollapserFactory.getRequestVariable(new TestRequestCollapser(timer,1).getCollapserKey().name());
+  reqContext.close();
+  assertNotNull(rv);
+  assertEquals(0,timer.tasks.size());
+}

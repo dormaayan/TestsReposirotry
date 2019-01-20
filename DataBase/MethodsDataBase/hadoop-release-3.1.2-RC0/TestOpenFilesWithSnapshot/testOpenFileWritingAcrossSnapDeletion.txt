@@ -1,0 +1,81 @@
+/** 
+ * Test client writing to open files are not interrupted when snapshots that captured open files get deleted.
+ */
+@Test(timeout=240000) public void testOpenFileWritingAcrossSnapDeletion() throws Exception {
+  final Path snapRootDir=new Path("/level_0_A");
+  final String flumeFileName="flume.log";
+  final String hbaseFileName="hbase.log";
+  final String snap1Name="snap_1";
+  final String snap2Name="snap_2";
+  final String snap3Name="snap_3";
+  final Path flumeFile=new Path(snapRootDir,flumeFileName);
+  FSDataOutputStream flumeOut=fs.create(flumeFile,false,8000,(short)3,1048576);
+  flumeOut.close();
+  final Path hbaseFile=new Path(snapRootDir,hbaseFileName);
+  FSDataOutputStream hbaseOut=fs.create(hbaseFile,false,8000,(short)3,1048576);
+  hbaseOut.close();
+  final AtomicBoolean writerError=new AtomicBoolean(false);
+  final CountDownLatch startLatch=new CountDownLatch(1);
+  final CountDownLatch deleteLatch=new CountDownLatch(1);
+  Thread t=new Thread(new Runnable(){
+    @Override public void run(){
+      try {
+        FSDataOutputStream flumeOutputStream=fs.append(flumeFile,8000);
+        FSDataOutputStream hbaseOutputStream=fs.append(hbaseFile,8000);
+        byte[] bytes=new byte[(int)(1024 * 0.2)];
+        Random r=new Random(Time.now());
+        for (int i=0; i < 200000; i++) {
+          r.nextBytes(bytes);
+          flumeOutputStream.write(bytes);
+          if (hbaseOutputStream != null) {
+            hbaseOutputStream.write(bytes);
+          }
+          if (i == 50000) {
+            startLatch.countDown();
+          }
+ else           if (i == 100000) {
+            deleteLatch.countDown();
+          }
+ else           if (i == 150000) {
+            hbaseOutputStream.hsync();
+            fs.delete(hbaseFile,true);
+            try {
+              hbaseOutputStream.close();
+            }
+ catch (            Exception e) {
+            }
+            hbaseOutputStream=null;
+          }
+ else           if (i % 5000 == 0) {
+            LOG.info("Write pos: " + flumeOutputStream.getPos() + ", size: "+ fs.getFileStatus(flumeFile).getLen()+ ", loop: "+ (i + 1));
+          }
+        }
+      }
+ catch (      Exception e) {
+        LOG.warn("Writer error: " + e);
+        writerError.set(true);
+      }
+    }
+  }
+);
+  t.start();
+  startLatch.await();
+  final Path snap1Dir=SnapshotTestHelper.createSnapshot(fs,snapRootDir,snap1Name);
+  final Path flumeS1Path=new Path(snap1Dir,flumeFileName);
+  LOG.info("Snap1 file status: " + fs.getFileStatus(flumeS1Path));
+  LOG.info("Current file status: " + fs.getFileStatus(flumeFile));
+  deleteLatch.await();
+  LOG.info("Snap1 file status: " + fs.getFileStatus(flumeS1Path));
+  LOG.info("Current file status: " + fs.getFileStatus(flumeFile));
+  LOG.info("Deleting " + snap1Name);
+  fs.deleteSnapshot(snapRootDir,snap1Name);
+  SnapshotTestHelper.createSnapshot(fs,snapRootDir,snap2Name);
+  SnapshotTestHelper.createSnapshot(fs,snapRootDir,snap3Name);
+  fs.deleteSnapshot(snapRootDir,snap3Name);
+  fs.deleteSnapshot(snapRootDir,snap2Name);
+  SnapshotTestHelper.createSnapshot(fs,snapRootDir,"test");
+  t.join();
+  Assert.assertFalse("Client encountered writing error!",writerError.get());
+  restartNameNode();
+  cluster.waitActive();
+}

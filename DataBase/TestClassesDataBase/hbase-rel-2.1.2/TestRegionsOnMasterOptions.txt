@@ -1,0 +1,98 @@
+/** 
+ * Test options for regions on master; none, system, or any (i.e. master is like any other regionserver). Checks how regions are deployed when each of the options are enabled. It then does kill combinations to make sure the distribution is more than just for startup. NOTE: Regions on Master does not work well. See HBASE-19828. Until addressed, disabling this test.
+ */
+@Ignore @Category({MediumTests.class}) public class TestRegionsOnMasterOptions {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestRegionsOnMasterOptions.class);
+  private static final Logger LOG=LoggerFactory.getLogger(TestRegionsOnMasterOptions.class);
+  @Rule public TestName name=new TestName();
+  private final static HBaseTestingUtility TEST_UTIL=new HBaseTestingUtility();
+  private Configuration c;
+  private String tablesOnMasterOldValue;
+  private String systemTablesOnMasterOldValue;
+  private static final int SLAVES=3;
+  private static final int MASTERS=2;
+  private static final int REGIONS=12;
+  private static final int SYSTEM_REGIONS=2;
+  @Before public void setup(){
+    this.c=TEST_UTIL.getConfiguration();
+    this.tablesOnMasterOldValue=c.get(LoadBalancer.TABLES_ON_MASTER);
+    this.systemTablesOnMasterOldValue=c.get(LoadBalancer.SYSTEM_TABLES_ON_MASTER);
+  }
+  @After public void tearDown(){
+    unset(LoadBalancer.TABLES_ON_MASTER,this.tablesOnMasterOldValue);
+    unset(LoadBalancer.SYSTEM_TABLES_ON_MASTER,this.systemTablesOnMasterOldValue);
+  }
+  private void unset(  final String key,  final String value){
+    if (value == null) {
+      c.unset(key);
+    }
+ else {
+      c.set(key,value);
+    }
+  }
+  @Test public void testRegionsOnAllServers() throws Exception {
+    c.setBoolean(LoadBalancer.TABLES_ON_MASTER,true);
+    c.setBoolean(LoadBalancer.SYSTEM_TABLES_ON_MASTER,false);
+    int rsCount=(REGIONS + SYSTEM_REGIONS) / (SLAVES + 1);
+    checkBalance(rsCount,rsCount);
+  }
+  @Test public void testNoRegionOnMaster() throws Exception {
+    c.setBoolean(LoadBalancer.TABLES_ON_MASTER,false);
+    c.setBoolean(LoadBalancer.SYSTEM_TABLES_ON_MASTER,false);
+    int rsCount=(REGIONS + SYSTEM_REGIONS) / SLAVES;
+    checkBalance(0,rsCount);
+  }
+  @Ignore @Test public void testSystemTablesOnMaster() throws Exception {
+    c.setBoolean(LoadBalancer.TABLES_ON_MASTER,true);
+    c.setBoolean(LoadBalancer.SYSTEM_TABLES_ON_MASTER,true);
+    checkBalance(SYSTEM_REGIONS,REGIONS / SLAVES);
+  }
+  private void checkBalance(  int masterCount,  int rsCount) throws Exception {
+    MiniHBaseCluster cluster=TEST_UTIL.startMiniCluster(MASTERS,SLAVES);
+    TableName tn=TableName.valueOf(this.name.getMethodName());
+    try {
+      Table t=TEST_UTIL.createMultiRegionTable(tn,HConstants.CATALOG_FAMILY,REGIONS);
+      LOG.info("Server: " + cluster.getMaster().getServerManager().getOnlineServersList());
+      List<HRegion> regions=cluster.getMaster().getRegions();
+      int mActualCount=regions.size();
+      if (masterCount == 0 || masterCount == SYSTEM_REGIONS) {
+        assertEquals(masterCount,mActualCount);
+      }
+ else {
+        checkCount(masterCount,mActualCount);
+      }
+      for (      JVMClusterUtil.RegionServerThread rst : cluster.getRegionServerThreads()) {
+        regions=rst.getRegionServer().getRegions();
+        int rsActualCount=regions.size();
+        checkCount(rsActualCount,rsCount);
+      }
+      HMaster oldMaster=cluster.getMaster();
+      cluster.killMaster(oldMaster.getServerName());
+      oldMaster.join();
+      while (cluster.getMaster() == null || cluster.getMaster().getServerName().equals(oldMaster.getServerName())) {
+        Threads.sleep(10);
+      }
+      while (!cluster.getMaster().isInitialized()) {
+        Threads.sleep(10);
+      }
+      while (cluster.getMaster().getAssignmentManager().computeRegionInTransitionStat().getTotalRITs() > 0) {
+        Threads.sleep(100);
+        LOG.info("Waiting on RIT to go to zero before calling balancer...");
+      }
+      LOG.info("Cluster is up; running balancer");
+      cluster.getMaster().balance();
+      regions=cluster.getMaster().getRegions();
+      int mNewActualCount=regions.size();
+      if (masterCount == 0 || masterCount == SYSTEM_REGIONS) {
+        assertEquals(masterCount,mNewActualCount);
+      }
+    }
+  finally {
+      LOG.info("Running shutdown of cluster");
+      TEST_UTIL.shutdownMiniCluster();
+    }
+  }
+  private void checkCount(  int actual,  int expected){
+    assertTrue("Actual=" + actual + ", expected="+ expected,actual >= (expected - 2) && actual <= (expected + 2));
+  }
+}

@@ -1,0 +1,64 @@
+public class BoltRequestMessageTest {
+  @Rule public ExpectedException exception=ExpectedException.none();
+  private final Neo4jPack neo4jPack=new Neo4jPackV1();
+  @Test public void shouldHandleCommonMessages() throws Throwable {
+    assertSerializes(new InitMessage("MyClient/1.0",map("scheme","basic")));
+    assertSerializes(AckFailureMessage.INSTANCE);
+    assertSerializes(ResetMessage.INSTANCE);
+    assertSerializes(new RunMessage("CREATE (n) RETURN åäö"));
+    assertSerializes(DiscardAllMessage.INSTANCE);
+    assertSerializes(PullAllMessage.INSTANCE);
+  }
+  @Test public void shouldHandleParameterizedStatements() throws Throwable {
+    MapValue parameters=ValueUtils.asMapValue(map("n",12L));
+    RunMessage msg=serializeAndDeserialize(new RunMessage("asd",parameters));
+    MapValue params=msg.params();
+    assertThat(params,equalTo(parameters));
+  }
+  @Test public void shouldSerializeNode() throws Throwable {
+    NodeValue nodeValue=nodeValue(12L,stringArray("User","Banana"),map(new String[]{"name","age"},new AnyValue[]{stringValue("Bob"),intValue(14)}));
+    assertThat(serialized(nodeValue),equalTo("B1 71 91 B3 4E 0C 92 84 55 73 65 72 86 42 61 6E" + lineSeparator() + "61 6E 61 A2 84 6E 61 6D 65 83 42 6F 62 83 61 67"+ lineSeparator()+ "65 0E"));
+  }
+  @Test public void shouldSerializeRelationship() throws Throwable {
+    RelationshipValue rel=relationshipValue(12L,nodeValue(1L,stringArray(),VirtualValues.EMPTY_MAP),nodeValue(2L,stringArray(),VirtualValues.EMPTY_MAP),stringValue("KNOWS"),map(new String[]{"name","age"},new AnyValue[]{stringValue("Bob"),intValue(14)}));
+    assertThat(serialized(rel),equalTo("B1 71 91 B5 52 0C 01 02 85 4B 4E 4F 57 53 A2 84" + lineSeparator() + "6E 61 6D 65 83 42 6F 62 83 61 67 65 0E"));
+  }
+  private String serialized(  AnyValue object) throws IOException {
+    RecordMessage message=new RecordMessage(record(object));
+    return HexPrinter.hex(serialize(neo4jPack,message),4," ");
+  }
+  private void assertSerializes(  RequestMessage msg) throws Exception {
+    assertThat(serializeAndDeserialize(msg),equalTo(msg));
+  }
+  private <T extends RequestMessage>T serializeAndDeserialize(  T msg) throws Exception {
+    RecordingByteChannel channel=new RecordingByteChannel();
+    Neo4jPack.Packer packer=neo4jPack.newPacker(new BufferedChannelOutput(channel));
+    BoltRequestMessageWriter writer=new BoltRequestMessageWriter(packer);
+    writer.write(msg).flush();
+    channel.eof();
+    return unpack(channel);
+  }
+  private <T extends RequestMessage>T unpack(  RecordingByteChannel channel) throws Exception {
+    List<RequestMessage> messages=new ArrayList<>();
+    BoltStateMachine stateMachine=mock(BoltStateMachine.class);
+    doAnswer(new Answer<Void>(){
+      @Override public Void answer(      InvocationOnMock invocationOnMock) throws Throwable {
+        RequestMessage msg=invocationOnMock.getArgument(0);
+        messages.add(msg);
+        return null;
+      }
+    }
+).when(stateMachine).process(any(),any());
+    BoltRequestMessageReader reader=new BoltRequestMessageReaderV1(new SynchronousBoltConnection(stateMachine),mock(BoltResponseMessageWriter.class),NullLogService.getInstance());
+    byte[] bytes=channel.getBytes();
+    String serialized=HexPrinter.hex(bytes);
+    Neo4jPack.Unpacker unpacker=neo4jPack.newUnpacker(new PackedInputArray(bytes));
+    try {
+      reader.read(unpacker);
+    }
+ catch (    Throwable e) {
+      throw new AssertionError("Failed to unpack message, wire data was:\n" + serialized + "["+ bytes.length+ "b]",e);
+    }
+    return (T)messages.get(0);
+  }
+}

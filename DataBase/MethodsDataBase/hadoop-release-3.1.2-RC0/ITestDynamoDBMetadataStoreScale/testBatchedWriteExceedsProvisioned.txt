@@ -1,0 +1,55 @@
+/** 
+ * Though the AWS SDK claims in documentation to handle retries and exponential backoff, we have witnessed com.amazonaws...dynamodbv2.model.ProvisionedThroughputExceededException (Status Code: 400; Error Code: ProvisionedThroughputExceededException) Hypothesis: Happens when the size of a batched write is bigger than the number of provisioned write units.  This test ensures we handle the case correctly, retrying w/ smaller batch instead of surfacing exceptions.
+ */
+@Test public void testBatchedWriteExceedsProvisioned() throws Exception {
+  final long iterations=5;
+  boolean isProvisionedChanged;
+  List<PathMetadata> toCleanup=new ArrayList<>();
+  assertTrue("Maximum batch size must big enough to run this test",S3GUARD_DDB_BATCH_WRITE_REQUEST_LIMIT >= BATCH_SIZE);
+  try (DynamoDBMetadataStore ddbms=(DynamoDBMetadataStore)createMetadataStore()){
+    DynamoDB ddb=ddbms.getDynamoDB();
+    String tableName=ddbms.getTable().getTableName();
+    final ProvisionedThroughputDescription existing=ddb.getTable(tableName).describe().getProvisionedThroughput();
+    isProvisionedChanged=(existing.getReadCapacityUnits() != SMALL_IO_UNITS || existing.getWriteCapacityUnits() != SMALL_IO_UNITS);
+    if (isProvisionedChanged) {
+      describe("Provisioning dynamo tbl %s read/write -> %d/%d",tableName,SMALL_IO_UNITS,SMALL_IO_UNITS);
+      ddbms.provisionTableBlocking(SMALL_IO_UNITS,SMALL_IO_UNITS);
+    }
+ else {
+      describe("Skipping provisioning table I/O, already %d/%d",SMALL_IO_UNITS,SMALL_IO_UNITS);
+    }
+    try {
+      try {
+        describe("Running %d iterations of batched put, size %d",iterations,BATCH_SIZE);
+        long pruneItems=0;
+        for (long i=0; i < iterations; i++) {
+          Path longPath=pathOfDepth(BATCH_SIZE,String.valueOf(i));
+          FileStatus status=basicFileStatus(longPath,0,false,12345,12345);
+          PathMetadata pm=new PathMetadata(status);
+          ddbms.put(pm);
+          toCleanup.add(pm);
+          pruneItems++;
+          if (pruneItems == BATCH_SIZE) {
+            describe("pruning files");
+            ddbms.prune(Long.MAX_VALUE);
+            pruneItems=0;
+          }
+        }
+      }
+  finally {
+        describe("Cleaning up table %s",tableName);
+        for (        PathMetadata pm : toCleanup) {
+          cleanupMetadata(ddbms,pm);
+        }
+      }
+    }
+  finally {
+      if (isProvisionedChanged) {
+        long write=existing.getWriteCapacityUnits();
+        long read=existing.getReadCapacityUnits();
+        describe("Restoring dynamo tbl %s read/write -> %d/%d",tableName,read,write);
+        ddbms.provisionTableBlocking(existing.getReadCapacityUnits(),existing.getWriteCapacityUnits());
+      }
+    }
+  }
+ }

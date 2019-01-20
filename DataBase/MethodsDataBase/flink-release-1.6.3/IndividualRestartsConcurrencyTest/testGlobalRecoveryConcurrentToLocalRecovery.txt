@@ -1,0 +1,41 @@
+/** 
+ * Tests that a local failover does not try to trump a global failover.
+ */
+@Test public void testGlobalRecoveryConcurrentToLocalRecovery() throws Exception {
+  final JobID jid=new JobID();
+  final int parallelism=2;
+  final ManuallyTriggeredDirectExecutor executor=new ManuallyTriggeredDirectExecutor();
+  final SimpleSlotProvider slotProvider=new SimpleSlotProvider(jid,parallelism);
+  final ExecutionGraph graph=createSampleGraph(jid,new IndividualFailoverWithCustomExecutor(executor),new FixedDelayRestartStrategy(1,0),slotProvider,2);
+  final ExecutionJobVertex ejv=graph.getVerticesTopologically().iterator().next();
+  final ExecutionVertex vertex1=ejv.getTaskVertices()[0];
+  final ExecutionVertex vertex2=ejv.getTaskVertices()[1];
+  graph.scheduleForExecution();
+  assertEquals(JobStatus.RUNNING,graph.getState());
+  vertex2.getCurrentExecutionAttempt().fail(new Exception("test failure"));
+  assertEquals(ExecutionState.FAILED,vertex2.getCurrentExecutionAttempt().getState());
+  assertEquals(JobStatus.RUNNING,graph.getState());
+  assertEquals(1,executor.numQueuedRunnables());
+  graph.failGlobal(new Exception("test exception"));
+  assertEquals(JobStatus.FAILING,graph.getState());
+  assertEquals(ExecutionState.FAILED,vertex2.getCurrentExecutionAttempt().getState());
+  assertEquals(ExecutionState.CANCELING,vertex1.getCurrentExecutionAttempt().getState());
+  vertex1.getCurrentExecutionAttempt().cancelingComplete();
+  waitUntilJobStatus(graph,JobStatus.RUNNING,1000);
+  assertEquals(JobStatus.RUNNING,graph.getState());
+  waitUntilExecutionState(vertex1.getCurrentExecutionAttempt(),ExecutionState.DEPLOYING,1000);
+  waitUntilExecutionState(vertex2.getCurrentExecutionAttempt(),ExecutionState.DEPLOYING,1000);
+  vertex1.getCurrentExecutionAttempt().switchToRunning();
+  vertex2.getCurrentExecutionAttempt().switchToRunning();
+  assertEquals(ExecutionState.RUNNING,vertex1.getCurrentExecutionAttempt().getState());
+  assertEquals(ExecutionState.RUNNING,vertex2.getCurrentExecutionAttempt().getState());
+  executor.trigger();
+  assertEquals(JobStatus.RUNNING,graph.getState());
+  assertEquals(ExecutionState.RUNNING,vertex1.getCurrentExecutionAttempt().getState());
+  assertEquals(ExecutionState.RUNNING,vertex2.getCurrentExecutionAttempt().getState());
+  assertEquals(1,vertex1.getCurrentExecutionAttempt().getAttemptNumber());
+  assertEquals(1,vertex2.getCurrentExecutionAttempt().getAttemptNumber());
+  assertEquals(1,vertex1.getCopyOfPriorExecutionsList().size());
+  assertEquals(1,vertex2.getCopyOfPriorExecutionsList().size());
+  assertEquals(0,slotProvider.getNumberOfAvailableSlots());
+}

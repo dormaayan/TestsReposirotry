@@ -1,0 +1,47 @@
+/** 
+ * Tests that we can write out an edit, close, and then read it back in again.
+ */
+@Test public void testEditAdd() throws IOException {
+  int colCount=10;
+  TableDescriptor htd=TableDescriptorBuilder.newBuilder(TableName.valueOf(currentTest.getMethodName())).setColumnFamily(ColumnFamilyDescriptorBuilder.of("column")).build();
+  NavigableMap<byte[],Integer> scopes=new TreeMap<byte[],Integer>(Bytes.BYTES_COMPARATOR);
+  for (  byte[] fam : htd.getColumnFamilyNames()) {
+    scopes.put(fam,0);
+  }
+  byte[] row=Bytes.toBytes("row");
+  WAL.Reader reader=null;
+  try {
+    final MultiVersionConcurrencyControl mvcc=new MultiVersionConcurrencyControl(1);
+    long timestamp=System.currentTimeMillis();
+    WALEdit cols=new WALEdit();
+    for (int i=0; i < colCount; i++) {
+      cols.add(new KeyValue(row,Bytes.toBytes("column"),Bytes.toBytes(Integer.toString(i)),timestamp,new byte[]{(byte)(i + '0')}));
+    }
+    RegionInfo info=RegionInfoBuilder.newBuilder(htd.getTableName()).setStartKey(row).setEndKey(Bytes.toBytes(Bytes.toString(row) + "1")).build();
+    final WAL log=wals.getWAL(info);
+    final long txid=log.append(info,new WALKeyImpl(info.getEncodedNameAsBytes(),htd.getTableName(),System.currentTimeMillis(),mvcc,scopes),cols,true);
+    log.sync(txid);
+    log.startCacheFlush(info.getEncodedNameAsBytes(),htd.getColumnFamilyNames());
+    log.completeCacheFlush(info.getEncodedNameAsBytes());
+    log.shutdown();
+    Path filename=AbstractFSWALProvider.getCurrentFileName(log);
+    reader=wals.createReader(fs,filename);
+    for (int i=0; i < 1; i++) {
+      WAL.Entry entry=reader.next(null);
+      if (entry == null)       break;
+      WALKey key=entry.getKey();
+      WALEdit val=entry.getEdit();
+      assertTrue(Bytes.equals(info.getEncodedNameAsBytes(),key.getEncodedRegionName()));
+      assertTrue(htd.getTableName().equals(key.getTableName()));
+      Cell cell=val.getCells().get(0);
+      assertTrue(Bytes.equals(row,0,row.length,cell.getRowArray(),cell.getRowOffset(),cell.getRowLength()));
+      assertEquals((byte)(i + '0'),CellUtil.cloneValue(cell)[0]);
+      System.out.println(key + " " + val);
+    }
+  }
+  finally {
+    if (reader != null) {
+      reader.close();
+    }
+  }
+}

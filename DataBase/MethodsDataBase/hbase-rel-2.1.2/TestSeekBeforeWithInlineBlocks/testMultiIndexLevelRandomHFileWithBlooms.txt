@@ -1,0 +1,54 @@
+/** 
+ * Scanner.seekBefore() could fail because when seeking to a previous HFile data block, it needs to know the size of that data block, which it calculates using current data block offset and the previous data block offset.  This fails to work when there are leaf-level index blocks in the scannable section of the HFile, i.e. starting in HFileV2.  This test will try seekBefore() on a flat (single-level) and multi-level (2,3) HFile and confirm this bug is now fixed.  This bug also happens for inline Bloom blocks for the same reasons.
+ */
+@Test public void testMultiIndexLevelRandomHFileWithBlooms() throws IOException {
+  conf=TEST_UTIL.getConfiguration();
+  for (int hfileVersion=HFile.MIN_FORMAT_VERSION_WITH_TAGS; hfileVersion <= HFile.MAX_FORMAT_VERSION; hfileVersion++) {
+    conf.setInt(HFile.FORMAT_VERSION_KEY,hfileVersion);
+    fs=HFileSystem.get(conf);
+    for (    BloomType bloomType : BloomType.values()) {
+      for (int testI=0; testI < INDEX_CHUNK_SIZES.length; testI++) {
+        int indexBlockSize=INDEX_CHUNK_SIZES[testI];
+        int expectedNumLevels=EXPECTED_NUM_LEVELS[testI];
+        LOG.info(String.format("Testing HFileVersion: %s, BloomType: %s, Index Levels: %s",hfileVersion,bloomType,expectedNumLevels));
+        conf.setInt(HFileBlockIndex.MAX_CHUNK_SIZE_KEY,indexBlockSize);
+        conf.setInt(BloomFilterFactory.IO_STOREFILE_BLOOM_BLOCK_SIZE,BLOOM_BLOCK_SIZE);
+        Cell[] cells=new Cell[NUM_KV];
+        Path hfilePath=new Path(TEST_UTIL.getDataTestDir(),String.format("testMultiIndexLevelRandomHFileWithBlooms-%s-%s-%s",hfileVersion,bloomType,testI));
+        conf.setFloat(HConstants.HFILE_BLOCK_CACHE_SIZE_KEY,0.0f);
+        CacheConfig cacheConf=new CacheConfig(conf);
+{
+          HFileContext meta=new HFileContextBuilder().withBlockSize(DATA_BLOCK_SIZE).build();
+          StoreFileWriter storeFileWriter=new StoreFileWriter.Builder(conf,cacheConf,fs).withFilePath(hfilePath).withFileContext(meta).withBloomType(bloomType).build();
+          for (int i=0; i < NUM_KV; i++) {
+            byte[] row=RandomKeyValueUtil.randomOrderedKey(RAND,i);
+            byte[] qual=RandomKeyValueUtil.randomRowOrQualifier(RAND);
+            byte[] value=RandomKeyValueUtil.randomValue(RAND);
+            KeyValue kv=new KeyValue(row,FAM,qual,value);
+            storeFileWriter.append(kv);
+            cells[i]=kv;
+          }
+          storeFileWriter.close();
+        }
+        HFile.Reader reader=HFile.createReader(fs,hfilePath,cacheConf,true,conf);
+        assertEquals(expectedNumLevels,reader.getTrailer().getNumDataIndexLevels());
+        for (        boolean pread : new boolean[]{false,true}) {
+          HFileScanner scanner=reader.getScanner(true,pread);
+          checkNoSeekBefore(cells,scanner,0);
+          for (int i=1; i < NUM_KV; i++) {
+            checkSeekBefore(cells,scanner,i);
+            checkCell(cells[i - 1],scanner.getCell());
+          }
+          assertTrue(scanner.seekTo());
+          for (int i=NUM_KV - 1; i >= 1; i--) {
+            checkSeekBefore(cells,scanner,i);
+            checkCell(cells[i - 1],scanner.getCell());
+          }
+          checkNoSeekBefore(cells,scanner,0);
+          scanner.close();
+        }
+        reader.close();
+      }
+    }
+  }
+}

@@ -1,0 +1,132 @@
+@Category({RestTests.class,MediumTests.class}) @RunWith(Parameterized.class) public class TestSchemaResource {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestSchemaResource.class);
+  private static final Logger LOG=LoggerFactory.getLogger(TestSchemaResource.class);
+  private static String TABLE1="TestSchemaResource1";
+  private static String TABLE2="TestSchemaResource2";
+  private static final HBaseTestingUtility TEST_UTIL=new HBaseTestingUtility();
+  private static final HBaseRESTTestingUtility REST_TEST_UTIL=new HBaseRESTTestingUtility();
+  private static Client client;
+  private static JAXBContext context;
+  private static Configuration conf;
+  private static TestTableSchemaModel testTableSchemaModel;
+  private static Header extraHdr=null;
+  private static boolean csrfEnabled=true;
+  @Parameterized.Parameters public static Collection<Object[]> parameters(){
+    return HBaseCommonTestingUtility.BOOLEAN_PARAMETERIZED;
+  }
+  public TestSchemaResource(  Boolean csrf){
+    csrfEnabled=csrf;
+  }
+  @BeforeClass public static void setUpBeforeClass() throws Exception {
+    conf=TEST_UTIL.getConfiguration();
+    conf.setBoolean(RESTServer.REST_CSRF_ENABLED_KEY,csrfEnabled);
+    extraHdr=new BasicHeader(RESTServer.REST_CSRF_CUSTOM_HEADER_DEFAULT,"");
+    TEST_UTIL.startMiniCluster();
+    REST_TEST_UTIL.startServletContainer(conf);
+    client=new Client(new Cluster().add("localhost",REST_TEST_UTIL.getServletPort()));
+    testTableSchemaModel=new TestTableSchemaModel();
+    context=JAXBContext.newInstance(ColumnSchemaModel.class,TableSchemaModel.class);
+  }
+  @AfterClass public static void tearDownAfterClass() throws Exception {
+    REST_TEST_UTIL.shutdownServletContainer();
+    TEST_UTIL.shutdownMiniCluster();
+  }
+  @After public void tearDown() throws Exception {
+    Admin admin=TEST_UTIL.getAdmin();
+    for (    String table : new String[]{TABLE1,TABLE2}) {
+      TableName t=TableName.valueOf(table);
+      if (admin.tableExists(t)) {
+        admin.disableTable(t);
+        admin.deleteTable(t);
+      }
+    }
+    conf.set("hbase.rest.readonly","false");
+  }
+  private static byte[] toXML(  TableSchemaModel model) throws JAXBException {
+    StringWriter writer=new StringWriter();
+    context.createMarshaller().marshal(model,writer);
+    return Bytes.toBytes(writer.toString());
+  }
+  private static TableSchemaModel fromXML(  byte[] content) throws JAXBException {
+    return (TableSchemaModel)context.createUnmarshaller().unmarshal(new ByteArrayInputStream(content));
+  }
+  @Test public void testTableCreateAndDeleteXML() throws IOException, JAXBException {
+    String schemaPath="/" + TABLE1 + "/schema";
+    TableSchemaModel model;
+    Response response;
+    Admin admin=TEST_UTIL.getAdmin();
+    assertFalse("Table " + TABLE1 + " should not exist",admin.tableExists(TableName.valueOf(TABLE1)));
+    model=testTableSchemaModel.buildTestModel(TABLE1);
+    testTableSchemaModel.checkModel(model,TABLE1);
+    if (csrfEnabled) {
+      response=client.put(schemaPath,Constants.MIMETYPE_XML,toXML(model));
+      assertEquals(400,response.getCode());
+    }
+    response=client.put(schemaPath,Constants.MIMETYPE_XML,toXML(model),extraHdr);
+    assertEquals("put failed with csrf " + (csrfEnabled ? "enabled" : "disabled"),201,response.getCode());
+    conf.set("hbase.rest.readonly","true");
+    response=client.put(schemaPath,Constants.MIMETYPE_XML,toXML(model),extraHdr);
+    assertEquals(403,response.getCode());
+    response=client.get(schemaPath,Constants.MIMETYPE_XML);
+    assertEquals(200,response.getCode());
+    assertEquals(Constants.MIMETYPE_XML,response.getHeader("content-type"));
+    model=fromXML(response.getBody());
+    testTableSchemaModel.checkModel(model,TABLE1);
+    response=client.get(schemaPath,Constants.MIMETYPE_JSON);
+    assertEquals(200,response.getCode());
+    assertEquals(Constants.MIMETYPE_JSON,response.getHeader("content-type"));
+    model=testTableSchemaModel.fromJSON(Bytes.toString(response.getBody()));
+    testTableSchemaModel.checkModel(model,TABLE1);
+    if (csrfEnabled) {
+      response=client.delete(schemaPath);
+      assertEquals(400,response.getCode());
+    }
+    response=client.delete(schemaPath,extraHdr);
+    assertEquals(403,response.getCode());
+    conf.set("hbase.rest.readonly","false");
+    response=client.delete(schemaPath,extraHdr);
+    assertEquals(200,response.getCode());
+    assertFalse(admin.tableExists(TableName.valueOf(TABLE1)));
+  }
+  @Test public void testTableCreateAndDeletePB() throws IOException, JAXBException {
+    String schemaPath="/" + TABLE2 + "/schema";
+    TableSchemaModel model;
+    Response response;
+    Admin admin=TEST_UTIL.getAdmin();
+    assertFalse(admin.tableExists(TableName.valueOf(TABLE2)));
+    model=testTableSchemaModel.buildTestModel(TABLE2);
+    testTableSchemaModel.checkModel(model,TABLE2);
+    if (csrfEnabled) {
+      response=client.put(schemaPath,Constants.MIMETYPE_PROTOBUF,model.createProtobufOutput());
+      assertEquals(400,response.getCode());
+    }
+    response=client.put(schemaPath,Constants.MIMETYPE_PROTOBUF,model.createProtobufOutput(),extraHdr);
+    assertEquals("put failed with csrf " + (csrfEnabled ? "enabled" : "disabled"),201,response.getCode());
+    conf.set("hbase.rest.readonly","true");
+    response=client.put(schemaPath,Constants.MIMETYPE_PROTOBUF,model.createProtobufOutput(),extraHdr);
+    assertNotNull(extraHdr);
+    assertEquals(403,response.getCode());
+    response=client.get(schemaPath,Constants.MIMETYPE_PROTOBUF);
+    assertEquals(200,response.getCode());
+    assertEquals(Constants.MIMETYPE_PROTOBUF,response.getHeader("content-type"));
+    model=new TableSchemaModel();
+    model.getObjectFromMessage(response.getBody());
+    testTableSchemaModel.checkModel(model,TABLE2);
+    response=client.get(schemaPath,Constants.MIMETYPE_PROTOBUF_IETF);
+    assertEquals(200,response.getCode());
+    assertEquals(Constants.MIMETYPE_PROTOBUF_IETF,response.getHeader("content-type"));
+    model=new TableSchemaModel();
+    model.getObjectFromMessage(response.getBody());
+    testTableSchemaModel.checkModel(model,TABLE2);
+    if (csrfEnabled) {
+      response=client.delete(schemaPath);
+      assertEquals(400,response.getCode());
+    }
+    response=client.delete(schemaPath,extraHdr);
+    assertEquals(403,response.getCode());
+    conf.set("hbase.rest.readonly","false");
+    response=client.delete(schemaPath,extraHdr);
+    assertEquals(200,response.getCode());
+    assertFalse(admin.tableExists(TableName.valueOf(TABLE2)));
+  }
+}

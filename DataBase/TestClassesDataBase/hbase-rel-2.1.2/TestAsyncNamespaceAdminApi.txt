@@ -1,0 +1,121 @@
+/** 
+ * Class to test asynchronous namespace admin operations.
+ */
+@RunWith(Parameterized.class) @Category({LargeTests.class,ClientTests.class}) public class TestAsyncNamespaceAdminApi extends TestAsyncAdminBase {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestAsyncNamespaceAdminApi.class);
+  private String prefix="TestNamespace";
+  private static HMaster master;
+  private static ZKNamespaceManager zkNamespaceManager;
+  @BeforeClass public static void setUpBeforeClass() throws Exception {
+    TEST_UTIL.getConfiguration().setInt(HConstants.HBASE_RPC_TIMEOUT_KEY,60000);
+    TEST_UTIL.getConfiguration().setInt(HConstants.HBASE_CLIENT_OPERATION_TIMEOUT,120000);
+    TEST_UTIL.getConfiguration().setInt(HConstants.HBASE_CLIENT_RETRIES_NUMBER,2);
+    TEST_UTIL.getConfiguration().setInt(START_LOG_ERRORS_AFTER_COUNT_KEY,0);
+    TEST_UTIL.startMiniCluster(1);
+    ASYNC_CONN=ConnectionFactory.createAsyncConnection(TEST_UTIL.getConfiguration()).get();
+    master=TEST_UTIL.getHBaseCluster().getMaster();
+    zkNamespaceManager=new ZKNamespaceManager(master.getZooKeeper());
+    zkNamespaceManager.start();
+    LOG.info("Done initializing cluster");
+  }
+  @Test public void testCreateAndDelete() throws Exception {
+    String testName="testCreateAndDelete";
+    String nsName=prefix + "_" + testName;
+    admin.createNamespace(NamespaceDescriptor.create(nsName).build()).join();
+    assertEquals(3,admin.listNamespaceDescriptors().get().size());
+    TEST_UTIL.waitFor(60000,new Waiter.Predicate<Exception>(){
+      @Override public boolean evaluate() throws Exception {
+        return zkNamespaceManager.list().size() == 3;
+      }
+    }
+);
+    assertNotNull(zkNamespaceManager.get(nsName));
+    admin.deleteNamespace(nsName).join();
+    assertEquals(2,admin.listNamespaceDescriptors().get().size());
+    assertEquals(2,zkNamespaceManager.list().size());
+    assertNull(zkNamespaceManager.get(nsName));
+  }
+  @Test public void testDeleteReservedNS() throws Exception {
+    boolean exceptionCaught=false;
+    try {
+      admin.deleteNamespace(NamespaceDescriptor.DEFAULT_NAMESPACE_NAME_STR).join();
+    }
+ catch (    Exception exp) {
+      LOG.warn(exp.toString(),exp);
+      exceptionCaught=true;
+    }
+ finally {
+      assertTrue(exceptionCaught);
+    }
+    try {
+      admin.deleteNamespace(NamespaceDescriptor.SYSTEM_NAMESPACE_NAME_STR).join();
+    }
+ catch (    Exception exp) {
+      LOG.warn(exp.toString(),exp);
+      exceptionCaught=true;
+    }
+ finally {
+      assertTrue(exceptionCaught);
+    }
+  }
+  @Test public void testNamespaceOperations() throws Exception {
+    admin.createNamespace(NamespaceDescriptor.create(prefix + "ns1").build()).join();
+    admin.createNamespace(NamespaceDescriptor.create(prefix + "ns2").build()).join();
+    runWithExpectedException(new Callable<Void>(){
+      @Override public Void call() throws Exception {
+        admin.createNamespace(NamespaceDescriptor.create(prefix + "ns1").build()).join();
+        return null;
+      }
+    }
+,NamespaceExistException.class);
+    runWithExpectedException(new Callable<Void>(){
+      @Override public Void call() throws Exception {
+        HTableDescriptor htd=new HTableDescriptor(TableName.valueOf("non_existing_namespace","table1"));
+        htd.addFamily(new HColumnDescriptor("family1"));
+        admin.createTable(htd).join();
+        return null;
+      }
+    }
+,NamespaceNotFoundException.class);
+    NamespaceDescriptor ns1=admin.getNamespaceDescriptor(prefix + "ns1").get();
+    assertEquals(prefix + "ns1",ns1.getName());
+    runWithExpectedException(new Callable<NamespaceDescriptor>(){
+      @Override public NamespaceDescriptor call() throws Exception {
+        return admin.getNamespaceDescriptor("non_existing_namespace").get();
+      }
+    }
+,NamespaceNotFoundException.class);
+    admin.deleteNamespace(prefix + "ns2").join();
+    runWithExpectedException(new Callable<Void>(){
+      @Override public Void call() throws Exception {
+        admin.deleteNamespace("non_existing_namespace").join();
+        return null;
+      }
+    }
+,NamespaceNotFoundException.class);
+    ns1=admin.getNamespaceDescriptor(prefix + "ns1").get();
+    ns1.setConfiguration("foo","bar");
+    admin.modifyNamespace(ns1).join();
+    ns1=admin.getNamespaceDescriptor(prefix + "ns1").get();
+    assertEquals("bar",ns1.getConfigurationValue("foo"));
+    runWithExpectedException(new Callable<Void>(){
+      @Override public Void call() throws Exception {
+        admin.modifyNamespace(NamespaceDescriptor.create("non_existing_namespace").build()).join();
+        return null;
+      }
+    }
+,NamespaceNotFoundException.class);
+    admin.deleteNamespace(prefix + "ns1").join();
+  }
+  private static <V,E>void runWithExpectedException(  Callable<V> callable,  Class<E> exceptionClass){
+    try {
+      callable.call();
+    }
+ catch (    Exception ex) {
+      LOG.info("Get exception is " + ex);
+      assertEquals(exceptionClass,ex.getCause().getClass());
+      return;
+    }
+    fail("Should have thrown exception " + exceptionClass);
+  }
+}

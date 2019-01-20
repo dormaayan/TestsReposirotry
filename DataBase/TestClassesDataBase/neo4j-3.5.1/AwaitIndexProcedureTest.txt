@@ -1,0 +1,116 @@
+public class AwaitIndexProcedureTest {
+  private static final int TIMEOUT=10;
+  private static final TimeUnit TIME_UNIT=TimeUnit.SECONDS;
+  private KernelTransaction transaction;
+  private TokenRead tokenRead;
+  private SchemaRead schemaRead;
+  private IndexProcedures procedure;
+  private LabelSchemaDescriptor descriptor;
+  private LabelSchemaDescriptor anyDescriptor;
+  private IndexReference anyIndex;
+  @Before public void setup(){
+    transaction=mock(KernelTransaction.class);
+    tokenRead=mock(TokenRead.class);
+    schemaRead=mock(SchemaRead.class);
+    procedure=new IndexProcedures(transaction,null);
+    descriptor=SchemaDescriptorFactory.forLabel(123,456);
+    anyDescriptor=SchemaDescriptorFactory.forLabel(0,0);
+    anyIndex=forSchema(anyDescriptor);
+    when(transaction.tokenRead()).thenReturn(tokenRead);
+    when(transaction.schemaRead()).thenReturn(schemaRead);
+  }
+  @Test public void shouldThrowAnExceptionIfTheLabelDoesntExist(){
+    when(tokenRead.nodeLabel("NonExistentLabel")).thenReturn(-1);
+    try {
+      procedure.awaitIndex(":NonExistentLabel(prop)",TIMEOUT,TIME_UNIT);
+      fail("Expected an exception");
+    }
+ catch (    ProcedureException e) {
+      assertThat(e.status(),is(Status.Schema.LabelAccessFailed));
+    }
+  }
+  @Test public void shouldThrowAnExceptionIfThePropertyKeyDoesntExist(){
+    when(tokenRead.propertyKey("nonExistentProperty")).thenReturn(-1);
+    try {
+      procedure.awaitIndex(":Label(nonExistentProperty)",TIMEOUT,TIME_UNIT);
+      fail("Expected an exception");
+    }
+ catch (    ProcedureException e) {
+      assertThat(e.status(),is(Status.Schema.PropertyKeyAccessFailed));
+    }
+  }
+  @Test public void shouldLookUpTheIndexByLabelIdAndPropertyKeyId() throws ProcedureException, SchemaRuleNotFoundException, IndexNotFoundKernelException {
+    when(tokenRead.nodeLabel(anyString())).thenReturn(descriptor.getLabelId());
+    when(tokenRead.propertyKey(anyString())).thenReturn(descriptor.getPropertyId());
+    when(schemaRead.index(anyInt(),any())).thenReturn(anyIndex);
+    when(schemaRead.indexGetState(any(IndexReference.class))).thenReturn(ONLINE);
+    procedure.awaitIndex(":Person(name)",TIMEOUT,TIME_UNIT);
+    verify(schemaRead).index(descriptor.getLabelId(),descriptor.getPropertyId());
+  }
+  @Test public void shouldThrowAnExceptionIfTheIndexHasFailed() throws SchemaRuleNotFoundException, IndexNotFoundKernelException {
+    when(tokenRead.nodeLabel(anyString())).thenReturn(0);
+    when(tokenRead.propertyKey(anyString())).thenReturn(0);
+    when(schemaRead.index(anyInt(),any())).thenReturn(anyIndex);
+    when(schemaRead.indexGetState(any(IndexReference.class))).thenReturn(FAILED);
+    when(schemaRead.indexGetFailure(any(IndexReference.class))).thenReturn(Exceptions.stringify(new Exception("Kilroy was here")));
+    try {
+      procedure.awaitIndex(":Person(name)",TIMEOUT,TIME_UNIT);
+      fail("Expected an exception");
+    }
+ catch (    ProcedureException e) {
+      assertThat(e.status(),is(Status.Schema.IndexCreationFailed));
+      assertThat(e.getMessage(),containsString("Kilroy was here"));
+    }
+  }
+  @Test public void shouldThrowAnExceptionIfTheIndexDoesNotExist() throws SchemaRuleNotFoundException {
+    when(tokenRead.propertyKey(anyString())).thenReturn(0);
+    when(tokenRead.nodeLabel(anyString())).thenReturn(0);
+    when(schemaRead.index(anyInt(),any())).thenReturn(IndexReference.NO_INDEX);
+    try {
+      procedure.awaitIndex(":Person(name)",TIMEOUT,TIME_UNIT);
+      fail("Expected an exception");
+    }
+ catch (    ProcedureException e) {
+      assertThat(e.status(),is(Status.Schema.IndexNotFound));
+    }
+  }
+  @Test public void shouldBlockUntilTheIndexIsOnline() throws SchemaRuleNotFoundException, IndexNotFoundKernelException, InterruptedException {
+    when(tokenRead.nodeLabel(anyString())).thenReturn(0);
+    when(tokenRead.propertyKey(anyString())).thenReturn(0);
+    when(schemaRead.index(anyInt(),any())).thenReturn(anyIndex);
+    AtomicReference<InternalIndexState> state=new AtomicReference<>(POPULATING);
+    when(schemaRead.indexGetState(any(IndexReference.class))).then(invocationOnMock -> state.get());
+    AtomicBoolean done=new AtomicBoolean(false);
+    new Thread(() -> {
+      try {
+        procedure.awaitIndex(":Person(name)",TIMEOUT,TIME_UNIT);
+      }
+ catch (      ProcedureException e) {
+        throw new RuntimeException(e);
+      }
+      done.set(true);
+    }
+).start();
+    assertThat(done.get(),is(false));
+    state.set(ONLINE);
+    assertEventually("Procedure did not return after index was online",done::get,is(true),TIMEOUT,TIME_UNIT);
+  }
+  @Test public void shouldTimeoutIfTheIndexTakesTooLongToComeOnline() throws InterruptedException, SchemaRuleNotFoundException, IndexNotFoundKernelException {
+    when(tokenRead.nodeLabel(anyString())).thenReturn(0);
+    when(tokenRead.propertyKey(anyString())).thenReturn(0);
+    when(schemaRead.index(anyInt(),anyInt())).thenReturn(anyIndex);
+    when(schemaRead.indexGetState(any(IndexReference.class))).thenReturn(POPULATING);
+    AtomicReference<ProcedureException> exception=new AtomicReference<>();
+    new Thread(() -> {
+      try {
+        procedure.awaitIndex(":Person(name)",0,TIME_UNIT);
+      }
+ catch (      ProcedureException e) {
+        exception.set(e);
+      }
+    }
+).start();
+    assertEventually("Procedure did not time out",exception::get,not(nullValue()),TIMEOUT,TIME_UNIT);
+    assertThat(exception.get().status(),is(Status.Procedure.ProcedureTimedOut));
+  }
+}

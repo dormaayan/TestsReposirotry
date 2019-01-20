@@ -1,0 +1,86 @@
+@Test public void testSavepoint() throws Exception {
+  final int parallelism=4;
+  final StreamExecutionEnvironment env=StreamExecutionEnvironment.getExecutionEnvironment();
+  env.setRestartStrategy(RestartStrategies.noRestart());
+  env.setStreamTimeCharacteristic(TimeCharacteristic.EventTime);
+switch (testStateBackend) {
+case StateBackendLoader.ROCKSDB_STATE_BACKEND_NAME:
+    env.setStateBackend(new RocksDBStateBackend(new MemoryStateBackend()));
+  break;
+case StateBackendLoader.MEMORY_STATE_BACKEND_NAME:
+env.setStateBackend(new MemoryStateBackend());
+break;
+default :
+throw new UnsupportedOperationException();
+}
+env.enableCheckpointing(500);
+env.setParallelism(parallelism);
+env.setMaxParallelism(parallelism);
+SourceFunction<Tuple2<Long,Long>> nonParallelSource;
+SourceFunction<Tuple2<Long,Long>> nonParallelSourceB;
+SourceFunction<Tuple2<Long,Long>> parallelSource;
+SourceFunction<Tuple2<Long,Long>> parallelSourceB;
+KeyedBroadcastProcessFunction<Long,Tuple2<Long,Long>,Tuple2<Long,Long>,Tuple2<Long,Long>> firstBroadcastFunction;
+KeyedBroadcastProcessFunction<Long,Tuple2<Long,Long>,Tuple2<Long,Long>,Tuple2<Long,Long>> secondBroadcastFunction;
+final Map<Long,Long> expectedFirstState=new HashMap<>();
+expectedFirstState.put(0L,0L);
+expectedFirstState.put(1L,1L);
+expectedFirstState.put(2L,2L);
+expectedFirstState.put(3L,3L);
+final Map<String,Long> expectedSecondState=new HashMap<>();
+expectedSecondState.put("0",0L);
+expectedSecondState.put("1",1L);
+expectedSecondState.put("2",2L);
+expectedSecondState.put("3",3L);
+final Map<Long,String> expectedThirdState=new HashMap<>();
+expectedThirdState.put(0L,"0");
+expectedThirdState.put(1L,"1");
+expectedThirdState.put(2L,"2");
+expectedThirdState.put(3L,"3");
+if (executionMode == StatefulJobSavepointMigrationITCase.ExecutionMode.PERFORM_SAVEPOINT) {
+nonParallelSource=new MigrationTestUtils.CheckpointingNonParallelSourceWithListState(NUM_SOURCE_ELEMENTS);
+nonParallelSourceB=new MigrationTestUtils.CheckpointingNonParallelSourceWithListState(NUM_SOURCE_ELEMENTS);
+parallelSource=new MigrationTestUtils.CheckpointingParallelSourceWithUnionListState(NUM_SOURCE_ELEMENTS);
+parallelSourceB=new MigrationTestUtils.CheckpointingParallelSourceWithUnionListState(NUM_SOURCE_ELEMENTS);
+firstBroadcastFunction=new CheckpointingKeyedBroadcastFunction();
+secondBroadcastFunction=new CheckpointingKeyedSingleBroadcastFunction();
+}
+ else if (executionMode == StatefulJobSavepointMigrationITCase.ExecutionMode.VERIFY_SAVEPOINT) {
+nonParallelSource=new MigrationTestUtils.CheckingNonParallelSourceWithListState(NUM_SOURCE_ELEMENTS);
+nonParallelSourceB=new MigrationTestUtils.CheckingNonParallelSourceWithListState(NUM_SOURCE_ELEMENTS);
+parallelSource=new MigrationTestUtils.CheckingParallelSourceWithUnionListState(NUM_SOURCE_ELEMENTS);
+parallelSourceB=new MigrationTestUtils.CheckingParallelSourceWithUnionListState(NUM_SOURCE_ELEMENTS);
+firstBroadcastFunction=new CheckingKeyedBroadcastFunction(expectedFirstState,expectedSecondState);
+secondBroadcastFunction=new CheckingKeyedSingleBroadcastFunction(expectedThirdState);
+}
+ else {
+throw new IllegalStateException("Unknown ExecutionMode " + executionMode);
+}
+KeyedStream<Tuple2<Long,Long>,Long> npStream=env.addSource(nonParallelSource).uid("CheckpointingSource1").keyBy(new KeySelector<Tuple2<Long,Long>,Long>(){
+private static final long serialVersionUID=-4514793867774977152L;
+@Override public Long getKey(Tuple2<Long,Long> value) throws Exception {
+return value.f0;
+}
+}
+);
+KeyedStream<Tuple2<Long,Long>,Long> pStream=env.addSource(parallelSource).uid("CheckpointingSource2").keyBy(new KeySelector<Tuple2<Long,Long>,Long>(){
+private static final long serialVersionUID=4940496713319948104L;
+@Override public Long getKey(Tuple2<Long,Long> value) throws Exception {
+return value.f0;
+}
+}
+);
+final MapStateDescriptor<Long,Long> firstBroadcastStateDesc=new MapStateDescriptor<>("broadcast-state-1",BasicTypeInfo.LONG_TYPE_INFO,BasicTypeInfo.LONG_TYPE_INFO);
+final MapStateDescriptor<String,Long> secondBroadcastStateDesc=new MapStateDescriptor<>("broadcast-state-2",BasicTypeInfo.STRING_TYPE_INFO,BasicTypeInfo.LONG_TYPE_INFO);
+final MapStateDescriptor<Long,String> thirdBroadcastStateDesc=new MapStateDescriptor<>("broadcast-state-3",BasicTypeInfo.LONG_TYPE_INFO,BasicTypeInfo.STRING_TYPE_INFO);
+BroadcastStream<Tuple2<Long,Long>> npBroadcastStream=env.addSource(nonParallelSourceB).uid("BrCheckpointingSource1").broadcast(firstBroadcastStateDesc,secondBroadcastStateDesc);
+BroadcastStream<Tuple2<Long,Long>> pBroadcastStream=env.addSource(parallelSourceB).uid("BrCheckpointingSource2").broadcast(thirdBroadcastStateDesc);
+npStream.connect(npBroadcastStream).process(firstBroadcastFunction).uid("BrProcess1").addSink(new MigrationTestUtils.AccumulatorCountingSink<>());
+pStream.connect(pBroadcastStream).process(secondBroadcastFunction).uid("BrProcess2").addSink(new MigrationTestUtils.AccumulatorCountingSink<>());
+if (executionMode == StatefulJobSavepointMigrationITCase.ExecutionMode.PERFORM_SAVEPOINT) {
+executeAndSavepoint(env,"src/test/resources/" + getBroadcastSavepointPath(testMigrateVersion,testStateBackend),new Tuple2<>(MigrationTestUtils.AccumulatorCountingSink.NUM_ELEMENTS_ACCUMULATOR,2 * NUM_SOURCE_ELEMENTS));
+}
+ else {
+restoreAndExecute(env,getResourceFilename(getBroadcastSavepointPath(testMigrateVersion,testStateBackend)),new Tuple2<>(MigrationTestUtils.CheckingNonParallelSourceWithListState.SUCCESSFUL_RESTORE_CHECK_ACCUMULATOR,2),new Tuple2<>(MigrationTestUtils.CheckingParallelSourceWithUnionListState.SUCCESSFUL_RESTORE_CHECK_ACCUMULATOR,2 * parallelism),new Tuple2<>(MigrationTestUtils.AccumulatorCountingSink.NUM_ELEMENTS_ACCUMULATOR,NUM_SOURCE_ELEMENTS * 2));
+}
+}

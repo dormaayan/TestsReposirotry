@@ -1,0 +1,51 @@
+/** 
+ * Unit tests that uses ZooKeeper but does not use the master-side methods but rather acts directly on ZK.
+ * @throws Exception
+ */
+@Test public void testActiveMasterManagerFromZK() throws Exception {
+  ZKWatcher zk=new ZKWatcher(TEST_UTIL.getConfiguration(),"testActiveMasterManagerFromZK",null,true);
+  try {
+    ZKUtil.deleteNode(zk,zk.getZNodePaths().masterAddressZNode);
+    ZKUtil.deleteNode(zk,zk.getZNodePaths().clusterStateZNode);
+  }
+ catch (  KeeperException.NoNodeException nne) {
+  }
+  ServerName firstMasterAddress=ServerName.valueOf("localhost",1,System.currentTimeMillis());
+  ServerName secondMasterAddress=ServerName.valueOf("localhost",2,System.currentTimeMillis());
+  DummyMaster ms1=new DummyMaster(zk,firstMasterAddress);
+  ActiveMasterManager activeMasterManager=ms1.getActiveMasterManager();
+  assertFalse(activeMasterManager.clusterHasActiveMaster.get());
+  ClusterStatusTracker clusterStatusTracker=ms1.getClusterStatusTracker();
+  clusterStatusTracker.setClusterUp();
+  activeMasterManager.blockUntilBecomingActiveMaster(100,Mockito.mock(MonitoredTask.class));
+  assertTrue(activeMasterManager.clusterHasActiveMaster.get());
+  assertMaster(zk,firstMasterAddress);
+  WaitToBeMasterThread t=new WaitToBeMasterThread(zk,secondMasterAddress);
+  t.start();
+  int sleeps=0;
+  while (!t.manager.clusterHasActiveMaster.get() && sleeps < 100) {
+    Thread.sleep(10);
+    sleeps++;
+  }
+  assertTrue(activeMasterManager.clusterHasActiveMaster.get());
+  assertTrue(t.manager.clusterHasActiveMaster.get());
+  assertFalse(t.isActiveMaster);
+  ms1.stop("stopping first server");
+  NodeDeletionListener listener=new NodeDeletionListener(zk,zk.getZNodePaths().masterAddressZNode);
+  zk.registerListener(listener);
+  LOG.info("Deleting master node");
+  ZKUtil.deleteNode(zk,zk.getZNodePaths().masterAddressZNode);
+  LOG.info("Waiting for active master manager to be notified");
+  listener.waitForDeletion();
+  LOG.info("Master node deleted");
+  sleeps=0;
+  while (!t.isActiveMaster && sleeps < 100) {
+    Thread.sleep(10);
+    sleeps++;
+  }
+  LOG.debug("Slept " + sleeps + " times");
+  assertTrue(t.manager.clusterHasActiveMaster.get());
+  assertTrue(t.isActiveMaster);
+  LOG.info("Deleting master node");
+  ZKUtil.deleteNode(zk,zk.getZNodePaths().masterAddressZNode);
+}

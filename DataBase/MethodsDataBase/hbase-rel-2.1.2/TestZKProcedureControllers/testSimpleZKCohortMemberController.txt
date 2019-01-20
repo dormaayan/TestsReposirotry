@@ -1,0 +1,46 @@
+/** 
+ * Smaller test to just test the actuation on the cohort member
+ * @throws Exception on failure
+ */
+@Test public void testSimpleZKCohortMemberController() throws Exception {
+  ZKWatcher watcher=UTIL.getZooKeeperWatcher();
+  final String operationName="instanceTest";
+  final Subprocedure sub=Mockito.mock(Subprocedure.class);
+  Mockito.when(sub.getName()).thenReturn(operationName);
+  final byte[] data=new byte[]{1,2,3};
+  final CountDownLatch prepared=new CountDownLatch(1);
+  final CountDownLatch committed=new CountDownLatch(1);
+  final ForeignExceptionDispatcher monitor=spy(new ForeignExceptionDispatcher());
+  final ZKProcedureMemberRpcs controller=new ZKProcedureMemberRpcs(watcher,"testSimple");
+  final ProcedureMember member=Mockito.mock(ProcedureMember.class);
+  Mockito.doReturn(sub).when(member).createSubprocedure(operationName,data);
+  Mockito.doAnswer(new Answer<Void>(){
+    @Override public Void answer(    InvocationOnMock invocation) throws Throwable {
+      controller.sendMemberAcquired(sub);
+      prepared.countDown();
+      return null;
+    }
+  }
+).when(member).submitSubprocedure(sub);
+  Mockito.doAnswer(new Answer<Void>(){
+    @Override public Void answer(    InvocationOnMock invocation) throws Throwable {
+      controller.sendMemberCompleted(sub,memberData);
+      committed.countDown();
+      return null;
+    }
+  }
+).when(member).receivedReachedGlobalBarrier(operationName);
+  controller.start(COHORT_NODE_NAME,member);
+  String prepare=ZKProcedureUtil.getAcquireBarrierNode(controller.getZkController(),operationName);
+  ZKUtil.createSetData(watcher,prepare,ProtobufUtil.prependPBMagic(data));
+  prepared.await();
+  String commit=ZKProcedureUtil.getReachedBarrierNode(controller.getZkController(),operationName);
+  LOG.debug("Found prepared, posting commit node:" + commit);
+  ZKUtil.createAndFailSilent(watcher,commit);
+  LOG.debug("Commit node:" + commit + ", exists:"+ ZKUtil.checkExists(watcher,commit));
+  committed.await();
+  verify(monitor,never()).receive(Mockito.any());
+  ZKUtil.deleteNodeRecursively(watcher,controller.getZkController().getBaseZnode());
+  assertEquals("Didn't delete prepare node",-1,ZKUtil.checkExists(watcher,prepare));
+  assertEquals("Didn't delete commit node",-1,ZKUtil.checkExists(watcher,commit));
+}

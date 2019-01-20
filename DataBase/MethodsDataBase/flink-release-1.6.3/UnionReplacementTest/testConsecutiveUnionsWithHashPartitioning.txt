@@ -1,0 +1,29 @@
+/** 
+ * Checks that a plan with consecutive UNIONs followed by PartitionByHash is correctly translated. The program can be illustrated as follows: Src1 -\ >-> Union12--< Src2 -/              \ >-> Union123 -> PartitionByHash -> Output Src3 ----------------/ In the resulting plan, the hash partitioning (ShippingStrategy.PARTITION_HASH) must be pushed to the inputs of the unions (Src1, Src2, Src3).
+ */
+@Test public void testConsecutiveUnionsWithHashPartitioning() throws Exception {
+  ExecutionEnvironment env=ExecutionEnvironment.getExecutionEnvironment();
+  env.setParallelism(DEFAULT_PARALLELISM);
+  DataSet<Tuple2<Long,Long>> src1=env.fromElements(new Tuple2<>(0L,0L));
+  DataSet<Tuple2<Long,Long>> src2=env.fromElements(new Tuple2<>(0L,0L));
+  DataSet<Tuple2<Long,Long>> src3=env.fromElements(new Tuple2<>(0L,0L));
+  DataSet<Tuple2<Long,Long>> union12=src1.union(src2);
+  DataSet<Tuple2<Long,Long>> union123=union12.union(src3);
+  union123.partitionByHash(1).output(new DiscardingOutputFormat<Tuple2<Long,Long>>()).name("out");
+  OptimizedPlan optimizedPlan=compileNoStats(env.createProgramPlan());
+  OptimizerPlanNodeResolver resolver=getOptimizerPlanNodeResolver(optimizedPlan);
+  SingleInputPlanNode sink=resolver.getNode("out");
+  assertEquals("Sink input should be hash partitioned.",PartitioningProperty.HASH_PARTITIONED,sink.getInput().getGlobalProperties().getPartitioning());
+  assertEquals("Sink input should be hash partitioned on 1.",new FieldList(1),sink.getInput().getGlobalProperties().getPartitioningFields());
+  SingleInputPlanNode partitioner=(SingleInputPlanNode)sink.getInput().getSource();
+  assertTrue(partitioner.getDriverStrategy() == DriverStrategy.UNARY_NO_OP);
+  assertEquals("Partitioner input should be hash partitioned.",PartitioningProperty.HASH_PARTITIONED,partitioner.getInput().getGlobalProperties().getPartitioning());
+  assertEquals("Partitioner input should be hash partitioned on 1.",new FieldList(1),partitioner.getInput().getGlobalProperties().getPartitioningFields());
+  assertEquals("Partitioner input channel should be forwarding",ShipStrategyType.FORWARD,partitioner.getInput().getShipStrategy());
+  NAryUnionPlanNode union=(NAryUnionPlanNode)partitioner.getInput().getSource();
+  for (  Channel c : union.getInputs()) {
+    assertEquals("Union input should be hash partitioned",PartitioningProperty.HASH_PARTITIONED,c.getGlobalProperties().getPartitioning());
+    assertEquals("Union input channel should be hash partitioning",ShipStrategyType.PARTITION_HASH,c.getShipStrategy());
+    assertTrue("Union input should be data source",c.getSource() instanceof SourcePlanNode);
+  }
+}

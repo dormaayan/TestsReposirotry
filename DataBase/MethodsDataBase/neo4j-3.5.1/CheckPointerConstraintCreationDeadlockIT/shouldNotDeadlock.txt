@@ -1,0 +1,48 @@
+@Test public void shouldNotDeadlock() throws Exception {
+  List<TransactionRepresentation> transactions=createConstraintCreatingTransactions();
+  Monitors monitors=new Monitors();
+  GraphDatabaseAPI db=(GraphDatabaseAPI)new TestGraphDatabaseFactory().setMonitors(monitors).newImpermanentDatabase();
+  Barrier.Control controller=new Barrier.Control();
+  boolean success=false;
+  try {
+    IndexingService.Monitor monitor=new IndexingService.MonitorAdapter(){
+      @Override public void indexPopulationScanComplete(){
+        controller.reached();
+      }
+    }
+;
+    monitors.addMonitorListener(monitor);
+    Future<Object> applier=applyInT2(db,transactions);
+    controller.await();
+    Future<Object> checkPointer=t3.execute(state -> db.getDependencyResolver().resolveDependency(CheckPointer.class).forceCheckPoint(new SimpleTriggerInfo("MANUAL")));
+    try {
+      t3.get().waitUntilWaiting(details -> details.isAt(LockWrapper.class,"writeLock"));
+    }
+ catch (    IllegalStateException e) {
+      checkPointer.get();
+    }
+    controller.release();
+    applier.get(10,SECONDS);
+    checkPointer.get(10,SECONDS);
+    success=true;
+    try (Transaction tx=db.beginTx()){
+      ConstraintDefinition constraint=single(db.schema().getConstraints(LABEL));
+      assertEquals(KEY,single(constraint.getPropertyKeys()));
+      tx.success();
+    }
+     createNode(db,"A");
+    try {
+      createNode(db,"A");
+      fail("Should have failed");
+    }
+ catch (    ConstraintViolationException e) {
+    }
+  }
+  finally {
+    if (!success) {
+      t2.interrupt();
+      t3.interrupt();
+    }
+    db.shutdown();
+  }
+}

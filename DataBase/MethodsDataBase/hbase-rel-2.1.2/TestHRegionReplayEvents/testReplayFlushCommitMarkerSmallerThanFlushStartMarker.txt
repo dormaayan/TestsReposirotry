@@ -1,0 +1,66 @@
+/** 
+ * Tests the case where we prepare a flush with some seqId and we receive a flush commit marker less than the previous flush start marker.
+ */
+@Test public void testReplayFlushCommitMarkerSmallerThanFlushStartMarker() throws IOException {
+  putDataWithFlushes(primaryRegion,100,200,100);
+  int numRows=300;
+  reader=createWALReaderForPrimary();
+  LOG.info("-- Replaying edits and flush events in secondary");
+  FlushDescriptor startFlushDesc=null;
+  FlushDescriptor commitFlushDesc=null;
+  int lastReplayed=0;
+  while (true) {
+    System.out.println(lastReplayed);
+    WAL.Entry entry=reader.next();
+    if (entry == null) {
+      break;
+    }
+    FlushDescriptor flushDesc=WALEdit.getFlushDescriptor(entry.getEdit().getCells().get(0));
+    if (flushDesc != null) {
+      if (flushDesc.getAction() == FlushAction.START_FLUSH) {
+        if (startFlushDesc == null) {
+          startFlushDesc=flushDesc;
+        }
+ else {
+          LOG.info("-- Replaying flush start in secondary");
+          startFlushDesc=flushDesc;
+          PrepareFlushResult result=secondaryRegion.replayWALFlushStartMarker(startFlushDesc);
+          assertNull(result.result);
+        }
+      }
+ else       if (flushDesc.getAction() == FlushAction.COMMIT_FLUSH) {
+        if (commitFlushDesc == null) {
+          commitFlushDesc=flushDesc;
+        }
+      }
+      verifyData(secondaryRegion,0,lastReplayed + 1,cq,families);
+    }
+ else {
+      lastReplayed=replayEdit(secondaryRegion,entry);
+    }
+  }
+  verifyData(secondaryRegion,0,numRows,cq,families);
+  int expectedStoreFileCount=0;
+  for (  HStore s : secondaryRegion.getStores()) {
+    assertEquals(expectedStoreFileCount,s.getStorefilesCount());
+  }
+  long regionMemstoreSize=secondaryRegion.getMemStoreDataSize();
+  LOG.info("Testing replaying flush COMMIT " + commitFlushDesc + " on top of flush START"+ startFlushDesc);
+  assertTrue(commitFlushDesc.getFlushSequenceNumber() < startFlushDesc.getFlushSequenceNumber());
+  LOG.info("-- Replaying flush commit in secondary" + commitFlushDesc);
+  secondaryRegion.replayWALFlushCommitMarker(commitFlushDesc);
+  expectedStoreFileCount++;
+  for (  HStore s : secondaryRegion.getStores()) {
+    assertEquals(expectedStoreFileCount,s.getStorefilesCount());
+  }
+  HStore store=secondaryRegion.getStore(Bytes.toBytes("cf1"));
+  MemStoreSize mss=store.getFlushableSize();
+  assertTrue(mss.getHeapSize() > 0);
+  long newRegionMemstoreSize=secondaryRegion.getMemStoreDataSize();
+  assertEquals(regionMemstoreSize,newRegionMemstoreSize);
+  assertNotNull(secondaryRegion.getPrepareFlushResult());
+  LOG.info("-- Verifying edits from secondary");
+  verifyData(secondaryRegion,0,numRows,cq,families);
+  LOG.info("-- Verifying edits from primary.");
+  verifyData(primaryRegion,0,numRows,cq,families);
+}

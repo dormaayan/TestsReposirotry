@@ -1,0 +1,37 @@
+@Test public void testHandlerIsolation() throws IOException, InterruptedException {
+  CallRunner generalTask=createMockTask();
+  CallRunner priorityTask=createMockTask();
+  CallRunner replicationTask=createMockTask();
+  List<CallRunner> tasks=ImmutableList.of(generalTask,priorityTask,replicationTask);
+  Map<CallRunner,Integer> qos=ImmutableMap.of(generalTask,0,priorityTask,HConstants.HIGH_QOS + 1,replicationTask,HConstants.REPLICATION_QOS);
+  PriorityFunction qosFunction=mock(PriorityFunction.class);
+  final Map<CallRunner,Thread> handlerThreads=Maps.newHashMap();
+  final CountDownLatch countDownLatch=new CountDownLatch(tasks.size());
+  Answer<Void> answerToRun=new Answer<Void>(){
+    @Override public Void answer(    InvocationOnMock invocationOnMock) throws Throwable {
+synchronized (handlerThreads) {
+        handlerThreads.put((CallRunner)invocationOnMock.getMock(),Thread.currentThread());
+      }
+      countDownLatch.countDown();
+      return null;
+    }
+  }
+;
+  for (  CallRunner task : tasks) {
+    task.setStatus(new MonitoredRPCHandlerImpl());
+    doAnswer(answerToRun).when(task).run();
+  }
+  RpcScheduler scheduler=new SimpleRpcScheduler(conf,1,1,1,qosFunction,HConstants.HIGH_QOS);
+  scheduler.init(CONTEXT);
+  scheduler.start();
+  for (  CallRunner task : tasks) {
+    when(qosFunction.getPriority(any(),any(),any())).thenReturn(qos.get(task));
+    scheduler.dispatch(task);
+  }
+  for (  CallRunner task : tasks) {
+    verify(task,timeout(10000)).run();
+  }
+  scheduler.stop();
+  countDownLatch.await();
+  assertEquals(3,ImmutableSet.copyOf(handlerThreads.values()).size());
+}

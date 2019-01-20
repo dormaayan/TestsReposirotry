@@ -1,0 +1,69 @@
+/** 
+ * Test master failover. Start up three fake regionservers and a master.
+ * @throws IOException
+ * @throws KeeperException
+ * @throws InterruptedException
+ * @throws org.apache.hbase.thirdparty.com.google.protobuf.ServiceException
+ */
+@Ignore @Test public void testFailover() throws Exception {
+  final long now=System.currentTimeMillis();
+  final ServerName sn0=ServerName.valueOf("0.example.org",0,now);
+  final ServerName sn1=ServerName.valueOf("1.example.org",1,now);
+  final ServerName sn2=ServerName.valueOf("2.example.org",2,now);
+  final ServerName[] sns=new ServerName[]{sn0,sn1,sn2};
+  final Configuration conf=TESTUTIL.getConfiguration();
+  final MockRegionServer rs0=new MockRegionServer(conf,sn0);
+  final MockRegionServer rs1=new MockRegionServer(conf,sn1);
+  final MockRegionServer rs2=new MockRegionServer(conf,sn2);
+  MetaTableLocator.setMetaLocation(rs0.getZooKeeper(),rs0.getServerName(),RegionState.State.OPEN);
+  final TableName tableName=TableName.valueOf(name.getMethodName());
+  Result[] results=new Result[]{MetaMockingUtil.getMetaTableRowResult(new HRegionInfo(tableName,HConstants.EMPTY_START_ROW,HBaseTestingUtility.KEYS[1]),rs2.getServerName()),MetaMockingUtil.getMetaTableRowResult(new HRegionInfo(tableName,HBaseTestingUtility.KEYS[1],HBaseTestingUtility.KEYS[2]),rs2.getServerName()),MetaMockingUtil.getMetaTableRowResult(new HRegionInfo(tableName,HBaseTestingUtility.KEYS[2],HConstants.EMPTY_END_ROW),rs2.getServerName())};
+  rs1.setNextResults(HRegionInfo.FIRST_META_REGIONINFO.getRegionName(),results);
+  final ClusterConnection mockedConnection=HConnectionTestingUtility.getMockedConnectionAndDecorate(TESTUTIL.getConfiguration(),rs0,rs0,rs0.getServerName(),HRegionInfo.FIRST_META_REGIONINFO);
+  HMaster master=new HMaster(conf){
+    @Override InetAddress getRemoteInetAddress(    final int port,    final long serverStartCode) throws UnknownHostException {
+      if (port > sns.length) {
+        return super.getRemoteInetAddress(port,serverStartCode);
+      }
+      ServerName sn=sns[port];
+      return InetAddress.getByAddress(sn.getHostname(),new byte[]{10,0,0,(byte)sn.getPort()});
+    }
+    @Override protected void initClusterSchemaService() throws IOException, InterruptedException {
+    }
+    @Override protected ServerManager createServerManager(    MasterServices master) throws IOException {
+      ServerManager sm=super.createServerManager(master);
+      ServerManager spy=Mockito.spy(sm);
+      return spy;
+    }
+    @Override public ClusterConnection getConnection(){
+      return mockedConnection;
+    }
+    @Override public ClusterConnection getClusterConnection(){
+      return mockedConnection;
+    }
+  }
+;
+  master.start();
+  try {
+    while (!master.serviceStarted)     Threads.sleep(10);
+    for (int i=0; i < sns.length; i++) {
+      RegionServerReportRequest.Builder request=RegionServerReportRequest.newBuilder();
+      ;
+      ServerName sn=ServerName.parseVersionedServerName(sns[i].getVersionedBytes());
+      request.setServer(ProtobufUtil.toServerName(sn));
+      request.setLoad(ServerMetricsBuilder.toServerLoad(ServerMetricsBuilder.of(sn)));
+      master.getMasterRpcServices().regionServerReport(null,request.build());
+    }
+    while (!master.isInitialized()) {
+      Threads.sleep(100);
+    }
+    assertTrue(master.isInitialized());
+  }
+  finally {
+    rs0.stop("Test is done");
+    rs1.stop("Test is done");
+    rs2.stop("Test is done");
+    master.stopMaster();
+    master.join();
+  }
+}

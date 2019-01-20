@@ -1,0 +1,40 @@
+/** 
+ * Test filter. Filter will filter out any write time that is <= 5 (BOUNDARY). We count how many items we filter out and we count how many cells make it through for distribution way down below in the Table#batch implementation. Puts in place a custom DevNullConnection so we can insert our counting Table.
+ * @throws IOException
+ */
+@Test public void testWALEntryFilter() throws IOException {
+  Configuration conf=HBaseConfiguration.create();
+  conf.setClass(WALEntrySinkFilter.WAL_ENTRY_FILTER_KEY,IfTimeIsGreaterThanBOUNDARYWALEntrySinkFilterImpl.class,WALEntrySinkFilter.class);
+  conf.setClass("hbase.client.connection.impl",DevNullConnection.class,Connection.class);
+  ReplicationSink sink=new ReplicationSink(conf,STOPPABLE);
+  List<org.apache.hadoop.hbase.shaded.protobuf.generated.AdminProtos.WALEntry> entries=new ArrayList<>();
+  AdminProtos.WALEntry.Builder entryBuilder=AdminProtos.WALEntry.newBuilder();
+  ByteString tableName=ByteString.copyFromUtf8(TableName.valueOf(this.name.getMethodName()).toString());
+  final List<Cell> cells=new ArrayList<>();
+  int count=BOUNDARY * 2;
+  for (int i=0; i < count; i++) {
+    byte[] bytes=Bytes.toBytes(i);
+    entryBuilder.clear();
+    entryBuilder.setKey(entryBuilder.getKeyBuilder().setLogSequenceNumber(i).setEncodedRegionName(ByteString.copyFrom(bytes)).setWriteTime(i).setTableName(tableName).build());
+    entryBuilder.setAssociatedCellCount(1);
+    entries.add(entryBuilder.build());
+    CellBuilder cellBuilder=CellBuilderFactory.create(CellBuilderType.DEEP_COPY);
+    Cell cell=cellBuilder.setRow(bytes).setFamily(bytes).setQualifier(bytes).setType(Cell.Type.Put).setTimestamp(i).setValue(bytes).build();
+    cells.add(cell);
+  }
+  CellScanner cellScanner=new CellScanner(){
+    int index=-1;
+    @Override public Cell current(){
+      return cells.get(index);
+    }
+    @Override public boolean advance() throws IOException {
+      index++;
+      return index < cells.size();
+    }
+  }
+;
+  sink.replicateEntries(entries,cellScanner,null,null,null);
+  assertTrue(FILTERED.get() > 0);
+  assertTrue(UNFILTERED.get() > 0);
+  assertEquals(count,FILTERED.get() + UNFILTERED.get());
+}

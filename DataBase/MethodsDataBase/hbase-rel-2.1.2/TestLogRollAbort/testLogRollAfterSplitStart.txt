@@ -1,0 +1,51 @@
+/** 
+ * Tests the case where a RegionServer enters a GC pause, comes back online after the master declared it dead and started to split. Want log rolling after a master split to fail. See HBASE-2312.
+ */
+@Test public void testLogRollAfterSplitStart() throws IOException {
+  LOG.info("Verify wal roll after split starts will fail.");
+  String logName=ServerName.valueOf("testLogRollAfterSplitStart",16010,System.currentTimeMillis()).toString();
+  Path thisTestsDir=new Path(HBASELOGDIR,AbstractFSWALProvider.getWALDirectoryName(logName));
+  final WALFactory wals=new WALFactory(conf,logName);
+  try {
+    TableName tableName=TableName.valueOf(this.getClass().getName());
+    RegionInfo regionInfo=RegionInfoBuilder.newBuilder(tableName).build();
+    WAL log=wals.getWAL(regionInfo);
+    MultiVersionConcurrencyControl mvcc=new MultiVersionConcurrencyControl(1);
+    int total=20;
+    for (int i=0; i < total; i++) {
+      WALEdit kvs=new WALEdit();
+      kvs.add(new KeyValue(Bytes.toBytes(i),tableName.getName(),tableName.getName()));
+      NavigableMap<byte[],Integer> scopes=new TreeMap<>(Bytes.BYTES_COMPARATOR);
+      scopes.put(Bytes.toBytes("column"),0);
+      log.append(regionInfo,new WALKeyImpl(regionInfo.getEncodedNameAsBytes(),tableName,System.currentTimeMillis(),mvcc,scopes),kvs,true);
+    }
+    log.sync();
+    ((AbstractFSWAL<?>)log).replaceWriter(((FSHLog)log).getOldPath(),null,null);
+    Path rsSplitDir=thisTestsDir.suffix(AbstractFSWALProvider.SPLITTING_EXT);
+    if (!fs.rename(thisTestsDir,rsSplitDir)) {
+      throw new IOException("Failed fs.rename for log split: " + thisTestsDir);
+    }
+    LOG.debug("Renamed region directory: " + rsSplitDir);
+    LOG.debug("Processing the old log files.");
+    WALSplitter.split(HBASELOGDIR,rsSplitDir,OLDLOGDIR,fs,conf,wals);
+    LOG.debug("Trying to roll the WAL.");
+    try {
+      log.rollWriter();
+      Assert.fail("rollWriter() did not throw any exception.");
+    }
+ catch (    IOException ioe) {
+      if (ioe.getCause() instanceof FileNotFoundException) {
+        LOG.info("Got the expected exception: ",ioe.getCause());
+      }
+ else {
+        Assert.fail("Unexpected exception: " + ioe);
+      }
+    }
+  }
+  finally {
+    wals.close();
+    if (fs.exists(thisTestsDir)) {
+      fs.delete(thisTestsDir,true);
+    }
+  }
+}

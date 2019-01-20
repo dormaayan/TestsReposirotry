@@ -1,0 +1,171 @@
+public abstract class AbstractDisruptionTestCase extends ESIntegTestCase {
+  static final TimeValue DISRUPTION_HEALING_OVERHEAD=TimeValue.timeValueSeconds(40);
+  private ClusterDiscoveryConfiguration discoveryConfig;
+  @Override protected Settings nodeSettings(  int nodeOrdinal){
+    return Settings.builder().put(discoveryConfig.nodeSettings(nodeOrdinal)).put(TestZenDiscovery.USE_MOCK_PINGS.getKey(),false).build();
+  }
+  @Before public void clearConfig(){
+    discoveryConfig=null;
+  }
+  @Override protected int numberOfShards(){
+    return 3;
+  }
+  @Override protected int numberOfReplicas(){
+    return 1;
+  }
+  private boolean disableBeforeIndexDeletion;
+  @Before public void setUp() throws Exception {
+    super.setUp();
+    disableBeforeIndexDeletion=false;
+  }
+  @Override public void setDisruptionScheme(  ServiceDisruptionScheme scheme){
+    if (scheme instanceof NetworkDisruption && ((NetworkDisruption)scheme).getNetworkLinkDisruptionType() instanceof NetworkDisruption.NetworkUnresponsive) {
+      disableBeforeIndexDeletion=true;
+    }
+    super.setDisruptionScheme(scheme);
+  }
+  @Override protected void beforeIndexDeletion() throws Exception {
+    if (disableBeforeIndexDeletion == false) {
+      super.beforeIndexDeletion();
+      internalCluster().assertConsistentHistoryBetweenTranslogAndLuceneIndex();
+      internalCluster().assertSeqNos();
+      internalCluster().assertSameDocIdsOnShards();
+    }
+  }
+  List<String> startCluster(  int numberOfNodes) throws ExecutionException, InterruptedException {
+    return startCluster(numberOfNodes,-1);
+  }
+  List<String> startCluster(  int numberOfNodes,  int minimumMasterNode) throws ExecutionException, InterruptedException {
+    return startCluster(numberOfNodes,minimumMasterNode,null);
+  }
+  List<String> startCluster(  int numberOfNodes,  int minimumMasterNode,  @Nullable int[] unicastHostsOrdinals) throws ExecutionException, InterruptedException {
+    configureCluster(numberOfNodes,unicastHostsOrdinals,minimumMasterNode);
+    List<String> nodes=internalCluster().startNodes(numberOfNodes);
+    ensureStableCluster(numberOfNodes);
+    ZenPing zenPing=((TestZenDiscovery)internalCluster().getInstance(Discovery.class)).getZenPing();
+    if (zenPing instanceof UnicastZenPing) {
+      ((UnicastZenPing)zenPing).clearTemporalResponses();
+    }
+    return nodes;
+  }
+  static final Settings DEFAULT_SETTINGS=Settings.builder().put(FaultDetection.PING_TIMEOUT_SETTING.getKey(),"1s").put(FaultDetection.PING_RETRIES_SETTING.getKey(),"1").put("discovery.zen.join_timeout","10s").put(DiscoverySettings.PUBLISH_TIMEOUT_SETTING.getKey(),"1s").put(TransportService.TCP_CONNECT_TIMEOUT.getKey(),"10s").build();
+  @Override protected Collection<Class<? extends Plugin>> nodePlugins(){
+    return Arrays.asList(MockTransportService.TestPlugin.class);
+  }
+  void configureCluster(  int numberOfNodes,  @Nullable int[] unicastHostsOrdinals,  int minimumMasterNode) throws ExecutionException, InterruptedException {
+    configureCluster(DEFAULT_SETTINGS,numberOfNodes,unicastHostsOrdinals,minimumMasterNode);
+  }
+  void configureCluster(  Settings settings,  int numberOfNodes,  @Nullable int[] unicastHostsOrdinals,  int minimumMasterNode) throws ExecutionException, InterruptedException {
+    if (minimumMasterNode < 0) {
+      minimumMasterNode=numberOfNodes / 2 + 1;
+    }
+    logger.info("---> configured unicast");
+    Settings nodeSettings=Settings.builder().put(settings).put(NodeEnvironment.MAX_LOCAL_STORAGE_NODES_SETTING.getKey(),numberOfNodes).put(ElectMasterService.DISCOVERY_ZEN_MINIMUM_MASTER_NODES_SETTING.getKey(),minimumMasterNode).build();
+    if (discoveryConfig == null) {
+      if (unicastHostsOrdinals == null) {
+        discoveryConfig=new ClusterDiscoveryConfiguration.UnicastZen(numberOfNodes,nodeSettings);
+      }
+ else {
+        discoveryConfig=new ClusterDiscoveryConfiguration.UnicastZen(numberOfNodes,nodeSettings,unicastHostsOrdinals);
+      }
+    }
+  }
+  ClusterState getNodeClusterState(  String node){
+    return client(node).admin().cluster().prepareState().setLocal(true).get().getState();
+  }
+  void assertNoMaster(  final String node) throws Exception {
+    assertNoMaster(node,null,TimeValue.timeValueSeconds(10));
+  }
+  void assertNoMaster(  final String node,  TimeValue maxWaitTime) throws Exception {
+    assertNoMaster(node,null,maxWaitTime);
+  }
+  void assertNoMaster(  final String node,  @Nullable final ClusterBlock expectedBlocks,  TimeValue maxWaitTime) throws Exception {
+    assertBusy(() -> {
+      ClusterState state=getNodeClusterState(node);
+      final DiscoveryNodes nodes=state.nodes();
+      assertNull("node [" + node + "] still has ["+ nodes.getMasterNode()+ "] as master",nodes.getMasterNode());
+      if (expectedBlocks != null) {
+        for (        ClusterBlockLevel level : expectedBlocks.levels()) {
+          assertTrue("node [" + node + "] does have level ["+ level+ "] in it's blocks",state.getBlocks().hasGlobalBlock(level));
+        }
+      }
+    }
+,maxWaitTime.getMillis(),TimeUnit.MILLISECONDS);
+  }
+  void assertDifferentMaster(  final String node,  final String oldMasterNode) throws Exception {
+    assertBusy(() -> {
+      ClusterState state=getNodeClusterState(node);
+      String masterNode=null;
+      if (state.nodes().getMasterNode() != null) {
+        masterNode=state.nodes().getMasterNode().getName();
+      }
+      logger.trace("[{}] master is [{}]",node,state.nodes().getMasterNode());
+      assertThat("node [" + node + "] still has ["+ masterNode+ "] as master",oldMasterNode,not(equalTo(masterNode)));
+    }
+,10,TimeUnit.SECONDS);
+  }
+  void assertMaster(  String masterNode,  List<String> nodes) throws Exception {
+    assertBusy(() -> {
+      for (      String node : nodes) {
+        ClusterState state=getNodeClusterState(node);
+        String failMsgSuffix="cluster_state:\n" + state;
+        assertThat("wrong node count on [" + node + "]. "+ failMsgSuffix,state.nodes().getSize(),equalTo(nodes.size()));
+        String otherMasterNodeName=state.nodes().getMasterNode() != null ? state.nodes().getMasterNode().getName() : null;
+        assertThat("wrong master on node [" + node + "]. "+ failMsgSuffix,otherMasterNodeName,equalTo(masterNode));
+      }
+    }
+);
+  }
+  public ServiceDisruptionScheme addRandomDisruptionScheme(){
+    NetworkDisruption p;
+    final DisruptedLinks disruptedLinks;
+    if (randomBoolean()) {
+      disruptedLinks=TwoPartitions.random(random(),internalCluster().getNodeNames());
+    }
+ else {
+      disruptedLinks=Bridge.random(random(),internalCluster().getNodeNames());
+    }
+    final NetworkLinkDisruptionType disruptionType;
+switch (randomInt(2)) {
+case 0:
+      disruptionType=new NetworkDisruption.NetworkUnresponsive();
+    break;
+case 1:
+  disruptionType=new NetworkDisconnect();
+break;
+case 2:
+disruptionType=NetworkDisruption.NetworkDelay.random(random());
+break;
+default :
+throw new IllegalArgumentException();
+}
+final ServiceDisruptionScheme scheme;
+if (rarely()) {
+scheme=new SlowClusterStateProcessing(random());
+}
+ else {
+scheme=new NetworkDisruption(disruptedLinks,disruptionType);
+}
+setDisruptionScheme(scheme);
+return scheme;
+}
+NetworkDisruption addRandomDisruptionType(TwoPartitions partitions){
+final NetworkLinkDisruptionType disruptionType;
+if (randomBoolean()) {
+disruptionType=new NetworkDisruption.NetworkUnresponsive();
+}
+ else {
+disruptionType=new NetworkDisconnect();
+}
+NetworkDisruption partition=new NetworkDisruption(partitions,disruptionType);
+setDisruptionScheme(partition);
+return partition;
+}
+TwoPartitions isolateNode(String isolatedNode){
+Set<String> side1=new HashSet<>();
+Set<String> side2=new HashSet<>(Arrays.asList(internalCluster().getNodeNames()));
+side1.add(isolatedNode);
+side2.remove(isolatedNode);
+return new TwoPartitions(side1,side2);
+}
+}

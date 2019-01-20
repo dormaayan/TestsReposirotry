@@ -1,0 +1,82 @@
+@Test public void testGetWithMultipleColumnFamilies() throws IOException, InterruptedException {
+  Table table=null;
+  try {
+    latch=new CountDownLatch(1);
+    getLatch=new CountDownLatch(1);
+    final TableName tableName=TableName.valueOf(name.getMethodName());
+    byte[][] fams=new byte[10][];
+    fams[0]=FAMILY;
+    for (int i=1; i < 10; i++) {
+      fams[i]=(Bytes.toBytes("testFamily" + i));
+    }
+    table=TEST_UTIL.createTable(tableName,fams,1,1024,CustomInnerRegionObserver.class.getName());
+    RegionLocator locator=TEST_UTIL.getConnection().getRegionLocator(tableName);
+    String regionName=locator.getAllRegionLocations().get(0).getRegionInfo().getEncodedName();
+    HRegion region=TEST_UTIL.getRSForFirstRegionInTable(tableName).getRegion(regionName);
+    BlockCache cache=setCacheProperties(region);
+    Put put=new Put(ROW);
+    put.addColumn(FAMILY,QUALIFIER,data);
+    table.put(put);
+    region.flush(true);
+    put=new Put(ROW1);
+    put.addColumn(FAMILY,QUALIFIER,data);
+    table.put(put);
+    region.flush(true);
+    for (int i=1; i < 10; i++) {
+      put=new Put(ROW);
+      put.addColumn(Bytes.toBytes("testFamily" + i),Bytes.toBytes("testQualifier" + i),data2);
+      table.put(put);
+      if (i % 2 == 0) {
+        region.flush(true);
+      }
+    }
+    region.flush(true);
+    byte[] QUALIFIER2=Bytes.add(QUALIFIER,QUALIFIER);
+    put=new Put(ROW);
+    put.addColumn(FAMILY,QUALIFIER2,data2);
+    table.put(put);
+    region.flush(true);
+    System.out.println("Flushing cache");
+    CustomInnerRegionObserver.waitForGets.set(true);
+    GetThread[] getThreads=initiateGet(table,true,true);
+    Thread.sleep(200);
+    Iterator<CachedBlock> iterator=cache.iterator();
+    boolean usedBlocksFound=false;
+    int refCount=0;
+    int noOfBlocksWithRef=0;
+    while (iterator.hasNext()) {
+      CachedBlock next=iterator.next();
+      BlockCacheKey cacheKey=new BlockCacheKey(next.getFilename(),next.getOffset());
+      if (cache instanceof BucketCache) {
+        refCount=((BucketCache)cache).getRefCount(cacheKey);
+      }
+ else       if (cache instanceof CombinedBlockCache) {
+        refCount=((CombinedBlockCache)cache).getRefCount(cacheKey);
+      }
+ else {
+        continue;
+      }
+      if (refCount != 0) {
+        System.out.println("The refCount is " + refCount);
+        assertEquals(NO_OF_THREADS,refCount);
+        usedBlocksFound=true;
+        noOfBlocksWithRef++;
+      }
+    }
+    assertTrue(usedBlocksFound);
+    assertEquals(3,noOfBlocksWithRef);
+    CustomInnerRegionObserver.getCdl().get().countDown();
+    for (    GetThread thread : getThreads) {
+      thread.join();
+    }
+    CustomInnerRegionObserver.waitForGets.set(true);
+    checkForBlockEviction(cache,true,false);
+    getLatch.countDown();
+    System.out.println("Gets should have returned the bloks");
+  }
+  finally {
+    if (table != null) {
+      table.close();
+    }
+  }
+}

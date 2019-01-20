@@ -1,0 +1,41 @@
+/** 
+ * Tests the  {@link JobMaster#requestPartitionState(IntermediateDataSetID,ResultPartitionID)}call for a finished result partition.
+ */
+@Test public void testRequestPartitionState() throws Exception {
+  final JobGraph producerConsumerJobGraph=producerConsumerJobGraph();
+  final JobMaster jobMaster=createJobMaster(configuration,producerConsumerJobGraph,haServices,new TestingJobManagerSharedServicesBuilder().build(),heartbeatServices);
+  jobMaster.start(jobMasterId,testingTimeout);
+  try {
+    final TestingResourceManagerGateway testingResourceManagerGateway=new TestingResourceManagerGateway();
+    final CompletableFuture<AllocationID> allocationIdFuture=new CompletableFuture<>();
+    testingResourceManagerGateway.setRequestSlotConsumer(slotRequest -> allocationIdFuture.complete(slotRequest.getAllocationId()));
+    rpcService.registerGateway(testingResourceManagerGateway.getAddress(),testingResourceManagerGateway);
+    final CompletableFuture<TaskDeploymentDescriptor> tddFuture=new CompletableFuture<>();
+    final TestingTaskExecutorGateway testingTaskExecutorGateway=new TestingTaskExecutorGatewayBuilder().setSubmitTaskConsumer((taskDeploymentDescriptor,jobMasterId) -> {
+      tddFuture.complete(taskDeploymentDescriptor);
+      return CompletableFuture.completedFuture(Acknowledge.get());
+    }
+).createTestingTaskExecutorGateway();
+    rpcService.registerGateway(testingTaskExecutorGateway.getAddress(),testingTaskExecutorGateway);
+    final JobMasterGateway jobMasterGateway=jobMaster.getSelfGateway(JobMasterGateway.class);
+    rmLeaderRetrievalService.notifyListener(testingResourceManagerGateway.getAddress(),testingResourceManagerGateway.getFencingToken().toUUID());
+    final AllocationID allocationId=allocationIdFuture.get();
+    final LocalTaskManagerLocation taskManagerLocation=new LocalTaskManagerLocation();
+    jobMasterGateway.registerTaskManager(testingTaskExecutorGateway.getAddress(),taskManagerLocation,testingTimeout).get();
+    final SlotOffer slotOffer=new SlotOffer(allocationId,0,ResourceProfile.UNKNOWN);
+    final Collection<SlotOffer> slotOffers=jobMasterGateway.offerSlots(taskManagerLocation.getResourceID(),Collections.singleton(slotOffer),testingTimeout).get();
+    assertThat(slotOffers,hasSize(1));
+    assertThat(slotOffers,contains(slotOffer));
+    final TaskDeploymentDescriptor tdd=tddFuture.get();
+    assertThat(tdd.getProducedPartitions(),hasSize(1));
+    final ResultPartitionDeploymentDescriptor partition=tdd.getProducedPartitions().iterator().next();
+    final ExecutionAttemptID executionAttemptId=tdd.getExecutionAttemptId();
+    final ExecutionAttemptID copiedExecutionAttemptId=new ExecutionAttemptID(executionAttemptId.getLowerPart(),executionAttemptId.getUpperPart());
+    jobMasterGateway.updateTaskExecutionState(new TaskExecutionState(producerConsumerJobGraph.getJobID(),executionAttemptId,ExecutionState.FINISHED)).get();
+    final CompletableFuture<ExecutionState> partitionStateFuture=jobMasterGateway.requestPartitionState(partition.getResultId(),new ResultPartitionID(partition.getPartitionId(),copiedExecutionAttemptId));
+    assertThat(partitionStateFuture.get(),equalTo(ExecutionState.FINISHED));
+  }
+  finally {
+    RpcUtils.terminateRpcEndpoint(jobMaster,testingTimeout);
+  }
+}

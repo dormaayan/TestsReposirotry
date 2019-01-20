@@ -1,0 +1,83 @@
+/** 
+ * Tests that configured  {@link SavepointRestoreSettings} are respected.
+ */
+@Test public void testSavepointRestoreSettings() throws Exception {
+  FiniteDuration timeout=new FiniteDuration(30,TimeUnit.SECONDS);
+  ActorSystem actorSystem=null;
+  ActorGateway jobManager=null;
+  ActorGateway archiver=null;
+  ActorGateway taskManager=null;
+  try {
+    actorSystem=AkkaUtils.createLocalActorSystem(new Configuration());
+    Tuple2<ActorRef,ActorRef> master=JobManager.startJobManagerActors(new Configuration(),actorSystem,TestingUtils.defaultExecutor(),TestingUtils.defaultExecutor(),highAvailabilityServices,NoOpMetricRegistry.INSTANCE,Option.empty(),Option.apply("jm"),Option.apply("arch"),TestingJobManager.class,TestingMemoryArchivist.class);
+    UUID leaderId=LeaderRetrievalUtils.retrieveLeaderSessionId(highAvailabilityServices.getJobManagerLeaderRetriever(HighAvailabilityServices.DEFAULT_JOB_ID),TestingUtils.TESTING_TIMEOUT());
+    jobManager=new AkkaActorGateway(master._1(),leaderId);
+    archiver=new AkkaActorGateway(master._2(),leaderId);
+    Configuration tmConfig=new Configuration();
+    tmConfig.setInteger(TaskManagerOptions.NUM_TASK_SLOTS,4);
+    ActorRef taskManagerRef=TaskManager.startTaskManagerComponentsAndActor(tmConfig,ResourceID.generate(),actorSystem,highAvailabilityServices,NoOpMetricRegistry.INSTANCE,"localhost",Option.apply("tm"),true,TestingTaskManager.class);
+    taskManager=new AkkaActorGateway(taskManagerRef,leaderId);
+    Object msg=new TestingTaskManagerMessages.NotifyWhenRegisteredAtJobManager(jobManager.actor());
+    Await.ready(taskManager.ask(msg,timeout),timeout);
+    JobVertex sourceVertex=new JobVertex("Source");
+    sourceVertex.setInvokableClass(BlockingStatefulInvokable.class);
+    sourceVertex.setParallelism(1);
+    JobGraph jobGraph=new JobGraph("TestingJob",sourceVertex);
+    JobCheckpointingSettings snapshottingSettings=new JobCheckpointingSettings(Collections.singletonList(sourceVertex.getID()),Collections.singletonList(sourceVertex.getID()),Collections.singletonList(sourceVertex.getID()),new CheckpointCoordinatorConfiguration(Long.MAX_VALUE,360000,0,Integer.MAX_VALUE,CheckpointRetentionPolicy.NEVER_RETAIN_AFTER_TERMINATION,true),null);
+    jobGraph.setSnapshotSettings(snapshottingSettings);
+    msg=new SubmitJob(jobGraph,ListeningBehaviour.DETACHED);
+    Await.result(jobManager.ask(msg,timeout),timeout);
+    msg=new TestingJobManagerMessages.WaitForAllVerticesToBeRunning(jobGraph.getJobID());
+    Await.result(jobManager.ask(msg,timeout),timeout);
+    File targetDirectory=tmpFolder.newFolder();
+    msg=new TriggerSavepoint(jobGraph.getJobID(),Option.apply(targetDirectory.getAbsolutePath()));
+    Future<Object> future=jobManager.ask(msg,timeout);
+    Object result=Await.result(future,timeout);
+    String savepointPath=((TriggerSavepointSuccess)result).savepointPath();
+    msg=new TestingJobManagerMessages.NotifyWhenJobRemoved(jobGraph.getJobID());
+    Future<?> removedFuture=jobManager.ask(msg,timeout);
+    Future<?> cancelFuture=jobManager.ask(new CancelJob(jobGraph.getJobID()),timeout);
+    Object response=Await.result(cancelFuture,timeout);
+    assertTrue("Unexpected response: " + response,response instanceof CancellationSuccess);
+    Await.ready(removedFuture,timeout);
+    JobVertex newSourceVertex=new JobVertex("NewSource");
+    newSourceVertex.setInvokableClass(BlockingStatefulInvokable.class);
+    newSourceVertex.setParallelism(1);
+    JobGraph newJobGraph=new JobGraph("NewTestingJob",newSourceVertex);
+    JobCheckpointingSettings newSnapshottingSettings=new JobCheckpointingSettings(Collections.singletonList(newSourceVertex.getID()),Collections.singletonList(newSourceVertex.getID()),Collections.singletonList(newSourceVertex.getID()),new CheckpointCoordinatorConfiguration(Long.MAX_VALUE,360000,0,Integer.MAX_VALUE,CheckpointRetentionPolicy.NEVER_RETAIN_AFTER_TERMINATION,true),null);
+    newJobGraph.setSnapshotSettings(newSnapshottingSettings);
+    SavepointRestoreSettings restoreSettings=SavepointRestoreSettings.forPath(savepointPath,false);
+    newJobGraph.setSavepointRestoreSettings(restoreSettings);
+    msg=new SubmitJob(newJobGraph,ListeningBehaviour.DETACHED);
+    response=Await.result(jobManager.ask(msg,timeout),timeout);
+    assertTrue("Unexpected response: " + response,response instanceof JobResultFailure);
+    JobResultFailure failure=(JobResultFailure)response;
+    Throwable cause=failure.cause().deserializeError(ClassLoader.getSystemClassLoader());
+    assertTrue(cause instanceof IllegalStateException);
+    assertTrue(cause.getMessage().contains("allowNonRestoredState"));
+    msg=new TestingJobManagerMessages.NotifyWhenJobRemoved(newJobGraph.getJobID());
+    Await.ready(jobManager.ask(msg,timeout),timeout);
+    restoreSettings=SavepointRestoreSettings.forPath(savepointPath,true);
+    newJobGraph.setSavepointRestoreSettings(restoreSettings);
+    msg=new SubmitJob(newJobGraph,ListeningBehaviour.DETACHED);
+    response=Await.result(jobManager.ask(msg,timeout),timeout);
+    assertTrue("Unexpected response: " + response,response instanceof JobSubmitSuccess);
+  }
+  finally {
+    if (actorSystem != null) {
+      actorSystem.shutdown();
+    }
+    if (archiver != null) {
+      archiver.actor().tell(PoisonPill.getInstance(),ActorRef.noSender());
+    }
+    if (jobManager != null) {
+      jobManager.actor().tell(PoisonPill.getInstance(),ActorRef.noSender());
+    }
+    if (taskManager != null) {
+      taskManager.actor().tell(PoisonPill.getInstance(),ActorRef.noSender());
+    }
+    if (actorSystem != null) {
+      actorSystem.awaitTermination(TestingUtils.TESTING_TIMEOUT());
+    }
+  }
+}

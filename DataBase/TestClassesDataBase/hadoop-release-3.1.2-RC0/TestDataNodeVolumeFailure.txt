@@ -1,0 +1,415 @@
+/** 
+ * Fine-grain testing of block files and locations after volume failure.
+ */
+public class TestDataNodeVolumeFailure {
+  private final static Logger LOG=LoggerFactory.getLogger(TestDataNodeVolumeFailure.class);
+  final private int block_size=512;
+  MiniDFSCluster cluster=null;
+  private Configuration conf;
+  final int dn_num=2;
+  final int blocks_num=30;
+  final short repl=2;
+  File dataDir=null;
+  File data_fail=null;
+  File failedDir=null;
+  private FileSystem fs;
+private class BlockLocs {
+    public int num_files=0;
+    public int num_locs=0;
+  }
+  final Map<String,BlockLocs> block_map=new HashMap<String,BlockLocs>();
+  @Rule public Timeout timeout=new Timeout(120 * 1000);
+  @Before public void setUp() throws Exception {
+    conf=new HdfsConfiguration();
+    conf.setLong(DFSConfigKeys.DFS_BLOCK_SIZE_KEY,block_size);
+    conf.setInt(DFSConfigKeys.DFS_DATANODE_FAILED_VOLUMES_TOLERATED_KEY,1);
+    conf.setInt(DFSConfigKeys.DFS_HEARTBEAT_INTERVAL_KEY,30);
+    conf.setTimeDuration(DFSConfigKeys.DFS_DATANODE_DISK_CHECK_MIN_GAP_KEY,0,TimeUnit.MILLISECONDS);
+    cluster=new MiniDFSCluster.Builder(conf).numDataNodes(dn_num).build();
+    cluster.waitActive();
+    fs=cluster.getFileSystem();
+    dataDir=new File(cluster.getDataDirectory());
+  }
+  @After public void tearDown() throws Exception {
+    if (data_fail != null) {
+      FileUtil.setWritable(data_fail,true);
+      data_fail=null;
+    }
+    if (failedDir != null) {
+      FileUtil.setWritable(failedDir,true);
+      failedDir=null;
+    }
+    if (cluster != null) {
+      cluster.shutdown();
+      cluster=null;
+    }
+  }
+  @Test(timeout=120000) public void testVolumeFailure() throws Exception {
+    System.out.println("Data dir: is " + dataDir.getPath());
+    String filename="/test.txt";
+    Path filePath=new Path(filename);
+    int filesize=block_size * blocks_num;
+    DFSTestUtil.createFile(fs,filePath,filesize,repl,1L);
+    DFSTestUtil.waitReplication(fs,filePath,repl);
+    System.out.println("file " + filename + "(size "+ filesize+ ") is created and replicated");
+    data_fail=cluster.getInstanceStorageDir(1,0);
+    failedDir=MiniDFSCluster.getFinalizedDir(data_fail,cluster.getNamesystem().getBlockPoolId());
+    if (failedDir.exists() && !deteteBlocks(failedDir)) {
+      throw new IOException("Could not delete hdfs directory '" + failedDir + "'");
+    }
+    data_fail.setReadOnly();
+    failedDir.setReadOnly();
+    System.out.println("Deleteing " + failedDir.getPath() + "; exist="+ failedDir.exists());
+    triggerFailure(filename,filesize);
+    final DataNode dn=cluster.getDataNodes().get(1);
+    GenericTestUtils.waitFor(new Supplier<Boolean>(){
+      @Override public Boolean get(){
+        final VolumeFailureSummary summary=dn.getFSDataset().getVolumeFailureSummary();
+        return summary != null && summary.getFailedStorageLocations() != null && summary.getFailedStorageLocations().length == 1;
+      }
+    }
+,10,30 * 1000);
+    DataNodeTestUtils.triggerHeartbeat(dn);
+    final BlockManager bm=cluster.getNamesystem().getBlockManager();
+    BlockManagerTestUtil.checkHeartbeat(bm);
+    assertEquals(1,cluster.getNamesystem().getVolumeFailuresTotal());
+    verify(filename,filesize);
+    System.out.println("creating file test1.txt");
+    Path fileName1=new Path("/test1.txt");
+    DFSTestUtil.createFile(fs,fileName1,filesize,repl,1L);
+    DFSTestUtil.waitReplication(fs,fileName1,repl);
+    System.out.println("file " + fileName1.getName() + " is created and replicated");
+  }
+  /** 
+ * Test that DataStorage and BlockPoolSliceStorage remove the failed volume after failure.
+ */
+  @Test(timeout=150000) public void testFailedVolumeBeingRemovedFromDataNode() throws Exception {
+    assumeNotWindows();
+    Path file1=new Path("/test1");
+    DFSTestUtil.createFile(fs,file1,1024,(short)2,1L);
+    DFSTestUtil.waitReplication(fs,file1,(short)2);
+    File dn0Vol1=cluster.getInstanceStorageDir(0,0);
+    DataNodeTestUtils.injectDataDirFailure(dn0Vol1);
+    DataNode dn0=cluster.getDataNodes().get(0);
+    DataNodeTestUtils.waitForDiskError(dn0,DataNodeTestUtils.getVolume(dn0,dn0Vol1));
+    DataStorage storage=dn0.getStorage();
+    assertEquals(1,storage.getNumStorageDirs());
+    for (int i=0; i < storage.getNumStorageDirs(); i++) {
+      Storage.StorageDirectory sd=storage.getStorageDir(i);
+      assertFalse(sd.getRoot().getAbsolutePath().startsWith(dn0Vol1.getAbsolutePath()));
+    }
+    final String bpid=cluster.getNamesystem().getBlockPoolId();
+    BlockPoolSliceStorage bpsStorage=storage.getBPStorage(bpid);
+    assertEquals(1,bpsStorage.getNumStorageDirs());
+    for (int i=0; i < bpsStorage.getNumStorageDirs(); i++) {
+      Storage.StorageDirectory sd=bpsStorage.getStorageDir(i);
+      assertFalse(sd.getRoot().getAbsolutePath().startsWith(dn0Vol1.getAbsolutePath()));
+    }
+    FsDatasetSpi<? extends FsVolumeSpi> data=dn0.getFSDataset();
+    try (FsDatasetSpi.FsVolumeReferences vols=data.getFsVolumeReferences()){
+      for (      FsVolumeSpi volume : vols) {
+        assertFalse(new File(volume.getStorageLocation().getUri()).getAbsolutePath().startsWith(dn0Vol1.getAbsolutePath()));
+      }
+    }
+     for (    ReplicaInfo replica : FsDatasetTestUtil.getReplicas(data,bpid)) {
+      assertNotNull(replica.getVolume());
+      assertFalse(new File(replica.getVolume().getStorageLocation().getUri()).getAbsolutePath().startsWith(dn0Vol1.getAbsolutePath()));
+    }
+    String[] dataDirStrs=dn0.getConf().get(DFSConfigKeys.DFS_DATANODE_DATA_DIR_KEY).split(",");
+    assertEquals(1,dataDirStrs.length);
+    assertFalse(dataDirStrs[0].contains(dn0Vol1.getAbsolutePath()));
+  }
+  /** 
+ * Test DataNode stops when the number of failed volumes exceeds dfs.datanode.failed.volumes.tolerated .
+ */
+  @Test(timeout=10000) public void testDataNodeShutdownAfterNumFailedVolumeExceedsTolerated() throws Exception {
+    assumeNotWindows();
+    final File dn0Vol1=cluster.getInstanceStorageDir(0,0);
+    final File dn0Vol2=cluster.getInstanceStorageDir(0,1);
+    DataNodeTestUtils.injectDataDirFailure(dn0Vol1,dn0Vol2);
+    DataNode dn0=cluster.getDataNodes().get(0);
+    DataNodeTestUtils.waitForDiskError(dn0,DataNodeTestUtils.getVolume(dn0,dn0Vol1));
+    DataNodeTestUtils.waitForDiskError(dn0,DataNodeTestUtils.getVolume(dn0,dn0Vol2));
+    assertFalse(dn0.shouldRun());
+  }
+  /** 
+ * Test that DN does not shutdown, as long as failure volumes being hot swapped.
+ */
+  @Test public void testVolumeFailureRecoveredByHotSwappingVolume() throws Exception {
+    assumeNotWindows();
+    final File dn0Vol1=cluster.getInstanceStorageDir(0,0);
+    final File dn0Vol2=cluster.getInstanceStorageDir(0,1);
+    final DataNode dn0=cluster.getDataNodes().get(0);
+    final String oldDataDirs=dn0.getConf().get(DFSConfigKeys.DFS_DATANODE_DATA_DIR_KEY);
+    DataNodeTestUtils.injectDataDirFailure(dn0Vol1);
+    DataNodeTestUtils.waitForDiskError(dn0,DataNodeTestUtils.getVolume(dn0,dn0Vol1));
+    String dataDirs=dn0Vol2.getPath();
+    assertThat(dn0.reconfigurePropertyImpl(DFSConfigKeys.DFS_DATANODE_DATA_DIR_KEY,dataDirs),is(dn0.getConf().get(DFSConfigKeys.DFS_DATANODE_DATA_DIR_KEY)));
+    DataNodeTestUtils.restoreDataDirFromFailure(dn0Vol1);
+    assertThat(dn0.reconfigurePropertyImpl(DFSConfigKeys.DFS_DATANODE_DATA_DIR_KEY,oldDataDirs),is(dn0.getConf().get(DFSConfigKeys.DFS_DATANODE_DATA_DIR_KEY)));
+    DataNodeTestUtils.injectDataDirFailure(dn0Vol2);
+    DataNodeTestUtils.waitForDiskError(dn0,DataNodeTestUtils.getVolume(dn0,dn0Vol2));
+    assertTrue(dn0.shouldRun());
+  }
+  /** 
+ * Test changing the number of volumes does not impact the disk failure tolerance.
+ */
+  @Test public void testTolerateVolumeFailuresAfterAddingMoreVolumes() throws Exception {
+    assumeNotWindows();
+    final File dn0Vol1=cluster.getInstanceStorageDir(0,0);
+    final File dn0Vol2=cluster.getInstanceStorageDir(0,1);
+    final File dn0VolNew=new File(dataDir,"data_new");
+    final DataNode dn0=cluster.getDataNodes().get(0);
+    final String oldDataDirs=dn0.getConf().get(DFSConfigKeys.DFS_DATANODE_DATA_DIR_KEY);
+    assertThat(dn0.reconfigurePropertyImpl(DFSConfigKeys.DFS_DATANODE_DATA_DIR_KEY,oldDataDirs + "," + dn0VolNew.getAbsolutePath()),is(dn0.getConf().get(DFSConfigKeys.DFS_DATANODE_DATA_DIR_KEY)));
+    DataNodeTestUtils.injectDataDirFailure(dn0Vol1);
+    DataNodeTestUtils.waitForDiskError(dn0,DataNodeTestUtils.getVolume(dn0,dn0Vol1));
+    assertTrue(dn0.shouldRun());
+    DataNodeTestUtils.injectDataDirFailure(dn0Vol2);
+    DataNodeTestUtils.waitForDiskError(dn0,DataNodeTestUtils.getVolume(dn0,dn0Vol2));
+    assertFalse(dn0.shouldRun());
+  }
+  /** 
+ * Test that there are under replication blocks after vol failures
+ */
+  @Test public void testUnderReplicationAfterVolFailure() throws Exception {
+    assumeNotWindows();
+    cluster.startDataNodes(conf,1,true,null,null);
+    cluster.waitActive();
+    final BlockManager bm=cluster.getNamesystem().getBlockManager();
+    Path file1=new Path("/test1");
+    DFSTestUtil.createFile(fs,file1,1024,(short)3,1L);
+    DFSTestUtil.waitReplication(fs,file1,(short)3);
+    File dn1Vol1=cluster.getInstanceStorageDir(0,0);
+    File dn2Vol1=cluster.getInstanceStorageDir(1,0);
+    DataNodeTestUtils.injectDataDirFailure(dn1Vol1,dn2Vol1);
+    Path file2=new Path("/test2");
+    DFSTestUtil.createFile(fs,file2,1024,(short)3,1L);
+    DFSTestUtil.waitReplication(fs,file2,(short)3);
+    GenericTestUtils.waitFor(new Supplier<Boolean>(){
+      @Override public Boolean get(){
+        long underReplicatedBlocks=bm.getLowRedundancyBlocksCount() + bm.getPendingReconstructionBlocksCount();
+        if (underReplicatedBlocks > 0) {
+          return true;
+        }
+        LOG.info("There is no under replicated block after volume failure.");
+        return false;
+      }
+    }
+,500,60000);
+  }
+  /** 
+ * Test if there is volume failure, the DataNode will fail to start. We fail a volume by setting the parent directory non-writable.
+ */
+  @Test(timeout=120000) public void testDataNodeFailToStartWithVolumeFailure() throws Exception {
+    assumeNotWindows();
+    failedDir=new File(dataDir,"failedDir");
+    assertTrue("Failed to fail a volume by setting it non-writable",failedDir.mkdir() && failedDir.setReadOnly());
+    startNewDataNodeWithDiskFailure(new File(failedDir,"newDir1"),false);
+  }
+  /** 
+ * DataNode will start and tolerate one failing disk according to config. We fail a volume by setting the parent directory non-writable.
+ */
+  @Test(timeout=120000) public void testDNStartAndTolerateOneVolumeFailure() throws Exception {
+    assumeNotWindows();
+    failedDir=new File(dataDir,"failedDir");
+    assertTrue("Failed to fail a volume by setting it non-writable",failedDir.mkdir() && failedDir.setReadOnly());
+    startNewDataNodeWithDiskFailure(new File(failedDir,"newDir1"),true);
+  }
+  /** 
+ * Test if data directory is not readable/writable, DataNode won't start.
+ */
+  @Test(timeout=120000) public void testDNFailToStartWithDataDirNonWritable() throws Exception {
+    assumeNotWindows();
+    final File readOnlyDir=new File(dataDir,"nonWritable");
+    assertTrue("Set the data dir permission non-writable",readOnlyDir.mkdir() && readOnlyDir.setReadOnly());
+    startNewDataNodeWithDiskFailure(new File(readOnlyDir,"newDir1"),false);
+  }
+  /** 
+ * DataNode will start and tolerate one non-writable data directory according to config.
+ */
+  @Test(timeout=120000) public void testDNStartAndTolerateOneDataDirNonWritable() throws Exception {
+    assumeNotWindows();
+    final File readOnlyDir=new File(dataDir,"nonWritable");
+    assertTrue("Set the data dir permission non-writable",readOnlyDir.mkdir() && readOnlyDir.setReadOnly());
+    startNewDataNodeWithDiskFailure(new File(readOnlyDir,"newDir1"),true);
+  }
+  /** 
+ * @param badDataDir bad data dir, either disk failure or non-writable
+ * @param tolerated true if one volume failure is allowed else false
+ */
+  private void startNewDataNodeWithDiskFailure(  File badDataDir,  boolean tolerated) throws Exception {
+    final File data5=new File(dataDir,"data5");
+    final String newDirs=badDataDir.toString() + "," + data5.toString();
+    final Configuration newConf=new Configuration(conf);
+    newConf.set(DFSConfigKeys.DFS_DATANODE_DATA_DIR_KEY,newDirs);
+    LOG.info("Setting dfs.datanode.data.dir for new DataNode as {}",newDirs);
+    newConf.setInt(DFSConfigKeys.DFS_DATANODE_FAILED_VOLUMES_TOLERATED_KEY,tolerated ? 1 : 0);
+    assertEquals(repl,cluster.getDataNodes().size());
+    try {
+      cluster.startDataNodes(newConf,1,false,null,null);
+      assertTrue("Failed to get expected IOException",tolerated);
+    }
+ catch (    IOException ioe) {
+      assertFalse("Unexpected IOException " + ioe,tolerated);
+      return;
+    }
+    assertEquals(repl + 1,cluster.getDataNodes().size());
+    final Path p=new Path("/test1.txt");
+    DFSTestUtil.createFile(fs,p,block_size * blocks_num,(short)3,1L);
+    DFSTestUtil.waitReplication(fs,p,(short)(repl + 1));
+  }
+  /** 
+ * verifies two things: 1. number of locations of each block in the name node matches number of actual files 2. block files + pending block equals to total number of blocks that a file has  including the replication (HDFS file has 30 blocks, repl=2 - total 60
+ * @param fn - file name
+ * @param fs - file size
+ * @throws IOException
+ */
+  private void verify(  String fn,  int fs) throws IOException {
+    int totalReal=countRealBlocks(block_map);
+    System.out.println("countRealBlocks counted " + totalReal + " blocks");
+    int totalNN=countNNBlocks(block_map,fn,fs);
+    System.out.println("countNNBlocks counted " + totalNN + " blocks");
+    for (    String bid : block_map.keySet()) {
+      BlockLocs bl=block_map.get(bid);
+      assertEquals("Num files should match num locations",bl.num_files,bl.num_locs);
+    }
+    assertEquals("Num physical blocks should match num stored in the NN",totalReal,totalNN);
+    FSNamesystem fsn=cluster.getNamesystem();
+    BlockManagerTestUtil.getComputedDatanodeWork(fsn.getBlockManager());
+    long underRepl=fsn.getUnderReplicatedBlocks();
+    long pendRepl=fsn.getPendingReplicationBlocks();
+    long totalRepl=underRepl + pendRepl;
+    System.out.println("underreplicated after = " + underRepl + " and pending repl ="+ pendRepl+ "; total underRepl = "+ totalRepl);
+    System.out.println("total blocks (real and replicating):" + (totalReal + totalRepl) + " vs. all files blocks "+ blocks_num * 2);
+    assertEquals("Incorrect total block count",totalReal + totalRepl,blocks_num * repl);
+  }
+  /** 
+ * go to each block on the 2nd DataNode until it fails...
+ * @param path
+ * @param size
+ * @throws IOException
+ */
+  private void triggerFailure(  String path,  long size) throws IOException {
+    NamenodeProtocols nn=cluster.getNameNodeRpc();
+    List<LocatedBlock> locatedBlocks=nn.getBlockLocations(path,0,size).getLocatedBlocks();
+    for (    LocatedBlock lb : locatedBlocks) {
+      DatanodeInfo dinfo=lb.getLocations()[1];
+      ExtendedBlock b=lb.getBlock();
+      try {
+        accessBlock(dinfo,lb);
+      }
+ catch (      IOException e) {
+        System.out.println("Failure triggered, on block: " + b.getBlockId() + "; corresponding volume should be removed by now");
+        break;
+      }
+    }
+  }
+  /** 
+ * simulate failure delete all the block files
+ * @param dir
+ * @throws IOException
+ */
+  private boolean deteteBlocks(  File dir){
+    Collection<File> fileList=FileUtils.listFiles(dir,TrueFileFilter.INSTANCE,TrueFileFilter.INSTANCE);
+    for (    File f : fileList) {
+      if (f.getName().startsWith(Block.BLOCK_FILE_PREFIX)) {
+        System.out.println("Deleting file " + f);
+        if (!f.delete())         return false;
+      }
+    }
+    return true;
+  }
+  /** 
+ * try to access a block on a data node. If fails - throws exception
+ * @param datanode
+ * @param lblock
+ * @throws IOException
+ */
+  private void accessBlock(  DatanodeInfo datanode,  LocatedBlock lblock) throws IOException {
+    InetSocketAddress targetAddr=null;
+    ExtendedBlock block=lblock.getBlock();
+    targetAddr=NetUtils.createSocketAddr(datanode.getXferAddr());
+    BlockReader blockReader=new BlockReaderFactory(new DfsClientConf(conf)).setInetSocketAddress(targetAddr).setBlock(block).setFileName(BlockReaderFactory.getFileName(targetAddr,"test-blockpoolid",block.getBlockId())).setBlockToken(lblock.getBlockToken()).setStartOffset(0).setLength(0).setVerifyChecksum(true).setClientName("TestDataNodeVolumeFailure").setDatanodeInfo(datanode).setCachingStrategy(CachingStrategy.newDefaultStrategy()).setClientCacheContext(ClientContext.getFromConf(conf)).setConfiguration(conf).setRemotePeerFactory(new RemotePeerFactory(){
+      @Override public Peer newConnectedPeer(      InetSocketAddress addr,      Token<BlockTokenIdentifier> blockToken,      DatanodeID datanodeId) throws IOException {
+        Peer peer=null;
+        Socket sock=NetUtils.getDefaultSocketFactory(conf).createSocket();
+        try {
+          sock.connect(addr,HdfsConstants.READ_TIMEOUT);
+          sock.setSoTimeout(HdfsConstants.READ_TIMEOUT);
+          peer=DFSUtilClient.peerFromSocket(sock);
+        }
+  finally {
+          if (peer == null) {
+            IOUtils.closeSocket(sock);
+          }
+        }
+        return peer;
+      }
+    }
+).build();
+    blockReader.close();
+  }
+  /** 
+ * Count datanodes that have copies of the blocks for a file put it into the map
+ * @param map
+ * @param path
+ * @param size
+ * @return
+ * @throws IOException
+ */
+  private int countNNBlocks(  Map<String,BlockLocs> map,  String path,  long size) throws IOException {
+    int total=0;
+    NamenodeProtocols nn=cluster.getNameNodeRpc();
+    List<LocatedBlock> locatedBlocks=nn.getBlockLocations(path,0,size).getLocatedBlocks();
+    for (    LocatedBlock lb : locatedBlocks) {
+      String blockId="" + lb.getBlock().getBlockId();
+      DatanodeInfo[] dn_locs=lb.getLocations();
+      BlockLocs bl=map.get(blockId);
+      if (bl == null) {
+        bl=new BlockLocs();
+      }
+      total+=dn_locs.length;
+      bl.num_locs+=dn_locs.length;
+      map.put(blockId,bl);
+    }
+    return total;
+  }
+  /** 
+ * look for real blocks by counting *.meta files in all the storage dirs 
+ * @param map
+ * @return
+ */
+  private int countRealBlocks(  Map<String,BlockLocs> map){
+    int total=0;
+    final String bpid=cluster.getNamesystem().getBlockPoolId();
+    for (int i=0; i < dn_num; i++) {
+      for (int j=0; j <= 1; j++) {
+        File storageDir=cluster.getInstanceStorageDir(i,j);
+        File dir=MiniDFSCluster.getFinalizedDir(storageDir,bpid);
+        if (dir == null) {
+          System.out.println("dir is null for dn=" + i + " and data_dir="+ j);
+          continue;
+        }
+        List<File> res=MiniDFSCluster.getAllBlockMetadataFiles(dir);
+        if (res == null) {
+          System.out.println("res is null for dir = " + dir + " i="+ i+ " and j="+ j);
+          continue;
+        }
+        for (        File f : res) {
+          String s=f.getName();
+          assertNotNull("Block file name should not be null",s);
+          String bid=s.substring(s.indexOf("_") + 1,s.lastIndexOf("_"));
+          BlockLocs val=map.get(bid);
+          if (val == null) {
+            val=new BlockLocs();
+          }
+          val.num_files++;
+          map.put(bid,val);
+        }
+        total+=res.size();
+      }
+    }
+    return total;
+  }
+}

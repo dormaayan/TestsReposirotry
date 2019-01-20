@@ -1,0 +1,70 @@
+@Test public void testRegionMerge() throws Exception {
+  String nsp1=prefix + "_regiontest";
+  final int initialRegions=3;
+  NamespaceDescriptor nspDesc=NamespaceDescriptor.create(nsp1).addConfiguration(TableNamespaceManager.KEY_MAX_REGIONS,"" + initialRegions).addConfiguration(TableNamespaceManager.KEY_MAX_TABLES,"2").build();
+  ADMIN.createNamespace(nspDesc);
+  final TableName tableTwo=TableName.valueOf(nsp1 + TableName.NAMESPACE_DELIM + "table2");
+  byte[] columnFamily=Bytes.toBytes("info");
+  HTableDescriptor tableDescOne=new HTableDescriptor(tableTwo);
+  tableDescOne.addFamily(new HColumnDescriptor(columnFamily));
+  ADMIN.createTable(tableDescOne,Bytes.toBytes("0"),Bytes.toBytes("9"),initialRegions);
+  Connection connection=ConnectionFactory.createConnection(UTIL.getConfiguration());
+  try (Table table=connection.getTable(tableTwo)){
+    UTIL.loadNumericRows(table,Bytes.toBytes("info"),1000,1999);
+  }
+   ADMIN.flush(tableTwo);
+  List<RegionInfo> hris=ADMIN.getRegions(tableTwo);
+  assertEquals(initialRegions,hris.size());
+  Collections.sort(hris,RegionInfo.COMPARATOR);
+  Future<?> f=ADMIN.mergeRegionsAsync(hris.get(0).getEncodedNameAsBytes(),hris.get(1).getEncodedNameAsBytes(),false);
+  f.get(10,TimeUnit.SECONDS);
+  hris=ADMIN.getRegions(tableTwo);
+  assertEquals(initialRegions - 1,hris.size());
+  Collections.sort(hris,RegionInfo.COMPARATOR);
+  byte[] splitKey=Bytes.toBytes("3");
+  HRegion regionToSplit=UTIL.getMiniHBaseCluster().getRegions(tableTwo).stream().filter(r -> r.getRegionInfo().containsRow(splitKey)).findFirst().get();
+  regionToSplit.compact(true);
+  UTIL.waitFor(30000,new Waiter.Predicate<Exception>(){
+    @Override public boolean evaluate() throws Exception {
+      return (CompactionState.NONE == ADMIN.getCompactionStateForRegion(regionToSplit.getRegionInfo().getRegionName()));
+    }
+  }
+);
+  regionToSplit.getStores().stream().forEach(s -> {
+    try {
+      s.closeAndArchiveCompactedFiles();
+    }
+ catch (    IOException e1) {
+      LOG.error("Error whiling cleaning compacted file");
+    }
+  }
+);
+  UTIL.waitFor(10000,regionToSplit::isSplittable);
+  ADMIN.splitRegionAsync(regionToSplit.getRegionInfo().getRegionName(),splitKey).get(10,TimeUnit.SECONDS);
+  hris=ADMIN.getRegions(tableTwo);
+  assertEquals(initialRegions,hris.size());
+  Collections.sort(hris,RegionInfo.COMPARATOR);
+  MiniHBaseCluster cluster=UTIL.getHBaseCluster();
+  MasterCoprocessorHost cpHost=cluster.getMaster().getMasterCoprocessorHost();
+  Coprocessor coprocessor=cpHost.findCoprocessor(CPMasterObserver.class);
+  CPMasterObserver masterObserver=(CPMasterObserver)coprocessor;
+  masterObserver.failMerge(true);
+  f=ADMIN.mergeRegionsAsync(hris.get(1).getEncodedNameAsBytes(),hris.get(2).getEncodedNameAsBytes(),false);
+  try {
+    f.get(10,TimeUnit.SECONDS);
+    fail("Merge was supposed to fail!");
+  }
+ catch (  ExecutionException ee) {
+  }
+  hris=ADMIN.getRegions(tableTwo);
+  assertEquals(initialRegions,hris.size());
+  Collections.sort(hris,RegionInfo.COMPARATOR);
+  try {
+    ADMIN.split(tableTwo,Bytes.toBytes("6"));
+    fail();
+  }
+ catch (  DoNotRetryRegionException e) {
+  }
+  Thread.sleep(2000);
+  assertEquals(initialRegions,ADMIN.getRegions(tableTwo).size());
+}

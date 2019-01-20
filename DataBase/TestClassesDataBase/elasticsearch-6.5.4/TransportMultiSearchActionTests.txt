@@ -1,0 +1,82 @@
+public class TransportMultiSearchActionTests extends ESTestCase {
+  protected ThreadPool threadPool;
+  @Before @Override public void setUp() throws Exception {
+    super.setUp();
+    threadPool=new TestThreadPool(getTestName());
+  }
+  @After @Override public void tearDown() throws Exception {
+    threadPool.shutdown();
+    super.tearDown();
+  }
+  public void testBatchExecute() throws Exception {
+    Settings settings=Settings.builder().put("node.name",TransportMultiSearchActionTests.class.getSimpleName()).build();
+    ActionFilters actionFilters=mock(ActionFilters.class);
+    when(actionFilters.filters()).thenReturn(new ActionFilter[0]);
+    ThreadPool threadPool=new ThreadPool(settings);
+    TransportService transportService=new TransportService(Settings.EMPTY,mock(Transport.class),threadPool,TransportService.NOOP_TRANSPORT_INTERCEPTOR,boundAddress -> DiscoveryNode.createLocal(settings,boundAddress.publishAddress(),UUIDs.randomBase64UUID()),null,Collections.emptySet()){
+      @Override public TaskManager getTaskManager(){
+        return taskManager;
+      }
+    }
+;
+    ClusterService clusterService=mock(ClusterService.class);
+    when(clusterService.state()).thenReturn(ClusterState.builder(new ClusterName("test")).build());
+    IndexNameExpressionResolver resolver=new IndexNameExpressionResolver(Settings.EMPTY);
+    TaskManager taskManager=mock(TaskManager.class);
+    int maxAllowedConcurrentSearches=scaledRandomIntBetween(1,16);
+    AtomicInteger counter=new AtomicInteger();
+    AtomicReference<AssertionError> errorHolder=new AtomicReference<>();
+    final List<String> threadPoolNames=Arrays.asList(ThreadPool.Names.GENERIC,ThreadPool.Names.SAME);
+    Randomness.shuffle(threadPoolNames);
+    final ExecutorService commonExecutor=threadPool.executor(threadPoolNames.get(0));
+    final ExecutorService rarelyExecutor=threadPool.executor(threadPoolNames.get(1));
+    final Set<SearchRequest> requests=Collections.newSetFromMap(Collections.synchronizedMap(new IdentityHashMap<>()));
+    TransportAction<SearchRequest,SearchResponse> searchAction=new TransportAction<SearchRequest,SearchResponse>(Settings.EMPTY,"action",threadPool,actionFilters,resolver,taskManager){
+      @Override protected void doExecute(      SearchRequest request,      ActionListener<SearchResponse> listener){
+        requests.add(request);
+        int currentConcurrentSearches=counter.incrementAndGet();
+        if (currentConcurrentSearches > maxAllowedConcurrentSearches) {
+          errorHolder.set(new AssertionError("Current concurrent search [" + currentConcurrentSearches + "] is higher than is allowed ["+ maxAllowedConcurrentSearches+ "]"));
+        }
+        final ExecutorService executorService=rarely() ? rarelyExecutor : commonExecutor;
+        executorService.execute(() -> {
+          counter.decrementAndGet();
+          listener.onResponse(new SearchResponse());
+        }
+);
+      }
+    }
+;
+    TransportMultiSearchAction action=new TransportMultiSearchAction(threadPool,actionFilters,transportService,clusterService,searchAction,resolver,10);
+    try {
+      int numSearchRequests=scaledRandomIntBetween(1,8192);
+      MultiSearchRequest multiSearchRequest=new MultiSearchRequest();
+      multiSearchRequest.maxConcurrentSearchRequests(maxAllowedConcurrentSearches);
+      for (int i=0; i < numSearchRequests; i++) {
+        multiSearchRequest.add(new SearchRequest());
+      }
+      MultiSearchResponse response=action.execute(multiSearchRequest).actionGet();
+      assertThat(response.getResponses().length,equalTo(numSearchRequests));
+      assertThat(requests.size(),equalTo(numSearchRequests));
+      assertThat(errorHolder.get(),nullValue());
+    }
+  finally {
+      assertTrue(ESTestCase.terminate(threadPool));
+    }
+  }
+  public void testDefaultMaxConcurrentSearches(){
+    int numDataNodes=randomIntBetween(1,10);
+    DiscoveryNodes.Builder builder=DiscoveryNodes.builder();
+    for (int i=0; i < numDataNodes; i++) {
+      builder.add(new DiscoveryNode("_id" + i,buildNewFakeTransportAddress(),Collections.emptyMap(),Collections.singleton(DiscoveryNode.Role.DATA),Version.CURRENT));
+    }
+    builder.add(new DiscoveryNode("master",buildNewFakeTransportAddress(),Collections.emptyMap(),Collections.singleton(DiscoveryNode.Role.MASTER),Version.CURRENT));
+    builder.add(new DiscoveryNode("ingest",buildNewFakeTransportAddress(),Collections.emptyMap(),Collections.singleton(DiscoveryNode.Role.INGEST),Version.CURRENT));
+    ClusterState state=ClusterState.builder(new ClusterName("_name")).nodes(builder).build();
+    int result=TransportMultiSearchAction.defaultMaxConcurrentSearches(10,state);
+    assertThat(result,equalTo(10 * numDataNodes));
+    state=ClusterState.builder(new ClusterName("_name")).build();
+    result=TransportMultiSearchAction.defaultMaxConcurrentSearches(10,state);
+    assertThat(result,equalTo(1));
+  }
+}

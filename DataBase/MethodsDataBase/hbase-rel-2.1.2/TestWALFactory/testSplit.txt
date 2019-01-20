@@ -1,0 +1,43 @@
+/** 
+ * Just write multiple logs then split.  Before fix for HADOOP-2283, this would fail.
+ * @throws IOException
+ */
+@Test public void testSplit() throws IOException {
+  final TableName tableName=TableName.valueOf(currentTest.getMethodName());
+  final byte[] rowName=tableName.getName();
+  final MultiVersionConcurrencyControl mvcc=new MultiVersionConcurrencyControl(1);
+  final int howmany=3;
+  RegionInfo[] infos=new RegionInfo[3];
+  Path tabledir=FSUtils.getWALTableDir(conf,tableName);
+  fs.mkdirs(tabledir);
+  for (int i=0; i < howmany; i++) {
+    infos[i]=RegionInfoBuilder.newBuilder(tableName).setStartKey(Bytes.toBytes("" + i)).setEndKey(Bytes.toBytes("" + (i + 1))).build();
+    fs.mkdirs(new Path(tabledir,infos[i].getEncodedName()));
+    LOG.info("allo " + new Path(tabledir,infos[i].getEncodedName()).toString());
+  }
+  NavigableMap<byte[],Integer> scopes=new TreeMap<>(Bytes.BYTES_COMPARATOR);
+  scopes.put(Bytes.toBytes("column"),0);
+  for (int ii=0; ii < howmany; ii++) {
+    for (int i=0; i < howmany; i++) {
+      final WAL log=wals.getWAL(infos[i]);
+      for (int j=0; j < howmany; j++) {
+        WALEdit edit=new WALEdit();
+        byte[] family=Bytes.toBytes("column");
+        byte[] qualifier=Bytes.toBytes(Integer.toString(j));
+        byte[] column=Bytes.toBytes("column:" + Integer.toString(j));
+        edit.add(new KeyValue(rowName,family,qualifier,System.currentTimeMillis(),column));
+        LOG.info("Region " + i + ": "+ edit);
+        WALKeyImpl walKey=new WALKeyImpl(infos[i].getEncodedNameAsBytes(),tableName,System.currentTimeMillis(),mvcc,scopes);
+        log.append(infos[i],walKey,edit,true);
+        walKey.getWriteEntry();
+      }
+      log.sync();
+      log.rollWriter(true);
+    }
+  }
+  wals.shutdown();
+  Path logDir=new Path(new Path(hbaseWALDir,HConstants.HREGION_LOGDIR_NAME),this.currentServername.toString());
+  Path oldLogDir=new Path(hbaseDir,HConstants.HREGION_OLDLOGDIR_NAME);
+  List<Path> splits=WALSplitter.split(hbaseWALDir,logDir,oldLogDir,fs,conf,wals);
+  verifySplits(splits,howmany);
+}

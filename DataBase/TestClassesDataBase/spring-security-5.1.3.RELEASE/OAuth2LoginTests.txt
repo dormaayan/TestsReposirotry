@@ -1,0 +1,65 @@
+/** 
+ * @author Rob Winch
+ * @since 5.1
+ */
+public class OAuth2LoginTests {
+  @Rule public final SpringTestRule spring=new SpringTestRule();
+  @Autowired private WebFilterChainProxy springSecurity;
+  private static ClientRegistration github=CommonOAuth2Provider.GITHUB.getBuilder("github").clientId("client").clientSecret("secret").build();
+  @Test public void defaultLoginPageWithMultipleClientRegistrationsThenLinks(){
+    this.spring.register(OAuth2LoginWithMulitpleClientRegistrations.class).autowire();
+    WebTestClient webTestClient=WebTestClientBuilder.bindToWebFilters(this.springSecurity).build();
+    WebDriver driver=WebTestClientHtmlUnitDriverBuilder.webTestClientSetup(webTestClient).build();
+    FormLoginTests.DefaultLoginPage loginPage=FormLoginTests.HomePage.to(driver,FormLoginTests.DefaultLoginPage.class).assertAt().assertLoginFormNotPresent().oauth2Login().assertClientRegistrationByName(this.github.getClientName()).and();
+  }
+@EnableWebFluxSecurity static class OAuth2LoginWithMulitpleClientRegistrations {
+    @Bean InMemoryReactiveClientRegistrationRepository clientRegistrationRepository(){
+      ClientRegistration google=CommonOAuth2Provider.GOOGLE.getBuilder("google").clientId("client").clientSecret("secret").build();
+      return new InMemoryReactiveClientRegistrationRepository(github,google);
+    }
+  }
+  @Test public void defaultLoginPageWithSingleClientRegistrationThenRedirect(){
+    this.spring.register(OAuth2LoginWithSingleClientRegistrations.class).autowire();
+    WebTestClient webTestClient=WebTestClientBuilder.bindToWebFilters(new GitHubWebFilter(),this.springSecurity).build();
+    WebDriver driver=WebTestClientHtmlUnitDriverBuilder.webTestClientSetup(webTestClient).build();
+    driver.get("http://localhost/");
+    assertThat(driver.getCurrentUrl()).startsWith("https://github.com/login/oauth/authorize");
+  }
+@EnableWebFluxSecurity static class OAuth2LoginWithSingleClientRegistrations {
+    @Bean InMemoryReactiveClientRegistrationRepository clientRegistrationRepository(){
+      return new InMemoryReactiveClientRegistrationRepository(github);
+    }
+  }
+  @Test public void oauth2LoginWhenCustomObjectsThenUsed(){
+    this.spring.register(OAuth2LoginWithSingleClientRegistrations.class,OAuth2LoginMockAuthenticationManagerConfig.class).autowire();
+    WebTestClient webTestClient=WebTestClientBuilder.bindToWebFilters(this.springSecurity).build();
+    OAuth2LoginMockAuthenticationManagerConfig config=this.spring.getContext().getBean(OAuth2LoginMockAuthenticationManagerConfig.class);
+    ServerAuthenticationConverter converter=config.authenticationConverter;
+    ReactiveAuthenticationManager manager=config.manager;
+    OAuth2AuthorizationExchange exchange=TestOAuth2AuthorizationExchanges.success();
+    OAuth2User user=TestOAuth2Users.create();
+    OAuth2AccessToken accessToken=TestOAuth2AccessTokens.noScopes();
+    OAuth2LoginAuthenticationToken result=new OAuth2LoginAuthenticationToken(github,exchange,user,user.getAuthorities(),accessToken);
+    when(converter.convert(any())).thenReturn(Mono.just(new TestingAuthenticationToken("a","b","c")));
+    when(manager.authenticate(any())).thenReturn(Mono.just(result));
+    webTestClient.get().uri("/login/oauth2/code/github").exchange().expectStatus().is3xxRedirection();
+    verify(converter).convert(any());
+    verify(manager).authenticate(any());
+  }
+@Configuration static class OAuth2LoginMockAuthenticationManagerConfig {
+    ReactiveAuthenticationManager manager=mock(ReactiveAuthenticationManager.class);
+    ServerAuthenticationConverter authenticationConverter=mock(ServerAuthenticationConverter.class);
+    @Bean public SecurityWebFilterChain springSecurityFilter(    ServerHttpSecurity http){
+      http.authorizeExchange().anyExchange().authenticated().and().oauth2Login().authenticationConverter(authenticationConverter).authenticationManager(manager);
+      return http.build();
+    }
+  }
+static class GitHubWebFilter implements WebFilter {
+    @Override public Mono<Void> filter(    ServerWebExchange exchange,    WebFilterChain chain){
+      if (exchange.getRequest().getURI().getHost().equals("github.com")) {
+        return exchange.getResponse().setComplete();
+      }
+      return chain.filter(exchange);
+    }
+  }
+}

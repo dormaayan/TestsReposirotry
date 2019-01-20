@@ -1,0 +1,82 @@
+@Test(timeout=60000) public void testAMRMClientWithContainerDemotion() throws YarnException, IOException {
+  AMRMClientImpl<AMRMClient.ContainerRequest> amClient=(AMRMClientImpl<AMRMClient.ContainerRequest>)AMRMClient.createAMRMClient();
+  Assert.assertSame(NMTokenCache.getSingleton(),amClient.getNMTokenCache());
+  amClient.init(conf);
+  amClient.start();
+  NMClientImpl nmClient=(NMClientImpl)NMClient.createNMClient();
+  Assert.assertNotNull(nmClient);
+  Assert.assertSame(NMTokenCache.getSingleton(),nmClient.getNMTokenCache());
+  nmClient.init(conf);
+  nmClient.start();
+  assertEquals(STATE.STARTED,nmClient.getServiceState());
+  amClient.registerApplicationMaster("Host",10000,"");
+  assertEquals(0,amClient.ask.size());
+  assertEquals(0,amClient.release.size());
+  amClient.addContainerRequest(new AMRMClient.ContainerRequest(capability,null,null,priority2,0,true,null,ExecutionTypeRequest.newInstance(ExecutionType.GUARANTEED,true)));
+  int oppContainersRequestedAny=amClient.getTable(0).get(priority2,ResourceRequest.ANY,ExecutionType.GUARANTEED,capability).remoteRequest.getNumContainers();
+  assertEquals(1,oppContainersRequestedAny);
+  assertEquals(1,amClient.ask.size());
+  assertEquals(0,amClient.release.size());
+  int allocatedContainerCount=0;
+  Map<ContainerId,Container> allocatedGuaranteedContainers=new HashMap<>();
+  int iterationsLeft=50;
+  amClient.getNMTokenCache().clearCache();
+  assertEquals(0,amClient.getNMTokenCache().numberOfTokensInCache());
+  AllocateResponse allocResponse=null;
+  while (allocatedContainerCount < oppContainersRequestedAny && iterationsLeft-- > 0) {
+    allocResponse=amClient.allocate(0.1f);
+    assertEquals(0,amClient.ask.size());
+    assertEquals(0,amClient.release.size());
+    allocatedContainerCount+=allocResponse.getAllocatedContainers().size();
+    for (    Container container : allocResponse.getAllocatedContainers()) {
+      if (container.getExecutionType() == ExecutionType.GUARANTEED) {
+        allocatedGuaranteedContainers.put(container.getId(),container);
+      }
+    }
+    if (allocatedContainerCount < oppContainersRequestedAny) {
+      sleep(100);
+    }
+  }
+  assertEquals(oppContainersRequestedAny,allocatedContainerCount);
+  assertEquals(oppContainersRequestedAny,allocatedGuaranteedContainers.size());
+  startContainer(allocResponse,nmClient);
+  try {
+    Container c=allocatedGuaranteedContainers.values().iterator().next();
+    amClient.requestContainerUpdate(c,UpdateContainerRequest.newInstance(c.getVersion(),c.getId(),ContainerUpdateType.DEMOTE_EXECUTION_TYPE,null,ExecutionType.GUARANTEED));
+    fail("Should throw Exception..");
+  }
+ catch (  IllegalArgumentException e) {
+    System.out.println("## " + e.getMessage());
+    assertTrue(e.getMessage().contains("target should be OPPORTUNISTIC and original should be GUARANTEED"));
+  }
+  Container c=allocatedGuaranteedContainers.values().iterator().next();
+  amClient.requestContainerUpdate(c,UpdateContainerRequest.newInstance(c.getVersion(),c.getId(),ContainerUpdateType.DEMOTE_EXECUTION_TYPE,null,ExecutionType.OPPORTUNISTIC));
+  iterationsLeft=120;
+  Map<ContainerId,UpdatedContainer> updatedContainers=new HashMap<>();
+  while (iterationsLeft-- > 0 && updatedContainers.isEmpty()) {
+    allocResponse=amClient.allocate(0.1f);
+    if (allocResponse.getUpdatedContainers() != null) {
+      for (      UpdatedContainer updatedContainer : allocResponse.getUpdatedContainers()) {
+        System.out.println("Got update..");
+        updatedContainers.put(updatedContainer.getContainer().getId(),updatedContainer);
+      }
+    }
+    if (iterationsLeft > 0) {
+      sleep(100);
+    }
+  }
+  assertEquals(1,updatedContainers.size());
+  for (  ContainerId cId : allocatedGuaranteedContainers.keySet()) {
+    Container orig=allocatedGuaranteedContainers.get(cId);
+    UpdatedContainer updatedContainer=updatedContainers.get(cId);
+    assertNotNull(updatedContainer);
+    assertEquals(ExecutionType.OPPORTUNISTIC,updatedContainer.getContainer().getExecutionType());
+    assertEquals(orig.getResource(),updatedContainer.getContainer().getResource());
+    assertEquals(orig.getNodeId(),updatedContainer.getContainer().getNodeId());
+    assertEquals(orig.getVersion() + 1,updatedContainer.getContainer().getVersion());
+  }
+  assertEquals(0,amClient.ask.size());
+  assertEquals(0,amClient.release.size());
+  updateContainerExecType(allocResponse,ExecutionType.OPPORTUNISTIC,nmClient);
+  amClient.ask.clear();
+}

@@ -1,0 +1,41 @@
+@Test public void shouldNotSeeEmptyLogFileWhenReadingTransactionStream() throws Exception {
+  LogVersionRepository logVersionRepository=new SimpleLogVersionRepository();
+  LogFiles logFiles=LogFilesBuilder.builder(directory.databaseLayout(),fileSystemRule.get()).withLogVersionRepository(logVersionRepository).withTransactionIdStore(new SimpleTransactionIdStore()).build();
+  life.add(logFiles);
+  LogFile logFile=logFiles.getLogFile();
+  FlushablePositionAwareChannel writer=logFile.getWriter();
+  LogPositionMarker startPosition=new LogPositionMarker();
+  writer.getCurrentPosition(startPosition);
+  AtomicBoolean end=new AtomicBoolean();
+  byte[] dataChunk=new byte[100];
+  AtomicInteger rotations=new AtomicInteger();
+  CountDownLatch startSignal=new CountDownLatch(1);
+  Future<Void> writeFuture=t2.execute(ignored -> {
+    ThreadLocalRandom random=ThreadLocalRandom.current();
+    startSignal.countDown();
+    while (!end.get()) {
+      writer.put(dataChunk,random.nextInt(1,dataChunk.length));
+      if (logFile.rotationNeeded()) {
+        logFile.rotate();
+        writer.getCurrentPosition(startPosition);
+        rotations.incrementAndGet();
+      }
+    }
+    return null;
+  }
+);
+  assertTrue(startSignal.await(10,SECONDS));
+  long maxEndTime=currentTimeMillis() + LIMIT_TIME;
+  int reads=0;
+  try {
+    for (; currentTimeMillis() < maxEndTime && reads < LIMIT_READS && rotations.get() < LIMIT_ROTATIONS; reads++) {
+      try (ReadableLogChannel reader=logFile.getReader(startPosition.newPosition())){
+        deplete(reader);
+      }
+     }
+  }
+  finally {
+    end.set(true);
+    writeFuture.get();
+  }
+}

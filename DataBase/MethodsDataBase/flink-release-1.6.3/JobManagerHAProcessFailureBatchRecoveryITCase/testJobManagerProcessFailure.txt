@@ -1,0 +1,101 @@
+@Test public void testJobManagerProcessFailure() throws Exception {
+  final int numberOfJobManagers=2;
+  final int numberOfTaskManagers=2;
+  final int numberOfSlotsPerTaskManager=2;
+  assertEquals(PARALLELISM,numberOfTaskManagers * numberOfSlotsPerTaskManager);
+  ActorSystem testActorSystem;
+  final JobManagerProcess[] jmProcess=new JobManagerProcess[numberOfJobManagers];
+  final ActorSystem[] tmActorSystem=new ActorSystem[numberOfTaskManagers];
+  HighAvailabilityServices highAvailabilityServices=null;
+  LeaderRetrievalService leaderRetrievalService=null;
+  File coordinateTempDir=null;
+  try {
+    final Deadline deadline=TestTimeOut.fromNow();
+    coordinateTempDir=createTempDirectory();
+    Configuration config=ZooKeeperTestUtils.createZooKeeperHAConfig(ZooKeeper.getConnectString(),FileStateBackendBasePath.getPath());
+    jmProcess[0]=new JobManagerProcess(0,config);
+    jmProcess[0].startProcess();
+    config.setString(TaskManagerOptions.MANAGED_MEMORY_SIZE,"4m");
+    config.setInteger(TaskManagerOptions.NETWORK_NUM_BUFFERS,100);
+    config.setInteger(TaskManagerOptions.NUM_TASK_SLOTS,2);
+    highAvailabilityServices=HighAvailabilityServicesUtils.createAvailableOrEmbeddedServices(config,TestingUtils.defaultExecutor());
+    for (int i=0; i < numberOfTaskManagers; i++) {
+      tmActorSystem[i]=AkkaUtils.createActorSystem(AkkaUtils.getDefaultAkkaConfig());
+      TaskManager.startTaskManagerComponentsAndActor(config,ResourceID.generate(),tmActorSystem[i],highAvailabilityServices,NoOpMetricRegistry.INSTANCE,"localhost",Option.<String>empty(),false,TaskManager.class);
+    }
+    testActorSystem=AkkaUtils.createActorSystem(AkkaUtils.getDefaultAkkaConfig());
+    jmProcess[0].getActorRef(testActorSystem,deadline.timeLeft());
+    TestingListener leaderListener=new TestingListener();
+    leaderRetrievalService=highAvailabilityServices.getJobManagerLeaderRetriever(HighAvailabilityServices.DEFAULT_JOB_ID);
+    leaderRetrievalService.start(leaderListener);
+    leaderListener.waitForNewLeader(deadline.timeLeft().toMillis());
+    String leaderAddress=leaderListener.getAddress();
+    UUID leaderId=leaderListener.getLeaderSessionID();
+    ActorRef leaderRef=AkkaUtils.getActorRef(leaderAddress,testActorSystem,deadline.timeLeft());
+    ActorGateway leaderGateway=new AkkaActorGateway(leaderRef,leaderId);
+    JobManagerActorTestUtils.waitForTaskManagers(numberOfTaskManagers,leaderGateway,deadline.timeLeft());
+    final File coordinateDirClosure=coordinateTempDir;
+    final Throwable[] errorRef=new Throwable[1];
+    Thread programTrigger=new Thread("Program Trigger"){
+      @Override public void run(){
+        try {
+          testJobManagerFailure(ZooKeeper.getConnectString(),coordinateDirClosure);
+        }
+ catch (        Throwable t) {
+          t.printStackTrace();
+          errorRef[0]=t;
+        }
+      }
+    }
+;
+    programTrigger.start();
+    AbstractTaskManagerProcessFailureRecoveryTest.waitForMarkerFiles(coordinateTempDir,READY_MARKER_FILE_PREFIX,PARALLELISM,deadline.timeLeft().toMillis());
+    jmProcess[0].destroy();
+    jmProcess[1]=new JobManagerProcess(1,config);
+    jmProcess[1].startProcess();
+    jmProcess[1].getActorRef(testActorSystem,deadline.timeLeft());
+    AbstractTaskManagerProcessFailureRecoveryTest.touchFile(new File(coordinateTempDir,PROCEED_MARKER_FILE));
+    programTrigger.join(deadline.timeLeft().toMillis());
+    AbstractTaskManagerProcessFailureRecoveryTest.waitForMarkerFiles(coordinateTempDir,FINISH_MARKER_FILE_PREFIX,1,deadline.timeLeft().toMillis());
+    assertFalse("The program did not finish in time",programTrigger.isAlive());
+    if (errorRef[0] != null) {
+      Throwable error=errorRef[0];
+      error.printStackTrace();
+      fail("The program encountered a " + error.getClass().getSimpleName() + " : "+ error.getMessage());
+    }
+  }
+ catch (  Throwable t) {
+    t.printStackTrace();
+    for (    JobManagerProcess p : jmProcess) {
+      if (p != null) {
+        p.printProcessLog();
+      }
+    }
+    throw t;
+  }
+ finally {
+    for (int i=0; i < numberOfTaskManagers; i++) {
+      if (tmActorSystem[i] != null) {
+        tmActorSystem[i].shutdown();
+      }
+    }
+    if (leaderRetrievalService != null) {
+      leaderRetrievalService.stop();
+    }
+    for (    JobManagerProcess jmProces : jmProcess) {
+      if (jmProces != null) {
+        jmProces.destroy();
+      }
+    }
+    if (highAvailabilityServices != null) {
+      highAvailabilityServices.closeAndCleanupAllData();
+    }
+    if (coordinateTempDir != null) {
+      try {
+        FileUtils.deleteDirectory(coordinateTempDir);
+      }
+ catch (      Throwable ignored) {
+      }
+    }
+  }
+}

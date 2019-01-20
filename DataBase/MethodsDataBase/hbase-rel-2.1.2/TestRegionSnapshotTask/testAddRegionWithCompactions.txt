@@ -1,0 +1,35 @@
+/** 
+ * Tests adding a region to the snapshot manifest while compactions are running on the region. The idea is to slow down the process of adding a store file to the manifest while triggering compactions on the region, allowing the store files to be marked for archival while snapshot operation is running. This test checks for the correct behavior in such a case that the compacted files should not be moved around if a snapshot operation is in progress. See HBASE-18398
+ */
+@Test public void testAddRegionWithCompactions() throws Exception {
+  final TableName tableName=TableName.valueOf("test_table");
+  Table table=setupTable(tableName);
+  List<HRegion> hRegions=TEST_UTIL.getHBaseCluster().getRegions(tableName);
+  final SnapshotProtos.SnapshotDescription snapshot=SnapshotProtos.SnapshotDescription.newBuilder().setTable(tableName.getNameAsString()).setType(SnapshotProtos.SnapshotDescription.Type.FLUSH).setName("test_table_snapshot").setVersion(SnapshotManifestV2.DESCRIPTOR_VERSION).build();
+  ForeignExceptionDispatcher monitor=new ForeignExceptionDispatcher(snapshot.getName());
+  final HRegion region=spy(hRegions.get(0));
+  Path workingDir=SnapshotDescriptionUtils.getWorkingSnapshotDir(snapshot,rootDir);
+  final SnapshotManifest manifest=SnapshotManifest.create(conf,fs,workingDir,snapshot,monitor);
+  manifest.addTableDescriptor(table.getTableDescriptor());
+  if (!fs.exists(workingDir)) {
+    fs.mkdirs(workingDir);
+  }
+  assertTrue(fs.exists(workingDir));
+  SnapshotDescriptionUtils.writeSnapshotInfo(snapshot,workingDir,fs);
+  doAnswer(__ -> {
+    addRegionToSnapshot(snapshot,region,manifest);
+    return null;
+  }
+).when(region).addRegionToSnapshot(snapshot,monitor);
+  FlushSnapshotSubprocedure.RegionSnapshotTask snapshotTask=new FlushSnapshotSubprocedure.RegionSnapshotTask(region,snapshot,true,monitor);
+  ExecutorService executor=Executors.newFixedThreadPool(1);
+  Future f=executor.submit(snapshotTask);
+  LOG.info("Starting major compaction");
+  region.compact(true);
+  LOG.info("Finished major compaction");
+  f.get();
+  manifest.consolidate();
+  assertNotNull(manifest.getRegionManifests());
+  assertEquals(1,manifest.getRegionManifests().size());
+  SnapshotReferenceUtil.verifySnapshot(conf,fs,manifest);
+}

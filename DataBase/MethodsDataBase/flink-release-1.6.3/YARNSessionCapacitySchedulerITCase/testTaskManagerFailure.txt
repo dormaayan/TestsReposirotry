@@ -1,0 +1,120 @@
+/** 
+ * Test TaskManager failure and also if the vcores are set correctly (see issue FLINK-2213).
+ */
+@Test(timeout=100000) public void testTaskManagerFailure() throws Exception {
+  assumeTrue("The new mode does not start TMs upfront.",!isNewMode);
+  LOG.info("Starting testTaskManagerFailure()");
+  Runner runner=startWithArgs(new String[]{"-j",flinkUberjar.getAbsolutePath(),"-t",flinkLibFolder.getAbsolutePath(),"-n","1","-jm","768m","-tm","1024m","-s","3","-nm","customName","-Dfancy-configuration-value=veryFancy","-Dyarn.maximum-failed-containers=3","-D" + YarnConfigOptions.VCORES.key() + "=2"},"Number of connected TaskManagers changed to 1. Slots available: 3",RunTypes.YARN_SESSION);
+  Assert.assertEquals(2,getRunningContainers());
+  final YarnClient yc=YarnClient.createYarnClient();
+  yc.init(YARN_CONFIGURATION);
+  yc.start();
+  List<ApplicationReport> apps=yc.getApplications(EnumSet.of(YarnApplicationState.RUNNING));
+  Assert.assertEquals(1,apps.size());
+  ApplicationReport app=apps.get(0);
+  Assert.assertEquals("customName",app.getName());
+  String url=app.getTrackingUrl();
+  if (!url.endsWith("/")) {
+    url+="/";
+  }
+  if (!url.startsWith("http://")) {
+    url="http://" + url;
+  }
+  LOG.info("Got application URL from YARN {}",url);
+  String response=TestBaseUtils.getFromHTTP(url + "taskmanagers/");
+  JsonNode parsedTMs=new ObjectMapper().readTree(response);
+  ArrayNode taskManagers=(ArrayNode)parsedTMs.get("taskmanagers");
+  Assert.assertNotNull(taskManagers);
+  Assert.assertEquals(1,taskManagers.size());
+  Assert.assertEquals(3,taskManagers.get(0).get("slotsNumber").asInt());
+  String jsonConfig=TestBaseUtils.getFromHTTP(url + "jobmanager/config");
+  Map<String,String> parsedConfig=WebMonitorUtils.fromKeyValueJsonArray(jsonConfig);
+  Assert.assertEquals("veryFancy",parsedConfig.get("fancy-configuration-value"));
+  Assert.assertEquals("3",parsedConfig.get("yarn.maximum-failed-containers"));
+  Assert.assertEquals("2",parsedConfig.get(YarnConfigOptions.VCORES.key()));
+  String oC=outContent.toString();
+  Pattern p=Pattern.compile("Flink JobManager is now running on ([a-zA-Z0-9.-]+):([0-9]+)");
+  Matcher matches=p.matcher(oC);
+  String hostname=null;
+  String port=null;
+  while (matches.find()) {
+    hostname=matches.group(1).toLowerCase();
+    port=matches.group(2);
+  }
+  LOG.info("Extracted hostname:port: {} {}",hostname,port);
+  Assert.assertEquals("unable to find hostname in " + jsonConfig,hostname,parsedConfig.get(JobManagerOptions.ADDRESS.key()));
+  Assert.assertEquals("unable to find port in " + jsonConfig,port,parsedConfig.get(JobManagerOptions.PORT.key()));
+  String logs=TestBaseUtils.getFromHTTP(url + "jobmanager/log");
+  Assert.assertTrue(logs.contains("Starting YARN ApplicationMaster"));
+  Assert.assertTrue(logs.contains("Starting JobManager"));
+  Assert.assertTrue(logs.contains("Starting JobManager Web Frontend"));
+  ContainerId taskManagerContainer=null;
+  NodeManager nodeManager=null;
+  UserGroupInformation remoteUgi=null;
+  NMTokenIdentifier nmIdent=null;
+  try {
+    remoteUgi=UserGroupInformation.getCurrentUser();
+  }
+ catch (  IOException e) {
+    LOG.warn("Unable to get curr user",e);
+    Assert.fail();
+  }
+  for (int nmId=0; nmId < NUM_NODEMANAGERS; nmId++) {
+    NodeManager nm=yarnCluster.getNodeManager(nmId);
+    ConcurrentMap<ContainerId,Container> containers=nm.getNMContext().getContainers();
+    for (    Map.Entry<ContainerId,Container> entry : containers.entrySet()) {
+      String command=StringUtils.join(entry.getValue().getLaunchContext().getCommands()," ");
+      if (command.contains(YarnTaskManager.class.getSimpleName())) {
+        taskManagerContainer=entry.getKey();
+        nodeManager=nm;
+        nmIdent=new NMTokenIdentifier(taskManagerContainer.getApplicationAttemptId(),null,"",0);
+        remoteUgi.addTokenIdentifier(nmIdent);
+      }
+    }
+    sleep(500);
+  }
+  Assert.assertNotNull("Unable to find container with TaskManager",taskManagerContainer);
+  Assert.assertNotNull("Illegal state",nodeManager);
+  yc.stop();
+  List<ContainerId> toStop=new LinkedList<ContainerId>();
+  toStop.add(taskManagerContainer);
+  StopContainersRequest scr=StopContainersRequest.newInstance(toStop);
+  try {
+    nodeManager.getNMContext().getContainerManager().stopContainers(scr);
+  }
+ catch (  Throwable e) {
+    LOG.warn("Error stopping container",e);
+    Assert.fail("Error stopping container: " + e.getMessage());
+  }
+  boolean ok=false;
+  do {
+    LOG.debug("Waiting for correct order of events. Output: {}",errContent.toString());
+    String o=errContent.toString();
+    int killedOff=o.indexOf("Container killed by the ApplicationMaster");
+    if (killedOff != -1) {
+      o=o.substring(killedOff);
+      ok=o.indexOf("Launching TaskManager") > 0;
+    }
+    sleep(1000);
+  }
+ while (!ok);
+  runner.sendStop();
+  try {
+    runner.join();
+  }
+ catch (  InterruptedException e) {
+    LOG.warn("Interrupted while stopping runner",e);
+  }
+  LOG.warn("stopped");
+  System.setOut(ORIGINAL_STDOUT);
+  System.setErr(ORIGINAL_STDERR);
+  oC=outContent.toString();
+  String eC=errContent.toString();
+  LOG.info("Sending stdout content through logger: \n\n{}\n\n",oC);
+  LOG.info("Sending stderr content through logger: \n\n{}\n\n",eC);
+  Assert.assertTrue("Expect to see failed container",eC.contains("New messages from the YARN cluster"));
+  Assert.assertTrue("Expect to see failed container",eC.contains("Container killed by the ApplicationMaster"));
+  Assert.assertTrue("Expect to see new container started",eC.contains("Launching TaskManager") && eC.contains("on host"));
+  remoteUgi.getTokenIdentifiers().remove(nmIdent);
+  LOG.info("Finished testTaskManagerFailure()");
+}

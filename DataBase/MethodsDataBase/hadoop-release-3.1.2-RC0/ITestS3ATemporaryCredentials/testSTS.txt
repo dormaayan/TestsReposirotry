@@ -1,0 +1,46 @@
+/** 
+ * Test use of STS for requesting temporary credentials. The property test.sts.endpoint can be set to point this at different STS endpoints. This test will use the AWS credentials (if provided) for S3A tests to request temporary credentials, then attempt to use those credentials instead.
+ * @throws IOException
+ */
+@Test public void testSTS() throws IOException {
+  Configuration conf=getContract().getConf();
+  if (!conf.getBoolean(TEST_STS_ENABLED,true)) {
+    skip("STS functional tests disabled");
+  }
+  S3xLoginHelper.Login login=S3AUtils.getAWSAccessKeys(URI.create("s3a://foobar"),conf);
+  if (!login.hasLogin()) {
+    skip("testSTS disabled because AWS credentials not configured");
+  }
+  AWSCredentialsProvider parentCredentials=new BasicAWSCredentialsProvider(login.getUser(),login.getPassword());
+  String stsEndpoint=conf.getTrimmed(TEST_STS_ENDPOINT,"");
+  AWSSecurityTokenServiceClient stsClient;
+  stsClient=new AWSSecurityTokenServiceClient(parentCredentials);
+  if (!stsEndpoint.isEmpty()) {
+    LOG.debug("STS Endpoint ={}",stsEndpoint);
+    stsClient.setEndpoint(stsEndpoint);
+  }
+  GetSessionTokenRequest sessionTokenRequest=new GetSessionTokenRequest();
+  sessionTokenRequest.setDurationSeconds(900);
+  GetSessionTokenResult sessionTokenResult;
+  sessionTokenResult=stsClient.getSessionToken(sessionTokenRequest);
+  Credentials sessionCreds=sessionTokenResult.getCredentials();
+  String childAccessKey=sessionCreds.getAccessKeyId();
+  conf.set(ACCESS_KEY,childAccessKey);
+  String childSecretKey=sessionCreds.getSecretAccessKey();
+  conf.set(SECRET_KEY,childSecretKey);
+  String sessionToken=sessionCreds.getSessionToken();
+  conf.set(SESSION_TOKEN,sessionToken);
+  conf.set(AWS_CREDENTIALS_PROVIDER,PROVIDER_CLASS);
+  try (S3AFileSystem fs=S3ATestUtils.createTestFileSystem(conf)){
+    createAndVerifyFile(fs,path("testSTS"),TEST_FILE_SIZE);
+  }
+   conf.set(SESSION_TOKEN,"invalid-" + sessionToken);
+  try (S3AFileSystem fs=S3ATestUtils.createTestFileSystem(conf)){
+    createAndVerifyFile(fs,path("testSTSInvalidToken"),TEST_FILE_SIZE);
+    fail("Expected an access exception, but file access to " + fs.getUri() + " was allowed: "+ fs);
+  }
+ catch (  AWSS3IOException|AWSBadRequestException ex) {
+    LOG.info("Expected Exception: {}",ex.toString());
+    LOG.debug("Expected Exception: {}",ex,ex);
+  }
+}

@@ -1,0 +1,150 @@
+/** 
+ * Start the HBase Thrift server on a random port through the command-line interface and talk to it from client side.
+ */
+@Category({ClientTests.class,LargeTests.class}) @RunWith(Parameterized.class) public class TestThriftServerCmdLine {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestThriftServerCmdLine.class);
+  private static final Logger LOG=LoggerFactory.getLogger(TestThriftServerCmdLine.class);
+  private final ImplType implType;
+  private boolean specifyFramed;
+  private boolean specifyBindIP;
+  private boolean specifyCompact;
+  private static final HBaseTestingUtility TEST_UTIL=new HBaseTestingUtility();
+  private Thread cmdLineThread;
+  private volatile Exception cmdLineException;
+  private Exception clientSideException;
+  private ThriftServer thriftServer;
+  private int port;
+  @Parameters public static Collection<Object[]> getParameters(){
+    Collection<Object[]> parameters=new ArrayList<>();
+    for (    ImplType implType : ImplType.values()) {
+      for (      boolean specifyFramed : new boolean[]{false,true}) {
+        for (        boolean specifyBindIP : new boolean[]{false,true}) {
+          if (specifyBindIP && !implType.canSpecifyBindIP) {
+            continue;
+          }
+          for (          boolean specifyCompact : new boolean[]{false,true}) {
+            parameters.add(new Object[]{implType,specifyFramed,specifyBindIP,specifyCompact});
+          }
+        }
+      }
+    }
+    return parameters;
+  }
+  public TestThriftServerCmdLine(  ImplType implType,  boolean specifyFramed,  boolean specifyBindIP,  boolean specifyCompact){
+    this.implType=implType;
+    this.specifyFramed=specifyFramed;
+    this.specifyBindIP=specifyBindIP;
+    this.specifyCompact=specifyCompact;
+    LOG.debug(getParametersString());
+  }
+  private String getParametersString(){
+    return "implType=" + implType + ", "+ "specifyFramed="+ specifyFramed+ ", "+ "specifyBindIP="+ specifyBindIP+ ", "+ "specifyCompact="+ specifyCompact;
+  }
+  @BeforeClass public static void setUpBeforeClass() throws Exception {
+    TEST_UTIL.getConfiguration().setBoolean("hbase.table.sanity.checks",false);
+    TEST_UTIL.startMiniCluster();
+    EnvironmentEdgeManagerTestHelper.injectEdge(new IncrementingEnvironmentEdge());
+  }
+  @AfterClass public static void tearDownAfterClass() throws Exception {
+    TEST_UTIL.shutdownMiniCluster();
+    EnvironmentEdgeManager.reset();
+  }
+  private void startCmdLineThread(  final String[] args){
+    LOG.info("Starting HBase Thrift server with command line: " + Joiner.on(" ").join(args));
+    cmdLineException=null;
+    cmdLineThread=new Thread(new Runnable(){
+      @Override public void run(){
+        try {
+          thriftServer.doMain(args);
+        }
+ catch (        Exception e) {
+          cmdLineException=e;
+        }
+      }
+    }
+);
+    cmdLineThread.setName(ThriftServer.class.getSimpleName() + "-cmdline");
+    cmdLineThread.start();
+  }
+  @Test public void testRunThriftServer() throws Exception {
+    List<String> args=new ArrayList<>();
+    if (implType != null) {
+      String serverTypeOption=implType.toString();
+      assertTrue(serverTypeOption.startsWith("-"));
+      args.add(serverTypeOption);
+    }
+    port=HBaseTestingUtility.randomFreePort();
+    args.add("-" + ThriftServer.PORT_OPTION);
+    args.add(String.valueOf(port));
+    args.add("-" + ThriftServer.INFOPORT_OPTION);
+    int infoPort=HBaseTestingUtility.randomFreePort();
+    args.add(String.valueOf(infoPort));
+    if (specifyFramed) {
+      args.add("-" + ThriftServer.FRAMED_OPTION);
+    }
+    if (specifyBindIP) {
+      args.add("-" + ThriftServer.BIND_OPTION);
+      args.add(InetAddress.getLocalHost().getHostName());
+    }
+    if (specifyCompact) {
+      args.add("-" + ThriftServer.COMPACT_OPTION);
+    }
+    args.add("start");
+    thriftServer=new ThriftServer(TEST_UTIL.getConfiguration());
+    startCmdLineThread(args.toArray(new String[args.size()]));
+    for (int i=0; i < 100 && (thriftServer.serverRunner == null || thriftServer.serverRunner.tserver == null); i++) {
+      Thread.sleep(100);
+    }
+    Class<? extends TServer> expectedClass=implType != null ? implType.serverClass : TBoundedThreadPoolServer.class;
+    assertEquals(expectedClass,thriftServer.serverRunner.tserver.getClass());
+    try {
+      talkToThriftServer();
+    }
+ catch (    Exception ex) {
+      clientSideException=ex;
+    }
+ finally {
+      stopCmdLineThread();
+    }
+    if (clientSideException != null) {
+      LOG.error("Thrift client threw an exception. Parameters:" + getParametersString(),clientSideException);
+      throw new Exception(clientSideException);
+    }
+  }
+  private static volatile boolean tableCreated=false;
+  private void talkToThriftServer() throws Exception {
+    TSocket sock=new TSocket(InetAddress.getLocalHost().getHostName(),port);
+    TTransport transport=sock;
+    if (specifyFramed || implType.isAlwaysFramed) {
+      transport=new TFramedTransport(transport);
+    }
+    sock.open();
+    try {
+      TProtocol prot;
+      if (specifyCompact) {
+        prot=new TCompactProtocol(transport);
+      }
+ else {
+        prot=new TBinaryProtocol(transport);
+      }
+      Hbase.Client client=new Hbase.Client(prot);
+      if (!tableCreated) {
+        TestThriftServer.createTestTables(client);
+        tableCreated=true;
+      }
+      TestThriftServer.checkTableList(client);
+    }
+  finally {
+      sock.close();
+    }
+  }
+  private void stopCmdLineThread() throws Exception {
+    LOG.debug("Stopping " + implType.simpleClassName() + " Thrift server");
+    thriftServer.stop();
+    cmdLineThread.join();
+    if (cmdLineException != null) {
+      LOG.error("Command-line invocation of HBase Thrift server threw an " + "exception",cmdLineException);
+      throw new Exception(cmdLineException);
+    }
+  }
+}

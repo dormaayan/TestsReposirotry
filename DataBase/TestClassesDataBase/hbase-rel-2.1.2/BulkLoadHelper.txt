@@ -1,0 +1,64 @@
+public static class BulkLoadHelper {
+  private final FileSystem fs;
+  private final Path loadPath;
+  private final Configuration conf;
+  public BulkLoadHelper(  Path loadPath) throws IOException {
+    fs=TEST_UTIL.getTestFileSystem();
+    conf=TEST_UTIL.getConfiguration();
+    loadPath=loadPath.makeQualified(fs);
+    this.loadPath=loadPath;
+  }
+  private void createHFile(  Path path,  byte[] family,  byte[] qualifier,  byte[] startKey,  byte[] endKey,  int numRows) throws IOException {
+    HFile.Writer writer=null;
+    long now=System.currentTimeMillis();
+    try {
+      HFileContext context=new HFileContextBuilder().build();
+      writer=HFile.getWriterFactory(conf,new CacheConfig(conf)).withPath(fs,path).withFileContext(context).create();
+      for (      byte[] key : Bytes.iterateOnSplits(startKey,endKey,true,numRows - 2)) {
+        KeyValue kv=new KeyValue(key,family,qualifier,now,key);
+        writer.append(kv);
+      }
+    }
+  finally {
+      if (writer != null) {
+        writer.close();
+      }
+    }
+  }
+  private BulkLoadHelper initHFileData(  byte[] family,  byte[] qualifier,  byte[][][] hfileRanges,  int numRowsPerRange,  FsPermission filePermission) throws Exception {
+    Path familyDir=new Path(loadPath,Bytes.toString(family));
+    fs.mkdirs(familyDir);
+    int hfileIdx=0;
+    List<Path> hfiles=new ArrayList<>();
+    for (    byte[][] range : hfileRanges) {
+      byte[] from=range[0];
+      byte[] to=range[1];
+      Path hfile=new Path(familyDir,"hfile_" + (hfileIdx++));
+      hfiles.add(hfile);
+      createHFile(hfile,family,qualifier,from,to,numRowsPerRange);
+    }
+    setPermission(fs,loadPath,FS_PERMISSION_ALL);
+    for (    Path hfile : hfiles) {
+      setPermission(fs,hfile,filePermission);
+    }
+    return this;
+  }
+  private void bulkLoadHFile(  TableName tableName) throws Exception {
+    try (Connection conn=ConnectionFactory.createConnection(conf);Admin admin=conn.getAdmin();RegionLocator locator=conn.getRegionLocator(tableName);Table table=conn.getTable(tableName)){
+      TEST_UTIL.waitUntilAllRegionsAssigned(tableName);
+      LoadIncrementalHFiles loader=new LoadIncrementalHFiles(conf);
+      loader.doBulkLoad(loadPath,admin,table,locator);
+    }
+   }
+  private static void setPermission(  FileSystem fs,  Path dir,  FsPermission perm) throws IOException {
+    if (!fs.getFileStatus(dir).isDirectory()) {
+      fs.setPermission(dir,perm);
+    }
+ else {
+      for (      FileStatus el : fs.listStatus(dir)) {
+        fs.setPermission(el.getPath(),perm);
+        setPermission(fs,el.getPath(),perm);
+      }
+    }
+  }
+}

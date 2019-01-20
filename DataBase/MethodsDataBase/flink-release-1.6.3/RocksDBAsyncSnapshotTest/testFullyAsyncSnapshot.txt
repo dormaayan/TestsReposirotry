@@ -1,0 +1,70 @@
+/** 
+ * This ensures that asynchronous state handles are actually materialized asynchronously. <p>We use latches to block at various stages and see if the code still continues through the parts that are not asynchronous. If the checkpoint is not done asynchronously the test will simply lock forever.
+ */
+@Test public void testFullyAsyncSnapshot() throws Exception {
+  final OneInputStreamTaskTestHarness<String,String> testHarness=new OneInputStreamTaskTestHarness<>(OneInputStreamTask::new,BasicTypeInfo.STRING_TYPE_INFO,BasicTypeInfo.STRING_TYPE_INFO);
+  testHarness.setupOutputForSingletonOperatorChain();
+  testHarness.configureForKeyedStream(new KeySelector<String,String>(){
+    @Override public String getKey(    String value) throws Exception {
+      return value;
+    }
+  }
+,BasicTypeInfo.STRING_TYPE_INFO);
+  StreamConfig streamConfig=testHarness.getStreamConfig();
+  File dbDir=temporaryFolder.newFolder();
+  RocksDBStateBackend backend=new RocksDBStateBackend(new MemoryStateBackend());
+  backend.setDbStoragePath(dbDir.getAbsolutePath());
+  streamConfig.setStateBackend(backend);
+  streamConfig.setStreamOperator(new AsyncCheckpointOperator());
+  streamConfig.setOperatorID(new OperatorID());
+  final OneShotLatch delayCheckpointLatch=new OneShotLatch();
+  final OneShotLatch ensureCheckpointLatch=new OneShotLatch();
+  CheckpointResponder checkpointResponderMock=new CheckpointResponder(){
+    @Override public void acknowledgeCheckpoint(    JobID jobID,    ExecutionAttemptID executionAttemptID,    long checkpointId,    CheckpointMetrics checkpointMetrics,    TaskStateSnapshot subtaskState){
+      try {
+        delayCheckpointLatch.await();
+      }
+ catch (      InterruptedException e) {
+        throw new RuntimeException(e);
+      }
+      boolean hasManagedKeyedState=false;
+      for (      Map.Entry<OperatorID,OperatorSubtaskState> entry : subtaskState.getSubtaskStateMappings()) {
+        OperatorSubtaskState state=entry.getValue();
+        if (state != null) {
+          hasManagedKeyedState|=state.getManagedKeyedState() != null;
+        }
+      }
+      assertTrue(hasManagedKeyedState);
+      ensureCheckpointLatch.trigger();
+    }
+    @Override public void declineCheckpoint(    JobID jobID,    ExecutionAttemptID executionAttemptID,    long checkpointId,    Throwable cause){
+    }
+  }
+;
+  JobID jobID=new JobID();
+  ExecutionAttemptID executionAttemptID=new ExecutionAttemptID(0L,0L);
+  TestTaskStateManager taskStateManagerTestMock=new TestTaskStateManager(jobID,executionAttemptID,checkpointResponderMock,TestLocalRecoveryConfig.disabled());
+  StreamMockEnvironment mockEnv=new StreamMockEnvironment(testHarness.jobConfig,testHarness.taskConfig,testHarness.memorySize,new MockInputSplitProvider(),testHarness.bufferSize,taskStateManagerTestMock);
+  testHarness.invoke(mockEnv);
+  final OneInputStreamTask<String,String> task=testHarness.getTask();
+  for (  Field field : StreamTask.class.getDeclaredFields()) {
+    if (field.getName().equals("isRunning")) {
+      field.setAccessible(true);
+      while (!field.getBoolean(task)) {
+        Thread.sleep(10);
+      }
+    }
+  }
+  task.triggerCheckpoint(new CheckpointMetaData(42,17),CheckpointOptions.forCheckpointWithDefaultLocation());
+  testHarness.processElement(new StreamRecord<>("Wohoo",0));
+  delayCheckpointLatch.trigger();
+  ensureCheckpointLatch.await();
+  testHarness.endInput();
+  ExecutorService threadPool=task.getAsyncOperationsThreadPool();
+  threadPool.shutdown();
+  Assert.assertTrue(threadPool.awaitTermination(60_000,TimeUnit.MILLISECONDS));
+  testHarness.waitForTaskCompletion();
+  if (mockEnv.wasFailedExternally()) {
+    fail("Unexpected exception during execution.");
+  }
+}

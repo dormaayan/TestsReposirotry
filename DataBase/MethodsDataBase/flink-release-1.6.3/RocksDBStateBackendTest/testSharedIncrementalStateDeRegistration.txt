@@ -1,0 +1,39 @@
+@Test public void testSharedIncrementalStateDeRegistration() throws Exception {
+  if (enableIncrementalCheckpointing) {
+    AbstractKeyedStateBackend<Integer> backend=createKeyedBackend(IntSerializer.INSTANCE);
+    try {
+      ValueStateDescriptor<String> kvId=new ValueStateDescriptor<>("id",String.class,null);
+      kvId.initializeSerializerUnlessSet(new ExecutionConfig());
+      ValueState<String> state=backend.getPartitionedState(VoidNamespace.INSTANCE,VoidNamespaceSerializer.INSTANCE,kvId);
+      Queue<IncrementalKeyedStateHandle> previousStateHandles=new LinkedList<>();
+      SharedStateRegistry sharedStateRegistry=spy(new SharedStateRegistry());
+      for (int checkpointId=0; checkpointId < 3; ++checkpointId) {
+        reset(sharedStateRegistry);
+        backend.setCurrentKey(checkpointId);
+        state.update("Hello-" + checkpointId);
+        RunnableFuture<SnapshotResult<KeyedStateHandle>> snapshot=backend.snapshot(checkpointId,checkpointId,createStreamFactory(),CheckpointOptions.forCheckpointWithDefaultLocation());
+        snapshot.run();
+        SnapshotResult<KeyedStateHandle> snapshotResult=snapshot.get();
+        IncrementalKeyedStateHandle stateHandle=(IncrementalKeyedStateHandle)snapshotResult.getJobManagerOwnedSnapshot();
+        Map<StateHandleID,StreamStateHandle> sharedState=new HashMap<>(stateHandle.getSharedState());
+        stateHandle.registerSharedStates(sharedStateRegistry);
+        for (        Map.Entry<StateHandleID,StreamStateHandle> e : sharedState.entrySet()) {
+          verify(sharedStateRegistry).registerReference(stateHandle.createSharedStateRegistryKeyFromFileName(e.getKey()),e.getValue());
+        }
+        previousStateHandles.add(stateHandle);
+        backend.notifyCheckpointComplete(checkpointId);
+        if (previousStateHandles.size() > 1) {
+          checkRemove(previousStateHandles.remove(),sharedStateRegistry);
+        }
+      }
+      while (!previousStateHandles.isEmpty()) {
+        reset(sharedStateRegistry);
+        checkRemove(previousStateHandles.remove(),sharedStateRegistry);
+      }
+    }
+  finally {
+      IOUtils.closeQuietly(backend);
+      backend.dispose();
+    }
+  }
+}

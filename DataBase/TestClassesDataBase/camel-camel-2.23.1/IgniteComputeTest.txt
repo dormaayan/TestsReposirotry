@@ -1,0 +1,99 @@
+public class IgniteComputeTest extends AbstractIgniteTest {
+  private static final List<Ignite> ADDITIONAL_INSTANCES=Lists.newArrayList();
+  private static final List<UUID> LISTENERS=Lists.newArrayList();
+  @Override protected String getScheme(){
+    return "ignite-compute";
+  }
+  @Override protected AbstractIgniteComponent createComponent(){
+    return IgniteComputeComponent.fromConfiguration(createConfiguration());
+  }
+  @Test public void testExecuteWithWrongPayload(){
+    try {
+      template.requestBody("ignite-compute:abc?executionType=EXECUTE",TestIgniteComputeResources.TEST_CALLABLE,String.class);
+    }
+ catch (    Exception e) {
+      assert_().that(ObjectHelper.getException(RuntimeCamelException.class,e).getMessage()).startsWith("Ignite Compute endpoint with EXECUTE");
+      return;
+    }
+    fail();
+  }
+  @Test @SuppressWarnings("unchecked") public void testCall(){
+    TestIgniteComputeResources.COUNTER.set(0);
+    String result=template.requestBody("ignite-compute:abc?executionType=CALL",TestIgniteComputeResources.TEST_CALLABLE,String.class);
+    assert_().that(result).isEqualTo("hello");
+    Object[] callables=new Object[5];
+    Arrays.fill(callables,TestIgniteComputeResources.TEST_CALLABLE);
+    Collection<String> colResult=template.requestBody("ignite-compute:abc?executionType=CALL",Lists.newArrayList(callables),Collection.class);
+    assert_().that(colResult).containsExactly("hello","hello","hello","hello","hello").inOrder();
+    String reduced=template.requestBodyAndHeader("ignite-compute:abc?executionType=CALL",Lists.newArrayList(callables),IgniteConstants.IGNITE_COMPUTE_REDUCER,TestIgniteComputeResources.STRING_JOIN_REDUCER,String.class);
+    assert_().that(reduced).isEqualTo("hellohellohellohellohello");
+  }
+  @Test public void testRun(){
+    TestIgniteComputeResources.COUNTER.set(0);
+    Object result=template.requestBody("ignite-compute:abc?executionType=RUN",TestIgniteComputeResources.TEST_RUNNABLE_COUNTER,Object.class);
+    assert_().that(result).isNull();
+    assert_().that(TestIgniteComputeResources.COUNTER.get()).isEqualTo(1);
+    Object[] runnables=new Object[5];
+    Arrays.fill(runnables,TestIgniteComputeResources.TEST_RUNNABLE_COUNTER);
+    result=template.requestBody("ignite-compute:abc?executionType=RUN",Lists.newArrayList(runnables),Collection.class);
+    assert_().that(result).isNull();
+    assert_().that(TestIgniteComputeResources.COUNTER.get()).isEqualTo(6);
+  }
+  @Test @SuppressWarnings("unchecked") public void testBroadcast(){
+    TestIgniteComputeResources.COUNTER.set(0);
+    startAdditionalGridInstance();
+    startAdditionalGridInstance();
+    ignite().events().enableLocal(EventType.EVT_JOB_FINISHED);
+    LISTENERS.add(ignite().events().remoteListen(null,TestIgniteComputeResources.EVENT_COUNTER,EventType.EVT_JOB_FINISHED));
+    Object result=template.requestBody("ignite-compute:abc?executionType=BROADCAST",TestIgniteComputeResources.TEST_RUNNABLE,Object.class);
+    assert_().that(result).isNull();
+    assert_().that(TestIgniteComputeResources.COUNTER.get()).isEqualTo(3);
+    Collection<String> colResult=template.requestBody("ignite-compute:abc?executionType=BROADCAST",TestIgniteComputeResources.TEST_CALLABLE,Collection.class);
+    assert_().that(colResult).isNotNull();
+    assert_().that(colResult).containsExactly("hello","hello","hello").inOrder();
+    colResult=template.requestBodyAndHeader("ignite-compute:abc?executionType=BROADCAST",TestIgniteComputeResources.TEST_CLOSURE,IgniteConstants.IGNITE_COMPUTE_PARAMS,"Camel",Collection.class);
+    assert_().that(colResult).isNotNull();
+    assert_().that(colResult).containsExactly("hello Camel","hello Camel","hello Camel").inOrder();
+  }
+  @Test public void testExecute(){
+    TestIgniteComputeResources.COUNTER.set(0);
+    startAdditionalGridInstance();
+    startAdditionalGridInstance();
+    ignite().events().enableLocal(EventType.EVT_JOB_RESULTED);
+    LISTENERS.add(ignite().events().remoteListen(null,TestIgniteComputeResources.EVENT_COUNTER,EventType.EVT_JOB_RESULTED));
+    String result=template.requestBodyAndHeader("ignite-compute:abc?executionType=EXECUTE",TestIgniteComputeResources.COMPUTE_TASK,IgniteConstants.IGNITE_COMPUTE_PARAMS,10,String.class);
+    assert_().that(result).isNotNull();
+    assert_().that(Splitter.on(",").splitToList(result)).containsAllOf("a0","a1","a2","a3","a4","a5","a6","a7","a8","a9");
+    result=template.requestBodyAndHeader("ignite-compute:abc?executionType=EXECUTE",TestIgniteComputeResources.COMPUTE_TASK.getClass(),IgniteConstants.IGNITE_COMPUTE_PARAMS,10,String.class);
+    assert_().that(result).isNotNull();
+    assert_().that(Splitter.on(",").splitToList(result)).containsAllOf("a0","a1","a2","a3","a4","a5","a6","a7","a8","a9");
+  }
+  @Test @SuppressWarnings("unchecked") public void testApply(){
+    TestIgniteComputeResources.COUNTER.set(0);
+    String result=template.requestBodyAndHeader("ignite-compute:abc?executionType=APPLY",TestIgniteComputeResources.TEST_CLOSURE,IgniteConstants.IGNITE_COMPUTE_PARAMS,"Camel",String.class);
+    assert_().that(result).isEqualTo("hello Camel");
+    Collection<String> colResult=template.requestBodyAndHeader("ignite-compute:abc?executionType=APPLY",TestIgniteComputeResources.TEST_CLOSURE,IgniteConstants.IGNITE_COMPUTE_PARAMS,Lists.newArrayList("Camel1","Camel2","Camel3"),Collection.class);
+    assert_().that(colResult).containsAllOf("hello Camel1","hello Camel2","hello Camel3");
+    Map<String,Object> headers=ImmutableMap.<String,Object>of(IgniteConstants.IGNITE_COMPUTE_PARAMS,Lists.newArrayList("Camel1","Camel2","Camel3"),IgniteConstants.IGNITE_COMPUTE_REDUCER,TestIgniteComputeResources.STRING_JOIN_REDUCER);
+    result=template.requestBodyAndHeaders("ignite-compute:abc?executionType=APPLY",TestIgniteComputeResources.TEST_CLOSURE,headers,String.class);
+    assert_().that(result).isEqualTo("hello Camel1hello Camel2hello Camel3");
+  }
+  @Override public boolean isCreateCamelContextPerClass(){
+    return true;
+  }
+  private void startAdditionalGridInstance(){
+    ADDITIONAL_INSTANCES.add(Ignition.start(createConfiguration()));
+  }
+  @After public void stopAdditionalIgniteInstances(){
+    for (    Ignite ignite : ADDITIONAL_INSTANCES) {
+      ignite.close();
+    }
+    ADDITIONAL_INSTANCES.clear();
+  }
+  @After public void stopRemoteListeners(){
+    for (    UUID uuid : LISTENERS) {
+      ignite().events().stopRemoteListen(uuid);
+    }
+    LISTENERS.clear();
+  }
+}

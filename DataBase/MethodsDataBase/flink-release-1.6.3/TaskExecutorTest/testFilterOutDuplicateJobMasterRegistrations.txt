@@ -1,0 +1,31 @@
+/** 
+ * This tests makes sure that duplicate JobMaster gained leadership messages are filtered out by the TaskExecutor. See FLINK-7526.
+ */
+@Test public void testFilterOutDuplicateJobMasterRegistrations() throws Exception {
+  final long verificationTimeout=500L;
+  final JobLeaderService jobLeaderService=mock(JobLeaderService.class);
+  final HeartbeatServices heartbeatServicesMock=mock(HeartbeatServices.class,Mockito.RETURNS_MOCKS);
+  final JobMasterGateway jobMasterGateway=mock(JobMasterGateway.class);
+  when(jobMasterGateway.getHostname()).thenReturn("localhost");
+  final JMTMRegistrationSuccess registrationMessage=new JMTMRegistrationSuccess(ResourceID.generate());
+  final JobManagerTable jobManagerTableMock=spy(new JobManagerTable());
+  TaskExecutorLocalStateStoresManager localStateStoresManager=new TaskExecutorLocalStateStoresManager(false,new File[]{tmp.newFolder()},Executors.directExecutor());
+  final TaskManagerServices taskManagerServices=new TaskManagerServicesBuilder().setTaskManagerLocation(taskManagerLocation).setJobManagerTable(jobManagerTableMock).setJobLeaderService(jobLeaderService).setTaskStateManager(localStateStoresManager).build();
+  final TaskExecutor taskExecutor=new TaskExecutor(rpc,taskManagerConfiguration,haServices,taskManagerServices,heartbeatServicesMock,UnregisteredMetricGroups.createUnregisteredTaskManagerMetricGroup(),dummyBlobCacheService,testingFatalErrorHandler);
+  try {
+    taskExecutor.start();
+    ArgumentCaptor<JobLeaderListener> jobLeaderListenerArgumentCaptor=ArgumentCaptor.forClass(JobLeaderListener.class);
+    verify(jobLeaderService).start(anyString(),any(RpcService.class),any(HighAvailabilityServices.class),jobLeaderListenerArgumentCaptor.capture());
+    JobLeaderListener taskExecutorListener=jobLeaderListenerArgumentCaptor.getValue();
+    taskExecutorListener.jobManagerGainedLeadership(jobId,jobMasterGateway,registrationMessage);
+    taskExecutorListener.jobManagerGainedLeadership(jobId,jobMasterGateway,registrationMessage);
+    ArgumentCaptor<JobManagerConnection> jobManagerConnectionArgumentCaptor=ArgumentCaptor.forClass(JobManagerConnection.class);
+    verify(jobManagerTableMock,Mockito.timeout(verificationTimeout).times(1)).put(eq(jobId),jobManagerConnectionArgumentCaptor.capture());
+    JobManagerConnection jobManagerConnection=jobManagerConnectionArgumentCaptor.getValue();
+    assertEquals(jobMasterGateway,jobManagerConnection.getJobManagerGateway());
+  }
+  finally {
+    taskExecutor.shutDown();
+    taskExecutor.getTerminationFuture().get(timeout.toMilliseconds(),TimeUnit.MILLISECONDS);
+  }
+}

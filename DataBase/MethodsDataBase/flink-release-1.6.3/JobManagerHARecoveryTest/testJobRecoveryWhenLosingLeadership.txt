@@ -1,0 +1,87 @@
+/** 
+ * Tests that the persisted job is not removed from the SubmittedJobGraphStore if the JobManager loses its leadership. Furthermore, it tests that the job manager can recover the job from the SubmittedJobGraphStore and checkpoint state is recovered as well.
+ */
+@Test public void testJobRecoveryWhenLosingLeadership() throws Exception {
+  FiniteDuration timeout=new FiniteDuration(30,TimeUnit.SECONDS);
+  FiniteDuration jobRecoveryTimeout=new FiniteDuration(0,TimeUnit.SECONDS);
+  Deadline deadline=new FiniteDuration(2,TimeUnit.MINUTES).fromNow();
+  Configuration flinkConfiguration=new Configuration();
+  UUID leaderSessionID=UUID.randomUUID();
+  UUID newLeaderSessionID=UUID.randomUUID();
+  int slots=2;
+  ActorRef archive=null;
+  ActorRef jobManager=null;
+  ActorRef taskManager=null;
+  flinkConfiguration.setString(HighAvailabilityOptions.HA_MODE,"zookeeper");
+  flinkConfiguration.setString(HighAvailabilityOptions.HA_STORAGE_PATH,temporaryFolder.newFolder().toString());
+  flinkConfiguration.setInteger(TaskManagerOptions.NUM_TASK_SLOTS,slots);
+  flinkConfiguration.setLong(BlobServerOptions.CLEANUP_INTERVAL,3_600L);
+  try {
+    Scheduler scheduler=new Scheduler(TestingUtils.defaultExecutionContext());
+    InMemorySubmittedJobGraphStore submittedJobGraphStore=new InMemorySubmittedJobGraphStore();
+    submittedJobGraphStore.start(null);
+    CompletedCheckpointStore checkpointStore=new RecoverableCompletedCheckpointStore();
+    CheckpointIDCounter checkpointCounter=new StandaloneCheckpointIDCounter();
+    CheckpointRecoveryFactory checkpointStateFactory=new TestingCheckpointRecoveryFactory(checkpointStore,checkpointCounter);
+    TestingLeaderElectionService myLeaderElectionService=new TestingLeaderElectionService();
+    SettableLeaderRetrievalService myLeaderRetrievalService=new SettableLeaderRetrievalService(null,null);
+    TestingHighAvailabilityServices testingHighAvailabilityServices=new TestingHighAvailabilityServices();
+    testingHighAvailabilityServices.setJobMasterLeaderRetriever(HighAvailabilityServices.DEFAULT_JOB_ID,myLeaderRetrievalService);
+    InstanceManager instanceManager=new InstanceManager();
+    instanceManager.addInstanceListener(scheduler);
+    archive=system.actorOf(JobManager.getArchiveProps(MemoryArchivist.class,10,Option.<Path>empty()));
+    BlobServer blobServer=new BlobServer(flinkConfiguration,testingHighAvailabilityServices.createBlobStore());
+    blobServer.start();
+    Props jobManagerProps=Props.create(TestingJobManager.class,flinkConfiguration,TestingUtils.defaultExecutor(),TestingUtils.defaultExecutor(),instanceManager,scheduler,blobServer,new BlobLibraryCacheManager(blobServer,FlinkUserCodeClassLoaders.ResolveOrder.CHILD_FIRST,new String[0]),archive,new FixedDelayRestartStrategy.FixedDelayRestartStrategyFactory(Int.MaxValue(),100),timeout,myLeaderElectionService,submittedJobGraphStore,checkpointStateFactory,jobRecoveryTimeout,UnregisteredMetricGroups.createUnregisteredJobManagerMetricGroup(),Option.<String>empty());
+    jobManager=system.actorOf(jobManagerProps);
+    ActorGateway gateway=new AkkaActorGateway(jobManager,leaderSessionID);
+    taskManager=TaskManager.startTaskManagerComponentsAndActor(flinkConfiguration,ResourceID.generate(),system,testingHighAvailabilityServices,NoOpMetricRegistry.INSTANCE,"localhost",Option.<String>apply("taskmanager"),true,TestingTaskManager.class);
+    ActorGateway tmGateway=new AkkaActorGateway(taskManager,leaderSessionID);
+    Future<Object> tmAlive=tmGateway.ask(TestingMessages.getAlive(),deadline.timeLeft());
+    Await.ready(tmAlive,deadline.timeLeft());
+    JobVertex sourceJobVertex=new JobVertex("Source");
+    sourceJobVertex.setInvokableClass(BlockingStatefulInvokable.class);
+    sourceJobVertex.setParallelism(slots);
+    JobGraph jobGraph=new JobGraph("TestingJob",sourceJobVertex);
+    List<JobVertexID> vertexId=Collections.singletonList(sourceJobVertex.getID());
+    jobGraph.setSnapshotSettings(new JobCheckpointingSettings(vertexId,vertexId,vertexId,new CheckpointCoordinatorConfiguration(100L,10L * 60L * 1000L,0L,1,CheckpointRetentionPolicy.NEVER_RETAIN_AFTER_TERMINATION,true),null));
+    BlockingStatefulInvokable.initializeStaticHelpers(slots);
+    Future<Object> isLeader=gateway.ask(TestingJobManagerMessages.getNotifyWhenLeader(),deadline.timeLeft());
+    Future<Object> isConnectedToJobManager=tmGateway.ask(new TestingTaskManagerMessages.NotifyWhenRegisteredAtJobManager(jobManager),deadline.timeLeft());
+    myLeaderElectionService.isLeader(leaderSessionID);
+    myLeaderRetrievalService.notifyListener(gateway.path(),leaderSessionID);
+    Await.ready(isLeader,deadline.timeLeft());
+    Await.ready(isConnectedToJobManager,deadline.timeLeft());
+    Future<Object> jobSubmitted=gateway.ask(new JobManagerMessages.SubmitJob(jobGraph,ListeningBehaviour.DETACHED),deadline.timeLeft());
+    Await.ready(jobSubmitted,deadline.timeLeft());
+    BlockingStatefulInvokable.awaitCompletedCheckpoints();
+    Future<Object> jobRemoved=gateway.ask(new TestingJobManagerMessages.NotifyWhenJobRemoved(jobGraph.getJobID()),deadline.timeLeft());
+    myLeaderElectionService.notLeader();
+    Await.ready(jobRemoved,deadline.timeLeft());
+    assertTrue(submittedJobGraphStore.contains(jobGraph.getJobID()));
+    Future<Object> jobRunning=gateway.ask(new TestingJobManagerMessages.NotifyWhenJobStatus(jobGraph.getJobID(),JobStatus.RUNNING),deadline.timeLeft());
+    myLeaderElectionService.isLeader(newLeaderSessionID);
+    myLeaderRetrievalService.notifyListener(gateway.path(),newLeaderSessionID);
+    Await.ready(jobRunning,deadline.timeLeft());
+    Future<Object> jobFinished=gateway.ask(new TestingJobManagerMessages.NotifyWhenJobRemoved(jobGraph.getJobID()),deadline.timeLeft());
+    BlockingInvokable.unblock();
+    Await.ready(jobFinished,deadline.timeLeft());
+    assertFalse(submittedJobGraphStore.contains(jobGraph.getJobID()));
+    long[] recoveredStates=BlockingStatefulInvokable.getRecoveredStates();
+    for (    long state : recoveredStates) {
+      boolean isExpected=state >= BlockingStatefulInvokable.NUM_CHECKPOINTS_TO_COMPLETE;
+      assertTrue("Did not recover checkpoint state correctly, expecting >= " + BlockingStatefulInvokable.NUM_CHECKPOINTS_TO_COMPLETE + ", but state was "+ state,isExpected);
+    }
+  }
+  finally {
+    if (archive != null) {
+      archive.tell(PoisonPill.getInstance(),ActorRef.noSender());
+    }
+    if (jobManager != null) {
+      jobManager.tell(PoisonPill.getInstance(),ActorRef.noSender());
+    }
+    if (taskManager != null) {
+      taskManager.tell(PoisonPill.getInstance(),ActorRef.noSender());
+    }
+  }
+}

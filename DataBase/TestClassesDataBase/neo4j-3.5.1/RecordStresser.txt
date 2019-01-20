@@ -1,0 +1,51 @@
+public class RecordStresser implements Callable<Void> {
+  private final PagedFile pagedFile;
+  private final Condition condition;
+  private final int maxRecords;
+  private final RecordFormat format;
+  private final int threadId;
+  private final TinyLockManager locks;
+  private long countSum;
+  public RecordStresser(  PagedFile pagedFile,  Condition condition,  int maxRecords,  RecordFormat format,  int threadId,  TinyLockManager locks){
+    this.pagedFile=pagedFile;
+    this.condition=condition;
+    this.maxRecords=maxRecords;
+    this.format=format;
+    this.threadId=threadId;
+    this.locks=locks;
+  }
+  @Override public Void call() throws Exception {
+    Random random=new Random();
+    int recordsPerPage=format.getRecordsPerPage();
+    int recordSize=format.getRecordSize();
+    try (PageCursor cursor=pagedFile.io(0,PF_SHARED_WRITE_LOCK)){
+      while (!condition.fulfilled()) {
+        int recordId=random.nextInt(maxRecords);
+        int pageId=recordId / recordsPerPage;
+        int recordOffset=(recordId % recordsPerPage) * recordSize;
+        locks.lock(recordId);
+        try {
+          assertTrue(cursor.next(pageId),"I must be able to access pages");
+          cursor.setOffset(recordOffset);
+          long newValue=format.incrementCounter(cursor,threadId);
+          countSum++;
+          assertFalse(cursor.shouldRetry(),"Write lock, so never a need to retry");
+          assertThat("Record-local count must be less than or equal to thread-local count sum",newValue,lessThanOrEqualTo(countSum));
+        }
+  finally {
+          locks.unlock(recordId);
+        }
+      }
+    }
+     return null;
+  }
+  public void verifyCounts() throws IOException {
+    long actualSum=0;
+    try (PageCursor cursor=pagedFile.io(0,PF_SHARED_READ_LOCK)){
+      while (cursor.next()) {
+        actualSum+=format.sumCountsForThread(cursor,threadId);
+      }
+    }
+     assertThat("Thread specific sum across all records",actualSum,is(countSum));
+  }
+}

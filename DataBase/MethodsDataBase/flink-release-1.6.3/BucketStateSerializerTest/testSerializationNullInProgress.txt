@@ -1,0 +1,45 @@
+@Test public void testSerializationNullInProgress() throws IOException {
+  final int noOfTasks=5;
+  final File testFolder=tempFolder.newFolder();
+  final FileSystem fs=FileSystem.get(testFolder.toURI());
+  final RecoverableWriter writer=fs.createRecoverableWriter();
+  final Path bucketPath=new Path(testFolder.getPath());
+  final Map<Long,List<RecoverableWriter.CommitRecoverable>> commitRecoverables=new HashMap<>();
+  for (int i=0; i < noOfTasks; i++) {
+    final List<RecoverableWriter.CommitRecoverable> recoverables=new ArrayList<>();
+    for (int j=0; j < 2 + i; j++) {
+      final Path part=new Path(bucketPath,"test-" + i + '-'+ j);
+      final RecoverableFsDataOutputStream stream=writer.open(part);
+      stream.write((PENDING_CONTENT + '-' + j).getBytes(Charset.forName("UTF-8")));
+      recoverables.add(stream.closeForCommit().getRecoverable());
+    }
+    commitRecoverables.put((long)i,recoverables);
+  }
+  final RecoverableWriter.ResumeRecoverable current=null;
+  final BucketState<String> bucketState=new BucketState<>("",bucketPath,Long.MAX_VALUE,current,commitRecoverables);
+  final SimpleVersionedSerializer<BucketState<String>> serializer=new BucketStateSerializer<>(writer.getResumeRecoverableSerializer(),writer.getCommitRecoverableSerializer(),SimpleVersionedStringSerializer.INSTANCE);
+  byte[] bytes=SimpleVersionedSerialization.writeVersionAndSerialize(serializer,bucketState);
+  final BucketState<String> recoveredState=SimpleVersionedSerialization.readVersionAndDeSerialize(serializer,bytes);
+  Assert.assertEquals(bucketPath,recoveredState.getBucketPath());
+  Assert.assertNull(recoveredState.getInProgressResumableFile());
+  final Map<Long,List<RecoverableWriter.CommitRecoverable>> recoveredRecoverables=recoveredState.getCommittableFilesPerCheckpoint();
+  Assert.assertEquals(5L,recoveredRecoverables.size());
+  for (  Map.Entry<Long,List<RecoverableWriter.CommitRecoverable>> entry : recoveredRecoverables.entrySet()) {
+    for (    RecoverableWriter.CommitRecoverable recoverable : entry.getValue()) {
+      writer.recoverForCommit(recoverable).commit();
+    }
+  }
+  FileStatus[] filestatuses=fs.listStatus(bucketPath);
+  Set<String> paths=new HashSet<>(filestatuses.length);
+  for (  FileStatus filestatus : filestatuses) {
+    paths.add(filestatus.getPath().getPath());
+  }
+  for (int i=0; i < noOfTasks; i++) {
+    for (int j=0; j < 2 + i; j++) {
+      final String part=new Path(bucketPath,"test-" + i + '-'+ j).toString();
+      Assert.assertTrue(paths.contains(part));
+      paths.remove(part);
+    }
+  }
+  Assert.assertTrue(paths.isEmpty());
+}

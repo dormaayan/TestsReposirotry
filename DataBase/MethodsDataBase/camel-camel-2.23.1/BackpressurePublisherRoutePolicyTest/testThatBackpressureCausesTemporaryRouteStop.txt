@@ -1,0 +1,35 @@
+@Test public void testThatBackpressureCausesTemporaryRouteStop() throws Exception {
+  CountDownLatch generationLatch=new CountDownLatch(25);
+  new RouteBuilder(){
+    @Override public void configure() throws Exception {
+      ThrottlingInflightRoutePolicy policy=new ThrottlingInflightRoutePolicy();
+      policy.setMaxInflightExchanges(10);
+      policy.setScope(ThrottlingInflightRoutePolicy.ThrottlingScope.Route);
+      policy.setResumePercentOfMax(70);
+      policy.setLoggingLevel(LoggingLevel.INFO);
+      from("timer:tick?period=50&repeatCount=35").id("policy-route").routePolicy(policy).process(x -> generationLatch.countDown()).to("reactive-streams:pub");
+    }
+  }
+.addRoutesToCamelContext(context);
+  CountDownLatch receptionLatch=new CountDownLatch(35);
+  Publisher<Exchange> pub=CamelReactiveStreams.get(context()).fromStream("pub",Exchange.class);
+  TestSubscriber<Exchange> subscriber=new TestSubscriber<Exchange>(){
+    @Override public void onNext(    Exchange o){
+      super.onNext(o);
+      receptionLatch.countDown();
+    }
+  }
+;
+  subscriber.setInitiallyRequested(10);
+  pub.subscribe(subscriber);
+  Observable.fromPublisher(pub).subscribe();
+  context.start();
+  generationLatch.await(5,TimeUnit.SECONDS);
+  assertEquals(25,receptionLatch.getCount());
+  subscriber.request(1);
+  Thread.sleep(250);
+  StatefulService service=(StatefulService)context().getRoute("policy-route").getConsumer();
+  assertTrue(service.isStopped() || service.isSuspended());
+  subscriber.request(24);
+  assertTrue(receptionLatch.await(5,TimeUnit.SECONDS));
+}

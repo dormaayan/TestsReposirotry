@@ -1,0 +1,90 @@
+/** 
+ * Test MetaTableAccessor but without spinning up a cluster. We mock regionserver back and forth (we do spin up a zk cluster).
+ */
+@Category({MiscTests.class,MediumTests.class}) public class TestMetaTableAccessorNoCluster {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestMetaTableAccessorNoCluster.class);
+  private static final Logger LOG=LoggerFactory.getLogger(TestMetaTableAccessorNoCluster.class);
+  private static final HBaseTestingUtility UTIL=new HBaseTestingUtility();
+  private static final Abortable ABORTABLE=new Abortable(){
+    boolean aborted=false;
+    @Override public void abort(    String why,    Throwable e){
+      LOG.info(why,e);
+      this.aborted=true;
+      throw new RuntimeException(e);
+    }
+    @Override public boolean isAborted(){
+      return this.aborted;
+    }
+  }
+;
+  @Before public void before() throws Exception {
+    UTIL.startMiniZKCluster();
+  }
+  @After public void after() throws IOException {
+    UTIL.shutdownMiniZKCluster();
+  }
+  @Test public void testGetHRegionInfo() throws IOException {
+    assertNull(MetaTableAccessor.getRegionInfo(new Result()));
+    List<Cell> kvs=new ArrayList<>();
+    Result r=Result.create(kvs);
+    assertNull(MetaTableAccessor.getRegionInfo(r));
+    byte[] f=HConstants.CATALOG_FAMILY;
+    kvs.add(new KeyValue(HConstants.EMPTY_BYTE_ARRAY,f,HConstants.SERVER_QUALIFIER,f));
+    r=Result.create(kvs);
+    assertNull(MetaTableAccessor.getRegionInfo(r));
+    kvs.add(new KeyValue(HConstants.EMPTY_BYTE_ARRAY,f,HConstants.REGIONINFO_QUALIFIER,f));
+    RegionInfo hri=MetaTableAccessor.getRegionInfo(Result.create(kvs));
+    assertTrue(hri == null);
+    kvs.clear();
+    kvs.add(new KeyValue(HConstants.EMPTY_BYTE_ARRAY,f,HConstants.REGIONINFO_QUALIFIER,RegionInfo.toByteArray(RegionInfoBuilder.FIRST_META_REGIONINFO)));
+    hri=MetaTableAccessor.getRegionInfo(Result.create(kvs));
+    assertNotNull(hri);
+    assertTrue(RegionInfo.COMPARATOR.compare(hri,RegionInfoBuilder.FIRST_META_REGIONINFO) == 0);
+  }
+  /** 
+ * Test that MetaTableAccessor will ride over server throwing "Server not running" IOEs.
+ * @see <a href="https://issues.apache.org/jira/browse/HBASE-3446">HBASE-3446</a>
+ * @throws IOException
+ * @throws InterruptedException
+ */
+  @Test public void testRideOverServerNotRunning() throws IOException, InterruptedException, ServiceException {
+    ZKWatcher zkw=new ZKWatcher(UTIL.getConfiguration(),this.getClass().getSimpleName(),ABORTABLE,true);
+    ServerName sn=ServerName.valueOf("example.com",1234,System.currentTimeMillis());
+    ClusterConnection connection=null;
+    try {
+      final ClientProtos.ClientService.BlockingInterface implementation=Mockito.mock(ClientProtos.ClientService.BlockingInterface.class);
+      List<Cell> kvs=new ArrayList<>();
+      final byte[] rowToVerify=Bytes.toBytes("rowToVerify");
+      kvs.add(new KeyValue(rowToVerify,HConstants.CATALOG_FAMILY,HConstants.REGIONINFO_QUALIFIER,RegionInfo.toByteArray(RegionInfoBuilder.FIRST_META_REGIONINFO)));
+      kvs.add(new KeyValue(rowToVerify,HConstants.CATALOG_FAMILY,HConstants.SERVER_QUALIFIER,Bytes.toBytes(sn.getHostAndPort())));
+      kvs.add(new KeyValue(rowToVerify,HConstants.CATALOG_FAMILY,HConstants.STARTCODE_QUALIFIER,Bytes.toBytes(sn.getStartcode())));
+      final List<CellScannable> cellScannables=new ArrayList<>(1);
+      cellScannables.add(Result.create(kvs));
+      final ScanResponse.Builder builder=ScanResponse.newBuilder();
+      for (      CellScannable result : cellScannables) {
+        builder.addCellsPerResult(((Result)result).size());
+      }
+      Mockito.when(implementation.scan((RpcController)Mockito.any(),(ScanRequest)Mockito.any())).thenThrow(new ServiceException("Server not running (1 of 3)")).thenThrow(new ServiceException("Server not running (2 of 3)")).thenThrow(new ServiceException("Server not running (3 of 3)")).thenAnswer(new Answer<ScanResponse>(){
+        @Override public ScanResponse answer(        InvocationOnMock invocation) throws Throwable {
+          ((HBaseRpcController)invocation.getArgument(0)).setCellScanner(CellUtil.createCellScanner(cellScannables));
+          return builder.setScannerId(1234567890L).setMoreResults(false).build();
+        }
+      }
+);
+      connection=HConnectionTestingUtility.getSpiedConnection(UTIL.getConfiguration());
+      final HRegionLocation anyLocation=new HRegionLocation(RegionInfoBuilder.FIRST_META_REGIONINFO,sn);
+      final RegionLocations rl=new RegionLocations(anyLocation);
+      Mockito.doReturn(rl).when(connection).locateRegion((TableName)Mockito.any(),(byte[])Mockito.any(),Mockito.anyBoolean(),Mockito.anyBoolean(),Mockito.anyInt());
+      Mockito.doReturn(implementation).when(connection).getClient(Mockito.any());
+      NavigableMap<RegionInfo,Result> hris=MetaTableAccessor.getServerUserRegions(connection,sn);
+      assertEquals(1,hris.size());
+      assertTrue(RegionInfo.COMPARATOR.compare(hris.firstEntry().getKey(),RegionInfoBuilder.FIRST_META_REGIONINFO) == 0);
+      assertTrue(Bytes.equals(rowToVerify,hris.firstEntry().getValue().getRow()));
+      Mockito.verify(implementation,Mockito.times(4)).scan((RpcController)Mockito.any(),(ScanRequest)Mockito.any());
+    }
+  finally {
+      if (connection != null && !connection.isClosed())       connection.close();
+      zkw.close();
+    }
+  }
+}

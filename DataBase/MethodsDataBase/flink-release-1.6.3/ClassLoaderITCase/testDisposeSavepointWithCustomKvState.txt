@@ -1,0 +1,57 @@
+/** 
+ * Tests disposal of a savepoint, which contains custom user code KvState.
+ */
+@Test public void testDisposeSavepointWithCustomKvState() throws Exception {
+  ClusterClient<?> clusterClient=new MiniClusterClient(new Configuration(),testCluster);
+  Deadline deadline=new FiniteDuration(100,TimeUnit.SECONDS).fromNow();
+  File checkpointDir=FOLDER.newFolder();
+  File outputDir=FOLDER.newFolder();
+  final PackagedProgram program=new PackagedProgram(new File(CUSTOM_KV_STATE_JAR_PATH),new String[]{String.valueOf(parallelism),checkpointDir.toURI().toString(),"5000",outputDir.toURI().toString()});
+  TestStreamEnvironment.setAsContext(testCluster,parallelism,Collections.singleton(new Path(CUSTOM_KV_STATE_JAR_PATH)),Collections.<URL>emptyList());
+  Thread invokeThread=new Thread(new Runnable(){
+    @Override public void run(){
+      try {
+        program.invokeInteractiveModeForExecution();
+      }
+ catch (      ProgramInvocationException ignored) {
+        if (ignored.getCause() == null || !(ignored.getCause() instanceof JobCancellationException)) {
+          ignored.printStackTrace();
+        }
+      }
+    }
+  }
+);
+  LOG.info("Starting program invoke thread");
+  invokeThread.start();
+  JobID jobId=null;
+  LOG.info("Waiting for job status running.");
+  while (jobId == null && deadline.hasTimeLeft()) {
+    Collection<JobStatusMessage> jobs=clusterClient.listJobs().get(deadline.timeLeft().toMillis(),TimeUnit.MILLISECONDS);
+    for (    JobStatusMessage job : jobs) {
+      if (job.getJobState() == JobStatus.RUNNING) {
+        jobId=job.getJobId();
+        LOG.info("Job running. ID: " + jobId);
+        break;
+      }
+    }
+    if (jobId == null) {
+      Thread.sleep(100L);
+    }
+  }
+  String savepointPath=null;
+  for (int i=0; i < 20; i++) {
+    LOG.info("Triggering savepoint (" + (i + 1) + "/20).");
+    try {
+      savepointPath=clusterClient.triggerSavepoint(jobId,null).get(deadline.timeLeft().toMillis(),TimeUnit.MILLISECONDS);
+    }
+ catch (    Exception cause) {
+      LOG.info("Failed to trigger savepoint. Retrying...",cause);
+      Thread.sleep(500);
+    }
+  }
+  assertNotNull("Failed to trigger savepoint",savepointPath);
+  clusterClient.disposeSavepoint(savepointPath).get();
+  clusterClient.cancel(jobId);
+  invokeThread.join(deadline.timeLeft().toMillis());
+  assertFalse("Program invoke thread still running",invokeThread.isAlive());
+}

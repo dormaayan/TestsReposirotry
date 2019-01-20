@@ -1,0 +1,68 @@
+/** 
+ * A generating source that is slow before the first two checkpoints went through and will indefinitely stall at a certain point to allow the checkpoint to complete. <p>After the checkpoints are through, it continues with full speed.
+ */
+private static class StringGeneratingSourceFunction extends RichParallelSourceFunction<String> implements ListCheckpointed<Integer>, CheckpointListener {
+  private static volatile int numCompletedCheckpoints=0;
+  private final long numElements;
+  private final long checkpointLatestAt;
+  private int index=-1;
+  private volatile boolean isRunning=true;
+  StringGeneratingSourceFunction(  long numElements,  long checkpointLatestAt){
+    this.numElements=numElements;
+    this.checkpointLatestAt=checkpointLatestAt;
+  }
+  @Override public void run(  SourceContext<String> ctx) throws Exception {
+    final Random rnd=new Random();
+    final StringBuilder stringBuilder=new StringBuilder();
+    final Object lockingObject=ctx.getCheckpointLock();
+    final int step=getRuntimeContext().getNumberOfParallelSubtasks();
+    if (index < 0) {
+      index=getRuntimeContext().getIndexOfThisSubtask();
+    }
+    while (isRunning && index < numElements) {
+      char first=(char)((index % 40) + 40);
+      stringBuilder.setLength(0);
+      stringBuilder.append(first);
+      String result=randomString(stringBuilder,rnd);
+synchronized (lockingObject) {
+        index+=step;
+        ctx.collect(result);
+      }
+      if (numCompletedCheckpoints < 2) {
+        if (index < checkpointLatestAt) {
+          Thread.sleep(1);
+        }
+ else {
+          while (isRunning && numCompletedCheckpoints < 2) {
+            Thread.sleep(5);
+          }
+        }
+      }
+    }
+  }
+  @Override public void cancel(){
+    isRunning=false;
+  }
+  @Override public List<Integer> snapshotState(  long checkpointId,  long timestamp) throws Exception {
+    return Collections.singletonList(this.index);
+  }
+  @Override public void restoreState(  List<Integer> state) throws Exception {
+    if (state.isEmpty() || state.size() > 1) {
+      throw new RuntimeException("Test failed due to unexpected recovered state size " + state.size());
+    }
+    this.index=state.get(0);
+  }
+  @Override public void notifyCheckpointComplete(  long checkpointId) throws Exception {
+    if (getRuntimeContext().getIndexOfThisSubtask() == 0) {
+      numCompletedCheckpoints++;
+    }
+  }
+  private static String randomString(  StringBuilder bld,  Random rnd){
+    final int len=rnd.nextInt(10) + 5;
+    for (int i=0; i < len; i++) {
+      char next=(char)(rnd.nextInt(20000) + 33);
+      bld.append(next);
+    }
+    return bld.toString();
+  }
+}

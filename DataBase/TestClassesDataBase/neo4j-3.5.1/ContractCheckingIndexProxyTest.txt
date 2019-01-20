@@ -1,0 +1,182 @@
+public class ContractCheckingIndexProxyTest {
+  private static final long TEST_TIMEOUT=20_000;
+  @Test(expected=IllegalStateException.class) public void shouldNotCreateIndexTwice() throws IOException {
+    IndexProxy inner=mockIndexProxy();
+    IndexProxy outer=newContractCheckingIndexProxy(inner);
+    outer.start();
+    outer.start();
+  }
+  @Test(expected=IllegalStateException.class) public void shouldNotCloseIndexTwice() throws IOException {
+    IndexProxy inner=mockIndexProxy();
+    IndexProxy outer=newContractCheckingIndexProxy(inner);
+    outer.close();
+    outer.close();
+  }
+  @Test(expected=IllegalStateException.class) public void shouldNotDropIndexTwice() throws IOException {
+    IndexProxy inner=mockIndexProxy();
+    IndexProxy outer=newContractCheckingIndexProxy(inner);
+    outer.drop();
+    outer.drop();
+  }
+  @Test(expected=IllegalStateException.class) public void shouldNotDropAfterClose() throws IOException {
+    IndexProxy inner=mockIndexProxy();
+    IndexProxy outer=newContractCheckingIndexProxy(inner);
+    outer.close();
+    outer.drop();
+  }
+  @Test public void shouldDropAfterCreate() throws IOException {
+    IndexProxy inner=mockIndexProxy();
+    IndexProxy outer=newContractCheckingIndexProxy(inner);
+    outer.start();
+    outer.drop();
+  }
+  @Test public void shouldCloseAfterCreate() throws IOException {
+    IndexProxy inner=mockIndexProxy();
+    IndexProxy outer=newContractCheckingIndexProxy(inner);
+    outer.start();
+    outer.close();
+  }
+  @Test(expected=IllegalStateException.class) public void shouldNotUpdateBeforeCreate() throws Exception {
+    IndexProxy inner=mockIndexProxy();
+    IndexProxy outer=newContractCheckingIndexProxy(inner);
+    try (IndexUpdater updater=outer.newUpdater(IndexUpdateMode.ONLINE)){
+      updater.process(null);
+    }
+   }
+  @Test(expected=IllegalStateException.class) public void shouldNotUpdateAfterClose() throws Exception {
+    IndexProxy inner=mockIndexProxy();
+    IndexProxy outer=newContractCheckingIndexProxy(inner);
+    outer.start();
+    outer.close();
+    try (IndexUpdater updater=outer.newUpdater(IndexUpdateMode.ONLINE)){
+      updater.process(null);
+    }
+   }
+  @Test(expected=IllegalStateException.class) public void shouldNotForceBeforeCreate() throws IOException {
+    IndexProxy inner=mockIndexProxy();
+    IndexProxy outer=newContractCheckingIndexProxy(inner);
+    outer.force(IOLimiter.UNLIMITED);
+  }
+  @Test(expected=IllegalStateException.class) public void shouldNotForceAfterClose() throws IOException {
+    IndexProxy inner=mockIndexProxy();
+    IndexProxy outer=newContractCheckingIndexProxy(inner);
+    outer.start();
+    outer.close();
+    outer.force(IOLimiter.UNLIMITED);
+  }
+  @Test(expected=IllegalStateException.class) public void shouldNotCloseWhileCreating() throws IOException {
+    final DoubleLatch latch=new DoubleLatch();
+    final IndexProxy inner=new IndexProxyAdapter(){
+      @Override public void start(){
+        latch.startAndWaitForAllToStartAndFinish();
+      }
+    }
+;
+    final IndexProxy outer=newContractCheckingIndexProxy(inner);
+    runInSeparateThread(outer::start);
+    try {
+      latch.waitForAllToStart();
+      outer.close();
+    }
+  finally {
+      latch.finish();
+    }
+  }
+  @Test(expected=IllegalStateException.class) public void shouldNotDropWhileCreating() throws IOException {
+    final DoubleLatch latch=new DoubleLatch();
+    final IndexProxy inner=new IndexProxyAdapter(){
+      @Override public void start(){
+        latch.startAndWaitForAllToStartAndFinish();
+      }
+    }
+;
+    final IndexProxy outer=newContractCheckingIndexProxy(inner);
+    runInSeparateThread(outer::start);
+    try {
+      latch.waitForAllToStart();
+      outer.drop();
+    }
+  finally {
+      latch.finish();
+    }
+  }
+  @Test(timeout=TEST_TIMEOUT) public void closeWaitForUpdateToFinish() throws IOException, InterruptedException {
+    CountDownLatch latch=new CountDownLatch(1);
+    final IndexProxy inner=new IndexProxyAdapter(){
+      @Override public IndexUpdater newUpdater(      IndexUpdateMode mode){
+        return super.newUpdater(mode);
+      }
+    }
+;
+    final IndexProxy outer=newContractCheckingIndexProxy(inner);
+    Thread actionThread=createActionThread(outer::close);
+    outer.start();
+    Thread updaterThread=runInSeparateThread(() -> {
+      try (IndexUpdater updater=outer.newUpdater(IndexUpdateMode.ONLINE)){
+        updater.process(null);
+        try {
+          actionThread.start();
+          latch.await();
+        }
+ catch (        InterruptedException e) {
+          throw new RuntimeException(e);
+        }
+      }
+ catch (      IndexEntryConflictException e) {
+        throw new RuntimeException(e);
+      }
+    }
+);
+    ThreadTestUtils.awaitThreadState(actionThread,TEST_TIMEOUT,Thread.State.TIMED_WAITING);
+    latch.countDown();
+    updaterThread.join();
+    actionThread.join();
+  }
+  @Test(timeout=TEST_TIMEOUT) public void closeWaitForForceToComplete() throws Exception {
+    CountDownLatch latch=new CountDownLatch(1);
+    AtomicReference<Thread> actionThreadReference=new AtomicReference<>();
+    final IndexProxy inner=new IndexProxyAdapter(){
+      @Override public void force(      IOLimiter ioLimiter){
+        try {
+          actionThreadReference.get().start();
+          latch.await();
+        }
+ catch (        Exception e) {
+          throw new RuntimeException(e);
+        }
+      }
+    }
+;
+    IndexProxy outer=newContractCheckingIndexProxy(inner);
+    Thread actionThread=createActionThread(outer::close);
+    actionThreadReference.set(actionThread);
+    outer.start();
+    Thread thread=runInSeparateThread(() -> outer.force(IOLimiter.UNLIMITED));
+    ThreadTestUtils.awaitThreadState(actionThread,TEST_TIMEOUT,Thread.State.TIMED_WAITING);
+    latch.countDown();
+    thread.join();
+    actionThread.join();
+  }
+private interface ThrowingRunnable {
+    void run() throws IOException ;
+  }
+  private Thread runInSeparateThread(  final ThrowingRunnable action){
+    Thread thread=createActionThread(action);
+    thread.start();
+    return thread;
+  }
+  private Thread createActionThread(  ThrowingRunnable action){
+    return new Thread(() -> {
+      try {
+        action.run();
+      }
+ catch (      IOException e) {
+        throw new RuntimeException(e);
+      }
+    }
+);
+  }
+  private ContractCheckingIndexProxy newContractCheckingIndexProxy(  IndexProxy inner){
+    return new ContractCheckingIndexProxy(inner,false);
+  }
+}

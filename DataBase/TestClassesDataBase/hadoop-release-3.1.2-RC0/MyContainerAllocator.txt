@@ -1,0 +1,131 @@
+static class MyContainerAllocator extends RMContainerAllocator {
+  static final List<TaskAttemptContainerAssignedEvent> events=new ArrayList<>();
+  static final List<TaskAttemptKillEvent> taskAttemptKillEvents=new ArrayList<>();
+  static final List<JobUpdatedNodesEvent> jobUpdatedNodeEvents=new ArrayList<>();
+  static final List<JobEvent> jobEvents=new ArrayList<>();
+  private MyResourceManager rm;
+  private boolean isUnregistered=false;
+  private AllocateResponse allocateResponse;
+  private static AppContext createAppContext(  ApplicationAttemptId appAttemptId,  Job job){
+    AppContext context=mock(RunningAppContext.class);
+    ApplicationId appId=appAttemptId.getApplicationId();
+    when(context.getApplicationID()).thenReturn(appId);
+    when(context.getApplicationAttemptId()).thenReturn(appAttemptId);
+    when(context.getJob(isA(JobId.class))).thenReturn(job);
+    when(context.getClock()).thenReturn(new ControlledClock());
+    when(context.getClusterInfo()).thenReturn(new ClusterInfo(Resource.newInstance(10240,1)));
+    when(context.getEventHandler()).thenReturn(new EventHandler(){
+      @Override public void handle(      Event event){
+        if (event instanceof TaskAttemptContainerAssignedEvent) {
+          events.add((TaskAttemptContainerAssignedEvent)event);
+        }
+ else         if (event instanceof TaskAttemptKillEvent) {
+          taskAttemptKillEvents.add((TaskAttemptKillEvent)event);
+        }
+ else         if (event instanceof JobUpdatedNodesEvent) {
+          jobUpdatedNodeEvents.add((JobUpdatedNodesEvent)event);
+        }
+ else         if (event instanceof JobEvent) {
+          jobEvents.add((JobEvent)event);
+        }
+      }
+    }
+);
+    return context;
+  }
+  private static AppContext createAppContext(  ApplicationAttemptId appAttemptId,  Job job,  Clock clock){
+    AppContext context=createAppContext(appAttemptId,job);
+    when(context.getClock()).thenReturn(clock);
+    return context;
+  }
+  private static ClientService createMockClientService(){
+    ClientService service=mock(ClientService.class);
+    when(service.getBindAddress()).thenReturn(NetUtils.createSocketAddr("localhost:4567"));
+    when(service.getHttpPort()).thenReturn(890);
+    return service;
+  }
+  MyContainerAllocator(  MyResourceManager rm,  ApplicationAttemptId appAttemptId,  AppContext context){
+    super(createMockClientService(),context,new NoopAMPreemptionPolicy());
+    this.rm=rm;
+  }
+  public MyContainerAllocator(  MyResourceManager rm,  Configuration conf,  ApplicationAttemptId appAttemptId,  Job job){
+    super(createMockClientService(),createAppContext(appAttemptId,job),new NoopAMPreemptionPolicy());
+    this.rm=rm;
+    super.init(conf);
+    super.start();
+  }
+  public MyContainerAllocator(  MyResourceManager rm,  Configuration conf,  ApplicationAttemptId appAttemptId,  Job job,  Clock clock){
+    super(createMockClientService(),createAppContext(appAttemptId,job,clock),new NoopAMPreemptionPolicy());
+    this.rm=rm;
+    super.init(conf);
+    super.start();
+  }
+  @Override protected ApplicationMasterProtocol createSchedulerProxy(){
+    return this.rm.getApplicationMasterService();
+  }
+  @Override protected void register(){
+    ApplicationAttemptId attemptId=getContext().getApplicationAttemptId();
+    Token<AMRMTokenIdentifier> token=rm.getRMContext().getRMApps().get(attemptId.getApplicationId()).getRMAppAttempt(attemptId).getAMRMToken();
+    try {
+      UserGroupInformation ugi=UserGroupInformation.getCurrentUser();
+      ugi.addTokenIdentifier(token.decodeIdentifier());
+    }
+ catch (    IOException e) {
+      throw new YarnRuntimeException(e);
+    }
+    super.register();
+  }
+  @Override protected void unregister(){
+    isUnregistered=true;
+  }
+  @Override protected Resource getMaxContainerCapability(){
+    return Resource.newInstance(10240,1);
+  }
+  public void sendRequest(  ContainerRequestEvent req){
+    sendRequests(Arrays.asList(new ContainerRequestEvent[]{req}));
+  }
+  public void sendRequests(  List<ContainerRequestEvent> reqs){
+    for (    ContainerRequestEvent req : reqs) {
+      super.handleEvent(req);
+    }
+  }
+  public void sendFailure(  ContainerFailedEvent f){
+    super.handleEvent(f);
+  }
+  public void sendDeallocate(  ContainerAllocatorEvent f){
+    super.handleEvent(f);
+  }
+  public List<TaskAttemptContainerAssignedEvent> schedule() throws Exception {
+    GenericTestUtils.waitFor(new Supplier<Boolean>(){
+      public Boolean get(){
+        return eventQueue.isEmpty();
+      }
+    }
+,100,10000);
+    super.heartbeat();
+    List<TaskAttemptContainerAssignedEvent> result=new ArrayList<>(events);
+    events.clear();
+    return result;
+  }
+  static List<TaskAttemptKillEvent> getTaskAttemptKillEvents(){
+    return taskAttemptKillEvents;
+  }
+  static List<JobUpdatedNodesEvent> getJobUpdatedNodeEvents(){
+    return jobUpdatedNodeEvents;
+  }
+  @Override protected void startAllocatorThread(){
+  }
+  @Override protected boolean isApplicationMasterRegistered(){
+    return super.isApplicationMasterRegistered();
+  }
+  public boolean isUnregistered(){
+    return isUnregistered;
+  }
+  public void updateSchedulerProxy(  MyResourceManager rm){
+    scheduler=rm.getApplicationMasterService();
+  }
+  @Override protected AllocateResponse makeRemoteRequest() throws IOException, YarnException {
+    allocateResponse=super.makeRemoteRequest();
+    return allocateResponse;
+  }
+}

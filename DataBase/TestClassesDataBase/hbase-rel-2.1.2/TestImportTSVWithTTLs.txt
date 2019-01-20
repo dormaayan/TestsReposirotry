@@ -1,0 +1,82 @@
+@Category({MapReduceTests.class,LargeTests.class}) public class TestImportTSVWithTTLs implements Configurable {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestImportTSVWithTTLs.class);
+  protected static final Logger LOG=LoggerFactory.getLogger(TestImportTSVWithTTLs.class);
+  protected static final String NAME=TestImportTsv.class.getSimpleName();
+  protected static HBaseTestingUtility util=new HBaseTestingUtility();
+  /** 
+ * Delete the tmp directory after running doMROnTableTest. Boolean. Default is false.
+ */
+  protected static final String DELETE_AFTER_LOAD_CONF=NAME + ".deleteAfterLoad";
+  /** 
+ * Force use of combiner in doMROnTableTest. Boolean. Default is true.
+ */
+  protected static final String FORCE_COMBINER_CONF=NAME + ".forceCombiner";
+  private final String FAMILY="FAM";
+  private static Configuration conf;
+  @Rule public TestName name=new TestName();
+  @Override public Configuration getConf(){
+    return util.getConfiguration();
+  }
+  @Override public void setConf(  Configuration conf){
+    throw new IllegalArgumentException("setConf not supported");
+  }
+  @BeforeClass public static void provisionCluster() throws Exception {
+    conf=util.getConfiguration();
+    conf.setInt("hfile.format.version",3);
+    conf.set("hbase.coprocessor.region.classes",TTLCheckingObserver.class.getName());
+    util.startMiniCluster();
+  }
+  @AfterClass public static void releaseCluster() throws Exception {
+    util.shutdownMiniCluster();
+  }
+  @Test public void testMROnTable() throws Exception {
+    final TableName tableName=TableName.valueOf(name.getMethodName() + util.getRandomUUID());
+    String[] args=new String[]{"-D" + ImportTsv.MAPPER_CONF_KEY + "=org.apache.hadoop.hbase.mapreduce.TsvImporterMapper","-D" + ImportTsv.COLUMNS_CONF_KEY + "=HBASE_ROW_KEY,FAM:A,FAM:B,HBASE_CELL_TTL","-D" + ImportTsv.SEPARATOR_CONF_KEY + "=\u001b",tableName.getNameAsString()};
+    String data="KEY\u001bVALUE1\u001bVALUE2\u001b1000000\n";
+    util.createTable(tableName,FAMILY);
+    doMROnTableTest(util,FAMILY,data,args,1);
+    util.deleteTable(tableName);
+  }
+  protected static Tool doMROnTableTest(  HBaseTestingUtility util,  String family,  String data,  String[] args,  int valueMultiplier) throws Exception {
+    TableName table=TableName.valueOf(args[args.length - 1]);
+    Configuration conf=new Configuration(util.getConfiguration());
+    FileSystem fs=FileSystem.get(conf);
+    Path inputPath=fs.makeQualified(new Path(util.getDataTestDirOnTestFS(table.getNameAsString()),"input.dat"));
+    FSDataOutputStream op=fs.create(inputPath,true);
+    op.write(Bytes.toBytes(data));
+    op.close();
+    LOG.debug(String.format("Wrote test data to file: %s",inputPath));
+    if (conf.getBoolean(FORCE_COMBINER_CONF,true)) {
+      LOG.debug("Forcing combiner.");
+      conf.setInt("mapreduce.map.combine.minspills",1);
+    }
+    List<String> argv=new ArrayList<>(Arrays.asList(args));
+    argv.add(inputPath.toString());
+    Tool tool=new ImportTsv();
+    LOG.debug("Running ImportTsv with arguments: " + argv);
+    try {
+      assertEquals(0,ToolRunner.run(conf,tool,argv.toArray(args)));
+    }
+  finally {
+      if (conf.getBoolean(DELETE_AFTER_LOAD_CONF,true)) {
+        LOG.debug("Deleting test subdirectory");
+        util.cleanupDataTestDirOnTestFS(table.getNameAsString());
+      }
+    }
+    return tool;
+  }
+public static class TTLCheckingObserver implements RegionCoprocessor, RegionObserver {
+    @Override public Optional<RegionObserver> getRegionObserver(){
+      return Optional.of(this);
+    }
+    @Override public void prePut(    ObserverContext<RegionCoprocessorEnvironment> e,    Put put,    WALEdit edit,    Durability durability) throws IOException {
+      Region region=e.getEnvironment().getRegion();
+      if (!region.getRegionInfo().isMetaRegion() && !region.getRegionInfo().getTable().isSystemTable()) {
+        if (put.getTTL() != Long.MAX_VALUE) {
+          return;
+        }
+        throw new IOException("Operation does not have TTL set");
+      }
+    }
+  }
+}

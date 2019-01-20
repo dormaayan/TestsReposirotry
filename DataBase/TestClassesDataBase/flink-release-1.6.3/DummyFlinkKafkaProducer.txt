@@ -1,0 +1,60 @@
+private static class DummyFlinkKafkaProducer<T> extends FlinkKafkaProducerBase<T> {
+  private static final long serialVersionUID=1L;
+  private static final String DUMMY_TOPIC="dummy-topic";
+  private transient KafkaProducer<?,?> mockProducer;
+  private transient List<Callback> pendingCallbacks;
+  private transient MultiShotLatch flushLatch;
+  private boolean isFlushed;
+  @SuppressWarnings("unchecked") DummyFlinkKafkaProducer(  Properties producerConfig,  KeyedSerializationSchema<T> schema,  FlinkKafkaPartitioner partitioner){
+    super(DUMMY_TOPIC,schema,producerConfig,partitioner);
+    this.mockProducer=mock(KafkaProducer.class);
+    when(mockProducer.send(any(ProducerRecord.class),any(Callback.class))).thenAnswer(new Answer<Object>(){
+      @Override public Object answer(      InvocationOnMock invocationOnMock) throws Throwable {
+        pendingCallbacks.add(invocationOnMock.getArgumentAt(1,Callback.class));
+        return null;
+      }
+    }
+);
+    this.pendingCallbacks=new ArrayList<>();
+    this.flushLatch=new MultiShotLatch();
+  }
+  long getPendingSize(){
+    if (flushOnCheckpoint) {
+      return numPendingRecords();
+    }
+ else {
+      throw new UnsupportedOperationException("getPendingSize not supported when flushing is disabled");
+    }
+  }
+  List<Callback> getPendingCallbacks(){
+    return pendingCallbacks;
+  }
+  KafkaProducer<?,?> getMockKafkaProducer(){
+    return mockProducer;
+  }
+  @Override public void snapshotState(  FunctionSnapshotContext ctx) throws Exception {
+    isFlushed=false;
+    super.snapshotState(ctx);
+    if (flushOnCheckpoint && !isFlushed) {
+      throw new RuntimeException("Flushing is enabled; snapshots should be blocked until all pending records are flushed");
+    }
+  }
+  public void waitUntilFlushStarted() throws Exception {
+    flushLatch.await();
+  }
+  @SuppressWarnings("unchecked") @Override protected <K,V>KafkaProducer<K,V> getKafkaProducer(  Properties props){
+    return (KafkaProducer<K,V>)mockProducer;
+  }
+  @Override protected void flush(){
+    flushLatch.trigger();
+    while (numPendingRecords() > 0) {
+      try {
+        Thread.sleep(10);
+      }
+ catch (      InterruptedException e) {
+        throw new RuntimeException("Unable to flush producer, task was interrupted");
+      }
+    }
+    isFlushed=true;
+  }
+}

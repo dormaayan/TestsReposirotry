@@ -1,0 +1,50 @@
+@Category({RegionServerTests.class,MediumTests.class}) public class TestHdfsSnapshotHRegion {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestHdfsSnapshotHRegion.class);
+  private static final HBaseTestingUtility TEST_UTIL=new HBaseTestingUtility();
+  private static final String SNAPSHOT_NAME="foo_snapshot";
+  private Table table;
+  public static final TableName TABLE_NAME=TableName.valueOf("foo");
+  public static final byte[] FAMILY=Bytes.toBytes("f1");
+  private DFSClient client;
+  private String baseDir;
+  @Before public void setUp() throws Exception {
+    Configuration c=TEST_UTIL.getConfiguration();
+    c.setBoolean("dfs.support.append",true);
+    TEST_UTIL.startMiniCluster(1);
+    table=TEST_UTIL.createMultiRegionTable(TABLE_NAME,FAMILY);
+    TEST_UTIL.loadTable(table,FAMILY);
+    client=new DFSClient(TEST_UTIL.getDFSCluster().getURI(),TEST_UTIL.getConfiguration());
+    String fullUrIPath=TEST_UTIL.getDefaultRootDirPath().toString();
+    String uriString=TEST_UTIL.getTestFileSystem().getUri().toString();
+    baseDir=StringUtils.removeStart(fullUrIPath,uriString);
+    client.allowSnapshot(baseDir);
+  }
+  @After public void tearDown() throws Exception {
+    client.deleteSnapshot(baseDir,SNAPSHOT_NAME);
+    TEST_UTIL.shutdownMiniCluster();
+  }
+  @Test public void testOpeningReadOnlyRegionBasic() throws Exception {
+    String snapshotDir=client.createSnapshot(baseDir,SNAPSHOT_NAME);
+    RegionInfo firstRegion=TEST_UTIL.getConnection().getRegionLocator(table.getName()).getAllRegionLocations().stream().findFirst().get().getRegion();
+    Path tableDir=FSUtils.getTableDir(new Path(snapshotDir),TABLE_NAME);
+    HRegion snapshottedRegion=openSnapshotRegion(firstRegion,tableDir);
+    Assert.assertNotNull(snapshottedRegion);
+    snapshottedRegion.close();
+  }
+  @Test public void testSnapshottingWithTmpSplitsAndMergeDirectoriesPresent() throws Exception {
+    RegionInfo firstRegion=TEST_UTIL.getConnection().getRegionLocator(table.getName()).getAllRegionLocations().stream().findFirst().get().getRegion();
+    String encodedName=firstRegion.getEncodedName();
+    Path tableDir=FSUtils.getTableDir(TEST_UTIL.getDefaultRootDirPath(),TABLE_NAME);
+    Path regionDirectoryPath=new Path(tableDir,encodedName);
+    TEST_UTIL.getTestFileSystem().create(new Path(regionDirectoryPath,HRegionFileSystem.REGION_TEMP_DIR));
+    TEST_UTIL.getTestFileSystem().create(new Path(regionDirectoryPath,HRegionFileSystem.REGION_SPLITS_DIR));
+    TEST_UTIL.getTestFileSystem().create(new Path(regionDirectoryPath,HRegionFileSystem.REGION_MERGES_DIR));
+    String snapshotDir=client.createSnapshot(baseDir,"foo_snapshot");
+    HRegion snapshottedRegion=openSnapshotRegion(firstRegion,FSUtils.getTableDir(new Path(snapshotDir),TABLE_NAME));
+    Assert.assertNotNull(snapshottedRegion);
+    snapshottedRegion.close();
+  }
+  private HRegion openSnapshotRegion(  RegionInfo firstRegion,  Path tableDir) throws IOException {
+    return HRegion.openReadOnlyFileSystemHRegion(TEST_UTIL.getConfiguration(),TEST_UTIL.getTestFileSystem(),tableDir,firstRegion,table.getDescriptor());
+  }
+}

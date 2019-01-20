@@ -1,0 +1,45 @@
+@Test public void testStop() throws Exception {
+  assertTrue(getRunningJobs(CLUSTER.getClusterClient()).isEmpty());
+  final JobVertex sender=new JobVertex("Sender");
+  sender.setParallelism(2);
+  sender.setInvokableClass(BlockingInvokable.class);
+  final JobGraph jobGraph=new JobGraph("Stoppable streaming test job",sender);
+  final JobID jid=jobGraph.getJobID();
+  ClusterClient<?> clusterClient=CLUSTER.getClusterClient();
+  clusterClient.setDetached(true);
+  clusterClient.submitJob(jobGraph,WebFrontendITCase.class.getClassLoader());
+  while (getRunningJobs(CLUSTER.getClusterClient()).isEmpty()) {
+    Thread.sleep(10);
+  }
+  BlockingInvokable.latch.await();
+  final FiniteDuration testTimeout=new FiniteDuration(2,TimeUnit.MINUTES);
+  final Deadline deadline=testTimeout.fromNow();
+  try (HttpTestClient client=new HttpTestClient("localhost",CLUSTER.getWebUIPort())){
+    if (CLUSTER.getCodebaseType() == TestBaseUtils.CodebaseType.NEW) {
+      client.sendPatchRequest("/jobs/" + jid + "/?mode=stop",deadline.timeLeft());
+      HttpTestClient.SimpleHttpResponse response=client.getNextResponse(deadline.timeLeft());
+      assertEquals(HttpResponseStatus.ACCEPTED,response.getStatus());
+      assertEquals("application/json; charset=UTF-8",response.getType());
+      assertEquals("{}",response.getContent());
+    }
+ else {
+      client.sendDeleteRequest("/jobs/" + jid + "/stop",deadline.timeLeft());
+      HttpTestClient.SimpleHttpResponse response=client.getNextResponse(deadline.timeLeft());
+      assertEquals(HttpResponseStatus.OK,response.getStatus());
+      assertEquals("application/json; charset=UTF-8",response.getType());
+      assertEquals("{}",response.getContent());
+    }
+  }
+   while (!getRunningJobs(CLUSTER.getClusterClient()).isEmpty()) {
+    Thread.sleep(20);
+  }
+  try (HttpTestClient client=new HttpTestClient("localhost",CLUSTER.getWebUIPort())){
+    FiniteDuration timeout=new FiniteDuration(30,TimeUnit.SECONDS);
+    client.sendGetRequest("/jobs/" + jid + "/config",timeout);
+    HttpTestClient.SimpleHttpResponse response=client.getNextResponse(timeout);
+    assertEquals(HttpResponseStatus.OK,response.getStatus());
+    assertEquals("application/json; charset=UTF-8",response.getType());
+    assertEquals("{\"jid\":\"" + jid + "\",\"name\":\"Stoppable streaming test job\","+ "\"execution-config\":{\"execution-mode\":\"PIPELINED\",\"restart-strategy\":\"Cluster level default restart strategy\","+ "\"job-parallelism\":-1,\"object-reuse-mode\":false,\"user-config\":{}}}",response.getContent());
+  }
+   BlockingInvokable.reset();
+}

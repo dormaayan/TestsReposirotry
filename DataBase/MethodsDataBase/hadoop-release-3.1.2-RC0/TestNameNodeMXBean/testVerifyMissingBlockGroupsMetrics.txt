@@ -1,0 +1,86 @@
+@Test public void testVerifyMissingBlockGroupsMetrics() throws Exception {
+  MiniDFSCluster cluster=null;
+  DistributedFileSystem fs=null;
+  try {
+    Configuration conf=new HdfsConfiguration();
+    int dataBlocks=StripedFileTestUtil.getDefaultECPolicy().getNumDataUnits();
+    int parityBlocks=StripedFileTestUtil.getDefaultECPolicy().getNumParityUnits();
+    int cellSize=StripedFileTestUtil.getDefaultECPolicy().getCellSize();
+    int totalSize=dataBlocks + parityBlocks;
+    cluster=new MiniDFSCluster.Builder(conf).numDataNodes(totalSize).build();
+    fs=cluster.getFileSystem();
+    fs.enableErasureCodingPolicy(StripedFileTestUtil.getDefaultECPolicy().getName());
+    Path ecDirPath=new Path("/striped");
+    fs.mkdir(ecDirPath,FsPermission.getDirDefault());
+    fs.getClient().setErasureCodingPolicy(ecDirPath.toString(),StripedFileTestUtil.getDefaultECPolicy().getName());
+    Path file=new Path(ecDirPath,"corrupted");
+    final int length=cellSize * dataBlocks;
+    final byte[] bytes=StripedFileTestUtil.generateBytes(length);
+    DFSTestUtil.writeFile(fs,file,bytes);
+    LocatedStripedBlock lsb=(LocatedStripedBlock)fs.getClient().getLocatedBlocks(file.toString(),0,cellSize * dataBlocks).get(0);
+    final LocatedBlock[] blks=StripedBlockUtil.parseStripedBlockGroup(lsb,cellSize,dataBlocks,parityBlocks);
+    for (int i=0; i < parityBlocks + 1; i++) {
+      int ipcPort=blks[i].getLocations()[0].getIpcPort();
+      cluster.corruptReplica(cluster.getDataNode(ipcPort),blks[i].getBlock());
+    }
+    for (    DataNode dn : cluster.getDataNodes()) {
+      DataNodeTestUtils.setHeartbeatsDisabledForTests(dn,true);
+    }
+    try {
+      IOUtils.copyBytes(fs.open(file),new IOUtils.NullOutputStream(),conf,true);
+    }
+ catch (    IOException ie) {
+      assertTrue(ie.getMessage().contains("missingChunksNum=" + (parityBlocks + 1)));
+    }
+    MBeanServer mbs=ManagementFactory.getPlatformMBeanServer();
+    ObjectName replStateMBeanName=new ObjectName("Hadoop:service=NameNode,name=ReplicatedBlocksState");
+    ObjectName ecBlkGrpStateMBeanName=new ObjectName("Hadoop:service=NameNode,name=ECBlockGroupsState");
+    ObjectName namenodeMXBeanName=new ObjectName("Hadoop:service=NameNode,name=NameNodeInfo");
+    long expectedMissingBlockCount=1L;
+    long expectedCorruptBlockCount=1L;
+    GenericTestUtils.waitFor(new Supplier<Boolean>(){
+      @Override public Boolean get(){
+        try {
+          Long numMissingBlocks=(Long)mbs.getAttribute(namenodeMXBeanName,"NumberOfMissingBlocks");
+          if (numMissingBlocks == expectedMissingBlockCount) {
+            return true;
+          }
+        }
+ catch (        Exception e) {
+          Assert.fail("Caught unexpected exception.");
+        }
+        return false;
+      }
+    }
+,1000,60000);
+    BlockManagerTestUtil.updateState(cluster.getNamesystem().getBlockManager());
+    long totalMissingBlocks=cluster.getNamesystem().getMissingBlocksCount();
+    Long replicaMissingBlocks=(Long)mbs.getAttribute(replStateMBeanName,"MissingReplicatedBlocks");
+    Long ecMissingBlocks=(Long)mbs.getAttribute(ecBlkGrpStateMBeanName,"MissingECBlockGroups");
+    assertEquals("Unexpected total missing blocks!",expectedMissingBlockCount,totalMissingBlocks);
+    assertEquals("Unexpected total missing blocks!",totalMissingBlocks,(replicaMissingBlocks + ecMissingBlocks));
+    assertEquals("Unexpected total ec missing blocks!",expectedMissingBlockCount,ecMissingBlocks.longValue());
+    long totalCorruptBlocks=cluster.getNamesystem().getCorruptReplicaBlocks();
+    Long replicaCorruptBlocks=(Long)mbs.getAttribute(replStateMBeanName,"CorruptReplicatedBlocks");
+    Long ecCorruptBlocks=(Long)mbs.getAttribute(ecBlkGrpStateMBeanName,"CorruptECBlockGroups");
+    assertEquals("Unexpected total corrupt blocks!",expectedCorruptBlockCount,totalCorruptBlocks);
+    assertEquals("Unexpected total corrupt blocks!",totalCorruptBlocks,(replicaCorruptBlocks + ecCorruptBlocks));
+    assertEquals("Unexpected total ec corrupt blocks!",expectedCorruptBlockCount,ecCorruptBlocks.longValue());
+    String corruptFiles=(String)(mbs.getAttribute(namenodeMXBeanName,"CorruptFiles"));
+    int numCorruptFiles=((Object[])JSON.parse(corruptFiles)).length;
+    assertEquals(1,numCorruptFiles);
+  }
+  finally {
+    if (fs != null) {
+      try {
+        fs.close();
+      }
+ catch (      Exception e) {
+        throw e;
+      }
+    }
+    if (cluster != null) {
+      cluster.shutdown();
+    }
+  }
+}

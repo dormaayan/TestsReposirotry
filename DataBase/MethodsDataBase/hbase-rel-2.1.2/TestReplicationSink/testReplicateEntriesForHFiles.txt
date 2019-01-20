@@ -1,0 +1,52 @@
+/** 
+ * Test replicateEntries with a bulk load entry for 25 HFiles
+ */
+@Test public void testReplicateEntriesForHFiles() throws Exception {
+  Path dir=TEST_UTIL.getDataTestDirOnTestFS("testReplicateEntries");
+  Path familyDir=new Path(dir,Bytes.toString(FAM_NAME1));
+  int numRows=10;
+  List<Path> p=new ArrayList<>(1);
+  final String hfilePrefix="hfile-";
+  Random rng=new SecureRandom();
+  Set<Integer> numbers=new HashSet<>();
+  while (numbers.size() < 50) {
+    numbers.add(rng.nextInt(1000));
+  }
+  List<Integer> numberList=new ArrayList<>(numbers);
+  Collections.sort(numberList);
+  Map<String,Long> storeFilesSize=new HashMap<>(1);
+  Configuration conf=TEST_UTIL.getConfiguration();
+  FileSystem fs=dir.getFileSystem(conf);
+  Iterator<Integer> numbersItr=numberList.iterator();
+  for (int i=0; i < 25; i++) {
+    Path hfilePath=new Path(familyDir,hfilePrefix + i);
+    HFileTestUtil.createHFile(conf,fs,hfilePath,FAM_NAME1,FAM_NAME1,Bytes.toBytes(numbersItr.next()),Bytes.toBytes(numbersItr.next()),numRows);
+    p.add(hfilePath);
+    storeFilesSize.put(hfilePath.getName(),fs.getFileStatus(hfilePath).getLen());
+  }
+  Map<byte[],List<Path>> storeFiles=new HashMap<>(1);
+  storeFiles.put(FAM_NAME1,p);
+  org.apache.hadoop.hbase.wal.WALEdit edit=null;
+  WALProtos.BulkLoadDescriptor loadDescriptor=null;
+  try (Connection c=ConnectionFactory.createConnection(conf);RegionLocator l=c.getRegionLocator(TABLE_NAME1)){
+    HRegionInfo regionInfo=l.getAllRegionLocations().get(0).getRegionInfo();
+    loadDescriptor=ProtobufUtil.toBulkLoadDescriptor(TABLE_NAME1,UnsafeByteOperations.unsafeWrap(regionInfo.getEncodedNameAsBytes()),storeFiles,storeFilesSize,1);
+    edit=org.apache.hadoop.hbase.wal.WALEdit.createBulkLoadEvent(regionInfo,loadDescriptor);
+  }
+   List<WALEntry> entries=new ArrayList<>(1);
+  WALEntry.Builder builder=createWALEntryBuilder(TABLE_NAME1);
+  for (int i=0; i < 25; i++) {
+    String pathToHfileFromNS=new StringBuilder(100).append(TABLE_NAME1.getNamespaceAsString()).append(Path.SEPARATOR).append(Bytes.toString(TABLE_NAME1.getName())).append(Path.SEPARATOR).append(Bytes.toString(loadDescriptor.getEncodedRegionName().toByteArray())).append(Path.SEPARATOR).append(Bytes.toString(FAM_NAME1)).append(Path.SEPARATOR).append(hfilePrefix + i).toString();
+    String dst=baseNamespaceDir + Path.SEPARATOR + pathToHfileFromNS;
+    Path dstPath=new Path(dst);
+    FileUtil.copy(fs,p.get(0),fs,dstPath,false,conf);
+  }
+  entries.add(builder.build());
+  try (ResultScanner scanner=table1.getScanner(new Scan())){
+    assertEquals(0,scanner.next(numRows).length);
+  }
+   SINK.replicateEntries(entries,CellUtil.createCellScanner(edit.getCells().iterator()),replicationClusterId,baseNamespaceDir,hfileArchiveDir);
+  try (ResultScanner scanner=table1.getScanner(new Scan())){
+    assertEquals(numRows,scanner.next(numRows).length);
+  }
+ }

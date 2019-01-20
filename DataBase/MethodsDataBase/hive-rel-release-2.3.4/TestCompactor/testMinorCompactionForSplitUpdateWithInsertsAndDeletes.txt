@@ -1,0 +1,55 @@
+@Test public void testMinorCompactionForSplitUpdateWithInsertsAndDeletes() throws Exception {
+  String agentInfo="UT_" + Thread.currentThread().getName();
+  String dbName="default";
+  String tblName="cws";
+  List<String> colNames=Arrays.asList("a","b");
+  String columnNamesProperty="a,b";
+  String columnTypesProperty="int:string";
+  executeStatementOnDriver("drop table if exists " + tblName,driver);
+  executeStatementOnDriver("CREATE TABLE " + tblName + "(a INT, b STRING) "+ " CLUSTERED BY(a) INTO 1 BUCKETS"+ " STORED AS ORC  TBLPROPERTIES ('transactional'='true',"+ "'transactional_properties'='default')",driver);
+  executeStatementOnDriver("INSERT INTO " + tblName + "(a,b) VALUES(1, 'foo')",driver);
+  executeStatementOnDriver("INSERT INTO " + tblName + "(a,b) VALUES(2, 'bar')",driver);
+  executeStatementOnDriver("DELETE FROM " + tblName + " WHERE a = 2",driver);
+  TxnStore txnHandler=TxnUtils.getTxnStore(conf);
+  txnHandler.compact(new CompactionRequest(dbName,tblName,CompactionType.MINOR));
+  Worker t=new Worker();
+  t.setThreadId((int)t.getId());
+  t.setHiveConf(conf);
+  AtomicBoolean stop=new AtomicBoolean(true);
+  AtomicBoolean looped=new AtomicBoolean();
+  t.init(stop,looped);
+  t.run();
+  IMetaStoreClient msClient=new HiveMetaStoreClient(conf);
+  Table table=msClient.getTable(dbName,tblName);
+  FileSystem fs=FileSystem.get(conf);
+  FileStatus[] stat=fs.listStatus(new Path(table.getSd().getLocation()),AcidUtils.deltaFileFilter);
+  String[] deltas=new String[stat.length];
+  Path minorCompactedDelta=null;
+  for (int i=0; i < deltas.length; i++) {
+    deltas[i]=stat[i].getPath().getName();
+    if (deltas[i].equals("delta_0000001_0000003")) {
+      minorCompactedDelta=stat[i].getPath();
+    }
+  }
+  Arrays.sort(deltas);
+  String[] expectedDeltas=new String[]{"delta_0000001_0000001_0000","delta_0000001_0000003","delta_0000002_0000002_0000"};
+  if (!Arrays.deepEquals(expectedDeltas,deltas)) {
+    Assert.fail("Expected: " + Arrays.toString(expectedDeltas) + ", found: "+ Arrays.toString(deltas));
+  }
+  checkExpectedTxnsPresent(null,new Path[]{minorCompactedDelta},columnNamesProperty,columnTypesProperty,0,1L,2L);
+  FileStatus[] deleteDeltaStat=fs.listStatus(new Path(table.getSd().getLocation()),AcidUtils.deleteEventDeltaDirFilter);
+  String[] deleteDeltas=new String[deleteDeltaStat.length];
+  Path minorCompactedDeleteDelta=null;
+  for (int i=0; i < deleteDeltas.length; i++) {
+    deleteDeltas[i]=deleteDeltaStat[i].getPath().getName();
+    if (deleteDeltas[i].equals("delete_delta_0000001_0000003")) {
+      minorCompactedDeleteDelta=deleteDeltaStat[i].getPath();
+    }
+  }
+  Arrays.sort(deleteDeltas);
+  String[] expectedDeleteDeltas=new String[]{"delete_delta_0000001_0000003","delete_delta_0000003_0000003_0000"};
+  if (!Arrays.deepEquals(expectedDeleteDeltas,deleteDeltas)) {
+    Assert.fail("Expected: " + Arrays.toString(expectedDeleteDeltas) + ", found: "+ Arrays.toString(deleteDeltas));
+  }
+  checkExpectedTxnsPresent(null,new Path[]{minorCompactedDeleteDelta},columnNamesProperty,columnTypesProperty,0,2L,2L);
+}

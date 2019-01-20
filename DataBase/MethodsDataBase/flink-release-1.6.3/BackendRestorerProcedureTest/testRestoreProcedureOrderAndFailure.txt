@@ -1,0 +1,47 @@
+/** 
+ * Tests that the restore procedure follows the order of the iterator and will retries failed attempts if there are more options.
+ */
+@Test public void testRestoreProcedureOrderAndFailure() throws Exception {
+  CloseableRegistry closeableRegistry=new CloseableRegistry();
+  CheckpointStreamFactory checkpointStreamFactory=new MemCheckpointStreamFactory(1024);
+  ListStateDescriptor<Integer> stateDescriptor=new ListStateDescriptor<>("test-state",Integer.class);
+  OperatorStateBackend originalBackend=backendSupplier.get();
+  SnapshotResult<OperatorStateHandle> snapshotResult;
+  try {
+    ListState<Integer> listState=originalBackend.getListState(stateDescriptor);
+    listState.add(0);
+    listState.add(1);
+    listState.add(2);
+    listState.add(3);
+    RunnableFuture<SnapshotResult<OperatorStateHandle>> snapshot=originalBackend.snapshot(0L,0L,checkpointStreamFactory,CheckpointOptions.forCheckpointWithDefaultLocation());
+    snapshot.run();
+    snapshotResult=snapshot.get();
+  }
+  finally {
+    originalBackend.close();
+    originalBackend.dispose();
+  }
+  OperatorStateHandle firstFailHandle=mock(OperatorStateHandle.class);
+  OperatorStateHandle secondSuccessHandle=spy(snapshotResult.getJobManagerOwnedSnapshot());
+  OperatorStateHandle thirdNotUsedHandle=mock(OperatorStateHandle.class);
+  List<StateObjectCollection<OperatorStateHandle>> sortedRestoreOptions=Arrays.asList(new StateObjectCollection<>(Collections.singletonList(firstFailHandle)),new StateObjectCollection<>(Collections.singletonList(secondSuccessHandle)),new StateObjectCollection<>(Collections.singletonList(thirdNotUsedHandle)));
+  BackendRestorerProcedure<OperatorStateBackend,OperatorStateHandle> restorerProcedure=new BackendRestorerProcedure<>(backendSupplier,closeableRegistry,"test op state backend");
+  OperatorStateBackend restoredBackend=restorerProcedure.createAndRestore(sortedRestoreOptions);
+  Assert.assertNotNull(restoredBackend);
+  try {
+    verify(firstFailHandle).openInputStream();
+    verify(secondSuccessHandle).openInputStream();
+    verifyZeroInteractions(thirdNotUsedHandle);
+    ListState<Integer> listState=restoredBackend.getListState(stateDescriptor);
+    Iterator<Integer> stateIterator=listState.get().iterator();
+    Assert.assertEquals(0,(int)stateIterator.next());
+    Assert.assertEquals(1,(int)stateIterator.next());
+    Assert.assertEquals(2,(int)stateIterator.next());
+    Assert.assertEquals(3,(int)stateIterator.next());
+    Assert.assertFalse(stateIterator.hasNext());
+  }
+  finally {
+    restoredBackend.close();
+    restoredBackend.dispose();
+  }
+}

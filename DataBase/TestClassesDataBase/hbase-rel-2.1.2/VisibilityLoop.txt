@@ -1,0 +1,124 @@
+static class VisibilityLoop extends Loop {
+  private static final int SLEEP_IN_MS=5000;
+  private static final Logger LOG=LoggerFactory.getLogger(VisibilityLoop.class);
+  IntegrationTestBigLinkedListWithVisibility it;
+  @Override protected void runGenerator(  int numMappers,  long numNodes,  String outputDir,  Integer width,  Integer wrapMultiplier,  Integer numWalkers) throws Exception {
+    Path outputPath=new Path(outputDir);
+    UUID uuid=UUID.randomUUID();
+    Path generatorOutput=new Path(outputPath,uuid.toString());
+    Generator generator=new VisibilityGenerator();
+    generator.setConf(getConf());
+    int retCode=generator.run(numMappers,numNodes,generatorOutput,width,wrapMultiplier,numWalkers);
+    if (retCode > 0) {
+      throw new RuntimeException("Generator failed with return code: " + retCode);
+    }
+  }
+  protected void runDelete(  int numMappers,  long numNodes,  String outputDir,  Integer width,  Integer wrapMultiplier,  int tableIndex) throws Exception {
+    LOG.info("Running copier on table " + IntegrationTestBigLinkedListWithVisibility.getTableName(tableIndex));
+    Copier copier=new Copier(IntegrationTestBigLinkedListWithVisibility.getTableName(tableIndex),tableIndex,true);
+    copier.setConf(getConf());
+    copier.runCopier(outputDir);
+    Thread.sleep(SLEEP_IN_MS);
+  }
+  protected void runVerify(  String outputDir,  int numReducers,  long expectedNumNodes,  boolean allTables) throws Exception {
+    Path outputPath=new Path(outputDir);
+    if (allTables) {
+      for (int i=0; i < DEFAULT_TABLES_COUNT; i++) {
+        LOG.info("Verifying table " + i);
+        sleep(SLEEP_IN_MS);
+        UUID uuid=UUID.randomUUID();
+        Path iterationOutput=new Path(outputPath,uuid.toString());
+        Verify verify=new VisibilityVerify(getTableName(i).getNameAsString(),i);
+        verify(numReducers,expectedNumNodes,iterationOutput,verify);
+      }
+    }
+    for (int i=0; i < DEFAULT_TABLES_COUNT; i++) {
+      runVerifyCommonTable(outputDir,numReducers,expectedNumNodes,i);
+    }
+  }
+  private void runVerify(  String outputDir,  int numReducers,  long expectedNodes,  int tableIndex) throws Exception {
+    long temp=expectedNodes;
+    for (int i=0; i < DEFAULT_TABLES_COUNT; i++) {
+      if (i <= tableIndex) {
+        expectedNodes=0;
+      }
+ else {
+        expectedNodes=temp;
+      }
+      LOG.info("Verifying data in the table with index " + i + " and expected nodes is "+ expectedNodes);
+      runVerifyCommonTable(outputDir,numReducers,expectedNodes,i);
+    }
+  }
+  private void sleep(  long ms) throws InterruptedException {
+    Thread.sleep(ms);
+  }
+  protected void runVerifyCommonTable(  String outputDir,  int numReducers,  long expectedNumNodes,  int index) throws Exception {
+    LOG.info("Verifying common table with index " + index);
+    sleep(SLEEP_IN_MS);
+    Path outputPath=new Path(outputDir);
+    UUID uuid=UUID.randomUUID();
+    Path iterationOutput=new Path(outputPath,uuid.toString());
+    Verify verify=new VisibilityVerify(TableName.valueOf(COMMON_TABLE_NAME).getNameAsString(),index);
+    verify(numReducers,expectedNumNodes,iterationOutput,verify);
+  }
+  protected void runCopier(  String outputDir) throws Exception {
+    for (int i=0; i < DEFAULT_TABLES_COUNT; i++) {
+      LOG.info("Running copier " + IntegrationTestBigLinkedListWithVisibility.getTableName(i));
+      sleep(SLEEP_IN_MS);
+      Copier copier=new Copier(IntegrationTestBigLinkedListWithVisibility.getTableName(i),i,false);
+      copier.setConf(getConf());
+      copier.runCopier(outputDir);
+    }
+  }
+  private void verify(  int numReducers,  long expectedNumNodes,  Path iterationOutput,  Verify verify) throws Exception {
+    verify.setConf(getConf());
+    int retCode=verify.run(iterationOutput,numReducers);
+    if (retCode > 0) {
+      throw new RuntimeException("Verify.run failed with return code: " + retCode);
+    }
+    if (!verify.verify(expectedNumNodes)) {
+      throw new RuntimeException("Verify.verify failed");
+    }
+    LOG.info("Verify finished with succees. Total nodes=" + expectedNumNodes);
+  }
+  @Override public int run(  String[] args) throws Exception {
+    if (args.length < 5) {
+      System.err.println("Usage: Loop <num iterations> " + "<num mappers> <num nodes per mapper> <output dir> " + "<num reducers> [<width> <wrap multiplier>]");
+      return 1;
+    }
+    LOG.info("Running Loop with args:" + Arrays.deepToString(args));
+    int numIterations=Integer.parseInt(args[0]);
+    int numMappers=Integer.parseInt(args[1]);
+    long numNodes=Long.parseLong(args[2]);
+    String outputDir=args[3];
+    int numReducers=Integer.parseInt(args[4]);
+    Integer width=(args.length < 6) ? null : Integer.parseInt(args[5]);
+    Integer wrapMultiplier=(args.length < 7) ? null : Integer.parseInt(args[6]);
+    long expectedNumNodes=0;
+    if (numIterations < 0) {
+      numIterations=Integer.MAX_VALUE;
+    }
+    for (int i=0; i < numIterations; i++) {
+      LOG.info("Starting iteration = " + i);
+      LOG.info("Generating data");
+      runGenerator(numMappers,numNodes,outputDir,width,wrapMultiplier,0);
+      expectedNumNodes+=numMappers * numNodes;
+      LOG.info("Running copier");
+      sleep(SLEEP_IN_MS);
+      runCopier(outputDir);
+      LOG.info("Verifying copied data");
+      sleep(SLEEP_IN_MS);
+      runVerify(outputDir,numReducers,expectedNumNodes,true);
+      sleep(SLEEP_IN_MS);
+      for (int j=0; j < DEFAULT_TABLES_COUNT; j++) {
+        LOG.info("Deleting data on table with index: " + j);
+        runDelete(numMappers,numNodes,outputDir,width,wrapMultiplier,j);
+        sleep(SLEEP_IN_MS);
+        LOG.info("Verifying common table after deleting");
+        runVerify(outputDir,numReducers,expectedNumNodes,j);
+        sleep(SLEEP_IN_MS);
+      }
+    }
+    return 0;
+  }
+}

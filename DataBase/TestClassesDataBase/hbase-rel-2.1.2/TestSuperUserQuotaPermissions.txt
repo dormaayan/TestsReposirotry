@@ -1,0 +1,194 @@
+/** 
+ * Test class to verify that the HBase superuser can override quotas.
+ */
+@Category(MediumTests.class) public class TestSuperUserQuotaPermissions {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestSuperUserQuotaPermissions.class);
+  private static final Logger LOG=LoggerFactory.getLogger(TestSuperUserQuotaPermissions.class);
+  private static final HBaseTestingUtility TEST_UTIL=new HBaseTestingUtility();
+  private static final String SUPERUSER_NAME=System.getProperty("user.name");
+  private static final UserGroupInformation SUPERUSER_UGI=UserGroupInformation.createUserForTesting(SUPERUSER_NAME,new String[0]);
+  private static final String REGULARUSER_NAME="quota_regularuser";
+  private static final UserGroupInformation REGULARUSER_UGI=UserGroupInformation.createUserForTesting(REGULARUSER_NAME,new String[0]);
+  private static final AtomicLong COUNTER=new AtomicLong(0);
+  @Rule public TestName testName=new TestName();
+  private SpaceQuotaHelperForTests helper;
+  @BeforeClass public static void setupMiniCluster() throws Exception {
+    Configuration conf=TEST_UTIL.getConfiguration();
+    SpaceQuotaHelperForTests.updateConfigForQuotas(conf);
+    conf.set(CoprocessorHost.MASTER_COPROCESSOR_CONF_KEY,AccessController.class.getName());
+    conf.set(CoprocessorHost.REGION_COPROCESSOR_CONF_KEY,AccessController.class.getName());
+    conf.set(CoprocessorHost.REGIONSERVER_COPROCESSOR_CONF_KEY,AccessController.class.getName());
+    conf.setBoolean("hbase.security.exec.permission.checks",true);
+    conf.setBoolean("hbase.security.authorization",true);
+    conf.set("hbase.superuser",SUPERUSER_NAME);
+    TEST_UTIL.startMiniCluster(1);
+  }
+  @AfterClass public static void tearDown() throws Exception {
+    TEST_UTIL.shutdownMiniCluster();
+  }
+  @Before public void removeAllQuotas() throws Exception {
+    final Connection conn=TEST_UTIL.getConnection();
+    if (helper == null) {
+      helper=new SpaceQuotaHelperForTests(TEST_UTIL,testName,COUNTER);
+    }
+    if (!conn.getAdmin().tableExists(QuotaUtil.QUOTA_TABLE_NAME)) {
+      helper.waitForQuotaTable(conn);
+    }
+ else {
+      helper.removeAllQuotas(conn);
+      assertEquals(0,helper.listNumDefinedQuotas(conn));
+    }
+  }
+  @Test public void testSuperUserCanStillCompact() throws Exception {
+    final TableName tn=doAsSuperUser(new Callable<TableName>(){
+      @Override public TableName call() throws Exception {
+        try (Connection conn=getConnection()){
+          Admin admin=conn.getAdmin();
+          final TableName tn=helper.createTableWithRegions(admin,5);
+          final long sizeLimit=2L * SpaceQuotaHelperForTests.ONE_MEGABYTE;
+          QuotaSettings settings=QuotaSettingsFactory.limitTableSpace(tn,sizeLimit,SpaceViolationPolicy.NO_WRITES_COMPACTIONS);
+          admin.setQuota(settings);
+          try {
+            AccessControlClient.grant(conn,tn,REGULARUSER_NAME,null,null,Action.READ,Action.WRITE);
+          }
+ catch (          Throwable t) {
+            if (t instanceof Exception) {
+              throw (Exception)t;
+            }
+            throw new Exception(t);
+          }
+          return tn;
+        }
+       }
+    }
+);
+    doAsRegularUser(new Callable<Void>(){
+      @Override public Void call() throws Exception {
+        try (Connection conn=getConnection()){
+          helper.writeData(tn,3L * SpaceQuotaHelperForTests.ONE_MEGABYTE);
+          return null;
+        }
+       }
+    }
+);
+    waitForTableToEnterQuotaViolation(tn);
+    try {
+      doAsRegularUser(new Callable<Void>(){
+        @Override public Void call() throws Exception {
+          try (Connection conn=getConnection()){
+            conn.getAdmin().majorCompact(tn);
+            return null;
+          }
+         }
+      }
+);
+      fail("Expected an exception trying to compact a table with a quota violation");
+    }
+ catch (    DoNotRetryIOException e) {
+    }
+    doAsSuperUser(new Callable<Void>(){
+      @Override public Void call() throws Exception {
+        try (Connection conn=getConnection()){
+          conn.getAdmin().majorCompact(tn);
+          return null;
+        }
+       }
+    }
+);
+  }
+  @Test public void testSuperuserCanRemoveQuota() throws Exception {
+    final TableName tn=doAsSuperUser(new Callable<TableName>(){
+      @Override public TableName call() throws Exception {
+        try (Connection conn=getConnection()){
+          final Admin admin=conn.getAdmin();
+          final TableName tn=helper.createTableWithRegions(admin,5);
+          final long sizeLimit=2L * SpaceQuotaHelperForTests.ONE_MEGABYTE;
+          QuotaSettings settings=QuotaSettingsFactory.limitTableSpace(tn,sizeLimit,SpaceViolationPolicy.NO_WRITES_COMPACTIONS);
+          admin.setQuota(settings);
+          try {
+            AccessControlClient.grant(conn,tn,REGULARUSER_NAME,null,null,Action.READ,Action.WRITE);
+          }
+ catch (          Throwable t) {
+            if (t instanceof Exception) {
+              throw (Exception)t;
+            }
+            throw new Exception(t);
+          }
+          return tn;
+        }
+       }
+    }
+);
+    doAsRegularUser(new Callable<Void>(){
+      @Override public Void call() throws Exception {
+        try (Connection conn=getConnection()){
+          helper.writeData(tn,3L * SpaceQuotaHelperForTests.ONE_MEGABYTE);
+          return null;
+        }
+       }
+    }
+);
+    waitForTableToEnterQuotaViolation(tn);
+    doAsRegularUser(new Callable<Void>(){
+      @Override public Void call() throws Exception {
+        try (Connection conn=getConnection()){
+          final Admin admin=conn.getAdmin();
+          QuotaSettings qs=QuotaSettingsFactory.removeTableSpaceLimit(tn);
+          try {
+            admin.setQuota(qs);
+            fail("Expected that an unprivileged user should not be allowed to remove a quota");
+          }
+ catch (          Exception e) {
+          }
+          return null;
+        }
+       }
+    }
+);
+    doAsSuperUser(new Callable<Void>(){
+      @Override public Void call() throws Exception {
+        try (Connection conn=getConnection()){
+          final Admin admin=conn.getAdmin();
+          QuotaSettings qs=QuotaSettingsFactory.removeTableSpaceLimit(tn);
+          admin.setQuota(qs);
+          assertNull(helper.getTableSpaceQuota(conn,tn));
+          return null;
+        }
+       }
+    }
+);
+  }
+  private Connection getConnection() throws IOException {
+    return ConnectionFactory.createConnection(TEST_UTIL.getConfiguration());
+  }
+  private <T>T doAsSuperUser(  Callable<T> task) throws Exception {
+    return doAsUser(SUPERUSER_UGI,task);
+  }
+  private <T>T doAsRegularUser(  Callable<T> task) throws Exception {
+    return doAsUser(REGULARUSER_UGI,task);
+  }
+  private <T>T doAsUser(  UserGroupInformation ugi,  Callable<T> task) throws Exception {
+    return ugi.doAs(new PrivilegedExceptionAction<T>(){
+      @Override public T run() throws Exception {
+        return task.call();
+      }
+    }
+);
+  }
+  private void waitForTableToEnterQuotaViolation(  TableName tn) throws Exception {
+    final HRegionServer rs=TEST_UTIL.getHBaseCluster().getRegionServer(0);
+    Waiter.waitFor(TEST_UTIL.getConfiguration(),30 * 1000,1000,new Predicate<Exception>(){
+      @Override public boolean evaluate() throws Exception {
+        Map<TableName,SpaceQuotaSnapshot> snapshots=rs.getRegionServerSpaceQuotaManager().copyQuotaSnapshots();
+        SpaceQuotaSnapshot snapshot=snapshots.get(tn);
+        if (snapshot == null) {
+          LOG.info("Found no snapshot for " + tn);
+          return false;
+        }
+        LOG.info("Found snapshot " + snapshot);
+        return snapshot.getQuotaStatus().isInViolation();
+      }
+    }
+);
+  }
+}

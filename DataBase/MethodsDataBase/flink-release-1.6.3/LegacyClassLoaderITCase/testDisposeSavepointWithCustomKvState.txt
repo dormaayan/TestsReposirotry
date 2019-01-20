@@ -1,0 +1,80 @@
+/** 
+ * Tests disposal of a savepoint, which contains custom user code KvState.
+ */
+@Test public void testDisposeSavepointWithCustomKvState() throws Exception {
+  Deadline deadline=new FiniteDuration(100,TimeUnit.SECONDS).fromNow();
+  File checkpointDir=FOLDER.newFolder();
+  File outputDir=FOLDER.newFolder();
+  final PackagedProgram program=new PackagedProgram(new File(CUSTOM_KV_STATE_JAR_PATH),new String[]{String.valueOf(parallelism),checkpointDir.toURI().toString(),"5000",outputDir.toURI().toString()});
+  TestStreamEnvironment.setAsContext(testCluster,parallelism,Collections.singleton(new Path(CUSTOM_KV_STATE_JAR_PATH)),Collections.<URL>emptyList());
+  Thread invokeThread=new Thread(new Runnable(){
+    @Override public void run(){
+      try {
+        program.invokeInteractiveModeForExecution();
+      }
+ catch (      ProgramInvocationException ignored) {
+        if (ignored.getCause() == null || !(ignored.getCause() instanceof JobCancellationException)) {
+          ignored.printStackTrace();
+        }
+      }
+    }
+  }
+);
+  LOG.info("Starting program invoke thread");
+  invokeThread.start();
+  JobID jobId=null;
+  ActorGateway jm=testCluster.getLeaderGateway(deadline.timeLeft());
+  LOG.info("Waiting for job status running.");
+  while (jobId == null && deadline.hasTimeLeft()) {
+    Future<Object> jobsFuture=jm.ask(JobManagerMessages.getRequestRunningJobsStatus(),deadline.timeLeft());
+    RunningJobsStatus runningJobs=(RunningJobsStatus)Await.result(jobsFuture,deadline.timeLeft());
+    for (    JobStatusMessage runningJob : runningJobs.getStatusMessages()) {
+      jobId=runningJob.getJobId();
+      LOG.info("Job running. ID: " + jobId);
+      break;
+    }
+    if (jobId == null) {
+      Thread.sleep(100L);
+    }
+  }
+  LOG.info("Wait for all tasks to be running.");
+  Future<Object> allRunning=jm.ask(new WaitForAllVerticesToBeRunning(jobId),deadline.timeLeft());
+  Await.ready(allRunning,deadline.timeLeft());
+  LOG.info("All tasks are running.");
+  String savepointPath=null;
+  for (int i=0; i < 20; i++) {
+    LOG.info("Triggering savepoint (" + (i + 1) + "/20).");
+    Future<Object> savepointFuture=jm.ask(new TriggerSavepoint(jobId,Option.<String>empty()),deadline.timeLeft());
+    Object savepointResponse=Await.result(savepointFuture,deadline.timeLeft());
+    if (savepointResponse.getClass() == TriggerSavepointSuccess.class) {
+      savepointPath=((TriggerSavepointSuccess)savepointResponse).savepointPath();
+      LOG.info("Triggered savepoint. Path: " + savepointPath);
+    }
+ else     if (savepointResponse.getClass() == JobManagerMessages.TriggerSavepointFailure.class) {
+      Throwable cause=((JobManagerMessages.TriggerSavepointFailure)savepointResponse).cause();
+      LOG.info("Failed to trigger savepoint. Retrying...",cause);
+      Thread.sleep(500);
+    }
+ else {
+      throw new IllegalStateException("Unexpected response to TriggerSavepoint");
+    }
+  }
+  assertNotNull("Failed to trigger savepoint",savepointPath);
+  LOG.info("Disposing savepoint at " + savepointPath);
+  Future<Object> disposeFuture=jm.ask(new DisposeSavepoint(savepointPath),deadline.timeLeft());
+  Object disposeResponse=Await.result(disposeFuture,deadline.timeLeft());
+  if (disposeResponse.getClass() == JobManagerMessages.getDisposeSavepointSuccess().getClass()) {
+    LOG.info("Disposed savepoint at " + savepointPath);
+  }
+ else   if (disposeResponse instanceof DisposeSavepointFailure) {
+    throw new IllegalStateException("Failed to dispose savepoint " + disposeResponse);
+  }
+ else {
+    throw new IllegalStateException("Unexpected response to DisposeSavepoint");
+  }
+  Future<?> cancelFuture=jm.ask(new JobManagerMessages.CancelJob(jobId),deadline.timeLeft());
+  Object response=Await.result(cancelFuture,deadline.timeLeft());
+  assertTrue("Unexpected response: " + response,response instanceof JobManagerMessages.CancellationSuccess);
+  invokeThread.join(deadline.timeLeft().toMillis());
+  assertFalse("Program invoke thread still running",invokeThread.isAlive());
+}

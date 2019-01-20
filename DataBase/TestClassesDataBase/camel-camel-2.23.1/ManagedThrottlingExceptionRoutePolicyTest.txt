@@ -1,0 +1,83 @@
+public class ManagedThrottlingExceptionRoutePolicyTest extends ManagementTestSupport {
+  @Test public void testRoutes() throws Exception {
+    if (isPlatform("aix")) {
+      return;
+    }
+    MBeanServer mbeanServer=getMBeanServer();
+    Set<ObjectName> set=mbeanServer.queryNames(new ObjectName("*:type=routes,*"),null);
+    assertEquals(1,set.size());
+    ObjectName on=set.iterator().next();
+    boolean registered=mbeanServer.isRegistered(on);
+    assertEquals("Should be registered",true,registered);
+    String uri=(String)mbeanServer.getAttribute(on,"EndpointUri");
+    assertEquals("direct://start",uri);
+    String state=(String)mbeanServer.getAttribute(on,"State");
+    assertEquals(ServiceStatus.Started.name(),state);
+    String policy=(String)mbeanServer.getAttribute(on,"RoutePolicyList");
+    assertNotNull(policy);
+    assertTrue(policy.startsWith("ThrottlingExceptionRoutePolicy"));
+    String mbeanName=String.format("org.apache.camel:context=camel-1,name=%s,type=services",policy);
+    set=mbeanServer.queryNames(new ObjectName(mbeanName),null);
+    assertEquals(1,set.size());
+    on=set.iterator().next();
+    assertTrue(mbeanServer.isRegistered(on));
+    String myType=(String)mbeanServer.getAttribute(on,"ServiceType");
+    assertEquals("ThrottlingExceptionRoutePolicy",myType);
+    ManagedThrottlingExceptionRoutePolicyMBean proxy=JMX.newMBeanProxy(mbeanServer,on,ManagedThrottlingExceptionRoutePolicyMBean.class);
+    assertNotNull(proxy);
+    String myState=proxy.currentState();
+    assertEquals("State closed, failures 0",myState);
+    Integer val=proxy.getCurrentFailures();
+    assertEquals(0,val.intValue());
+    Long lastFail=proxy.getLastFailure();
+    assertEquals(0L,lastFail.longValue());
+    Long openAt=proxy.getOpenAt();
+    assertEquals(0L,openAt.longValue());
+    String handlerClass=proxy.getHalfOpenHandlerName();
+    assertEquals("DummyHandler",handlerClass);
+    Integer threshold=proxy.getFailureThreshold();
+    assertEquals(10,threshold.intValue());
+    Long window=proxy.getFailureWindow();
+    assertEquals(1000L,window.longValue());
+    Long halfOpenAfter=proxy.getHalfOpenAfter();
+    assertEquals(5000L,halfOpenAfter.longValue());
+    proxy.setHalfOpenAfter(10000L);
+    halfOpenAfter=proxy.getHalfOpenAfter();
+    assertEquals(10000L,halfOpenAfter.longValue());
+    try {
+      getMockEndpoint("mock:result").expectedMessageCount(0);
+      template.sendBody("direct:start","Hello World");
+      assertMockEndpointsSatisfied();
+    }
+ catch (    Exception e) {
+    }
+    myState=proxy.currentState();
+    assertTrue(myState.contains("State closed, failures 1, last failure"));
+    val=proxy.getCurrentFailures();
+    assertEquals(1,val.intValue());
+    Thread.sleep(200);
+    lastFail=proxy.getLastFailure();
+    assertTrue(lastFail.longValue() > 0);
+  }
+  @Override protected RouteBuilder createRouteBuilder() throws Exception {
+    ThrottlingExceptionRoutePolicy policy=new ThrottlingExceptionRoutePolicy(10,1000,5000,null);
+    policy.setHalfOpenHandler(new DummyHandler());
+    return new RouteBuilder(){
+      @Override public void configure() throws Exception {
+        from("direct:start").routeId("testRoute").routePolicy(policy).to("log:foo").process(new BoomProcess()).to("mock:result");
+      }
+    }
+;
+  }
+class BoomProcess implements Processor {
+    @Override public void process(    Exchange exchange) throws Exception {
+      Thread.sleep(50);
+      throw new RuntimeException("boom!");
+    }
+  }
+class DummyHandler implements ThrottlingExceptionHalfOpenHandler {
+    @Override public boolean isReadyToBeClosed(){
+      return false;
+    }
+  }
+}

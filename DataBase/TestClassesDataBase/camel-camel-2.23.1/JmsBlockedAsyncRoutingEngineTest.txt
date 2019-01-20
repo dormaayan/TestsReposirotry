@@ -1,0 +1,75 @@
+/** 
+ * Tests CAMEL-5769. Camel JMS producer can block a thread under specific circumstances.
+ */
+public class JmsBlockedAsyncRoutingEngineTest extends CamelTestSupport {
+  private static final Logger LOG=LoggerFactory.getLogger(JmsBlockedAsyncRoutingEngineTest.class);
+  private BrokerService broker;
+  private final CountDownLatch latch=new CountDownLatch(5);
+  private final Synchronization callback=new Synchronization(){
+    @Override public void onFailure(    Exchange exchange){
+      LOG.info(">>>> Callback onFailure");
+      latch.countDown();
+    }
+    @Override public void onComplete(    Exchange exchange){
+      LOG.info(">>>> Callback onComplete");
+      latch.countDown();
+    }
+  }
+;
+  public void startBroker() throws Exception {
+    String brokerName="test-broker-" + System.currentTimeMillis();
+    String brokerUri="vm://" + brokerName;
+    broker=new BrokerService();
+    broker.setBrokerName(brokerName);
+    broker.setBrokerId(brokerName);
+    broker.addConnector(brokerUri);
+    broker.setPersistent(false);
+    broker.setPlugins(new BrokerPlugin[]{new DelayerBrokerPlugin()});
+    broker.start();
+  }
+  protected CamelContext createCamelContext() throws Exception {
+    CamelContext camelContext=super.createCamelContext();
+    startBroker();
+    ConnectionFactory connectionFactory=new ActiveMQConnectionFactory(broker.getVmConnectorURI());
+    camelContext.addComponent("activemq",jmsComponentAutoAcknowledge(connectionFactory));
+    return camelContext;
+  }
+  @Test public void testBlockedAsyncRoutingEngineTest() throws Exception {
+    try {
+      template.asyncRequestBody("activemq:queue:test?requestTimeout=500&useMessageIDAsCorrelationID=true","hello");
+    }
+ catch (    Exception e) {
+    }
+    Thread.sleep(3000);
+    template.asyncCallbackRequestBody("activemq:queue:test?requestTimeout=500&useMessageIDAsCorrelationID=true","beSlow",callback);
+    template.asyncCallbackRequestBody("activemq:queue:test?requestTimeout=500&useMessageIDAsCorrelationID=true","beSlow",callback);
+    template.asyncCallbackRequestBody("activemq:queue:test?requestTimeout=500&useMessageIDAsCorrelationID=true","beSlow",callback);
+    template.asyncCallbackRequestBody("activemq:queue:test?requestTimeout=500&useMessageIDAsCorrelationID=true","beSlow",callback);
+    template.asyncCallbackRequestBody("activemq:queue:test?requestTimeout=500&useMessageIDAsCorrelationID=true","beSlow",callback);
+    assertTrue(latch.await(3000,TimeUnit.MILLISECONDS));
+  }
+  @After public void cleanup(){
+    LOG.info(">>>>> Latch countdown count was: " + latch.getCount());
+  }
+  protected RouteBuilder createRouteBuilder() throws Exception {
+    return new RouteBuilder(){
+      public void configure() throws Exception {
+        from("activemq:queue:test?concurrentConsumers=5&useMessageIDAsCorrelationID=true&transacted=true").filter().simple("${in.body} == 'beSlow'").delay(constant(2000)).log(">>>>> Received message on test queue").setBody(constant("Reply")).log(">>>>> Sending back reply");
+      }
+    }
+;
+  }
+private class DelayerBrokerPlugin extends BrokerPluginSupport {
+    int i;
+    @Override public void send(    ProducerBrokerExchange producerExchange,    Message messageSend) throws Exception {
+      String destinationName=messageSend.getDestination().getPhysicalName();
+      LOG.info("******** Received message for destination " + destinationName);
+      if (destinationName.toLowerCase().contains("test") && i == 0) {
+        Thread.sleep(2000);
+        LOG.info("******** Waited 2 seconds for destination: " + destinationName);
+        i++;
+      }
+      super.send(producerExchange,messageSend);
+    }
+  }
+}

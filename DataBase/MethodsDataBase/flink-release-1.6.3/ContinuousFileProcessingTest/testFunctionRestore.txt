@@ -1,0 +1,53 @@
+@Test public void testFunctionRestore() throws Exception {
+  String testBasePath=hdfsURI + "/" + UUID.randomUUID()+ "/";
+  org.apache.hadoop.fs.Path path=null;
+  long fileModTime=Long.MIN_VALUE;
+  for (int i=0; i < 1; i++) {
+    Tuple2<org.apache.hadoop.fs.Path,String> file=createFileAndFillWithData(testBasePath,"file",i,"This is test line.");
+    path=file.f0;
+    fileModTime=hdfs.getFileStatus(file.f0).getModificationTime();
+  }
+  TextInputFormat format=new TextInputFormat(new Path(testBasePath));
+  final ContinuousFileMonitoringFunction<String> monitoringFunction=createTestContinuousFileMonitoringFunction(format,FileProcessingMode.PROCESS_CONTINUOUSLY);
+  StreamSource<TimestampedFileInputSplit,ContinuousFileMonitoringFunction<String>> src=new StreamSource<>(monitoringFunction);
+  final AbstractStreamOperatorTestHarness<TimestampedFileInputSplit> testHarness=new AbstractStreamOperatorTestHarness<>(src,1,1,0);
+  testHarness.open();
+  final Throwable[] error=new Throwable[1];
+  final OneShotLatch latch=new OneShotLatch();
+  final DummySourceContext sourceContext=new DummySourceContext(){
+    @Override public void collect(    TimestampedFileInputSplit element){
+      latch.trigger();
+    }
+  }
+;
+  Thread runner=new Thread(){
+    @Override public void run(){
+      try {
+        monitoringFunction.run(sourceContext);
+      }
+ catch (      Throwable t) {
+        t.printStackTrace();
+        error[0]=t;
+      }
+    }
+  }
+;
+  runner.start();
+  if (!latch.isTriggered()) {
+    latch.await();
+  }
+synchronized (sourceContext.getCheckpointLock()) {
+  }
+  OperatorSubtaskState snapshot=testHarness.snapshot(0,0);
+  monitoringFunction.cancel();
+  runner.join();
+  testHarness.close();
+  final ContinuousFileMonitoringFunction<String> monitoringFunctionCopy=createTestContinuousFileMonitoringFunction(format,FileProcessingMode.PROCESS_CONTINUOUSLY);
+  StreamSource<TimestampedFileInputSplit,ContinuousFileMonitoringFunction<String>> srcCopy=new StreamSource<>(monitoringFunctionCopy);
+  AbstractStreamOperatorTestHarness<TimestampedFileInputSplit> testHarnessCopy=new AbstractStreamOperatorTestHarness<>(srcCopy,1,1,0);
+  testHarnessCopy.initializeState(snapshot);
+  testHarnessCopy.open();
+  Assert.assertNull(error[0]);
+  Assert.assertEquals(fileModTime,monitoringFunctionCopy.getGlobalModificationTime());
+  hdfs.delete(path,false);
+}

@@ -1,0 +1,73 @@
+/** 
+ * Test writing edits into an HRegion, closing it, splitting logs, opening Region again.  Verify seqids.
+ * @throws IOException
+ * @throws IllegalAccessException
+ * @throws NoSuchFieldException
+ * @throws IllegalArgumentException
+ * @throws SecurityException
+ */
+@Test public void testReplayEditsWrittenViaHRegion() throws IOException, SecurityException, IllegalArgumentException, NoSuchFieldException, IllegalAccessException, InterruptedException {
+  final TableName tableName=TableName.valueOf("testReplayEditsWrittenViaHRegion");
+  final HRegionInfo hri=createBasic3FamilyHRegionInfo(tableName);
+  final Path basedir=FSUtils.getTableDir(this.hbaseRootDir,tableName);
+  deleteDir(basedir);
+  final byte[] rowName=tableName.getName();
+  final int countPerFamily=10;
+  final HTableDescriptor htd=createBasic3FamilyHTD(tableName);
+  HRegion region3=HBaseTestingUtility.createRegionAndWAL(hri,hbaseRootDir,this.conf,htd);
+  HBaseTestingUtility.closeRegionAndWAL(region3);
+  WAL wal=createWAL(this.conf,hbaseRootDir,logName);
+  HRegion region=HRegion.openHRegion(this.conf,this.fs,hbaseRootDir,hri,htd,wal);
+  long seqid=region.getOpenSeqNum();
+  boolean first=true;
+  for (  HColumnDescriptor hcd : htd.getFamilies()) {
+    addRegionEdits(rowName,hcd.getName(),countPerFamily,this.ee,region,"x");
+    if (first) {
+      region.flush(true);
+      first=false;
+    }
+  }
+  final Get g=new Get(rowName);
+  Result result=region.get(g);
+  assertEquals(countPerFamily * htd.getFamilies().size(),result.size());
+  region.close(true);
+  wal.shutdown();
+  runWALSplit(this.conf);
+  WAL wal2=createWAL(this.conf,hbaseRootDir,logName);
+  HRegion region2=HRegion.openHRegion(conf,this.fs,hbaseRootDir,hri,htd,wal2);
+  long seqid2=region2.getOpenSeqNum();
+  assertTrue(seqid + result.size() < seqid2);
+  final Result result1b=region2.get(g);
+  assertEquals(result.size(),result1b.size());
+  for (  HColumnDescriptor hcd : htd.getFamilies()) {
+    addRegionEdits(rowName,hcd.getName(),countPerFamily,this.ee,region2,"y");
+  }
+  final Result result2=region2.get(g);
+  assertEquals(2 * result.size(),result2.size());
+  wal2.sync();
+  final Configuration newConf=HBaseConfiguration.create(this.conf);
+  User user=HBaseTestingUtility.getDifferentUser(newConf,tableName.getNameAsString());
+  user.runAs(new PrivilegedExceptionAction<Object>(){
+    @Override public Object run() throws Exception {
+      runWALSplit(newConf);
+      FileSystem newFS=FileSystem.get(newConf);
+      WAL wal3=createWAL(newConf,hbaseRootDir,logName);
+      final AtomicInteger countOfRestoredEdits=new AtomicInteger(0);
+      HRegion region3=new HRegion(basedir,wal3,newFS,newConf,hri,htd,null){
+        @Override protected void restoreEdit(        HStore s,        Cell cell,        MemStoreSizing memstoreSizing){
+          super.restoreEdit(s,cell,memstoreSizing);
+          countOfRestoredEdits.incrementAndGet();
+        }
+      }
+;
+      long seqid3=region3.initialize();
+      Result result3=region3.get(g);
+      assertEquals(result2.size(),result3.size());
+      assertEquals(htd.getFamilies().size() * countPerFamily,countOfRestoredEdits.get());
+      region3.close();
+      wal3.close();
+      return null;
+    }
+  }
+);
+}

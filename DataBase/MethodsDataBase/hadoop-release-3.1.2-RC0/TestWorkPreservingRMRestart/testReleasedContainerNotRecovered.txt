@@ -1,0 +1,35 @@
+@Test(timeout=50000) public void testReleasedContainerNotRecovered() throws Exception {
+  rm1=new MockRM(conf);
+  MockNM nm1=new MockNM("h1:1234",15120,rm1.getResourceTrackerService());
+  nm1.registerNode();
+  rm1.start();
+  RMApp app1=rm1.submitApp(1024);
+  final MockAM am1=MockRM.launchAndRegisterAM(app1,rm1,nm1);
+  conf.setInt(YarnConfiguration.RM_NM_EXPIRY_INTERVAL_MS,8000);
+  rm2=new MockRM(conf,rm1.getRMStateStore());
+  rm2.start();
+  nm1.setResourceTrackerService(rm2.getResourceTrackerService());
+  rm2.waitForState(app1.getApplicationId(),RMAppState.ACCEPTED);
+  am1.setAMRMProtocol(rm2.getApplicationMasterService(),rm2.getRMContext());
+  am1.registerAppAttempt(true);
+  final ContainerId runningContainer=ContainerId.newContainerId(am1.getApplicationAttemptId(),2);
+  am1.allocate(null,Arrays.asList(runningContainer));
+  List<NMContainerStatus> containerStatuses=createNMContainerStatusForApp(am1);
+  nm1.registerNode(containerStatuses,null);
+  waitForNumContainersToRecover(1,rm2,am1.getApplicationAttemptId());
+  final AbstractYarnScheduler scheduler=(AbstractYarnScheduler)rm2.getResourceScheduler();
+  AllocateResponse response=am1.allocate(null,null);
+  boolean receivedCompletedContainer=false;
+  for (  ContainerStatus status : response.getCompletedContainersStatuses()) {
+    if (status.getContainerId().equals(runningContainer)) {
+      receivedCompletedContainer=true;
+    }
+  }
+  assertTrue(receivedCompletedContainer);
+  GenericTestUtils.waitFor(new Supplier<Boolean>(){
+    public Boolean get(){
+      return scheduler.getApplicationAttempt(am1.getApplicationAttemptId()).getPendingRelease().isEmpty() && scheduler.getRMContainer(runningContainer) == null;
+    }
+  }
+,1000,20000);
+}

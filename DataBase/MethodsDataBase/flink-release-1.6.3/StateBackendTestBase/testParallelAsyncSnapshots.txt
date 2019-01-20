@@ -1,0 +1,42 @@
+/** 
+ * The purpose of this test is to check that parallel snapshots are possible, and work even if a previous snapshot is still running and blocking.
+ */
+@Test public void testParallelAsyncSnapshots() throws Exception {
+  OneShotLatch blocker=new OneShotLatch();
+  OneShotLatch waiter=new OneShotLatch();
+  BlockerCheckpointStreamFactory streamFactory=new BlockerCheckpointStreamFactory(1024 * 1024);
+  streamFactory.setWaiterLatch(waiter);
+  streamFactory.setBlockerLatch(blocker);
+  streamFactory.setAfterNumberInvocations(10);
+  final AbstractKeyedStateBackend<Integer> backend=createKeyedBackend(IntSerializer.INSTANCE);
+  try {
+    if (!backend.supportsAsynchronousSnapshots()) {
+      return;
+    }
+    InternalValueState<Integer,VoidNamespace,Integer> valueState=backend.createInternalState(VoidNamespaceSerializer.INSTANCE,new ValueStateDescriptor<>("test",IntSerializer.INSTANCE));
+    valueState.setCurrentNamespace(VoidNamespace.INSTANCE);
+    for (int i=0; i < 10; ++i) {
+      backend.setCurrentKey(i);
+      valueState.update(i);
+    }
+    RunnableFuture<SnapshotResult<KeyedStateHandle>> snapshot1=backend.snapshot(0L,0L,streamFactory,CheckpointOptions.forCheckpointWithDefaultLocation());
+    Thread runner1=new Thread(snapshot1,"snapshot-1-runner");
+    runner1.start();
+    waiter.await();
+    for (int i=5; i < 15; ++i) {
+      backend.setCurrentKey(i);
+      valueState.update(i + 1);
+    }
+    streamFactory.setWaiterLatch(null);
+    streamFactory.setBlockerLatch(null);
+    RunnableFuture<SnapshotResult<KeyedStateHandle>> snapshot2=backend.snapshot(1L,1L,streamFactory,CheckpointOptions.forCheckpointWithDefaultLocation());
+    Thread runner2=new Thread(snapshot2,"snapshot-2-runner");
+    runner2.start();
+    snapshot2.get();
+    blocker.trigger();
+    snapshot1.get();
+  }
+  finally {
+    backend.dispose();
+  }
+}

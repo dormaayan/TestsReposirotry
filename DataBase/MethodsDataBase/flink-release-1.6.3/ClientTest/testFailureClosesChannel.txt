@@ -1,0 +1,79 @@
+/** 
+ * Tests that a server failure closes the connection and removes it from the established connections.
+ */
+@Test public void testFailureClosesChannel() throws Exception {
+  Deadline deadline=TEST_TIMEOUT.fromNow();
+  AtomicKvStateRequestStats stats=new AtomicKvStateRequestStats();
+  final MessageSerializer<KvStateInternalRequest,KvStateResponse> serializer=new MessageSerializer<>(new KvStateInternalRequest.KvStateInternalRequestDeserializer(),new KvStateResponse.KvStateResponseDeserializer());
+  Client<KvStateInternalRequest,KvStateResponse> client=null;
+  Channel serverChannel=null;
+  try {
+    client=new Client<>("Test Client",1,serializer,stats);
+    final LinkedBlockingQueue<ByteBuf> received=new LinkedBlockingQueue<>();
+    final AtomicReference<Channel> channel=new AtomicReference<>();
+    serverChannel=createServerChannel(new ChannelInboundHandlerAdapter(){
+      @Override public void channelActive(      ChannelHandlerContext ctx) throws Exception {
+        channel.set(ctx.channel());
+      }
+      @Override public void channelRead(      ChannelHandlerContext ctx,      Object msg) throws Exception {
+        received.add((ByteBuf)msg);
+      }
+    }
+);
+    InetSocketAddress serverAddress=getKvStateServerAddress(serverChannel);
+    List<Future<KvStateResponse>> futures=new ArrayList<>();
+    KvStateInternalRequest request=new KvStateInternalRequest(new KvStateID(),new byte[0]);
+    futures.add(client.sendRequest(serverAddress,request));
+    futures.add(client.sendRequest(serverAddress,request));
+    ByteBuf buf=received.poll(deadline.timeLeft().toMillis(),TimeUnit.MILLISECONDS);
+    assertNotNull("Receive timed out",buf);
+    buf.release();
+    buf=received.poll(deadline.timeLeft().toMillis(),TimeUnit.MILLISECONDS);
+    assertNotNull("Receive timed out",buf);
+    buf.release();
+    assertEquals(1L,stats.getNumConnections());
+    Channel ch=channel.get();
+    assertNotNull("Channel not active",ch);
+    ch.writeAndFlush(MessageSerializer.serializeServerFailure(serverChannel.alloc(),new RuntimeException("Expected test server failure")));
+    try {
+      futures.remove(0).get(deadline.timeLeft().toMillis(),TimeUnit.MILLISECONDS);
+      fail("Did not throw expected server failure");
+    }
+ catch (    ExecutionException e) {
+      if (!(e.getCause() instanceof RuntimeException)) {
+        fail("Did not throw expected Exception");
+      }
+    }
+    try {
+      futures.remove(0).get(deadline.timeLeft().toMillis(),TimeUnit.MILLISECONDS);
+      fail("Did not throw expected server failure");
+    }
+ catch (    ExecutionException e) {
+      if (!(e.getCause() instanceof RuntimeException)) {
+        fail("Did not throw expected Exception");
+      }
+    }
+    assertEquals(0L,stats.getNumConnections());
+    while (deadline.hasTimeLeft() && (stats.getNumSuccessful() != 0L || stats.getNumFailed() != 2L)) {
+      Thread.sleep(100L);
+    }
+    assertEquals(2L,stats.getNumRequests());
+    assertEquals(0L,stats.getNumSuccessful());
+    assertEquals(2L,stats.getNumFailed());
+  }
+  finally {
+    if (client != null) {
+      try {
+        client.shutdown().get(10L,TimeUnit.SECONDS);
+      }
+ catch (      Exception e) {
+        e.printStackTrace();
+      }
+      Assert.assertTrue(client.isEventGroupShutdown());
+    }
+    if (serverChannel != null) {
+      serverChannel.close();
+    }
+    assertEquals("Channel leak",0L,stats.getNumConnections());
+  }
+}

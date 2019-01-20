@@ -1,0 +1,54 @@
+/** 
+ * In case we have 10 internal blocks on 5 racks, where 9 of blocks are live and 1 decommissioning, make sure the reconstruction happens correctly.
+ */
+@Test public void testReconstructionWithDecommission() throws Exception {
+  final String[] rackNames=getRacks(dataBlocks + parityBlocks + 2,dataBlocks);
+  final String[] hostNames=getHosts(dataBlocks + parityBlocks + 2);
+  cluster=new MiniDFSCluster.Builder(conf).racks(rackNames).hosts(hostNames).numDataNodes(hostNames.length).build();
+  cluster.waitActive();
+  fs=cluster.getFileSystem();
+  fs.enableErasureCodingPolicy(StripedFileTestUtil.getDefaultECPolicy().getName());
+  fs.setErasureCodingPolicy(new Path("/"),StripedFileTestUtil.getDefaultECPolicy().getName());
+  final BlockManager bm=cluster.getNamesystem().getBlockManager();
+  final DatanodeManager dm=bm.getDatanodeManager();
+  MiniDFSCluster.DataNodeProperties h9=stopDataNode(hostNames[hostNames.length - 3]);
+  MiniDFSCluster.DataNodeProperties h10=stopDataNode(hostNames[hostNames.length - 2]);
+  final Path file=new Path("/foo");
+  DFSTestUtil.createFile(fs,file,cellSize * dataBlocks * 2,(short)1,0L);
+  final BlockInfo blockInfo=cluster.getNamesystem().getFSDirectory().getINode(file.toString()).asFile().getLastBlock();
+  cluster.restartDataNode(h9);
+  cluster.waitActive();
+  MiniDFSCluster.DataNodeProperties h11=stopDataNode(hostNames[hostNames.length - 1]);
+  boolean recovered=bm.countNodes(blockInfo).liveReplicas() >= dataBlocks + parityBlocks;
+  for (int i=0; i < 10 & !recovered; i++) {
+    Thread.sleep(1000);
+    recovered=bm.countNodes(blockInfo).liveReplicas() >= dataBlocks + parityBlocks;
+  }
+  Assert.assertTrue(recovered);
+  DataNode datanode9=getDataNode(hostNames[hostNames.length - 3]);
+  Assert.assertNotNull(datanode9);
+  final DatanodeDescriptor dn9=dm.getDatanode(datanode9.getDatanodeId());
+  dn9.startDecommission();
+  cluster.restartDataNode(h10);
+  cluster.restartDataNode(h11);
+  cluster.waitActive();
+  DataNodeTestUtils.triggerBlockReport(getDataNode(hostNames[hostNames.length - 1]));
+  boolean satisfied=bm.isPlacementPolicySatisfied(blockInfo);
+  Assert.assertFalse(satisfied);
+  final DatanodeAdminManager decomManager=(DatanodeAdminManager)Whitebox.getInternalState(dm,"datanodeAdminManager");
+  cluster.getNamesystem().writeLock();
+  try {
+    dn9.stopDecommission();
+    decomManager.startDecommission(dn9);
+  }
+  finally {
+    cluster.getNamesystem().writeUnlock();
+  }
+  boolean decommissioned=dn9.isDecommissioned();
+  for (int i=0; i < 10 && !decommissioned; i++) {
+    Thread.sleep(1000);
+    decommissioned=dn9.isDecommissioned();
+  }
+  Assert.assertTrue(decommissioned);
+  Assert.assertTrue(bm.isPlacementPolicySatisfied(blockInfo));
+}

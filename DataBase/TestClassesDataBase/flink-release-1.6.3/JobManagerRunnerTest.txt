@@ -1,0 +1,115 @@
+/** 
+ * Tests for the  {@link JobManagerRunner}
+ */
+public class JobManagerRunnerTest extends TestLogger {
+  @ClassRule public static TemporaryFolder temporaryFolder=new TemporaryFolder();
+  private static Configuration configuration;
+  private static TestingRpcService rpcService;
+  private static BlobServer blobServer;
+  private static HeartbeatServices heartbeatServices=new HeartbeatServices(1000L,1000L);
+  private static JobManagerSharedServices jobManagerSharedServices;
+  private static JobGraph jobGraph;
+  private static ArchivedExecutionGraph archivedExecutionGraph;
+  private TestingHighAvailabilityServices haServices;
+  private TestingFatalErrorHandler fatalErrorHandler;
+  @BeforeClass public static void setupClass() throws Exception {
+    configuration=new Configuration();
+    rpcService=new TestingRpcService();
+    configuration.setString(BlobServerOptions.STORAGE_DIRECTORY,temporaryFolder.newFolder().getAbsolutePath());
+    blobServer=new BlobServer(configuration,new VoidBlobStore());
+    jobManagerSharedServices=JobManagerSharedServices.fromConfiguration(configuration,blobServer);
+    final JobVertex jobVertex=new JobVertex("Test vertex");
+    jobVertex.setInvokableClass(NoOpInvokable.class);
+    jobGraph=new JobGraph(jobVertex);
+    archivedExecutionGraph=new ArchivedExecutionGraphBuilder().setJobID(jobGraph.getJobID()).setState(JobStatus.FINISHED).build();
+  }
+  @Before public void setup(){
+    haServices=new TestingHighAvailabilityServices();
+    haServices.setJobMasterLeaderElectionService(jobGraph.getJobID(),new TestingLeaderElectionService());
+    haServices.setResourceManagerLeaderRetriever(new SettableLeaderRetrievalService());
+    haServices.setCheckpointRecoveryFactory(new StandaloneCheckpointRecoveryFactory());
+    fatalErrorHandler=new TestingFatalErrorHandler();
+  }
+  @After public void tearDown() throws Exception {
+    fatalErrorHandler.rethrowError();
+  }
+  @AfterClass public static void tearDownClass() throws Exception {
+    if (jobManagerSharedServices != null) {
+      jobManagerSharedServices.shutdown();
+    }
+    if (blobServer != null) {
+      blobServer.close();
+    }
+    if (rpcService != null) {
+      rpcService.stopService();
+    }
+  }
+  @Test public void testJobCompletion() throws Exception {
+    final JobManagerRunner jobManagerRunner=createJobManagerRunner();
+    try {
+      jobManagerRunner.start();
+      final CompletableFuture<ArchivedExecutionGraph> resultFuture=jobManagerRunner.getResultFuture();
+      assertThat(resultFuture.isDone(),is(false));
+      jobManagerRunner.jobReachedGloballyTerminalState(archivedExecutionGraph);
+      assertThat(resultFuture.get(),is(archivedExecutionGraph));
+    }
+  finally {
+      jobManagerRunner.close();
+    }
+  }
+  @Test public void testJobFinishedByOther() throws Exception {
+    final JobManagerRunner jobManagerRunner=createJobManagerRunner();
+    try {
+      jobManagerRunner.start();
+      final CompletableFuture<ArchivedExecutionGraph> resultFuture=jobManagerRunner.getResultFuture();
+      assertThat(resultFuture.isDone(),is(false));
+      jobManagerRunner.jobFinishedByOther();
+      try {
+        resultFuture.get();
+        fail("Should have failed.");
+      }
+ catch (      ExecutionException ee) {
+        assertThat(ExceptionUtils.stripExecutionException(ee),instanceOf(JobNotFinishedException.class));
+      }
+    }
+  finally {
+      jobManagerRunner.close();
+    }
+  }
+  @Test public void testShutDown() throws Exception {
+    final JobManagerRunner jobManagerRunner=createJobManagerRunner();
+    try {
+      jobManagerRunner.start();
+      final CompletableFuture<ArchivedExecutionGraph> resultFuture=jobManagerRunner.getResultFuture();
+      assertThat(resultFuture.isDone(),is(false));
+      jobManagerRunner.closeAsync();
+      try {
+        resultFuture.get();
+        fail("Should have failed.");
+      }
+ catch (      ExecutionException ee) {
+        assertThat(ExceptionUtils.stripExecutionException(ee),instanceOf(JobNotFinishedException.class));
+      }
+    }
+  finally {
+      jobManagerRunner.close();
+    }
+  }
+  @Test public void testLibraryCacheManagerRegistration() throws Exception {
+    final JobManagerRunner jobManagerRunner=createJobManagerRunner();
+    try {
+      jobManagerRunner.start();
+      final LibraryCacheManager libraryCacheManager=jobManagerSharedServices.getLibraryCacheManager();
+      final JobID jobID=jobGraph.getJobID();
+      assertThat(libraryCacheManager.hasClassLoader(jobID),is(true));
+      jobManagerRunner.close();
+      assertThat(libraryCacheManager.hasClassLoader(jobID),is(false));
+    }
+  finally {
+      jobManagerRunner.close();
+    }
+  }
+  @Nonnull private JobManagerRunner createJobManagerRunner() throws Exception {
+    return new JobManagerRunner(ResourceID.generate(),jobGraph,configuration,rpcService,haServices,heartbeatServices,blobServer,jobManagerSharedServices,UnregisteredJobManagerJobMetricGroupFactory.INSTANCE,fatalErrorHandler);
+  }
+}

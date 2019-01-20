@@ -1,0 +1,51 @@
+/** 
+ * JUnit resource to fail with an assertion when Netty detects a resource leak (only with <tt>ERROR</tt> logging enabled for <tt>org.apache.flink.shaded.netty4.io.netty.util.ResourceLeakDetector</tt>). <p>This should be used in a class rule: <pre> {@code}
+ * @literal @ClassRulepublic static final NettyLeakDetectionResource LEAK_DETECTION = new NettyLeakDetectionResource(); }</pre>
+ */
+public class NettyLeakDetectionResource extends ExternalResource {
+  @GuardedBy("refCountLock") private static ResourceLeakDetectorFactory previousLeakDetector;
+  @GuardedBy("refCountLock") private static ResourceLeakDetector.Level previousLeakDetectorLevel;
+  private static final Object refCountLock=new Object();
+  private static int refCount=0;
+  public NettyLeakDetectionResource(){
+    Assert.assertTrue("Error logging must be enabled for the ResourceLeakDetector.",LoggerFactory.getLogger(ResourceLeakDetector.class).isErrorEnabled());
+  }
+  @Override protected void before(){
+synchronized (refCountLock) {
+      if (refCount == 0) {
+        previousLeakDetector=ResourceLeakDetectorFactory.instance();
+        previousLeakDetectorLevel=ResourceLeakDetector.getLevel();
+        ++refCount;
+        ResourceLeakDetector.setLevel(ResourceLeakDetector.Level.PARANOID);
+        ResourceLeakDetectorFactory.setResourceLeakDetectorFactory(new FailingResourceLeakDetectorFactory());
+      }
+    }
+  }
+  @Override protected synchronized void after(){
+synchronized (refCountLock) {
+      --refCount;
+      if (refCount == 0) {
+        ResourceLeakDetectorFactory.setResourceLeakDetectorFactory(previousLeakDetector);
+        ResourceLeakDetector.setLevel(previousLeakDetectorLevel);
+      }
+    }
+  }
+private static class FailingResourceLeakDetectorFactory extends ResourceLeakDetectorFactory {
+    public <T>ResourceLeakDetector<T> newResourceLeakDetector(    Class<T> resource,    int samplingInterval,    long maxActive){
+      return new FailingResourceLeakDetector<T>(resource,samplingInterval,maxActive);
+    }
+  }
+private static class FailingResourceLeakDetector<T> extends ResourceLeakDetector<T> {
+    FailingResourceLeakDetector(    Class<?> resourceType,    int samplingInterval,    long maxActive){
+      super(resourceType,samplingInterval,maxActive);
+    }
+    @Override protected void reportTracedLeak(    String resourceType,    String records){
+      super.reportTracedLeak(resourceType,records);
+      fail(String.format("LEAK: %s.release() was not called before it's garbage-collected.%s",resourceType,records));
+    }
+    @Override protected void reportUntracedLeak(    String resourceType){
+      super.reportUntracedLeak(resourceType);
+      fail(String.format("LEAK: %s.release() was not called before it's garbage-collected.",resourceType));
+    }
+  }
+}

@@ -1,0 +1,90 @@
+@Test public void testMultiColumnScanner() throws IOException {
+  HRegion region=TEST_UTIL.createTestRegion(TABLE_NAME,new HColumnDescriptor(FAMILY).setCompressionType(comprAlgo).setBloomFilterType(bloomType).setMaxVersions(MAX_VERSIONS).setDataBlockEncoding(dataBlockEncoding));
+  List<String> rows=sequentialStrings("row",NUM_ROWS);
+  List<String> qualifiers=sequentialStrings("qual",NUM_COLUMNS);
+  List<KeyValue> kvs=new ArrayList<>();
+  Set<String> keySet=new HashSet<>();
+  Map<String,Long> lastDelTimeMap=new HashMap<>();
+  Random rand=new Random(29372937L);
+  for (int iFlush=0; iFlush < NUM_FLUSHES; ++iFlush) {
+    for (    String qual : qualifiers) {
+      if (rand.nextDouble() < COLUMN_SKIP_IN_STORE_FILE_PROB)       continue;
+      byte[] qualBytes=Bytes.toBytes(qual);
+      for (      String row : rows) {
+        Put p=new Put(Bytes.toBytes(row));
+        for (        long ts : TIMESTAMPS) {
+          String value=createValue(row,qual,ts);
+          KeyValue kv=KeyValueTestUtil.create(row,FAMILY,qual,ts,value);
+          assertEquals(kv.getTimestamp(),ts);
+          p.add(kv);
+          String keyAsString=kv.toString();
+          if (!keySet.contains(keyAsString)) {
+            keySet.add(keyAsString);
+            kvs.add(kv);
+          }
+        }
+        region.put(p);
+        Delete d=new Delete(Bytes.toBytes(row));
+        boolean deletedSomething=false;
+        for (        long ts : TIMESTAMPS)         if (rand.nextDouble() < DELETE_PROBABILITY) {
+          d.addColumns(FAMILY_BYTES,qualBytes,ts);
+          String rowAndQual=row + "_" + qual;
+          Long whenDeleted=lastDelTimeMap.get(rowAndQual);
+          lastDelTimeMap.put(rowAndQual,whenDeleted == null ? ts : Math.max(ts,whenDeleted));
+          deletedSomething=true;
+        }
+        if (deletedSomething)         region.delete(d);
+      }
+    }
+    region.flush(true);
+  }
+  Collections.sort(kvs,CellComparatorImpl.COMPARATOR);
+  for (int maxVersions=1; maxVersions <= TIMESTAMPS.length; ++maxVersions) {
+    for (int columnBitMask=1; columnBitMask <= MAX_COLUMN_BIT_MASK; ++columnBitMask) {
+      Scan scan=new Scan();
+      scan.setMaxVersions(maxVersions);
+      Set<String> qualSet=new TreeSet<>();
+{
+        int columnMaskTmp=columnBitMask;
+        for (        String qual : qualifiers) {
+          if ((columnMaskTmp & 1) != 0) {
+            scan.addColumn(FAMILY_BYTES,Bytes.toBytes(qual));
+            qualSet.add(qual);
+          }
+          columnMaskTmp>>=1;
+        }
+        assertEquals(0,columnMaskTmp);
+      }
+      InternalScanner scanner=region.getScanner(scan);
+      List<Cell> results=new ArrayList<>();
+      int kvPos=0;
+      int numResults=0;
+      String queryInfo="columns queried: " + qualSet + " (columnBitMask="+ columnBitMask+ "), maxVersions="+ maxVersions;
+      while (scanner.next(results) || results.size() > 0) {
+        for (        Cell kv : results) {
+          while (kvPos < kvs.size() && !matchesQuery(kvs.get(kvPos),qualSet,maxVersions,lastDelTimeMap)) {
+            ++kvPos;
+          }
+          String rowQual=getRowQualStr(kv);
+          String deleteInfo="";
+          Long lastDelTS=lastDelTimeMap.get(rowQual);
+          if (lastDelTS != null) {
+            deleteInfo="; last timestamp when row/column " + rowQual + " was deleted: "+ lastDelTS;
+          }
+          assertTrue("Scanner returned additional key/value: " + kv + ", "+ queryInfo+ deleteInfo+ ";",kvPos < kvs.size());
+          assertTrue("Scanner returned wrong key/value; " + queryInfo + deleteInfo+ ";",PrivateCellUtil.equalsIgnoreMvccVersion(kvs.get(kvPos),(kv)));
+          ++kvPos;
+          ++numResults;
+        }
+        results.clear();
+      }
+      for (; kvPos < kvs.size(); ++kvPos) {
+        KeyValue remainingKV=kvs.get(kvPos);
+        assertFalse("Matching column not returned by scanner: " + remainingKV + ", "+ queryInfo+ ", results returned: "+ numResults,matchesQuery(remainingKV,qualSet,maxVersions,lastDelTimeMap));
+      }
+    }
+  }
+  assertTrue("This test is supposed to delete at least some row/column " + "pairs",lastDelTimeMap.size() > 0);
+  LOG.info("Number of row/col pairs deleted at least once: " + lastDelTimeMap.size());
+  HBaseTestingUtility.closeRegionAndWAL(region);
+}

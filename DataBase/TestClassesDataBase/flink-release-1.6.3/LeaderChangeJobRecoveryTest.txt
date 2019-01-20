@@ -1,0 +1,59 @@
+public class LeaderChangeJobRecoveryTest extends TestLogger {
+  private static FiniteDuration timeout=FiniteDuration.apply(30,TimeUnit.SECONDS);
+  private int numTMs=1;
+  private int numSlotsPerTM=1;
+  private int parallelism=numTMs * numSlotsPerTM;
+  private JobID jobId;
+  private TestingCluster cluster=null;
+  private JobGraph job=createBlockingJob(parallelism);
+  private TestingManualHighAvailabilityServices highAvailabilityServices;
+  @Before public void before() throws TimeoutException, InterruptedException {
+    jobId=HighAvailabilityServices.DEFAULT_JOB_ID;
+    Tasks.BlockingOnceReceiver$.MODULE$.blocking_$eq(true);
+    Configuration configuration=new Configuration();
+    configuration.setInteger(ConfigConstants.LOCAL_NUMBER_JOB_MANAGER,1);
+    configuration.setInteger(ConfigConstants.LOCAL_NUMBER_TASK_MANAGER,numTMs);
+    configuration.setInteger(TaskManagerOptions.NUM_TASK_SLOTS,numSlotsPerTM);
+    configuration.setString(ConfigConstants.RESTART_STRATEGY,"fixeddelay");
+    configuration.setInteger(ConfigConstants.RESTART_STRATEGY_FIXED_DELAY_ATTEMPTS,9999);
+    configuration.setString(ConfigConstants.RESTART_STRATEGY_FIXED_DELAY_DELAY,"100 milli");
+    highAvailabilityServices=new TestingManualHighAvailabilityServices();
+    cluster=new TestingCluster(configuration,highAvailabilityServices,true,false);
+    cluster.start(false);
+    cluster.waitForActorsToBeAlive();
+  }
+  /** 
+ * Tests that the job is not restarted or at least terminates eventually in case that the JobManager loses its leadership.
+ * @throws Exception
+ */
+  @Test public void testNotRestartedWhenLosingLeadership() throws Exception {
+    UUID leaderSessionID=UUID.randomUUID();
+    highAvailabilityServices.grantLeadership(jobId,0,leaderSessionID);
+    highAvailabilityServices.notifyRetrievers(jobId,0,leaderSessionID);
+    cluster.waitForTaskManagersToBeRegistered(timeout);
+    cluster.submitJobDetached(job);
+    ActorGateway jm=cluster.getLeaderGateway(timeout);
+    Future<Object> wait=jm.ask(new TestingJobManagerMessages.WaitForAllVerticesToBeRunningOrFinished(job.getJobID()),timeout);
+    Await.ready(wait,timeout);
+    Future<Object> futureExecutionGraph=jm.ask(new TestingJobManagerMessages.RequestExecutionGraph(job.getJobID()),timeout);
+    TestingJobManagerMessages.ResponseExecutionGraph responseExecutionGraph=(TestingJobManagerMessages.ResponseExecutionGraph)Await.result(futureExecutionGraph,timeout);
+    assertTrue(responseExecutionGraph instanceof TestingJobManagerMessages.ExecutionGraphFound);
+    ExecutionGraph executionGraph=(ExecutionGraph)((TestingJobManagerMessages.ExecutionGraphFound)responseExecutionGraph).executionGraph();
+    highAvailabilityServices.revokeLeadership(jobId);
+    executionGraph.getTerminationFuture().get(30,TimeUnit.SECONDS);
+  }
+  public JobGraph createBlockingJob(  int parallelism){
+    Tasks.BlockingOnceReceiver$.MODULE$.blocking_$eq(true);
+    JobVertex sender=new JobVertex("sender");
+    JobVertex receiver=new JobVertex("receiver");
+    sender.setInvokableClass(Tasks.Sender.class);
+    receiver.setInvokableClass(Tasks.BlockingOnceReceiver.class);
+    sender.setParallelism(parallelism);
+    receiver.setParallelism(parallelism);
+    receiver.connectNewDataSetAsInput(sender,DistributionPattern.POINTWISE,ResultPartitionType.PIPELINED);
+    SlotSharingGroup slotSharingGroup=new SlotSharingGroup();
+    sender.setSlotSharingGroup(slotSharingGroup);
+    receiver.setSlotSharingGroup(slotSharingGroup);
+    return new JobGraph("Blocking test job",sender,receiver);
+  }
+}

@@ -1,0 +1,52 @@
+/** 
+ * Test we do not lose data if we fail a flush and then close. Part of HBase-10466
+ * @throws Exception
+ */
+@Test public void testFlushSizeSizing() throws Exception {
+  LOG.info("Setting up a faulty file system that cannot write in " + this.name.getMethodName());
+  final Configuration conf=HBaseConfiguration.create(TEST_UTIL.getConfiguration());
+  conf.setInt("hbase.hstore.flush.retries.number",1);
+  User user=User.createUserForTesting(conf,this.name.getMethodName(),new String[]{"foo"});
+  conf.setClass("fs.file.impl",FaultyFileSystem.class,FileSystem.class);
+  user.runAs(new PrivilegedExceptionAction<Object>(){
+    @Override public Object run() throws Exception {
+      FileSystem fs=FileSystem.get(conf);
+      assertEquals(FaultyFileSystem.class,fs.getClass());
+      FaultyFileSystem ffs=(FaultyFileSystem)fs;
+      init(name.getMethodName(),conf);
+      MemStoreSize mss=store.memstore.getFlushableSize();
+      assertEquals(0,mss.getDataSize());
+      LOG.info("Adding some data");
+      MemStoreSizing kvSize=new NonThreadSafeMemStoreSizing();
+      store.add(new KeyValue(row,family,qf1,1,(byte[])null),kvSize);
+      kvSize.incMemStoreSize(0,MutableSegment.DEEP_OVERHEAD,0);
+      mss=store.memstore.getFlushableSize();
+      assertEquals(kvSize.getMemStoreSize(),mss);
+      try {
+        LOG.info("Flushing");
+        flushStore(store,id++);
+        fail("Didn't bubble up IOE!");
+      }
+ catch (      IOException ioe) {
+        assertTrue(ioe.getMessage().contains("Fault injected"));
+      }
+      kvSize.incMemStoreSize(0,CSLMImmutableSegment.DEEP_OVERHEAD_CSLM - MutableSegment.DEEP_OVERHEAD,0);
+      mss=store.memstore.getFlushableSize();
+      assertEquals(kvSize.getMemStoreSize(),mss);
+      MemStoreSizing kvSize2=new NonThreadSafeMemStoreSizing();
+      store.add(new KeyValue(row,family,qf2,2,(byte[])null),kvSize2);
+      kvSize2.incMemStoreSize(0,MutableSegment.DEEP_OVERHEAD,0);
+      assertEquals(kvSize.getMemStoreSize(),mss);
+      ffs.fault.set(false);
+      flushStore(store,id++);
+      mss=store.memstore.getFlushableSize();
+      assertEquals(kvSize2.getMemStoreSize(),mss);
+      flushStore(store,id++);
+      mss=store.memstore.getFlushableSize();
+      assertEquals(0,mss.getDataSize());
+      assertEquals(MutableSegment.DEEP_OVERHEAD,mss.getHeapSize());
+      return null;
+    }
+  }
+);
+}

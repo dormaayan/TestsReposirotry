@@ -1,0 +1,147 @@
+@Category({MasterTests.class,MediumTests.class}) public class TestMaster {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestMaster.class);
+  private static final HBaseTestingUtility TEST_UTIL=new HBaseTestingUtility();
+  private static final Logger LOG=LoggerFactory.getLogger(TestMaster.class);
+  private static final TableName TABLENAME=TableName.valueOf("TestMaster");
+  private static final byte[] FAMILYNAME=Bytes.toBytes("fam");
+  private static Admin admin;
+  @Rule public TestName name=new TestName();
+  @BeforeClass public static void beforeAllTests() throws Exception {
+    TEST_UTIL.getConfiguration().setInt(HConstants.HBASE_CLIENT_RETRIES_NUMBER,3);
+    TEST_UTIL.startMiniCluster(2);
+    admin=TEST_UTIL.getAdmin();
+  }
+  @AfterClass public static void afterAllTests() throws Exception {
+    TEST_UTIL.shutdownMiniCluster();
+  }
+  /** 
+ * Return the region and current deployment for the region containing the given row. If the region cannot be found, returns null. If it is found, but not currently deployed, the second element of the pair may be null.
+ */
+  private Pair<RegionInfo,ServerName> getTableRegionForRow(  HMaster master,  TableName tableName,  byte[] rowKey) throws IOException {
+    final AtomicReference<Pair<RegionInfo,ServerName>> result=new AtomicReference<>(null);
+    MetaTableAccessor.Visitor visitor=new MetaTableAccessor.Visitor(){
+      @Override public boolean visit(      Result data) throws IOException {
+        if (data == null || data.size() <= 0) {
+          return true;
+        }
+        Pair<RegionInfo,ServerName> pair=new Pair<>(MetaTableAccessor.getRegionInfo(data),MetaTableAccessor.getServerName(data,0));
+        if (!pair.getFirst().getTable().equals(tableName)) {
+          return false;
+        }
+        result.set(pair);
+        return true;
+      }
+    }
+;
+    MetaTableAccessor.scanMeta(master.getConnection(),visitor,tableName,rowKey,1);
+    return result.get();
+  }
+  @Test @SuppressWarnings("deprecation") public void testMasterOpsWhileSplitting() throws Exception {
+    MiniHBaseCluster cluster=TEST_UTIL.getHBaseCluster();
+    HMaster m=cluster.getMaster();
+    try (Table ht=TEST_UTIL.createTable(TABLENAME,FAMILYNAME)){
+      assertTrue(m.getTableStateManager().isTableState(TABLENAME,TableState.State.ENABLED));
+      TEST_UTIL.loadTable(ht,FAMILYNAME,false);
+    }
+     List<Pair<RegionInfo,ServerName>> tableRegions=MetaTableAccessor.getTableRegionsAndLocations(m.getConnection(),TABLENAME);
+    LOG.info("Regions after load: " + Joiner.on(',').join(tableRegions));
+    assertEquals(1,tableRegions.size());
+    assertArrayEquals(HConstants.EMPTY_START_ROW,tableRegions.get(0).getFirst().getStartKey());
+    assertArrayEquals(HConstants.EMPTY_END_ROW,tableRegions.get(0).getFirst().getEndKey());
+    LOG.info("Splitting table");
+    TEST_UTIL.getAdmin().split(TABLENAME);
+    LOG.info("Making sure we can call getTableRegions while opening");
+    while (tableRegions.size() < 3) {
+      tableRegions=MetaTableAccessor.getTableRegionsAndLocations(m.getConnection(),TABLENAME,false);
+      Thread.sleep(100);
+    }
+    LOG.info("Regions: " + Joiner.on(',').join(tableRegions));
+    assertEquals(3,tableRegions.size());
+    LOG.info("Making sure we can call getTableRegionClosest while opening");
+    Pair<RegionInfo,ServerName> pair=getTableRegionForRow(m,TABLENAME,Bytes.toBytes("cde"));
+    LOG.info("Result is: " + pair);
+    Pair<RegionInfo,ServerName> tableRegionFromName=MetaTableAccessor.getRegion(m.getConnection(),pair.getFirst().getRegionName());
+    assertTrue(RegionInfo.COMPARATOR.compare(tableRegionFromName.getFirst(),pair.getFirst()) == 0);
+  }
+  @Test public void testMoveRegionWhenNotInitialized(){
+    MiniHBaseCluster cluster=TEST_UTIL.getHBaseCluster();
+    HMaster m=cluster.getMaster();
+    try {
+      m.setInitialized(false);
+      RegionInfo meta=RegionInfoBuilder.FIRST_META_REGIONINFO;
+      m.move(meta.getEncodedNameAsBytes(),null);
+      fail("Region should not be moved since master is not initialized");
+    }
+ catch (    IOException ioe) {
+      assertTrue(ioe instanceof PleaseHoldException);
+    }
+ finally {
+      m.setInitialized(true);
+    }
+  }
+  @Test public void testMoveThrowsUnknownRegionException() throws IOException {
+    final TableName tableName=TableName.valueOf(name.getMethodName());
+    HTableDescriptor htd=new HTableDescriptor(tableName);
+    HColumnDescriptor hcd=new HColumnDescriptor("value");
+    htd.addFamily(hcd);
+    admin.createTable(htd,null);
+    try {
+      RegionInfo hri=RegionInfoBuilder.newBuilder(tableName).setStartKey(Bytes.toBytes("A")).setEndKey(Bytes.toBytes("Z")).build();
+      admin.move(hri.getEncodedNameAsBytes(),null);
+      fail("Region should not be moved since it is fake");
+    }
+ catch (    IOException ioe) {
+      assertTrue(ioe instanceof UnknownRegionException);
+    }
+ finally {
+      TEST_UTIL.deleteTable(tableName);
+    }
+  }
+  @Test public void testMoveThrowsPleaseHoldException() throws IOException {
+    final TableName tableName=TableName.valueOf(name.getMethodName());
+    HMaster master=TEST_UTIL.getMiniHBaseCluster().getMaster();
+    HTableDescriptor htd=new HTableDescriptor(tableName);
+    HColumnDescriptor hcd=new HColumnDescriptor("value");
+    htd.addFamily(hcd);
+    admin.createTable(htd,null);
+    try {
+      List<RegionInfo> tableRegions=admin.getRegions(tableName);
+      master.setInitialized(false);
+      admin.move(tableRegions.get(0).getEncodedNameAsBytes(),null);
+      fail("Region should not be moved since master is not initialized");
+    }
+ catch (    IOException ioe) {
+      assertTrue(StringUtils.stringifyException(ioe).contains("PleaseHoldException"));
+    }
+ finally {
+      master.setInitialized(true);
+      TEST_UTIL.deleteTable(tableName);
+    }
+  }
+  @Test public void testBlockingHbkc1WithLockFile() throws IOException {
+    Path hbckLockPath=new Path(HBaseFsck.getTmpDir(TEST_UTIL.getConfiguration()),HBaseFsck.HBCK_LOCK_FILE);
+    FileSystem fs=TEST_UTIL.getTestFileSystem();
+    assertTrue(fs.exists(hbckLockPath));
+    TEST_UTIL.getMiniHBaseCluster().killMaster(TEST_UTIL.getMiniHBaseCluster().getMaster().getServerName());
+    assertTrue(fs.exists(hbckLockPath));
+    TEST_UTIL.getMiniHBaseCluster().startMaster();
+    TEST_UTIL.waitFor(30000,() -> TEST_UTIL.getMiniHBaseCluster().getMaster() != null && TEST_UTIL.getMiniHBaseCluster().getMaster().isInitialized());
+    assertTrue(fs.exists(hbckLockPath));
+    TEST_UTIL.getMiniHBaseCluster().startMaster();
+    assertTrue(fs.exists(hbckLockPath));
+    fs.delete(hbckLockPath,true);
+    assertFalse(fs.exists(hbckLockPath));
+    TEST_UTIL.getMiniHBaseCluster().getLiveMasterThreads().stream().map(sn -> sn.getMaster().getServerName()).forEach(sn -> {
+      try {
+        TEST_UTIL.getMiniHBaseCluster().killMaster(sn);
+      }
+ catch (      IOException e) {
+        e.printStackTrace();
+      }
+    }
+);
+    TEST_UTIL.getMiniHBaseCluster().startMaster();
+    TEST_UTIL.waitFor(30000,() -> TEST_UTIL.getMiniHBaseCluster().getMaster() != null && TEST_UTIL.getMiniHBaseCluster().getMaster().isInitialized());
+    assertTrue(fs.exists(hbckLockPath));
+  }
+}

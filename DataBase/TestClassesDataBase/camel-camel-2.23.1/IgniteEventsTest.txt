@@ -1,0 +1,90 @@
+public class IgniteEventsTest extends AbstractIgniteTest {
+  @Override protected String getScheme(){
+    return "ignite-events";
+  }
+  @Override protected AbstractIgniteComponent createComponent(){
+    return IgniteEventsComponent.fromConfiguration(createConfiguration());
+  }
+  @Test public void testConsumeAllEvents() throws Exception {
+    context.addRoutes(new RouteBuilder(){
+      @Override public void configure() throws Exception {
+        from("ignite-events:abc").to("mock:test1");
+      }
+    }
+);
+    getMockEndpoint("mock:test1").expectedMinimumMessageCount(9);
+    IgniteCache<String,String> cache=ignite().getOrCreateCache("abc");
+    cache.put("abc","123");
+    cache.get("abc");
+    cache.remove("abc");
+    cache.withExpiryPolicy(CreatedExpiryPolicy.factoryOf(new Duration(TimeUnit.MILLISECONDS,100)).create()).put("abc","123");
+    Thread.sleep(150);
+    cache.get("abc");
+    assertMockEndpointsSatisfied();
+    List<Integer> eventTypes=receivedEventTypes("mock:test1");
+    assert_().that(eventTypes).containsAllOf(EventType.EVT_CACHE_STARTED,EventType.EVT_CACHE_ENTRY_CREATED,EventType.EVT_CACHE_OBJECT_PUT,EventType.EVT_CACHE_OBJECT_READ,EventType.EVT_CACHE_OBJECT_REMOVED,EventType.EVT_CACHE_OBJECT_PUT,EventType.EVT_CACHE_OBJECT_EXPIRED).inOrder();
+  }
+  @Test public void testConsumeFilteredEventsWithRef() throws Exception {
+    context.getRegistry(JndiRegistry.class).bind("filter",Sets.newHashSet(EventType.EVT_CACHE_OBJECT_PUT));
+    context.addRoutes(new RouteBuilder(){
+      @Override public void configure() throws Exception {
+        from("ignite-events:abc?events=#filter").to("mock:test2");
+      }
+    }
+);
+    getMockEndpoint("mock:test2").expectedMessageCount(2);
+    IgniteCache<String,String> cache=ignite().getOrCreateCache("abc");
+    cache.put("abc","123");
+    cache.get("abc");
+    cache.remove("abc");
+    cache.get("abc");
+    cache.put("abc","123");
+    assertMockEndpointsSatisfied();
+    List<Integer> eventTypes=receivedEventTypes("mock:test2");
+    assert_().that(eventTypes).containsExactly(EventType.EVT_CACHE_OBJECT_PUT,EventType.EVT_CACHE_OBJECT_PUT).inOrder();
+  }
+  @Test public void testConsumeFilteredEventsInline() throws Exception {
+    context.addRoutes(new RouteBuilder(){
+      @Override public void configure() throws Exception {
+        from("ignite-events:abc?events=EVT_CACHE_OBJECT_PUT").to("mock:test3");
+      }
+    }
+);
+    getMockEndpoint("mock:test3").expectedMessageCount(2);
+    IgniteCache<String,String> cache=ignite().getOrCreateCache("abc");
+    cache.put("abc","123");
+    cache.get("abc");
+    cache.remove("abc");
+    cache.get("abc");
+    cache.put("abc","123");
+    assertMockEndpointsSatisfied();
+    List<Integer> eventTypes=receivedEventTypes("mock:test3");
+    assert_().that(eventTypes).containsExactly(EventType.EVT_CACHE_OBJECT_PUT,EventType.EVT_CACHE_OBJECT_PUT).inOrder();
+  }
+  private List<Integer> receivedEventTypes(  String mockEndpoint){
+    List<Integer> eventTypes=Lists.newArrayList(Lists.transform(getMockEndpoint(mockEndpoint).getExchanges(),new Function<Exchange,Integer>(){
+      @Override public Integer apply(      Exchange input){
+        return input.getIn().getBody(Event.class).type();
+      }
+    }
+));
+    return eventTypes;
+  }
+  @Override public boolean isCreateCamelContextPerClass(){
+    return true;
+  }
+  @After public void stopAllRoutes() throws Exception {
+    for (    Route route : context.getRoutes()) {
+      if (context.getRouteStatus(route.getId()) != ServiceStatus.Started) {
+        return;
+      }
+      context.stopRoute(route.getId());
+    }
+    resetMocks();
+  }
+  @Override protected IgniteConfiguration createConfiguration(){
+    IgniteConfiguration config=new IgniteConfiguration();
+    config.setIncludeEventTypes(EventType.EVTS_ALL_MINUS_METRIC_UPDATE);
+    return config;
+  }
+}

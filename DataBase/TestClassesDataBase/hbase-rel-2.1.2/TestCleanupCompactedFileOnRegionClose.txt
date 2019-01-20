@@ -1,0 +1,114 @@
+@Category({MediumTests.class}) public class TestCleanupCompactedFileOnRegionClose {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestCleanupCompactedFileOnRegionClose.class);
+  private static HBaseTestingUtility util;
+  @BeforeClass public static void beforeClass() throws Exception {
+    util=new HBaseTestingUtility();
+    util.getConfiguration().setInt(CompactionConfiguration.HBASE_HSTORE_COMPACTION_MIN_KEY,100);
+    util.getConfiguration().set("dfs.blocksize","64000");
+    util.getConfiguration().set("dfs.namenode.fs-limits.min-block-size","1024");
+    util.getConfiguration().set(TimeToLiveHFileCleaner.TTL_CONF_KEY,"0");
+    util.startMiniCluster(2);
+  }
+  @AfterClass public static void afterclass() throws Exception {
+    util.shutdownMiniCluster();
+  }
+  @Test public void testCleanupOnClose() throws Exception {
+    TableName tableName=TableName.valueOf("testCleanupOnClose");
+    String familyName="f";
+    byte[] familyNameBytes=Bytes.toBytes(familyName);
+    util.createTable(tableName,familyName);
+    HBaseAdmin hBaseAdmin=util.getHBaseAdmin();
+    Table table=util.getConnection().getTable(tableName);
+    HRegionServer rs=util.getRSForFirstRegionInTable(tableName);
+    Region region=rs.getRegions(tableName).get(0);
+    int refSFCount=4;
+    for (int i=0; i < refSFCount; i++) {
+      for (int j=0; j < refSFCount; j++) {
+        Put put=new Put(Bytes.toBytes(j));
+        put.addColumn(familyNameBytes,Bytes.toBytes(i),Bytes.toBytes(j));
+        table.put(put);
+      }
+      util.flush(tableName);
+    }
+    assertEquals(refSFCount,region.getStoreFileList(new byte[][]{familyNameBytes}).size());
+    Delete delete=new Delete(Bytes.toBytes(refSFCount - 1));
+    table.delete(delete);
+    util.flush(tableName);
+    assertFalse(table.exists(new Get(Bytes.toBytes(refSFCount - 1))));
+    Scan scan=new Scan();
+    scan.setStopRow(Bytes.toBytes(refSFCount - 2));
+    scan.setCaching(1);
+    ResultScanner scanner=table.getScanner(scan);
+    Result res=scanner.next();
+    assertNotNull(res);
+    assertEquals(refSFCount,res.getFamilyMap(familyNameBytes).size());
+    int count=0;
+    for (    HStoreFile sf : (Collection<HStoreFile>)region.getStore(familyNameBytes).getStorefiles()) {
+synchronized (sf) {
+        if (count < refSFCount) {
+          assertTrue(sf.isReferencedInReads());
+        }
+ else {
+          assertFalse(sf.isReferencedInReads());
+        }
+      }
+      count++;
+    }
+    util.compact(tableName,true);
+    assertEquals(1,region.getStoreFileList(new byte[][]{familyNameBytes}).size());
+    assertEquals(refSFCount + 1,((HStore)region.getStore(familyNameBytes)).getStoreEngine().getStoreFileManager().getCompactedfiles().size());
+    hBaseAdmin.unassign(region.getRegionInfo().getRegionName(),false);
+    hBaseAdmin.assign(region.getRegionInfo().getRegionName());
+    util.waitUntilNoRegionsInTransition(10000);
+    assertFalse("Deleted row should not exist",table.exists(new Get(Bytes.toBytes(refSFCount - 1))));
+    rs=util.getRSForFirstRegionInTable(tableName);
+    region=rs.getRegions(tableName).get(0);
+    assertEquals(1,region.getStoreFileList(new byte[][]{familyNameBytes}).size());
+    assertEquals(0,((HStore)region.getStore(familyNameBytes)).getStoreEngine().getStoreFileManager().getCompactedfiles().size());
+  }
+  @Test public void testIOExceptionThrownOnClose() throws Exception {
+    byte[] filler=new byte[128000];
+    TableName tableName=TableName.valueOf("testIOExceptionThrownOnClose");
+    String familyName="f";
+    byte[] familyNameBytes=Bytes.toBytes(familyName);
+    util.createTable(tableName,familyName);
+    Table table=util.getConnection().getTable(tableName);
+    HRegionServer rs=util.getRSForFirstRegionInTable(tableName);
+    Region region=rs.getRegions(tableName).get(0);
+    int refSFCount=4;
+    for (int i=0; i < refSFCount; i++) {
+      for (int j=0; j < refSFCount; j++) {
+        Put put=new Put(Bytes.toBytes(j));
+        put.addColumn(familyNameBytes,Bytes.toBytes(i),filler);
+        table.put(put);
+      }
+      util.flush(tableName);
+    }
+    assertEquals(refSFCount,region.getStoreFileList(new byte[][]{familyNameBytes}).size());
+    HStore store=((HRegion)region).getStore(familyNameBytes);
+    HStoreFile hsf=((Collection<HStoreFile>)region.getStore(familyNameBytes).getStorefiles()).iterator().next();
+    long readPt=((HRegion)region).getReadPoint(IsolationLevel.READ_COMMITTED);
+    StoreFileScanner preadScanner=hsf.getPreadScanner(false,readPt,0,false);
+    StoreFileScanner streamScanner=hsf.getStreamScanner(false,false,false,readPt,0,false);
+    preadScanner.seek(KeyValue.LOWESTKEY);
+    streamScanner.seek(KeyValue.LOWESTKEY);
+    util.compact(tableName,true);
+    assertNotNull(preadScanner.next());
+    assertNotNull(streamScanner.next());
+    store.closeAndArchiveCompactedFiles(true);
+    try {
+      assertNotNull(preadScanner.next());
+      fail("Expected IOException");
+    }
+ catch (    IOException ex) {
+      ex.printStackTrace();
+    }
+    try {
+      assertNotNull(streamScanner.next());
+      fail("Expected IOException");
+    }
+ catch (    IOException ex) {
+      ex.printStackTrace();
+    }
+  }
+}

@@ -1,0 +1,48 @@
+@Test(timeout=60_000) public void shouldWaitOnStopUntilTheRunningCheckpointIsDone() throws Throwable {
+  final AtomicReference<Throwable> ex=new AtomicReference<>();
+  final AtomicBoolean stoppedCompleted=new AtomicBoolean();
+  final DoubleLatch checkPointerLatch=new DoubleLatch(1);
+  OtherThreadExecutor<Void> otherThreadExecutor=new OtherThreadExecutor<>("scheduler stopper",null);
+  CheckPointer checkPointer=new CheckPointer(){
+    @Override public long checkPointIfNeeded(    TriggerInfo triggerInfo){
+      checkPointerLatch.startAndWaitForAllToStart();
+      checkPointerLatch.waitForAllToFinish();
+      return 42;
+    }
+    @Override public long tryCheckPoint(    TriggerInfo triggerInfo){
+      throw new RuntimeException("this should have not been called");
+    }
+    @Override public long forceCheckPoint(    TriggerInfo triggerInfo){
+      throw new RuntimeException("this should have not been called");
+    }
+    @Override public long lastCheckPointedTransactionId(){
+      return 42;
+    }
+  }
+;
+  final CheckPointScheduler scheduler=new CheckPointScheduler(checkPointer,ioLimiter,jobScheduler,20L,health);
+  scheduler.start();
+  Thread runCheckPointer=new Thread(jobScheduler::runJob);
+  runCheckPointer.start();
+  checkPointerLatch.waitForAllToStart();
+  otherThreadExecutor.executeDontWait((WorkerCommand<Void,Void>)state -> {
+    try {
+      scheduler.stop();
+      stoppedCompleted.set(true);
+    }
+ catch (    Throwable throwable) {
+      ex.set(throwable);
+    }
+    return null;
+  }
+);
+  otherThreadExecutor.waitUntilWaiting(details -> details.isAt(CheckPointScheduler.class,"waitOngoingCheckpointCompletion"));
+  assertFalse(stoppedCompleted.get());
+  checkPointerLatch.finish();
+  runCheckPointer.join();
+  while (!stoppedCompleted.get()) {
+    Thread.sleep(1);
+  }
+  otherThreadExecutor.close();
+  assertNull(ex.get());
+}

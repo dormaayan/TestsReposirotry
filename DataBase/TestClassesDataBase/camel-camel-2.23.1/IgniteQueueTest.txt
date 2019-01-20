@@ -1,0 +1,140 @@
+public class IgniteQueueTest extends AbstractIgniteTest {
+  @Override protected String getScheme(){
+    return "ignite-queue";
+  }
+  @Override protected AbstractIgniteComponent createComponent(){
+    return IgniteQueueComponent.fromConfiguration(createConfiguration());
+  }
+  @Test public void testOperations(){
+    boolean result=template.requestBody("ignite-queue:abc?operation=ADD","hello",boolean.class);
+    assert_().that(result).isTrue();
+    assert_().that(ignite().queue("abc",0,new CollectionConfiguration()).contains("hello")).isTrue();
+    result=template.requestBody("ignite-queue:abc?operation=CONTAINS","hello",boolean.class);
+    assert_().that(result).isTrue();
+    assert_().that(ignite().queue("abc",0,new CollectionConfiguration()).contains("hello")).isTrue();
+    result=template.requestBody("ignite-queue:abc?operation=REMOVE","hello",boolean.class);
+    assert_().that(result).isTrue();
+    assert_().that(ignite().queue("abc",0,new CollectionConfiguration()).contains("hello")).isFalse();
+    result=template.requestBody("ignite-queue:abc?operation=CONTAINS","hello",boolean.class);
+    assert_().that(result).isFalse();
+  }
+  @Test @SuppressWarnings("unchecked") public void testOperations2(){
+    for (int i=0; i < 100; i++) {
+      template.requestBody("ignite-queue:abc?operation=ADD","hello" + i);
+    }
+    int size=template.requestBody("ignite-queue:abc?operation=SIZE","hello",int.class);
+    assert_().that(size).isEqualTo(100);
+    assert_().that(ignite().queue("abc",0,new CollectionConfiguration()).size()).isEqualTo(100);
+    List<String> toRetain=Lists.newArrayList();
+    for (int i=0; i < 50; i++) {
+      toRetain.add("hello" + i);
+    }
+    boolean retained=template.requestBodyAndHeader("ignite-queue:abc?operation=CLEAR",toRetain,IgniteConstants.IGNITE_QUEUE_OPERATION,IgniteQueueOperation.RETAIN_ALL,boolean.class);
+    assert_().that(retained).isTrue();
+    size=template.requestBody("ignite-queue:abc?operation=SIZE","hello",int.class);
+    assert_().that(size).isEqualTo(50);
+    assert_().that(ignite().queue("abc",0,new CollectionConfiguration()).size()).isEqualTo(50);
+    Iterator<String> iterator=template.requestBody("ignite-queue:abc?operation=ITERATOR","hello",Iterator.class);
+    assert_().that(Iterators.toArray(iterator,String.class)).asList().containsExactlyElementsIn(toRetain).inOrder();
+    String[] array=template.requestBody("ignite-queue:abc?operation=ARRAY","hello",String[].class);
+    assert_().that(array).asList().containsExactlyElementsIn(toRetain).inOrder();
+    Object result=template.requestBody("ignite-queue:abc?operation=CLEAR","hello",String.class);
+    assert_().that(result).isEqualTo("hello");
+    assert_().that(ignite().queue("abc",0,new CollectionConfiguration()).size()).isEqualTo(0);
+    size=template.requestBody("ignite-queue:abc?operation=SIZE","hello",int.class);
+    assert_().that(size).isEqualTo(0);
+    assert_().that(ignite().queue("abc",0,new CollectionConfiguration()).size()).isEqualTo(0);
+  }
+  @Test public void testRetainSingle(){
+    for (int i=0; i < 100; i++) {
+      template.requestBody("ignite-queue:abc?operation=ADD","hello" + i);
+    }
+    boolean retained=template.requestBody("ignite-queue:abc?operation=RETAIN_ALL","hello10",boolean.class);
+    assert_().that(retained).isTrue();
+    String[] array=template.requestBody("ignite-queue:abc?operation=ARRAY","hello",String[].class);
+    assert_().that(array).asList().containsExactly("hello10");
+  }
+  @Test public void testCollectionsAsCacheObject(){
+    for (int i=0; i < 100; i++) {
+      template.requestBody("ignite-queue:abc?operation=ADD","hello" + i);
+    }
+    Set<String> toAdd=Sets.newHashSet("hello101","hello102","hello103");
+    template.requestBody("ignite-queue:abc?operation=ADD&treatCollectionsAsCacheObjects=true",toAdd);
+    int size=template.requestBody("ignite-queue:abc?operation=SIZE","hello",int.class);
+    assert_().that(size).isEqualTo(101);
+    assert_().that(ignite().queue("abc",0,new CollectionConfiguration()).size()).isEqualTo(101);
+    assert_().that(ignite().queue("abc",0,new CollectionConfiguration()).contains(toAdd)).isTrue();
+    boolean contains=template.requestBody("ignite-queue:abc?operation=CONTAINS&treatCollectionsAsCacheObjects=true",toAdd,boolean.class);
+    assert_().that(contains).isTrue();
+    template.requestBody("ignite-queue:abc?operation=REMOVE&treatCollectionsAsCacheObjects=true",toAdd);
+    size=template.requestBody("ignite-queue:abc?operation=SIZE","hello",int.class);
+    assert_().that(size).isEqualTo(100);
+    assert_().that(ignite().queue("abc",0,new CollectionConfiguration()).size()).isEqualTo(100);
+    assert_().that(ignite().queue("abc",0,new CollectionConfiguration()).contains(toAdd)).isFalse();
+  }
+  @Test public void testWithConfiguration(){
+    CollectionConfiguration configuration=new CollectionConfiguration();
+    configuration.setCacheMode(CacheMode.PARTITIONED);
+    context.getRegistry(JndiRegistry.class).bind("config",configuration);
+    IgniteQueueEndpoint igniteEndpoint=context.getEndpoint("ignite-queue:abc?operation=ADD&configuration=#config",IgniteQueueEndpoint.class);
+    template.requestBody(igniteEndpoint,"hello");
+    assert_().that(ignite().queue("abc",0,configuration).size()).isEqualTo(1);
+    assert_().that(igniteEndpoint.getConfiguration()).isEqualTo(configuration);
+  }
+  @Test public void testBoundedQueueAndOtherOperations() throws Exception {
+    List<String> list=Lists.newArrayList();
+    for (int i=0; i < 100; i++) {
+      template.requestBody("ignite-queue:def?operation=ADD&capacity=100","hello" + i);
+      list.add("hello" + i);
+    }
+    assert_().that(template.requestBody("ignite-queue:def?operation=ADD&capacity=100","hello101",boolean.class)).isFalse();
+    assert_().that(template.requestBody("ignite-queue:def?operation=OFFER&capacity=100","hello101",boolean.class)).isFalse();
+    final CountDownLatch latch=new CountDownLatch(1);
+    Thread t=new Thread(new Runnable(){
+      @Override public void run(){
+        assert_().that(template.requestBody("ignite-queue:def?operation=PUT&capacity=100","hello101",boolean.class)).isFalse();
+        latch.countDown();
+      }
+    }
+);
+    t.start();
+    assert_().that(latch.await(2000,TimeUnit.MILLISECONDS)).isFalse();
+    t.interrupt();
+    assert_().that(template.requestBody("ignite-queue:def?operation=PEEK&capacity=100",null,String.class)).isEqualTo("hello0");
+    assert_().that(template.requestBody("ignite-queue:def?operation=ELEMENT&capacity=100",null,String.class)).isEqualTo("hello0");
+    assert_().that(template.requestBody("ignite-queue:def?operation=TAKE&capacity=100",null,String.class)).isEqualTo("hello0");
+    assert_().that(template.requestBody("ignite-queue:def?operation=SIZE&capacity=100",null,int.class)).isEqualTo(99);
+    assert_().that(template.requestBody("ignite-queue:def?operation=DRAIN&capacity=100",null,String[].class)).asList().hasSize(99);
+    assert_().that(template.requestBody("ignite-queue:def?operation=SIZE&capacity=100",null,int.class)).isEqualTo(0);
+    assert_().that(template.requestBody("ignite-queue:def?operation=POLL&capacity=100",null,String.class)).isNull();
+    t=new Thread(new Runnable(){
+      @Override public void run(){
+        assert_().that(template.requestBody("ignite-queue:def?operation=TAKE&capacity=100",null,String.class)).isEqualTo("hello102");
+        latch.countDown();
+      }
+    }
+);
+    t.start();
+    assert_().that(template.requestBody("ignite-queue:def?operation=ADD&capacity=100","hello102",boolean.class)).isTrue();
+    assert_().that(latch.await(1000,TimeUnit.MILLISECONDS)).isTrue();
+    assert_().that(Executors.newSingleThreadExecutor().submit(new Callable<Long>(){
+      @Override public Long call() throws Exception {
+        Stopwatch sw=Stopwatch.createStarted();
+        assert_().that(template.requestBody("ignite-queue:def?operation=POLL&timeoutMillis=1000&capacity=100",null,String.class)).isNull();
+        return sw.elapsed(TimeUnit.MILLISECONDS);
+      }
+    }
+).get()).isAtLeast(1000L);
+  }
+  @Override public boolean isCreateCamelContextPerClass(){
+    return true;
+  }
+  @After public void deleteQueues(){
+    for (    String queueName : ImmutableSet.<String>of("abc")) {
+      ignite().queue(queueName,0,new CollectionConfiguration()).close();
+    }
+    for (    String queueName : ImmutableSet.<String>of("def")) {
+      ignite().queue(queueName,100,new CollectionConfiguration()).close();
+    }
+  }
+}

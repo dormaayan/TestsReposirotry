@@ -1,0 +1,48 @@
+/** 
+ * Manufacture a state that will throw UnexpectedStateException. Change an assigned region's 'state' to be OPENING. That'll mess up a subsequent unassign causing it to throw UnexpectedStateException. We can easily manufacture this infinite retry state in UnassignProcedure because it has no startTransition. AssignProcedure does where it squashes whatever the current region state is making it OFFLINE. That makes it harder to mess it up. Make do with UnassignProcedure for now.
+ */
+@Test public void testUnableToAssign() throws Exception {
+  try (Admin admin=TEST_UTIL.getAdmin()){
+    final RegionInfo region=pickArbitraryRegion(admin);
+    AssignmentManager am=TEST_UTIL.getHBaseCluster().getMaster().getAssignmentManager();
+    RegionStates.RegionStateNode rsn=am.getRegionStates().getRegionStateNode(region);
+    am.markRegionAsOpening(rsn);
+    Runnable unassign=() -> {
+      try {
+        admin.unassign(region.getRegionName(),true);
+      }
+ catch (      IOException ioe) {
+        fail("Failed assign");
+      }
+    }
+;
+    Thread t=new Thread(unassign,"unassign");
+    t.start();
+    while (!t.isAlive()) {
+      Threads.sleep(100);
+    }
+    Threads.sleep(1000);
+    JsonParser parser=new JsonParser();
+    long oldTimeout=0;
+    int timeoutIncrements=0;
+    while (true) {
+      long timeout=getUnassignTimeout(parser,admin.getProcedures());
+      if (timeout > oldTimeout) {
+        LOG.info("Timeout incremented, was {}, now is {}, increments={}",timeout,oldTimeout,timeoutIncrements);
+        oldTimeout=timeout;
+        timeoutIncrements++;
+        if (timeoutIncrements > 3) {
+          break;
+        }
+      }
+      Thread.sleep(1000);
+    }
+    TEST_UTIL.getMiniHBaseCluster().stopMaster(0).join();
+    HMaster master=TEST_UTIL.getMiniHBaseCluster().startMaster().getMaster();
+    TEST_UTIL.waitFor(30000,() -> master.isInitialized());
+    am=master.getAssignmentManager();
+    rsn=am.getRegionStates().getRegionStateNode(region);
+    am.markRegionAsOpened(rsn);
+    t.join();
+  }
+ }

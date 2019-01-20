@@ -1,0 +1,124 @@
+public class ReversedSingleFileTransactionCursorTest {
+  private final DefaultFileSystemRule fs=new DefaultFileSystemRule();
+  private final TestDirectory directory=TestDirectory.testDirectory(fs);
+  private final LifeRule life=new LifeRule(true);
+  private final RandomRule random=new RandomRule();
+  private final ExpectedException expectedException=ExpectedException.none();
+  @Rule public final RuleChain rules=RuleChain.outerRule(random).around(fs).around(directory).around(life).around(expectedException);
+  private long txId=TransactionIdStore.BASE_TX_ID;
+  private LogProvider logProvider=new AssertableLogProvider(true);
+  private ReverseTransactionCursorLoggingMonitor monitor=new ReverseTransactionCursorLoggingMonitor(logProvider.getLog(ReversedSingleFileTransactionCursor.class));
+  private LogFile logFile;
+  @Before public void setUp() throws IOException {
+    LogVersionRepository logVersionRepository=new SimpleLogVersionRepository();
+    SimpleTransactionIdStore transactionIdStore=new SimpleTransactionIdStore();
+    LogFiles logFiles=LogFilesBuilder.builder(directory.databaseLayout(),fs).withLogVersionRepository(logVersionRepository).withTransactionIdStore(transactionIdStore).build();
+    life.add(logFiles);
+    logFile=logFiles.getLogFile();
+  }
+  @Test public void shouldHandleVerySmallTransactions() throws Exception {
+    writeTransactions(10,1,1);
+    CommittedTransactionRepresentation[] readTransactions=readAllFromReversedCursor();
+    assertTransactionRange(readTransactions,txId,TransactionIdStore.BASE_TX_ID);
+  }
+  @Test public void shouldHandleManyVerySmallTransactions() throws Exception {
+    writeTransactions(20_000,1,1);
+    CommittedTransactionRepresentation[] readTransactions=readAllFromReversedCursor();
+    assertTransactionRange(readTransactions,txId,TransactionIdStore.BASE_TX_ID);
+  }
+  @Test public void shouldHandleLargeTransactions() throws Exception {
+    writeTransactions(10,1000,1000);
+    CommittedTransactionRepresentation[] readTransactions=readAllFromReversedCursor();
+    assertTransactionRange(readTransactions,txId,TransactionIdStore.BASE_TX_ID);
+  }
+  @Test public void shouldHandleEmptyLog() throws Exception {
+    CommittedTransactionRepresentation[] readTransactions=readAllFromReversedCursor();
+    assertEquals(0,readTransactions.length);
+  }
+  @Test public void shouldDetectAndPreventChannelReadingMultipleLogVersions() throws Exception {
+    writeTransactions(1,1,1);
+    logFile.rotate();
+    writeTransactions(1,1,1);
+    try (ReadAheadLogChannel channel=(ReadAheadLogChannel)logFile.getReader(start(0))){
+      new ReversedSingleFileTransactionCursor(channel,new VersionAwareLogEntryReader<>(),false,monitor);
+      fail("Should've failed");
+    }
+ catch (    IllegalArgumentException e) {
+      assertThat(e.getMessage(),containsString("multiple log versions"));
+    }
+  }
+  @Test public void readCorruptedTransactionLog() throws IOException {
+    int readableTransactions=10;
+    writeTransactions(readableTransactions,1,1);
+    appendCorruptedTransaction();
+    writeTransactions(readableTransactions,1,1);
+    CommittedTransactionRepresentation[] committedTransactionRepresentations=readAllFromReversedCursor();
+    assertTransactionRange(committedTransactionRepresentations,readableTransactions + TransactionIdStore.BASE_TX_ID,TransactionIdStore.BASE_TX_ID);
+  }
+  @Test public void failToReadCorruptedTransactionLogWhenConfigured() throws IOException {
+    int readableTransactions=10;
+    writeTransactions(readableTransactions,1,1);
+    appendCorruptedTransaction();
+    writeTransactions(readableTransactions,1,1);
+    expectedException.expect(UnsupportedLogVersionException.class);
+    readAllFromReversedCursorFailOnCorrupted();
+  }
+  private CommittedTransactionRepresentation[] readAllFromReversedCursor() throws IOException {
+    try (ReversedSingleFileTransactionCursor cursor=txCursor(false)){
+      return exhaust(cursor);
+    }
+   }
+  private CommittedTransactionRepresentation[] readAllFromReversedCursorFailOnCorrupted() throws IOException {
+    try (ReversedSingleFileTransactionCursor cursor=txCursor(true)){
+      return exhaust(cursor);
+    }
+   }
+  private void assertTransactionRange(  CommittedTransactionRepresentation[] readTransactions,  long highTxId,  long lowTxId){
+    long expectedTxId=highTxId;
+    for (    CommittedTransactionRepresentation tx : readTransactions) {
+      assertEquals(expectedTxId,tx.getCommitEntry().getTxId());
+      expectedTxId--;
+    }
+    assertEquals(expectedTxId,lowTxId);
+  }
+  private ReversedSingleFileTransactionCursor txCursor(  boolean failOnCorruptedLogFiles) throws IOException {
+    ReadAheadLogChannel fileReader=(ReadAheadLogChannel)logFile.getReader(start(0),NO_MORE_CHANNELS);
+    try {
+      return new ReversedSingleFileTransactionCursor(fileReader,new VersionAwareLogEntryReader<>(),failOnCorruptedLogFiles,monitor);
+    }
+ catch (    UnsupportedLogVersionException e) {
+      fileReader.close();
+      throw e;
+    }
+  }
+  private void writeTransactions(  int transactionCount,  int minTransactionSize,  int maxTransactionSize) throws IOException {
+    FlushablePositionAwareChannel channel=logFile.getWriter();
+    TransactionLogWriter writer=new TransactionLogWriter(new LogEntryWriter(channel));
+    for (int i=0; i < transactionCount; i++) {
+      writer.append(tx(random.intBetween(minTransactionSize,maxTransactionSize)),++txId);
+    }
+    channel.prepareForFlush().flush();
+  }
+  private void appendCorruptedTransaction() throws IOException {
+    FlushablePositionAwareChannel channel=logFile.getWriter();
+    TransactionLogWriter writer=new TransactionLogWriter(new CorruptedLogEntryWriter(channel));
+    writer.append(tx(random.intBetween(100,1000)),++txId);
+  }
+  private TransactionRepresentation tx(  int size){
+    Collection<StorageCommand> commands=new ArrayList<>();
+    for (int i=0; i < size; i++) {
+      commands.add(new Command.NodeCommand(new NodeRecord(i),new NodeRecord(i).initialize(true,i,false,i,NO_LABELS_FIELD.longValue())));
+    }
+    PhysicalTransactionRepresentation tx=new PhysicalTransactionRepresentation(commands);
+    tx.setHeader(new byte[0],0,0,0,0,0,0);
+    return tx;
+  }
+private static class CorruptedLogEntryWriter extends LogEntryWriter {
+    CorruptedLogEntryWriter(    FlushableChannel channel){
+      super(channel);
+    }
+    @Override public void writeStartEntry(    int masterId,    int authorId,    long timeWritten,    long latestCommittedTxWhenStarted,    byte[] additionalHeaderData) throws IOException {
+      writeLogEntryHeader(TX_START,channel);
+    }
+  }
+}

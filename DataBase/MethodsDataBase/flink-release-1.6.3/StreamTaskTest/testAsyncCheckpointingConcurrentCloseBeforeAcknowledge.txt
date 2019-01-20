@@ -1,0 +1,53 @@
+/** 
+ * FLINK-5667 <p>Tests that a concurrent cancel operation discards the state handles of a not yet acknowledged checkpoint and prevents sending an acknowledge message to the CheckpointCoordinator. The situation can only happen if the cancel call is executed before Environment.acknowledgeCheckpoint().
+ */
+@Test public void testAsyncCheckpointingConcurrentCloseBeforeAcknowledge() throws Exception {
+  final long checkpointId=42L;
+  final long timestamp=1L;
+  final OneShotLatch createSubtask=new OneShotLatch();
+  final OneShotLatch completeSubtask=new OneShotLatch();
+  Environment mockEnvironment=spy(new MockEnvironmentBuilder().build());
+  whenNew(OperatorSnapshotFinalizer.class).withAnyArguments().thenAnswer((Answer<OperatorSnapshotFinalizer>)invocation -> {
+    createSubtask.trigger();
+    completeSubtask.await();
+    Object[] arguments=invocation.getArguments();
+    return new OperatorSnapshotFinalizer((OperatorSnapshotFutures)arguments[0]);
+  }
+);
+  StreamTask<?,?> streamTask=new EmptyStreamTask(mockEnvironment);
+  CheckpointMetaData checkpointMetaData=new CheckpointMetaData(checkpointId,timestamp);
+  final StreamOperator<?> streamOperator=mock(StreamOperator.class);
+  final OperatorID operatorID=new OperatorID();
+  when(streamOperator.getOperatorID()).thenReturn(operatorID);
+  KeyedStateHandle managedKeyedStateHandle=mock(KeyedStateHandle.class);
+  KeyedStateHandle rawKeyedStateHandle=mock(KeyedStateHandle.class);
+  OperatorStateHandle managedOperatorStateHandle=mock(OperatorStreamStateHandle.class);
+  OperatorStateHandle rawOperatorStateHandle=mock(OperatorStreamStateHandle.class);
+  OperatorSnapshotFutures operatorSnapshotResult=new OperatorSnapshotFutures(DoneFuture.of(SnapshotResult.of(managedKeyedStateHandle)),DoneFuture.of(SnapshotResult.of(rawKeyedStateHandle)),DoneFuture.of(SnapshotResult.of(managedOperatorStateHandle)),DoneFuture.of(SnapshotResult.of(rawOperatorStateHandle)));
+  when(streamOperator.snapshotState(anyLong(),anyLong(),any(CheckpointOptions.class),any(CheckpointStreamFactory.class))).thenReturn(operatorSnapshotResult);
+  StreamOperator<?>[] streamOperators={streamOperator};
+  OperatorChain<Void,AbstractStreamOperator<Void>> operatorChain=mock(OperatorChain.class);
+  when(operatorChain.getAllOperators()).thenReturn(streamOperators);
+  CheckpointStorage checkpointStorage=new MemoryBackendCheckpointStorage(new JobID(),null,null,Integer.MAX_VALUE);
+  ExecutorService executor=Executors.newFixedThreadPool(1);
+  Whitebox.setInternalState(streamTask,"isRunning",true);
+  Whitebox.setInternalState(streamTask,"lock",new Object());
+  Whitebox.setInternalState(streamTask,"operatorChain",operatorChain);
+  Whitebox.setInternalState(streamTask,"cancelables",new CloseableRegistry());
+  Whitebox.setInternalState(streamTask,"asyncOperationsThreadPool",executor);
+  Whitebox.setInternalState(streamTask,"configuration",new StreamConfig(new Configuration()));
+  Whitebox.setInternalState(streamTask,"checkpointStorage",checkpointStorage);
+  streamTask.triggerCheckpoint(checkpointMetaData,CheckpointOptions.forCheckpointWithDefaultLocation());
+  createSubtask.await();
+  streamTask.cancel();
+  completeSubtask.trigger();
+  executor.shutdown();
+  if (!executor.awaitTermination(10000L,TimeUnit.MILLISECONDS)) {
+    fail("Executor did not shut down within the given timeout. This indicates that the " + "checkpointing did not resume.");
+  }
+  verify(mockEnvironment,never()).acknowledgeCheckpoint(eq(checkpointId),any(CheckpointMetrics.class),any(TaskStateSnapshot.class));
+  verify(managedKeyedStateHandle).discardState();
+  verify(rawKeyedStateHandle).discardState();
+  verify(managedOperatorStateHandle).discardState();
+  verify(rawOperatorStateHandle).discardState();
+}

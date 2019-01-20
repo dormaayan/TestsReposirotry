@@ -1,0 +1,131 @@
+public class StoreMigratorTest {
+  private final TestDirectory directory=TestDirectory.testDirectory();
+  private final DefaultFileSystemRule fileSystemRule=new DefaultFileSystemRule();
+  private final PageCacheRule pageCacheRule=new PageCacheRule();
+  private final RandomRule random=new RandomRule();
+  private PageCache pageCache;
+  private JobScheduler jobScheduler;
+  @Rule public final RuleChain ruleChain=RuleChain.outerRule(directory).around(fileSystemRule).around(pageCacheRule).around(random);
+  @Before public void setUp(){
+    jobScheduler=new ThreadPoolJobScheduler();
+    pageCache=pageCacheRule.getPageCache(fileSystemRule);
+  }
+  @After public void tearDown() throws Exception {
+    jobScheduler.close();
+  }
+  @Test public void shouldExtractTransactionInformationFromMetaDataStore() throws Exception {
+    long txId=42;
+    long checksum=123456789123456789L;
+    long timestamp=919191919191919191L;
+    TransactionId expected=new TransactionId(txId,checksum,timestamp);
+    DatabaseLayout databaseLayout=directory.databaseLayout();
+    File neoStore=databaseLayout.metadataStore();
+    neoStore.createNewFile();
+    Config config=mock(Config.class);
+    LogService logService=mock(LogService.class);
+    setRecord(pageCache,neoStore,LAST_TRANSACTION_ID,txId);
+    setRecord(pageCache,neoStore,LAST_TRANSACTION_CHECKSUM,checksum);
+    setRecord(pageCache,neoStore,LAST_TRANSACTION_COMMIT_TIMESTAMP,timestamp);
+    StoreMigrator migrator=new StoreMigrator(fileSystemRule.get(),pageCache,config,logService,jobScheduler);
+    TransactionId actual=migrator.extractTransactionIdInformation(neoStore,txId);
+    assertEquals(expected,actual);
+  }
+  @Test public void shouldGenerateTransactionInformationWhenLogsNotPresent() throws Exception {
+    long txId=42;
+    DatabaseLayout databaseLayout=directory.databaseLayout();
+    File neoStore=databaseLayout.metadataStore();
+    neoStore.createNewFile();
+    Config config=mock(Config.class);
+    LogService logService=new SimpleLogService(NullLogProvider.getInstance(),NullLogProvider.getInstance());
+    assertEquals(FIELD_NOT_PRESENT,getRecord(pageCache,neoStore,LAST_TRANSACTION_ID));
+    assertEquals(FIELD_NOT_PRESENT,getRecord(pageCache,neoStore,LAST_TRANSACTION_CHECKSUM));
+    assertEquals(FIELD_NOT_PRESENT,getRecord(pageCache,neoStore,LAST_TRANSACTION_COMMIT_TIMESTAMP));
+    StoreMigrator migrator=new StoreMigrator(fileSystemRule.get(),pageCache,config,logService,jobScheduler);
+    TransactionId actual=migrator.extractTransactionIdInformation(neoStore,txId);
+    assertEquals(txId,actual.transactionId());
+    assertEquals(TransactionIdStore.UNKNOWN_TX_CHECKSUM,actual.checksum());
+    assertEquals(TransactionIdStore.UNKNOWN_TX_COMMIT_TIMESTAMP,actual.commitTimestamp());
+  }
+  @Test public void extractTransactionInformationFromLogsInCustomRelativeLocation() throws Exception {
+    DatabaseLayout databaseLayout=directory.databaseLayout();
+    File customLogLocation=databaseLayout.file("customLogLocation");
+    extractTransactionalInformationFromLogs(customLogLocation.getName(),customLogLocation,databaseLayout,directory.databaseDir());
+  }
+  @Test public void extractTransactionInformationFromLogsInCustomAbsoluteLocation() throws Exception {
+    DatabaseLayout databaseLayout=directory.databaseLayout();
+    File customLogLocation=databaseLayout.file("customLogLocation");
+    extractTransactionalInformationFromLogs(customLogLocation.getAbsolutePath(),customLogLocation,databaseLayout,directory.databaseDir());
+  }
+  private void extractTransactionalInformationFromLogs(  String path,  File customLogLocation,  DatabaseLayout databaseLayout,  File storeDir) throws IOException {
+    LogService logService=new SimpleLogService(NullLogProvider.getInstance(),NullLogProvider.getInstance());
+    File neoStore=databaseLayout.metadataStore();
+    GraphDatabaseService database=new TestGraphDatabaseFactory().newEmbeddedDatabaseBuilder(storeDir).setConfig(logical_logs_location,path).newGraphDatabase();
+    for (int i=0; i < 10; i++) {
+      try (Transaction transaction=database.beginTx()){
+        Node node=database.createNode();
+        transaction.success();
+      }
+     }
+    database.shutdown();
+    MetaDataStore.setRecord(pageCache,neoStore,MetaDataStore.Position.LAST_CLOSED_TRANSACTION_LOG_VERSION,MetaDataRecordFormat.FIELD_NOT_PRESENT);
+    Config config=Config.defaults(logical_logs_location,path);
+    StoreMigrator migrator=new StoreMigrator(fileSystemRule.get(),pageCache,config,logService,jobScheduler);
+    LogPosition logPosition=migrator.extractTransactionLogPosition(neoStore,databaseLayout,100);
+    File[] logFiles=customLogLocation.listFiles();
+    assertNotNull(logFiles);
+    assertEquals(0,logPosition.getLogVersion());
+    assertEquals(logFiles[0].length(),logPosition.getByteOffset());
+  }
+  @Test public void shouldGenerateTransactionInformationWhenLogsAreEmpty() throws Exception {
+    long txId=1;
+    DatabaseLayout databaseLayout=directory.databaseLayout();
+    File neoStore=databaseLayout.metadataStore();
+    neoStore.createNewFile();
+    Config config=mock(Config.class);
+    LogService logService=new SimpleLogService(NullLogProvider.getInstance(),NullLogProvider.getInstance());
+    assertEquals(FIELD_NOT_PRESENT,getRecord(pageCache,neoStore,LAST_TRANSACTION_ID));
+    assertEquals(FIELD_NOT_PRESENT,getRecord(pageCache,neoStore,LAST_TRANSACTION_CHECKSUM));
+    assertEquals(FIELD_NOT_PRESENT,getRecord(pageCache,neoStore,LAST_TRANSACTION_COMMIT_TIMESTAMP));
+    StoreMigrator migrator=new StoreMigrator(fileSystemRule.get(),pageCache,config,logService,jobScheduler);
+    TransactionId actual=migrator.extractTransactionIdInformation(neoStore,txId);
+    assertEquals(txId,actual.transactionId());
+    assertEquals(TransactionIdStore.BASE_TX_CHECKSUM,actual.checksum());
+    assertEquals(TransactionIdStore.BASE_TX_COMMIT_TIMESTAMP,actual.commitTimestamp());
+  }
+  @Test public void writeAndReadLastTxInformation() throws IOException {
+    StoreMigrator migrator=newStoreMigrator();
+    TransactionId writtenTxId=new TransactionId(random.nextLong(),random.nextLong(),random.nextLong());
+    migrator.writeLastTxInformation(directory.databaseLayout(),writtenTxId);
+    TransactionId readTxId=migrator.readLastTxInformation(directory.databaseLayout());
+    assertEquals(writtenTxId,readTxId);
+  }
+  @Test public void writeAndReadLastTxLogPosition() throws IOException {
+    StoreMigrator migrator=newStoreMigrator();
+    LogPosition writtenLogPosition=new LogPosition(random.nextLong(),random.nextLong());
+    migrator.writeLastTxLogPosition(directory.databaseLayout(),writtenLogPosition);
+    LogPosition readLogPosition=migrator.readLastTxLogPosition(directory.databaseLayout());
+    assertEquals(writtenLogPosition,readLogPosition);
+  }
+  @Test public void shouldNotMigrateFilesForVersionsWithSameCapability() throws Exception {
+    StoreMigrator migrator=newStoreMigrator();
+    DatabaseLayout dbLayout=directory.databaseLayout();
+    File neoStore=dbLayout.metadataStore();
+    neoStore.createNewFile();
+    MyProgressReporter progressReporter=new MyProgressReporter();
+    migrator.migrate(dbLayout,directory.databaseLayout("migrationDir"),progressReporter,StandardV3_0.STORE_VERSION,StandardV3_2.STORE_VERSION);
+    assertFalse(progressReporter.started);
+  }
+  private StoreMigrator newStoreMigrator(){
+    return new StoreMigrator(fileSystemRule,pageCache,Config.defaults(),NullLogService.getInstance(),jobScheduler);
+  }
+private static class MyProgressReporter implements ProgressReporter {
+    public boolean started;
+    @Override public void start(    long max){
+      started=true;
+    }
+    @Override public void progress(    long add){
+    }
+    @Override public void completed(){
+    }
+  }
+}

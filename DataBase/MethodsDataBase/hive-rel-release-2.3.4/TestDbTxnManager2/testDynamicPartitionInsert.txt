@@ -1,0 +1,34 @@
+/** 
+ * Check that DP with partial spec properly updates TXN_COMPONENTS
+ * @throws Exception
+ */
+@Test public void testDynamicPartitionInsert() throws Exception {
+  dropTable(new String[]{"target"});
+  checkCmdOnDriver(driver.run("create table target (a int, b int) " + "partitioned by (p int, q int) clustered by (a) into 2  buckets " + "stored as orc TBLPROPERTIES ('transactional'='true')"));
+  long txnid1=txnMgr.openTxn(ctx,"T1");
+  checkCmdOnDriver(driver.compileAndRespond("insert into target partition(p=1,q) values (1,2,2), (3,4,2), (5,6,3), (7,8,2)"));
+  txnMgr.acquireLocks(driver.getPlan(),ctx,"T1");
+  List<ShowLocksResponseElement> locks=getLocks(txnMgr);
+  Assert.assertEquals("Unexpected lock count",1,locks.size());
+  checkLock(LockType.SHARED_READ,LockState.ACQUIRED,"default","target",null,locks);
+  Assert.assertEquals("HIVE_LOCKS mismatch(" + JavaUtils.txnIdToString(txnid1) + "): "+ TxnDbUtil.queryToString("select * from HIVE_LOCKS"),1,TxnDbUtil.countQueryAgent("select count(*) from HIVE_LOCKS where hl_txnid=" + txnid1));
+  txnMgr.rollbackTxn();
+  Assert.assertEquals("TXN_COMPONENTS mismatch(" + JavaUtils.txnIdToString(txnid1) + "): "+ TxnDbUtil.queryToString("select * from TXN_COMPONENTS"),0,TxnDbUtil.countQueryAgent("select count(*) from TXN_COMPONENTS where tc_txnid=" + txnid1));
+  checkCmdOnDriver(driver.run("insert into target partition(p=1,q) values (1,2,2), (3,4,2), (5,6,3), (7,8,2)"));
+  driver.run("select count(*) from target");
+  List<String> r=new ArrayList<>();
+  driver.getResults(r);
+  Assert.assertEquals("","4",r.get(0));
+  Assert.assertEquals("COMPLETED_TXN_COMPONENTS mismatch(" + JavaUtils.txnIdToString(txnid1 + 1) + "): "+ TxnDbUtil.queryToString("select * from COMPLETED_TXN_COMPONENTS"),2,TxnDbUtil.countQueryAgent("select count(*) from COMPLETED_TXN_COMPONENTS where ctc_txnid=" + (txnid1 + 1)));
+  long txnid2=txnMgr.openTxn(ctx,"T1");
+  checkCmdOnDriver(driver.compileAndRespond("insert into target partition(p=1,q) values (10,2,2), (30,4,2), (50,6,3), (70,8,2)"));
+  txnMgr.acquireLocks(driver.getPlan(),ctx,"T1");
+  locks=getLocks(txnMgr);
+  Assert.assertEquals("Unexpected lock count",1,locks.size());
+  checkLock(LockType.SHARED_READ,LockState.ACQUIRED,"default","target",null,locks);
+  AddDynamicPartitions adp=new AddDynamicPartitions(txnid2,"default","target",Arrays.asList("p=1/q=2","p=1/q=2"));
+  adp.setOperationType(DataOperationType.INSERT);
+  txnHandler.addDynamicPartitions(adp);
+  Assert.assertEquals("TXN_COMPONENTS mismatch(" + JavaUtils.txnIdToString(txnid2) + "): "+ TxnDbUtil.queryToString("select * from TXN_COMPONENTS"),2,TxnDbUtil.countQueryAgent("select count(*) from TXN_COMPONENTS where tc_txnid=" + txnid2));
+  txnMgr.commitTxn();
+}

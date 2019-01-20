@@ -1,0 +1,105 @@
+@Test(timeout=90000) public void testFsckReplicaDetails() throws Exception {
+  final short replFactor=1;
+  short numDn=1;
+  final long blockSize=512;
+  final long fileSize=1024;
+  String[] racks={"/rack1"};
+  String[] hosts={"host1"};
+  conf.setLong(DFSConfigKeys.DFS_BLOCK_SIZE_KEY,blockSize);
+  conf.setInt(DFSConfigKeys.DFS_REPLICATION_KEY,1);
+  DistributedFileSystem dfs;
+  File builderBaseDir=new File(GenericTestUtils.getRandomizedTempPath());
+  cluster=new MiniDFSCluster.Builder(conf,builderBaseDir).numDataNodes(numDn).hosts(hosts).racks(racks).build();
+  cluster.waitClusterUp();
+  dfs=cluster.getFileSystem();
+  final String testFile=new String("/testfile");
+  final Path path=new Path(testFile);
+  DFSTestUtil.createFile(dfs,path,fileSize,replFactor,1000L);
+  DFSTestUtil.waitReplication(dfs,path,replFactor);
+  String fsckOut=runFsck(conf,0,true,testFile,"-files","-maintenance","-blocks","-replicaDetails");
+  assertTrue(fsckOut.contains(NamenodeFsck.HEALTHY_STATUS));
+  assertTrue(fsckOut.contains("(LIVE)"));
+  assertFalse(fsckOut.contains("(ENTERING MAINTENANCE)"));
+  assertFalse(fsckOut.contains("(IN MAINTENANCE)"));
+  FSNamesystem fsn=cluster.getNameNode().getNamesystem();
+  BlockManager bm=fsn.getBlockManager();
+  final DatanodeManager dnm=bm.getDatanodeManager();
+  DatanodeDescriptor dnDesc0=dnm.getDatanode(cluster.getDataNodes().get(0).getDatanodeId());
+  bm.getDatanodeManager().getDatanodeAdminManager().startDecommission(dnDesc0);
+  final String dn0Name=dnDesc0.getXferAddr();
+  fsckOut=runFsck(conf,0,true,testFile,"-files","-maintenance","-blocks","-replicaDetails");
+  assertTrue(fsckOut.contains("(DECOMMISSIONING)"));
+  assertFalse(fsckOut.contains("(ENTERING MAINTENANCE)"));
+  assertFalse(fsckOut.contains("(IN MAINTENANCE)"));
+  cluster.startDataNodes(conf,1,true,null,new String[]{"/rack2"},new String[]{"host2"},null,false);
+  final AtomicBoolean checkDecommissionInProgress=new AtomicBoolean(false);
+  GenericTestUtils.waitFor(new Supplier<Boolean>(){
+    @Override public Boolean get(){
+      DatanodeInfo datanodeInfo=null;
+      try {
+        for (        DatanodeInfo info : dfs.getDataNodeStats()) {
+          if (dn0Name.equals(info.getXferAddr())) {
+            datanodeInfo=info;
+          }
+        }
+        if (!checkDecommissionInProgress.get() && datanodeInfo != null && datanodeInfo.isDecommissionInProgress()) {
+          checkDecommissionInProgress.set(true);
+        }
+        if (datanodeInfo != null && datanodeInfo.isDecommissioned()) {
+          return true;
+        }
+      }
+ catch (      Exception e) {
+        LOG.warn("Unexpected exception: " + e);
+        return false;
+      }
+      return false;
+    }
+  }
+,500,30000);
+  fsckOut=runFsck(conf,0,true,testFile,"-files","-maintenance","-blocks","-replicaDetails");
+  assertTrue(fsckOut.contains("(DECOMMISSIONED)"));
+  assertFalse(fsckOut.contains("(ENTERING MAINTENANCE)"));
+  assertFalse(fsckOut.contains("(IN MAINTENANCE)"));
+  DatanodeDescriptor dnDesc1=dnm.getDatanode(cluster.getDataNodes().get(1).getDatanodeId());
+  final String dn1Name=dnDesc1.getXferAddr();
+  bm.getDatanodeManager().getDatanodeAdminManager().startMaintenance(dnDesc1,Long.MAX_VALUE);
+  fsckOut=runFsck(conf,0,true,testFile,"-files","-maintenance","-blocks","-replicaDetails");
+  assertTrue(fsckOut.contains("(DECOMMISSIONED)"));
+  assertTrue(fsckOut.contains("(ENTERING MAINTENANCE)"));
+  assertFalse(fsckOut.contains("(IN MAINTENANCE)"));
+  fsckOut=runFsck(conf,0,true,testFile,"-files","-blocks","-replicaDetails");
+  assertTrue(fsckOut.contains("(DECOMMISSIONED)"));
+  assertFalse(fsckOut.contains("(ENTERING MAINTENANCE)"));
+  assertFalse(fsckOut.contains("(IN MAINTENANCE)"));
+  cluster.startDataNodes(conf,1,true,null,new String[]{"/rack3"},new String[]{"host3"},null,false);
+  GenericTestUtils.waitFor(new Supplier<Boolean>(){
+    @Override public Boolean get(){
+      DatanodeInfo dnInfo=null;
+      try {
+        for (        DatanodeInfo info : dfs.getDataNodeStats()) {
+          if (dn1Name.equals(info.getXferAddr())) {
+            dnInfo=info;
+          }
+        }
+        if (dnInfo != null && dnInfo.isInMaintenance()) {
+          return true;
+        }
+      }
+ catch (      Exception e) {
+        LOG.warn("Unexpected exception: " + e);
+        return false;
+      }
+      return false;
+    }
+  }
+,500,30000);
+  fsckOut=runFsck(conf,0,true,testFile,"-files","-maintenance","-blocks","-replicaDetails");
+  assertTrue(fsckOut.contains("(DECOMMISSIONED)"));
+  assertFalse(fsckOut.contains("(ENTERING MAINTENANCE)"));
+  assertTrue(fsckOut.contains("(IN MAINTENANCE)"));
+  fsckOut=runFsck(conf,0,true,testFile,"-files","-blocks","-replicaDetails");
+  assertTrue(fsckOut.contains("(DECOMMISSIONED)"));
+  assertFalse(fsckOut.contains("(ENTERING MAINTENANCE)"));
+  assertFalse(fsckOut.contains("(IN MAINTENANCE)"));
+}

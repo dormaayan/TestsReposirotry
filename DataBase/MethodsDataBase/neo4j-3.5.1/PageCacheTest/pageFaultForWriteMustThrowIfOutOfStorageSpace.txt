@@ -1,0 +1,44 @@
+@Test void pageFaultForWriteMustThrowIfOutOfStorageSpace(){
+  assertTimeout(ofMillis(SHORT_TIMEOUT_MILLIS),() -> {
+    final AtomicInteger writeCounter=new AtomicInteger();
+    AtomicBoolean restrictWrites=new AtomicBoolean(true);
+    FileSystemAbstraction fs=new DelegatingFileSystemAbstraction(this.fs){
+      private List<StoreChannel> channels=new CopyOnWriteArrayList<>();
+      @Override public StoreChannel open(      File fileName,      OpenMode openMode) throws IOException {
+        StoreChannel channel=new DelegatingStoreChannel(super.open(fileName,openMode)){
+          @Override public void writeAll(          ByteBuffer src,          long position) throws IOException {
+            if (restrictWrites.get() && writeCounter.incrementAndGet() > 10) {
+              throw new IOException("No space left on device");
+            }
+            super.writeAll(src,position);
+          }
+        }
+;
+        channels.add(channel);
+        return channel;
+      }
+      @Override public void close() throws IOException {
+        IOUtils.closeAll(channels);
+        super.close();
+      }
+    }
+;
+    fs.create(file("a")).close();
+    getPageCache(fs,maxPages,PageCacheTracer.NULL,PageCursorTracerSupplier.NULL);
+    PagedFile pagedFile=map(file("a"),filePageSize);
+    try (PageCursor cursor=pagedFile.io(0,PF_SHARED_WRITE_LOCK)){
+      assertThrows(IOException.class,() -> {
+        while (cursor.next()) {
+        }
+      }
+);
+    }
+  finally {
+      restrictWrites.set(false);
+      pagedFile.close();
+      pageCache.close();
+      fs.close();
+    }
+  }
+);
+}

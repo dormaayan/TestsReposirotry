@@ -1,0 +1,265 @@
+public class MongoDbTailableCursorConsumerTest extends AbstractMongoDbTest {
+  private MongoCollection<BasicDBObject> cappedTestCollection;
+  private String cappedTestCollectionName;
+  @Test public void testThousandRecordsWithoutReadPreference() throws Exception {
+    testThousandRecordsWithRouteId("tailableCursorConsumer1");
+  }
+  @Test public void testThousandRecordsWithReadPreference() throws Exception {
+    testThousandRecordsWithRouteId("tailableCursorConsumer1.readPreference");
+  }
+  @Test public void testNoRecords() throws Exception {
+    assertEquals(0,cappedTestCollection.count());
+    MockEndpoint mock=getMockEndpoint("mock:test");
+    mock.expectedMessageCount(0);
+    CreateCollectionOptions collectionOptions=new CreateCollectionOptions().capped(true).sizeInBytes(1000000000).maxDocuments(1000);
+    db.createCollection(cappedTestCollectionName,collectionOptions);
+    cappedTestCollection=db.getCollection(cappedTestCollectionName,BasicDBObject.class);
+    assertEquals(0,cappedTestCollection.count());
+    addTestRoutes();
+    context.startRoute("tailableCursorConsumer1");
+    Thread.sleep(1000);
+    mock.assertIsSatisfied();
+    context.stopRoute("tailableCursorConsumer1");
+  }
+  @Test public void testMultipleBursts() throws Exception {
+    assertEquals(0,cappedTestCollection.count());
+    MockEndpoint mock=getMockEndpoint("mock:test");
+    mock.expectedMessageCount(5000);
+    CreateCollectionOptions createCollectionOptions=new CreateCollectionOptions().capped(true).sizeInBytes(1000000000).maxDocuments(1000);
+    db.createCollection(cappedTestCollectionName,createCollectionOptions);
+    cappedTestCollection=db.getCollection(cappedTestCollectionName,BasicDBObject.class);
+    addTestRoutes();
+    context.startRoute("tailableCursorConsumer1");
+    Thread t=new Thread(new Runnable(){
+      @Override public void run(){
+        for (int i=0; i < 5000; i++) {
+          if (i % 1000 == 0) {
+            try {
+              Thread.sleep(500);
+            }
+ catch (            InterruptedException e) {
+              return;
+            }
+          }
+          cappedTestCollection.insertOne(new BasicDBObject("increasing",i).append("string","value" + i));
+        }
+      }
+    }
+);
+    t.start();
+    t.join();
+    mock.assertIsSatisfied();
+    context.stopRoute("tailableCursorConsumer1");
+  }
+  @Test public void testHundredThousandRecords() throws Exception {
+    assertEquals(0,cappedTestCollection.count());
+    final MockEndpoint mock=getMockEndpoint("mock:test");
+    mock.expectedMessageCount(1000);
+    db.createCollection(cappedTestCollectionName,new CreateCollectionOptions().capped(true).sizeInBytes(1000000000).maxDocuments(1000));
+    cappedTestCollection=db.getCollection(cappedTestCollectionName,BasicDBObject.class);
+    addTestRoutes();
+    context.startRoute("tailableCursorConsumer1");
+    Thread t=new Thread(new Runnable(){
+      @Override public void run(){
+        for (int i=1; i <= 100000; i++) {
+          cappedTestCollection.insertOne(new BasicDBObject("increasing",i).append("string","value" + i));
+          if (i % 1000 == 0) {
+            try {
+              MongoDbTailableCursorConsumerTest.this.assertAndResetMockEndpoint(mock);
+            }
+ catch (            Exception e) {
+              return;
+            }
+          }
+        }
+      }
+    }
+);
+    t.start();
+    t.join();
+    context.stopRoute("tailableCursorConsumer1");
+  }
+  @Test public void testPersistentTailTrack() throws Exception {
+    assertEquals(0,cappedTestCollection.count());
+    final MockEndpoint mock=getMockEndpoint("mock:test");
+    db.getCollection(MongoDbTailTrackingConfig.DEFAULT_COLLECTION).drop();
+    db.createCollection(cappedTestCollectionName,new CreateCollectionOptions().capped(true).sizeInBytes(1000000000).maxDocuments(1000));
+    cappedTestCollection=db.getCollection(cappedTestCollectionName,BasicDBObject.class);
+    cappedTestCollection.createIndex(new BasicDBObject("increasing",1));
+    addTestRoutes();
+    context.startRoute("tailableCursorConsumer2");
+    mock.expectedMessageCount(300);
+    Thread t=new Thread(new Runnable(){
+      @Override public void run(){
+        for (int i=1; i <= 300; i++) {
+          cappedTestCollection.insertOne(new BasicDBObject("increasing",i).append("string","value" + i));
+        }
+      }
+    }
+);
+    t.start();
+    t.join();
+    mock.assertIsSatisfied();
+    mock.reset();
+    context.stopRoute("tailableCursorConsumer2");
+    while (context.getRouteStatus("tailableCursorConsumer2") != ServiceStatus.Stopped) {
+    }
+    context.startRoute("tailableCursorConsumer2");
+    mock.expectedMessageCount(300);
+    t=new Thread(new Runnable(){
+      @Override public void run(){
+        for (int i=301; i <= 600; i++) {
+          cappedTestCollection.insertOne(new BasicDBObject("increasing",i).append("string","value" + i));
+        }
+      }
+    }
+);
+    t.start();
+    t.join();
+    mock.assertIsSatisfied();
+    Object firstBody=mock.getExchanges().get(0).getIn().getBody();
+    assertTrue(firstBody instanceof DBObject);
+    assertEquals(301,((DBObject)firstBody).get("increasing"));
+    assertEquals(300,db.getCollection(MongoDbTailTrackingConfig.DEFAULT_COLLECTION).find(new BasicDBObject("persistentId","darwin")).first().get("lastTrackingValue"));
+    context.stopRoute("tailableCursorConsumer2");
+    while (context.getRouteStatus("tailableCursorConsumer2") != ServiceStatus.Stopped) {
+    }
+    assertEquals(600,db.getCollection(MongoDbTailTrackingConfig.DEFAULT_COLLECTION).find(new BasicDBObject("persistentId","darwin")).first().get("lastTrackingValue"));
+  }
+  @Test public void testPersistentTailTrackIncreasingDateField() throws Exception {
+    assertEquals(0,cappedTestCollection.count());
+    final MockEndpoint mock=getMockEndpoint("mock:test");
+    final Calendar startTimestamp=Calendar.getInstance();
+    MongoCollection<BasicDBObject> trackingCol=db.getCollection(MongoDbTailTrackingConfig.DEFAULT_COLLECTION,BasicDBObject.class);
+    trackingCol.drop();
+    trackingCol=db.getCollection(MongoDbTailTrackingConfig.DEFAULT_COLLECTION,BasicDBObject.class);
+    db.createCollection(cappedTestCollectionName,new CreateCollectionOptions().capped(true).sizeInBytes(1000000000).maxDocuments(1000));
+    cappedTestCollection=db.getCollection(cappedTestCollectionName,BasicDBObject.class);
+    addTestRoutes();
+    context.startRoute("tailableCursorConsumer2");
+    mock.expectedMessageCount(300);
+    Thread t=new Thread(new Runnable(){
+      @Override public void run(){
+        for (int i=1; i <= 300; i++) {
+          Calendar c=(Calendar)(startTimestamp.clone());
+          c.add(Calendar.MINUTE,i);
+          cappedTestCollection.insertOne(new BasicDBObject("increasing",c.getTime()).append("string","value" + i));
+        }
+      }
+    }
+);
+    t.start();
+    t.join();
+    mock.assertIsSatisfied();
+    mock.reset();
+    Calendar cal300=(Calendar)startTimestamp.clone();
+    cal300.add(Calendar.MINUTE,300);
+    context.stopRoute("tailableCursorConsumer2");
+    assertEquals(cal300.getTime(),trackingCol.find(new BasicDBObject("persistentId","darwin")).first().get(MongoDbTailTrackingConfig.DEFAULT_FIELD));
+    context.startRoute("tailableCursorConsumer2");
+    mock.expectedMessageCount(300);
+    t=new Thread(new Runnable(){
+      @Override public void run(){
+        for (int i=301; i <= 600; i++) {
+          Calendar c=(Calendar)(startTimestamp.clone());
+          c.add(Calendar.MINUTE,i);
+          cappedTestCollection.insertOne(new BasicDBObject("increasing",c.getTime()).append("string","value" + i));
+        }
+      }
+    }
+);
+    t.start();
+    t.join();
+    mock.assertIsSatisfied();
+    Object firstBody=mock.getExchanges().get(0).getIn().getBody();
+    assertTrue(firstBody instanceof DBObject);
+    Calendar cal301=(Calendar)startTimestamp.clone();
+    cal301.add(Calendar.MINUTE,301);
+    assertEquals(cal301.getTime(),((DBObject)firstBody).get("increasing"));
+    context.stopRoute("tailableCursorConsumer2");
+    Calendar cal600=(Calendar)startTimestamp.clone();
+    cal600.add(Calendar.MINUTE,600);
+    assertEquals(cal600.getTime(),trackingCol.find(new BasicDBObject("persistentId","darwin")).first().get(MongoDbTailTrackingConfig.DEFAULT_FIELD));
+  }
+  @Test public void testCustomTailTrackLocation() throws Exception {
+    assertEquals(0,cappedTestCollection.count());
+    final MockEndpoint mock=getMockEndpoint("mock:test");
+    MongoCollection<BasicDBObject> trackingCol=mongo.getDatabase("einstein").getCollection("curie",BasicDBObject.class);
+    trackingCol.drop();
+    trackingCol=mongo.getDatabase("einstein").getCollection("curie",BasicDBObject.class);
+    db.createCollection(cappedTestCollectionName,new CreateCollectionOptions().capped(true).sizeInBytes(1000000000).maxDocuments(1000));
+    cappedTestCollection=db.getCollection(cappedTestCollectionName,BasicDBObject.class);
+    addTestRoutes();
+    context.startRoute("tailableCursorConsumer3");
+    mock.expectedMessageCount(300);
+    Thread t=new Thread(new Runnable(){
+      @Override public void run(){
+        for (int i=1; i <= 300; i++) {
+          cappedTestCollection.insertOne(new BasicDBObject("increasing",i).append("string","value" + i));
+        }
+      }
+    }
+);
+    t.start();
+    t.join();
+    mock.assertIsSatisfied();
+    mock.reset();
+    context.stopRoute("tailableCursorConsumer3");
+    assertEquals(300,trackingCol.find(new BasicDBObject("persistentId","darwin")).first().get("newton"));
+    context.startRoute("tailableCursorConsumer3");
+    mock.expectedMessageCount(300);
+    t=new Thread(new Runnable(){
+      @Override public void run(){
+        for (int i=301; i <= 600; i++) {
+          cappedTestCollection.insertOne(new BasicDBObject("increasing",i).append("string","value" + i));
+        }
+      }
+    }
+);
+    t.start();
+    t.join();
+    mock.assertIsSatisfied();
+    Object firstBody=mock.getExchanges().get(0).getIn().getBody();
+    assertTrue(firstBody instanceof DBObject);
+    assertEquals(301,((DBObject)firstBody).get("increasing"));
+    context.stopRoute("tailableCursorConsumer3");
+    assertEquals(600,trackingCol.find(new BasicDBObject("persistentId","darwin")).first().get("newton"));
+  }
+  public void assertAndResetMockEndpoint(  MockEndpoint mock) throws Exception {
+    mock.assertIsSatisfied();
+    mock.reset();
+  }
+  private void testThousandRecordsWithRouteId(  String routeId) throws Exception {
+    assertEquals(0,cappedTestCollection.count());
+    MockEndpoint mock=getMockEndpoint("mock:test");
+    mock.expectedMessageCount(1000);
+    db.createCollection(cappedTestCollectionName,new CreateCollectionOptions().capped(true).sizeInBytes(1000000000).maxDocuments(1000));
+    cappedTestCollection=db.getCollection(cappedTestCollectionName,BasicDBObject.class);
+    for (int i=0; i < 1000; i++) {
+      cappedTestCollection.insertOne(new BasicDBObject("increasing",i).append("string","value" + i));
+    }
+    assertEquals(1000,cappedTestCollection.count());
+    addTestRoutes();
+    context.startRoute(routeId);
+    Thread.sleep(1000);
+    mock.assertIsSatisfied();
+    context.stopRoute(routeId);
+  }
+  @Override public void doPostSetup(){
+    super.doPostSetup();
+    cappedTestCollectionName="camelTestCapped";
+    cappedTestCollection=db.getCollection(cappedTestCollectionName,BasicDBObject.class);
+    cappedTestCollection.drop();
+  }
+  protected void addTestRoutes() throws Exception {
+    context.addRoutes(new RouteBuilder(){
+      @Override public void configure() throws Exception {
+        from("mongodb:myDb?database={{mongodb.testDb}}&collection={{mongodb.cappedTestCollection}}&tailTrackIncreasingField=increasing").id("tailableCursorConsumer1").autoStartup(false).to("mock:test");
+        from("mongodb:myDb?database={{mongodb.testDb}}&collection={{mongodb.cappedTestCollection}}&tailTrackIncreasingField=increasing&persistentTailTracking=true&persistentId=darwin").id("tailableCursorConsumer2").autoStartup(false).to("mock:test");
+        from("mongodb:myDb?database={{mongodb.testDb}}&collection={{mongodb.cappedTestCollection}}&tailTrackIncreasingField=increasing&" + "persistentTailTracking=true&persistentId=darwin&tailTrackDb=einstein&tailTrackCollection=curie&tailTrackField=newton").id("tailableCursorConsumer3").autoStartup(false).to("mock:test");
+        from("mongodb:myDb?database={{mongodb.testDb}}&collection={{mongodb.cappedTestCollection}}&tailTrackIncreasingField=increasing&readPreference=primary").id("tailableCursorConsumer1.readPreference").autoStartup(false).to("mock:test");
+      }
+    }
+);
+  }
+}

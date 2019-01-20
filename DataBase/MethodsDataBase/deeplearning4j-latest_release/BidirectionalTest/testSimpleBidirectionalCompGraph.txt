@@ -1,0 +1,74 @@
+@Test public void testSimpleBidirectionalCompGraph(){
+  for (  WorkspaceMode wsm : WorkspaceMode.values()) {
+    log.info("*** Starting workspace mode: " + wsm);
+    Nd4j.getRandom().setSeed(12345);
+    Bidirectional.Mode[] modes=new Bidirectional.Mode[]{Bidirectional.Mode.CONCAT,Bidirectional.Mode.ADD,Bidirectional.Mode.AVERAGE,Bidirectional.Mode.MUL};
+    INDArray in=Nd4j.rand(new int[]{3,10,6});
+    for (    Bidirectional.Mode m : modes) {
+      ComputationGraphConfiguration conf1=new NeuralNetConfiguration.Builder().activation(Activation.TANH).weightInit(WeightInit.XAVIER).trainingWorkspaceMode(wsm).inferenceWorkspaceMode(wsm).updater(new Adam()).graphBuilder().addInputs("in").layer("0",new Bidirectional(m,new SimpleRnn.Builder().nIn(10).nOut(10).build()),"in").setOutputs("0").build();
+      ComputationGraph net1=new ComputationGraph(conf1);
+      net1.init();
+      ComputationGraphConfiguration conf2=new NeuralNetConfiguration.Builder().activation(Activation.TANH).weightInit(WeightInit.XAVIER).updater(new Adam()).graphBuilder().addInputs("in").layer("0",new SimpleRnn.Builder().nIn(10).nOut(10).build(),"in").setOutputs("0").build();
+      ComputationGraph net2=new ComputationGraph(conf2.clone());
+      net2.init();
+      ComputationGraph net3=new ComputationGraph(conf2.clone());
+      net3.init();
+      net2.setParam("0_W",net1.getParam("0_fW"));
+      net2.setParam("0_RW",net1.getParam("0_fRW"));
+      net2.setParam("0_b",net1.getParam("0_fb"));
+      net3.setParam("0_W",net1.getParam("0_bW"));
+      net3.setParam("0_RW",net1.getParam("0_bRW"));
+      net3.setParam("0_b",net1.getParam("0_bb"));
+      INDArray out1=net1.outputSingle(in);
+      INDArray out2=net2.outputSingle(in);
+      INDArray out3=TimeSeriesUtils.reverseTimeSeries(net3.outputSingle(TimeSeriesUtils.reverseTimeSeries(in,LayerWorkspaceMgr.noWorkspaces(),ArrayType.INPUT)),LayerWorkspaceMgr.noWorkspaces(),ArrayType.INPUT);
+      INDArray outExp;
+switch (m) {
+case ADD:
+        outExp=out2.add(out3);
+      break;
+case MUL:
+    outExp=out2.mul(out3);
+  break;
+case AVERAGE:
+outExp=out2.add(out3).muli(0.5);
+break;
+case CONCAT:
+outExp=Nd4j.concat(1,out2,out3);
+break;
+default :
+throw new RuntimeException();
+}
+assertEquals(m.toString(),outExp,out1);
+if (m == Bidirectional.Mode.ADD || m == Bidirectional.Mode.CONCAT) {
+INDArray eps=Nd4j.rand(new int[]{3,10,6});
+INDArray eps1;
+if (m == Bidirectional.Mode.CONCAT) {
+eps1=Nd4j.concat(1,eps,eps);
+}
+ else {
+eps1=eps;
+}
+net1.outputSingle(true,false,in);
+net2.outputSingle(true,false,in);
+net3.outputSingle(true,false,TimeSeriesUtils.reverseTimeSeries(in,LayerWorkspaceMgr.noWorkspaces(),ArrayType.INPUT));
+Gradient g1=net1.backpropGradient(eps1);
+Gradient g2=net2.backpropGradient(eps);
+Gradient g3=net3.backpropGradient(TimeSeriesUtils.reverseTimeSeries(eps,LayerWorkspaceMgr.noWorkspaces(),ArrayType.INPUT));
+for (boolean updates : new boolean[]{false,true}) {
+if (updates) {
+net1.getUpdater().update(g1,0,0,3,LayerWorkspaceMgr.noWorkspaces());
+net2.getUpdater().update(g2,0,0,3,LayerWorkspaceMgr.noWorkspaces());
+net3.getUpdater().update(g3,0,0,3,LayerWorkspaceMgr.noWorkspaces());
+}
+assertEquals(g2.gradientForVariable().get("0_W"),g1.gradientForVariable().get("0_fW"));
+assertEquals(g2.gradientForVariable().get("0_RW"),g1.gradientForVariable().get("0_fRW"));
+assertEquals(g2.gradientForVariable().get("0_b"),g1.gradientForVariable().get("0_fb"));
+assertEquals(g3.gradientForVariable().get("0_W"),g1.gradientForVariable().get("0_bW"));
+assertEquals(g3.gradientForVariable().get("0_RW"),g1.gradientForVariable().get("0_bRW"));
+assertEquals(g3.gradientForVariable().get("0_b"),g1.gradientForVariable().get("0_bb"));
+}
+}
+}
+}
+}

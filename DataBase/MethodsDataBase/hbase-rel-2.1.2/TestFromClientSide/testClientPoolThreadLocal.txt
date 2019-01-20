@@ -1,0 +1,61 @@
+@Ignore("Flakey: HBASE-8989") @Test public void testClientPoolThreadLocal() throws IOException {
+  final TableName tableName=TableName.valueOf(name.getMethodName());
+  int poolSize=Integer.MAX_VALUE;
+  int numVersions=3;
+  Configuration conf=TEST_UTIL.getConfiguration();
+  conf.set(HConstants.HBASE_CLIENT_IPC_POOL_TYPE,"thread-local");
+  conf.setInt(HConstants.HBASE_CLIENT_IPC_POOL_SIZE,poolSize);
+  final Table table=TEST_UTIL.createTable(tableName,new byte[][]{FAMILY},3);
+  final long ts=EnvironmentEdgeManager.currentTime();
+  final Get get=new Get(ROW);
+  get.addColumn(FAMILY,QUALIFIER);
+  get.setMaxVersions();
+  for (int versions=1; versions <= numVersions; versions++) {
+    Put put=new Put(ROW);
+    put.addColumn(FAMILY,QUALIFIER,ts + versions,VALUE);
+    table.put(put);
+    Result result=table.get(get);
+    NavigableMap<Long,byte[]> navigableMap=result.getMap().get(FAMILY).get(QUALIFIER);
+    assertEquals("The number of versions of '" + Bytes.toString(FAMILY) + ":"+ Bytes.toString(QUALIFIER)+ " did not match",versions,navigableMap.size());
+    for (    Map.Entry<Long,byte[]> entry : navigableMap.entrySet()) {
+      assertTrue("The value at time " + entry.getKey() + " did not match what was put",Bytes.equals(VALUE,entry.getValue()));
+    }
+  }
+  final Object waitLock=new Object();
+  ExecutorService executorService=Executors.newFixedThreadPool(numVersions);
+  final AtomicReference<AssertionError> error=new AtomicReference<>(null);
+  for (int versions=numVersions; versions < numVersions * 2; versions++) {
+    final int versionsCopy=versions;
+    executorService.submit(new Callable<Void>(){
+      @Override public Void call(){
+        try {
+          Put put=new Put(ROW);
+          put.addColumn(FAMILY,QUALIFIER,ts + versionsCopy,VALUE);
+          table.put(put);
+          Result result=table.get(get);
+          NavigableMap<Long,byte[]> navigableMap=result.getMap().get(FAMILY).get(QUALIFIER);
+          assertEquals("The number of versions of '" + Bytes.toString(FAMILY) + ":"+ Bytes.toString(QUALIFIER)+ " did not match "+ versionsCopy,versionsCopy,navigableMap.size());
+          for (          Map.Entry<Long,byte[]> entry : navigableMap.entrySet()) {
+            assertTrue("The value at time " + entry.getKey() + " did not match what was put",Bytes.equals(VALUE,entry.getValue()));
+          }
+synchronized (waitLock) {
+            waitLock.wait();
+          }
+        }
+ catch (        Exception e) {
+        }
+catch (        AssertionError e) {
+          error.set(e);
+          LOG.error(e.toString(),e);
+        }
+        return null;
+      }
+    }
+);
+  }
+synchronized (waitLock) {
+    waitLock.notifyAll();
+  }
+  executorService.shutdownNow();
+  assertNull(error.get());
+}

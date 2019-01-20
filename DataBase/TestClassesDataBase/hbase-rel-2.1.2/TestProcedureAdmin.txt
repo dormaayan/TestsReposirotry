@@ -1,0 +1,130 @@
+@Category({MasterTests.class,MediumTests.class}) public class TestProcedureAdmin {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestProcedureAdmin.class);
+  private static final Logger LOG=LoggerFactory.getLogger(TestProcedureAdmin.class);
+  @Rule public TestName name=new TestName();
+  protected static final HBaseTestingUtility UTIL=new HBaseTestingUtility();
+  private static void setupConf(  Configuration conf){
+    conf.setInt(MasterProcedureConstants.MASTER_PROCEDURE_THREADS,1);
+    conf.setInt(MasterProcedureConstants.MASTER_URGENT_PROCEDURE_THREADS,0);
+  }
+  @BeforeClass public static void setupCluster() throws Exception {
+    setupConf(UTIL.getConfiguration());
+    UTIL.startMiniCluster(1);
+  }
+  @AfterClass public static void cleanupTest() throws Exception {
+    try {
+      UTIL.shutdownMiniCluster();
+    }
+ catch (    Exception e) {
+      LOG.warn("failure shutting down cluster",e);
+    }
+  }
+  @Before public void setup() throws Exception {
+    final ProcedureExecutor<MasterProcedureEnv> procExec=getMasterProcedureExecutor();
+    ProcedureTestingUtility.setKillAndToggleBeforeStoreUpdate(procExec,false);
+    assertTrue("expected executor to be running",procExec.isRunning());
+  }
+  @After public void tearDown() throws Exception {
+    assertTrue("expected executor to be running",getMasterProcedureExecutor().isRunning());
+    ProcedureTestingUtility.setKillAndToggleBeforeStoreUpdate(getMasterProcedureExecutor(),false);
+    for (    HTableDescriptor htd : UTIL.getAdmin().listTables()) {
+      LOG.info("Tear down, remove table=" + htd.getTableName());
+      UTIL.deleteTable(htd.getTableName());
+    }
+  }
+  @Test public void testAbortProcedureSuccess() throws Exception {
+    final TableName tableName=TableName.valueOf(name.getMethodName());
+    final ProcedureExecutor<MasterProcedureEnv> procExec=getMasterProcedureExecutor();
+    MasterProcedureTestingUtility.createTable(procExec,tableName,null,"f");
+    ProcedureTestingUtility.waitNoProcedureRunning(procExec);
+    ProcedureTestingUtility.setKillAndToggleBeforeStoreUpdate(procExec,true);
+    long procId=procExec.submitProcedure(new DisableTableProcedure(procExec.getEnvironment(),tableName,false));
+    ProcedureTestingUtility.waitProcedure(procExec,procId);
+    boolean abortResult=procExec.abort(procId,true);
+    assertTrue(abortResult);
+    MasterProcedureTestingUtility.testRestartWithAbort(procExec,procId);
+    ProcedureTestingUtility.waitNoProcedureRunning(procExec);
+    MasterProcedureTestingUtility.validateTableIsEnabled(UTIL.getHBaseCluster().getMaster(),tableName);
+  }
+  @Test public void testAbortProcedureFailure() throws Exception {
+    final TableName tableName=TableName.valueOf(name.getMethodName());
+    final ProcedureExecutor<MasterProcedureEnv> procExec=getMasterProcedureExecutor();
+    RegionInfo[] regions=MasterProcedureTestingUtility.createTable(procExec,tableName,null,"f");
+    UTIL.getAdmin().disableTable(tableName);
+    ProcedureTestingUtility.waitNoProcedureRunning(procExec);
+    ProcedureTestingUtility.setKillAndToggleBeforeStoreUpdate(procExec,true);
+    long procId=procExec.submitProcedure(new DeleteTableProcedure(procExec.getEnvironment(),tableName));
+    ProcedureTestingUtility.waitProcedure(procExec,procId);
+    for (int i=0; i < 2; ++i) {
+      ProcedureTestingUtility.assertProcNotYetCompleted(procExec,procId);
+      ProcedureTestingUtility.restart(procExec);
+      ProcedureTestingUtility.waitProcedure(procExec,procId);
+    }
+    boolean abortResult=procExec.abort(procId,true);
+    assertFalse(abortResult);
+    MasterProcedureTestingUtility.testRestartWithAbort(procExec,procId);
+    ProcedureTestingUtility.waitNoProcedureRunning(procExec);
+    ProcedureTestingUtility.assertProcNotFailed(procExec,procId);
+    MasterProcedureTestingUtility.validateTableDeletion(UTIL.getHBaseCluster().getMaster(),tableName);
+  }
+  @Test public void testAbortProcedureInterruptedNotAllowed() throws Exception {
+    final TableName tableName=TableName.valueOf(name.getMethodName());
+    final ProcedureExecutor<MasterProcedureEnv> procExec=getMasterProcedureExecutor();
+    RegionInfo[] regions=MasterProcedureTestingUtility.createTable(procExec,tableName,null,"f");
+    ProcedureTestingUtility.waitNoProcedureRunning(procExec);
+    ProcedureTestingUtility.setKillAndToggleBeforeStoreUpdate(procExec,true);
+    long procId=procExec.submitProcedure(new DisableTableProcedure(procExec.getEnvironment(),tableName,true));
+    ProcedureTestingUtility.waitProcedure(procExec,procId);
+    boolean abortResult=procExec.abort(procId,false);
+    assertFalse(abortResult);
+    ProcedureTestingUtility.setKillAndToggleBeforeStoreUpdate(procExec,false);
+    ProcedureTestingUtility.restart(procExec);
+    ProcedureTestingUtility.waitNoProcedureRunning(procExec);
+    ProcedureTestingUtility.assertProcNotFailed(procExec,procId);
+    MasterProcedureTestingUtility.validateTableIsDisabled(UTIL.getHBaseCluster().getMaster(),tableName);
+  }
+  @Test public void testAbortNonExistProcedure() throws Exception {
+    final ProcedureExecutor<MasterProcedureEnv> procExec=getMasterProcedureExecutor();
+    Random randomGenerator=new Random();
+    long procId;
+    do {
+      procId=randomGenerator.nextLong();
+    }
+ while (procExec.getResult(procId) != null);
+    boolean abortResult=procExec.abort(procId,true);
+    assertFalse(abortResult);
+  }
+  @Test public void testGetProcedure() throws Exception {
+    final TableName tableName=TableName.valueOf(name.getMethodName());
+    final ProcedureExecutor<MasterProcedureEnv> procExec=getMasterProcedureExecutor();
+    MasterProcedureTestingUtility.createTable(procExec,tableName,null,"f");
+    ProcedureTestingUtility.waitNoProcedureRunning(procExec);
+    ProcedureTestingUtility.setKillAndToggleBeforeStoreUpdate(procExec,true);
+    long procId=procExec.submitProcedure(new DisableTableProcedure(procExec.getEnvironment(),tableName,false));
+    ProcedureTestingUtility.waitProcedure(procExec,procId);
+    List<Procedure<MasterProcedureEnv>> procedures=procExec.getProcedures();
+    assertTrue(procedures.size() >= 1);
+    boolean found=false;
+    for (    Procedure<?> proc : procedures) {
+      if (proc.getProcId() == procId) {
+        assertTrue(proc.isRunnable());
+        found=true;
+      }
+ else {
+        assertTrue(proc.isSuccess());
+      }
+    }
+    assertTrue(found);
+    ProcedureTestingUtility.setKillAndToggleBeforeStoreUpdate(procExec,false);
+    ProcedureTestingUtility.restart(procExec);
+    ProcedureTestingUtility.waitNoProcedureRunning(procExec);
+    ProcedureTestingUtility.assertProcNotFailed(procExec,procId);
+    procedures=procExec.getProcedures();
+    for (    Procedure proc : procedures) {
+      assertTrue(proc.isSuccess());
+    }
+  }
+  private ProcedureExecutor<MasterProcedureEnv> getMasterProcedureExecutor(){
+    return UTIL.getHBaseCluster().getMaster().getMasterProcedureExecutor();
+  }
+}

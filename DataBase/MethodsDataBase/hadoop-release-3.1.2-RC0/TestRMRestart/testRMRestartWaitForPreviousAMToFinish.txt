@@ -1,0 +1,91 @@
+@Test(timeout=60000) public void testRMRestartWaitForPreviousAMToFinish() throws Exception {
+  YarnConfiguration conf=new YarnConfiguration(this.conf);
+  conf.setInt(YarnConfiguration.RM_AM_MAX_ATTEMPTS,40);
+  MockRM rm1=createMockRM(conf);
+  MemoryRMStateStore memStore=(MemoryRMStateStore)rm1.getRMStateStore();
+  Map<ApplicationId,ApplicationStateData> rmAppState=memStore.getState().getApplicationState();
+  rm1.start();
+  AbstractYarnScheduler ys=(AbstractYarnScheduler)rm1.getResourceScheduler();
+  MockNM nm1=new MockNM("127.0.0.1:1234",16382,rm1.getResourceTrackerService());
+  nm1.registerNode();
+  RMApp app1=rm1.submitApp(200);
+  rm1.waitForState(app1.getApplicationId(),RMAppState.ACCEPTED);
+  MockAM am1=launchAM(app1,rm1,nm1);
+  nm1.nodeHeartbeat(am1.getApplicationAttemptId(),1,ContainerState.COMPLETE);
+  rm1.waitForState(am1.getApplicationAttemptId(),RMAppAttemptState.FAILED);
+  TestSchedulerUtils.waitSchedulerApplicationAttemptStopped(ys,am1.getApplicationAttemptId());
+  MockAM am2=launchAM(app1,rm1,nm1);
+  Assert.assertEquals(1,rmAppState.size());
+  Assert.assertEquals(app1.getState(),RMAppState.RUNNING);
+  Assert.assertEquals(app1.getAppAttempts().get(app1.getCurrentAppAttempt().getAppAttemptId()).getAppAttemptState(),RMAppAttemptState.RUNNING);
+  MockRM rm2=createMockRM(conf,memStore);
+  rm2.start();
+  nm1.setResourceTrackerService(rm2.getResourceTrackerService());
+  NodeHeartbeatResponse res=nm1.nodeHeartbeat(true);
+  Assert.assertEquals(NodeAction.RESYNC,res.getNodeAction());
+  RMApp rmApp=rm2.getRMContext().getRMApps().get(app1.getApplicationId());
+  rm2.waitForState(app1.getApplicationId(),RMAppState.ACCEPTED);
+  Assert.assertEquals(RMAppState.ACCEPTED,rmApp.getState());
+  Assert.assertEquals(2,rmApp.getAppAttempts().size());
+  rm2.waitForState(am1.getApplicationAttemptId(),RMAppAttemptState.FAILED);
+  rm2.waitForState(am2.getApplicationAttemptId(),RMAppAttemptState.LAUNCHED);
+  Assert.assertEquals(RMAppAttemptState.FAILED,rmApp.getAppAttempts().get(am1.getApplicationAttemptId()).getAppAttemptState());
+  Assert.assertEquals(RMAppAttemptState.LAUNCHED,rmApp.getAppAttempts().get(am2.getApplicationAttemptId()).getAppAttemptState());
+  NMContainerStatus status=TestRMRestart.createNMContainerStatus(am2.getApplicationAttemptId(),1,ContainerState.COMPLETE);
+  nm1.registerNode(Arrays.asList(status),null);
+  rm2.waitForState(am2.getApplicationAttemptId(),RMAppAttemptState.FAILED);
+  ys=(AbstractYarnScheduler)rm2.getResourceScheduler();
+  TestSchedulerUtils.waitSchedulerApplicationAttemptStopped(ys,am2.getApplicationAttemptId());
+  launchAM(rmApp,rm2,nm1);
+  Assert.assertEquals(3,rmApp.getAppAttempts().size());
+  rm2.waitForState(rmApp.getCurrentAppAttempt().getAppAttemptId(),RMAppAttemptState.RUNNING);
+  conf.setInt(YarnConfiguration.RM_AM_EXPIRY_INTERVAL_MS,10000);
+  MockRM rm3=createMockRM(conf,memStore);
+  rm3.start();
+  nm1.setResourceTrackerService(rm3.getResourceTrackerService());
+  rmApp=rm3.getRMContext().getRMApps().get(app1.getApplicationId());
+  rm3.waitForState(app1.getApplicationId(),RMAppState.ACCEPTED);
+  Assert.assertEquals(rmApp.getState(),RMAppState.ACCEPTED);
+  Assert.assertEquals(3,rmApp.getAppAttempts().size());
+  rm3.waitForState(am1.getApplicationAttemptId(),RMAppAttemptState.FAILED);
+  rm3.waitForState(am2.getApplicationAttemptId(),RMAppAttemptState.FAILED);
+  ApplicationAttemptId latestAppAttemptId=rmApp.getCurrentAppAttempt().getAppAttemptId();
+  rm3.waitForState(latestAppAttemptId,RMAppAttemptState.LAUNCHED);
+  Assert.assertEquals(RMAppAttemptState.FAILED,rmApp.getAppAttempts().get(am1.getApplicationAttemptId()).getAppAttemptState());
+  Assert.assertEquals(RMAppAttemptState.FAILED,rmApp.getAppAttempts().get(am2.getApplicationAttemptId()).getAppAttemptState());
+  Assert.assertEquals(RMAppAttemptState.LAUNCHED,rmApp.getAppAttempts().get(latestAppAttemptId).getAppAttemptState());
+  rm3.waitForState(latestAppAttemptId,RMAppAttemptState.FAILED);
+  rm3.waitForState(rmApp.getApplicationId(),RMAppState.ACCEPTED);
+  final int maxRetry=10;
+  final RMApp rmAppForCheck=rmApp;
+  GenericTestUtils.waitFor(new Supplier<Boolean>(){
+    @Override public Boolean get(){
+      return new Boolean(rmAppForCheck.getAppAttempts().size() == 4);
+    }
+  }
+,100,maxRetry * 100);
+  Assert.assertEquals(RMAppAttemptState.FAILED,rmApp.getAppAttempts().get(latestAppAttemptId).getAppAttemptState());
+  latestAppAttemptId=rmApp.getCurrentAppAttempt().getAppAttemptId();
+  RMApp app2=rm3.submitApp(200);
+  rm3.waitForState(app2.getApplicationId(),RMAppState.ACCEPTED);
+  Assert.assertEquals(1,app2.getAppAttempts().size());
+  Assert.assertEquals(0,memStore.getState().getApplicationState().get(app2.getApplicationId()).getAttemptCount());
+  MockRM rm4=createMockRM(conf,memStore);
+  rm4.start();
+  rmApp=rm4.getRMContext().getRMApps().get(app1.getApplicationId());
+  rm4.waitForState(rmApp.getApplicationId(),RMAppState.ACCEPTED);
+  int timeoutSecs=0;
+  while (rmApp.getAppAttempts().size() != 2 && timeoutSecs++ < 40) {
+    Thread.sleep(200);
+  }
+  Assert.assertEquals(4,rmApp.getAppAttempts().size());
+  Assert.assertEquals(RMAppState.ACCEPTED,rmApp.getState());
+  rm4.waitForState(latestAppAttemptId,RMAppAttemptState.SCHEDULED);
+  Assert.assertEquals(RMAppAttemptState.SCHEDULED,rmApp.getAppAttempts().get(latestAppAttemptId).getAppAttemptState());
+  app2=rm4.getRMContext().getRMApps().get(app2.getApplicationId());
+  rm4.waitForState(app2.getApplicationId(),RMAppState.ACCEPTED);
+  Assert.assertEquals(RMAppState.ACCEPTED,app2.getState());
+  Assert.assertEquals(1,app2.getAppAttempts().size());
+  rm4.waitForState(app2.getCurrentAppAttempt().getAppAttemptId(),RMAppAttemptState.SCHEDULED);
+  Assert.assertEquals(RMAppAttemptState.SCHEDULED,app2.getCurrentAppAttempt().getAppAttemptState());
+}

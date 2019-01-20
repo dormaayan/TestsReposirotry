@@ -1,0 +1,122 @@
+private static class TaskExecutorServiceForTest extends TaskExecutorService {
+  private final Lock iclCreationLock=new ReentrantLock();
+  private final Map<String,Condition> iclCreationConditions=new HashMap<>();
+  private final Lock tryScheduleLock=new ReentrantLock();
+  private final Condition tryScheduleCondition=tryScheduleLock.newCondition();
+  private boolean isInTrySchedule=false;
+  private int scheduleAttempts=0;
+  public TaskExecutorServiceForTest(  int numExecutors,  int waitQueueSize,  String waitQueueComparatorClassName,  boolean enablePreemption){
+    this(numExecutors,waitQueueSize,waitQueueComparatorClassName,enablePreemption,null);
+  }
+  public TaskExecutorServiceForTest(  int numExecutors,  int waitQueueSize,  String waitQueueComparatorClassName,  boolean enablePreemption,  Clock clock){
+    super(numExecutors,waitQueueSize,waitQueueComparatorClassName,enablePreemption,Thread.currentThread().getContextClassLoader(),null,clock);
+  }
+  private ConcurrentMap<String,InternalCompletionListenerForTest> completionListeners=new ConcurrentHashMap<>();
+  @Override void tryScheduleUnderLock(  final TaskWrapper taskWrapper) throws RejectedExecutionException {
+    tryScheduleLock.lock();
+    try {
+      isInTrySchedule=true;
+      super.tryScheduleUnderLock(taskWrapper);
+    }
+  finally {
+      isInTrySchedule=false;
+      ++scheduleAttempts;
+      tryScheduleCondition.signal();
+      tryScheduleLock.unlock();
+    }
+  }
+  public void waitForScheduleRuns(  int n) throws InterruptedException {
+    tryScheduleLock.lock();
+    try {
+      int targetRuns=scheduleAttempts + n;
+      while (scheduleAttempts < targetRuns) {
+        tryScheduleCondition.await(100,TimeUnit.MILLISECONDS);
+      }
+    }
+  finally {
+      tryScheduleLock.unlock();
+    }
+  }
+  private void awaitTryScheduleIfInProgress() throws InterruptedException {
+    tryScheduleLock.lock();
+    try {
+      while (isInTrySchedule) {
+        tryScheduleCondition.await();
+      }
+    }
+  finally {
+      tryScheduleLock.unlock();
+    }
+  }
+  @Override InternalCompletionListener createInternalCompletionListener(  TaskWrapper taskWrapper){
+    iclCreationLock.lock();
+    try {
+      InternalCompletionListenerForTest icl=new InternalCompletionListenerForTest(taskWrapper);
+      completionListeners.put(taskWrapper.getRequestId(),icl);
+      Condition condition=iclCreationConditions.get(taskWrapper.getRequestId());
+      if (condition == null) {
+        condition=iclCreationLock.newCondition();
+        iclCreationConditions.put(taskWrapper.getRequestId(),condition);
+      }
+      condition.signalAll();
+      return icl;
+    }
+  finally {
+      iclCreationLock.unlock();
+    }
+  }
+  InternalCompletionListenerForTest getInternalCompletionListenerForTest(  String requestId) throws InterruptedException {
+    iclCreationLock.lock();
+    try {
+      Condition condition=iclCreationConditions.get(requestId);
+      if (condition == null) {
+        condition=iclCreationLock.newCondition();
+        iclCreationConditions.put(requestId,condition);
+      }
+      while (completionListeners.get(requestId) == null) {
+        condition.await();
+      }
+      return completionListeners.get(requestId);
+    }
+  finally {
+      iclCreationLock.unlock();
+    }
+  }
+private class InternalCompletionListenerForTest extends TaskExecutorService.InternalCompletionListener {
+    private final Lock lock=new ReentrantLock();
+    private final Condition completionCondition=lock.newCondition();
+    private final AtomicBoolean isComplete=new AtomicBoolean(false);
+    public InternalCompletionListenerForTest(    TaskWrapper taskWrapper){
+      super(taskWrapper);
+    }
+    @Override public void onSuccess(    TaskRunner2Result result){
+      super.onSuccess(result);
+      markComplete();
+    }
+    @Override public void onFailure(    Throwable t){
+      super.onFailure(t);
+      markComplete();
+    }
+    private void markComplete(){
+      lock.lock();
+      try {
+        isComplete.set(true);
+        completionCondition.signal();
+      }
+  finally {
+        lock.unlock();
+      }
+    }
+    private void awaitCompletion() throws InterruptedException {
+      lock.lock();
+      try {
+        while (!isComplete.get()) {
+          completionCondition.await();
+        }
+      }
+  finally {
+        lock.unlock();
+      }
+    }
+  }
+}

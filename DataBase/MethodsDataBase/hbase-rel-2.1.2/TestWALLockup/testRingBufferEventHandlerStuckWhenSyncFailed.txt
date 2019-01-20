@@ -1,0 +1,92 @@
+/** 
+ * If below is broken, we will see this test timeout because RingBufferEventHandler was stuck in attainSafePoint. Everyone will wait for sync to finish forever. See HBASE-14317.
+ */
+@Test(timeout=30000) public void testRingBufferEventHandlerStuckWhenSyncFailed() throws IOException, InterruptedException {
+class DodgyFSLog extends FSHLog {
+    private volatile boolean zigZagCreated=false;
+    public DodgyFSLog(    FileSystem fs,    Path root,    String logDir,    Configuration conf) throws IOException {
+      super(fs,root,logDir,conf);
+    }
+    @Override protected void afterCreatingZigZagLatch(){
+      zigZagCreated=true;
+      try {
+        Thread.sleep(3000);
+      }
+ catch (      InterruptedException ignore) {
+      }
+    }
+    @Override protected long getSequenceOnRingBuffer(){
+      return super.getSequenceOnRingBuffer();
+    }
+    protected void publishSyncOnRingBufferAndBlock(    long sequence){
+      try {
+        super.blockOnSync(super.publishSyncOnRingBuffer(sequence,false));
+        Assert.fail("Expect an IOException here.");
+      }
+ catch (      IOException ignore) {
+      }
+    }
+    @Override protected Writer createWriterInstance(    Path path) throws IOException {
+      final Writer w=super.createWriterInstance(path);
+      return new Writer(){
+        @Override public void close() throws IOException {
+          w.close();
+        }
+        @Override public void sync(        boolean forceSync) throws IOException {
+          throw new IOException("FAKE! Failed to replace a bad datanode...SYNC");
+        }
+        @Override public void append(        Entry entry) throws IOException {
+          w.append(entry);
+        }
+        @Override public long getLength(){
+          return w.getLength();
+        }
+      }
+;
+    }
+  }
+  final Server server=Mockito.mock(Server.class);
+  Mockito.when(server.getConfiguration()).thenReturn(CONF);
+  Mockito.when(server.isStopped()).thenReturn(false);
+  Mockito.when(server.isAborted()).thenReturn(false);
+  RegionServerServices services=Mockito.mock(RegionServerServices.class);
+  FileSystem fs=FileSystem.get(CONF);
+  Path rootDir=new Path(dir + getName());
+  final DodgyFSLog dodgyWAL=new DodgyFSLog(fs,rootDir,getName(),CONF);
+  LogRoller logRoller=new LogRoller(server,services);
+  logRoller.addWAL(dodgyWAL);
+  logRoller.start();
+  try {
+    final long seqForSync=dodgyWAL.getSequenceOnRingBuffer();
+    LOG.info("Trigger log roll for creating a ZigZagLatch.");
+    logRoller.requestRollAll();
+    while (!dodgyWAL.zigZagCreated) {
+      Thread.sleep(10);
+    }
+    LOG.info("Send sync for RingBufferEventHandler");
+    Thread syncThread=new Thread(){
+      @Override public void run(){
+        dodgyWAL.publishSyncOnRingBufferAndBlock(seqForSync);
+      }
+    }
+;
+    syncThread.start();
+    syncThread.join();
+    try {
+      LOG.info("Call sync for testing whether RingBufferEventHandler is hanging.");
+      dodgyWAL.sync(false);
+      Assert.fail("Expect an IOException here.");
+    }
+ catch (    IOException ignore) {
+    }
+  }
+  finally {
+    Mockito.when(server.isStopped()).thenReturn(true);
+    if (logRoller != null) {
+      logRoller.interrupt();
+    }
+    if (dodgyWAL != null) {
+      dodgyWAL.close();
+    }
+  }
+}

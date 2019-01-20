@@ -1,0 +1,303 @@
+/** 
+ * Test creating/using/deleting snapshots from the client <p> This is an end-to-end test for the snapshot utility TODO This is essentially a clone of TestSnapshotFromClient.  This is worth refactoring this because there will be a few more flavors of snapshots that need to run these tests.
+ */
+@Category({RegionServerTests.class,LargeTests.class}) public class TestFlushSnapshotFromClient {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestFlushSnapshotFromClient.class);
+  private static final Logger LOG=LoggerFactory.getLogger(TestFlushSnapshotFromClient.class);
+  protected static final HBaseTestingUtility UTIL=new HBaseTestingUtility();
+  protected static final int NUM_RS=2;
+  protected static final byte[] TEST_FAM=Bytes.toBytes("fam");
+  protected static final TableName TABLE_NAME=TableName.valueOf("test");
+  protected final int DEFAULT_NUM_ROWS=100;
+  protected Admin admin=null;
+  @BeforeClass public static void setupCluster() throws Exception {
+    setupConf(UTIL.getConfiguration());
+    UTIL.startMiniCluster(NUM_RS);
+  }
+  protected static void setupConf(  Configuration conf){
+    conf.setInt("hbase.regionsever.info.port",-1);
+    conf.setInt("hbase.hregion.memstore.flush.size",25000);
+    conf.setInt("hbase.hstore.compaction.min",10);
+    conf.setInt("hbase.hstore.compactionThreshold",10);
+    conf.setInt("hbase.hstore.blockingStoreFiles",12);
+    conf.setBoolean(SnapshotManager.HBASE_SNAPSHOT_ENABLED,true);
+    conf.set(HConstants.HBASE_REGION_SPLIT_POLICY_KEY,ConstantSizeRegionSplitPolicy.class.getName());
+  }
+  @Before public void setup() throws Exception {
+    createTable();
+    this.admin=UTIL.getConnection().getAdmin();
+  }
+  protected void createTable() throws Exception {
+    SnapshotTestingUtils.createTable(UTIL,TABLE_NAME,TEST_FAM);
+  }
+  @After public void tearDown() throws Exception {
+    UTIL.deleteTable(TABLE_NAME);
+    SnapshotTestingUtils.deleteAllSnapshots(this.admin);
+    this.admin.close();
+    SnapshotTestingUtils.deleteArchiveDirectory(UTIL);
+  }
+  @AfterClass public static void cleanupTest() throws Exception {
+    try {
+      UTIL.shutdownMiniCluster();
+    }
+ catch (    Exception e) {
+      LOG.warn("failure shutting down cluster",e);
+    }
+  }
+  /** 
+ * Test simple flush snapshotting a table that is online
+ * @throws Exception
+ */
+  @Test public void testFlushTableSnapshot() throws Exception {
+    SnapshotTestingUtils.assertNoSnapshots(admin);
+    SnapshotTestingUtils.loadData(UTIL,TABLE_NAME,DEFAULT_NUM_ROWS,TEST_FAM);
+    LOG.debug("FS state before snapshot:");
+    UTIL.getHBaseCluster().getMaster().getMasterFileSystem().logFileSystemState(LOG);
+    String snapshotString="offlineTableSnapshot";
+    byte[] snapshot=Bytes.toBytes(snapshotString);
+    admin.snapshot(snapshotString,TABLE_NAME,SnapshotType.FLUSH);
+    LOG.debug("Snapshot completed.");
+    List<SnapshotDescription> snapshots=SnapshotTestingUtils.assertOneSnapshotThatMatches(admin,snapshot,TABLE_NAME);
+    LOG.debug("FS state after snapshot:");
+    UTIL.getHBaseCluster().getMaster().getMasterFileSystem().logFileSystemState(LOG);
+    SnapshotTestingUtils.confirmSnapshotValid(UTIL,ProtobufUtil.createHBaseProtosSnapshotDesc(snapshots.get(0)),TABLE_NAME,TEST_FAM);
+  }
+  /** 
+ * Test snapshotting a table that is online without flushing
+ * @throws Exception
+ */
+  @Test public void testSkipFlushTableSnapshot() throws Exception {
+    SnapshotTestingUtils.assertNoSnapshots(admin);
+    Table table=UTIL.getConnection().getTable(TABLE_NAME);
+    UTIL.loadTable(table,TEST_FAM);
+    UTIL.flush(TABLE_NAME);
+    LOG.debug("FS state before snapshot:");
+    UTIL.getHBaseCluster().getMaster().getMasterFileSystem().logFileSystemState(LOG);
+    String snapshotString="skipFlushTableSnapshot";
+    byte[] snapshot=Bytes.toBytes(snapshotString);
+    admin.snapshot(snapshotString,TABLE_NAME,SnapshotType.SKIPFLUSH);
+    LOG.debug("Snapshot completed.");
+    List<SnapshotDescription> snapshots=SnapshotTestingUtils.assertOneSnapshotThatMatches(admin,snapshot,TABLE_NAME);
+    LOG.debug("FS state after snapshot:");
+    UTIL.getHBaseCluster().getMaster().getMasterFileSystem().logFileSystemState(LOG);
+    SnapshotTestingUtils.confirmSnapshotValid(UTIL,ProtobufUtil.createHBaseProtosSnapshotDesc(snapshots.get(0)),TABLE_NAME,TEST_FAM);
+    admin.deleteSnapshot(snapshot);
+    snapshots=admin.listSnapshots();
+    SnapshotTestingUtils.assertNoSnapshots(admin);
+  }
+  /** 
+ * Test simple flush snapshotting a table that is online
+ * @throws Exception
+ */
+  @Test public void testFlushTableSnapshotWithProcedure() throws Exception {
+    SnapshotTestingUtils.assertNoSnapshots(admin);
+    SnapshotTestingUtils.loadData(UTIL,TABLE_NAME,DEFAULT_NUM_ROWS,TEST_FAM);
+    LOG.debug("FS state before snapshot:");
+    UTIL.getHBaseCluster().getMaster().getMasterFileSystem().logFileSystemState(LOG);
+    String snapshotString="offlineTableSnapshot";
+    byte[] snapshot=Bytes.toBytes(snapshotString);
+    Map<String,String> props=new HashMap<>();
+    props.put("table",TABLE_NAME.getNameAsString());
+    admin.execProcedure(SnapshotManager.ONLINE_SNAPSHOT_CONTROLLER_DESCRIPTION,snapshotString,props);
+    LOG.debug("Snapshot completed.");
+    List<SnapshotDescription> snapshots=SnapshotTestingUtils.assertOneSnapshotThatMatches(admin,snapshot,TABLE_NAME);
+    LOG.debug("FS state after snapshot:");
+    UTIL.getHBaseCluster().getMaster().getMasterFileSystem().logFileSystemState(LOG);
+    SnapshotTestingUtils.confirmSnapshotValid(UTIL,ProtobufUtil.createHBaseProtosSnapshotDesc(snapshots.get(0)),TABLE_NAME,TEST_FAM);
+  }
+  @Test public void testSnapshotFailsOnNonExistantTable() throws Exception {
+    SnapshotTestingUtils.assertNoSnapshots(admin);
+    TableName tableName=TableName.valueOf("_not_a_table");
+    boolean fail=false;
+    do {
+      try {
+        admin.getTableDescriptor(tableName);
+        fail=true;
+        LOG.error("Table:" + tableName + " already exists, checking a new name");
+        tableName=TableName.valueOf(tableName + "!");
+      }
+ catch (      TableNotFoundException e) {
+        fail=false;
+      }
+    }
+ while (fail);
+    try {
+      admin.snapshot("fail",tableName,SnapshotType.FLUSH);
+      fail("Snapshot succeeded even though there is not table.");
+    }
+ catch (    SnapshotCreationException e) {
+      LOG.info("Correctly failed to snapshot a non-existant table:" + e.getMessage());
+    }
+  }
+  @Test public void testAsyncFlushSnapshot() throws Exception {
+    SnapshotProtos.SnapshotDescription snapshot=SnapshotProtos.SnapshotDescription.newBuilder().setName("asyncSnapshot").setTable(TABLE_NAME.getNameAsString()).setType(SnapshotProtos.SnapshotDescription.Type.FLUSH).build();
+    admin.takeSnapshotAsync(new SnapshotDescription("asyncSnapshot",TABLE_NAME,SnapshotType.FLUSH));
+    HMaster master=UTIL.getMiniHBaseCluster().getMaster();
+    SnapshotTestingUtils.waitForSnapshotToComplete(master,snapshot,200);
+    LOG.info(" === Async Snapshot Completed ===");
+    UTIL.getHBaseCluster().getMaster().getMasterFileSystem().logFileSystemState(LOG);
+    SnapshotTestingUtils.assertOneSnapshotThatMatches(admin,snapshot);
+  }
+  @Test public void testSnapshotStateAfterMerge() throws Exception {
+    int numRows=DEFAULT_NUM_ROWS;
+    SnapshotTestingUtils.assertNoSnapshots(admin);
+    SnapshotTestingUtils.loadData(UTIL,TABLE_NAME,numRows,TEST_FAM);
+    String snapshotBeforeMergeName="snapshotBeforeMerge";
+    admin.snapshot(snapshotBeforeMergeName,TABLE_NAME,SnapshotType.FLUSH);
+    TableName cloneBeforeMergeName=TableName.valueOf("cloneBeforeMerge");
+    admin.cloneSnapshot(snapshotBeforeMergeName,cloneBeforeMergeName);
+    SnapshotTestingUtils.waitForTableToBeOnline(UTIL,cloneBeforeMergeName);
+    List<HRegionInfo> regions=admin.getTableRegions(TABLE_NAME);
+    Collections.sort(regions,new Comparator<HRegionInfo>(){
+      @Override public int compare(      HRegionInfo r1,      HRegionInfo r2){
+        return Bytes.compareTo(r1.getStartKey(),r2.getStartKey());
+      }
+    }
+);
+    int numRegions=admin.getTableRegions(TABLE_NAME).size();
+    int numRegionsAfterMerge=numRegions - 2;
+    admin.mergeRegionsAsync(regions.get(1).getEncodedNameAsBytes(),regions.get(2).getEncodedNameAsBytes(),true);
+    admin.mergeRegionsAsync(regions.get(4).getEncodedNameAsBytes(),regions.get(5).getEncodedNameAsBytes(),true);
+    waitRegionsAfterMerge(numRegionsAfterMerge);
+    assertEquals(numRegionsAfterMerge,admin.getTableRegions(TABLE_NAME).size());
+    TableName cloneAfterMergeName=TableName.valueOf("cloneAfterMerge");
+    admin.cloneSnapshot(snapshotBeforeMergeName,cloneAfterMergeName);
+    SnapshotTestingUtils.waitForTableToBeOnline(UTIL,cloneAfterMergeName);
+    verifyRowCount(UTIL,TABLE_NAME,numRows);
+    verifyRowCount(UTIL,cloneBeforeMergeName,numRows);
+    verifyRowCount(UTIL,cloneAfterMergeName,numRows);
+    UTIL.deleteTable(cloneAfterMergeName);
+    UTIL.deleteTable(cloneBeforeMergeName);
+  }
+  @Test public void testTakeSnapshotAfterMerge() throws Exception {
+    int numRows=DEFAULT_NUM_ROWS;
+    SnapshotTestingUtils.assertNoSnapshots(admin);
+    SnapshotTestingUtils.loadData(UTIL,TABLE_NAME,numRows,TEST_FAM);
+    List<HRegionInfo> regions=admin.getTableRegions(TABLE_NAME);
+    Collections.sort(regions,new Comparator<HRegionInfo>(){
+      @Override public int compare(      HRegionInfo r1,      HRegionInfo r2){
+        return Bytes.compareTo(r1.getStartKey(),r2.getStartKey());
+      }
+    }
+);
+    int numRegions=admin.getTableRegions(TABLE_NAME).size();
+    int numRegionsAfterMerge=numRegions - 2;
+    admin.mergeRegionsAsync(regions.get(1).getEncodedNameAsBytes(),regions.get(2).getEncodedNameAsBytes(),true);
+    admin.mergeRegionsAsync(regions.get(4).getEncodedNameAsBytes(),regions.get(5).getEncodedNameAsBytes(),true);
+    waitRegionsAfterMerge(numRegionsAfterMerge);
+    assertEquals(numRegionsAfterMerge,admin.getTableRegions(TABLE_NAME).size());
+    String snapshotName="snapshotAfterMerge";
+    SnapshotTestingUtils.snapshot(admin,snapshotName,TABLE_NAME,SnapshotType.FLUSH,3);
+    TableName cloneName=TableName.valueOf("cloneMerge");
+    admin.cloneSnapshot(snapshotName,cloneName);
+    SnapshotTestingUtils.waitForTableToBeOnline(UTIL,cloneName);
+    verifyRowCount(UTIL,TABLE_NAME,numRows);
+    verifyRowCount(UTIL,cloneName,numRows);
+    UTIL.deleteTable(cloneName);
+  }
+  /** 
+ * Basic end-to-end test of simple-flush-based snapshots
+ */
+  @Test public void testFlushCreateListDestroy() throws Exception {
+    LOG.debug("------- Starting Snapshot test -------------");
+    SnapshotTestingUtils.assertNoSnapshots(admin);
+    SnapshotTestingUtils.loadData(UTIL,TABLE_NAME,DEFAULT_NUM_ROWS,TEST_FAM);
+    String snapshotName="flushSnapshotCreateListDestroy";
+    FileSystem fs=UTIL.getHBaseCluster().getMaster().getMasterFileSystem().getFileSystem();
+    Path rootDir=UTIL.getHBaseCluster().getMaster().getMasterFileSystem().getRootDir();
+    SnapshotTestingUtils.createSnapshotAndValidate(admin,TABLE_NAME,Bytes.toString(TEST_FAM),snapshotName,rootDir,fs,true);
+  }
+  /** 
+ * Demonstrate that we reject snapshot requests if there is a snapshot already running on the same table currently running and that concurrent snapshots on different tables can both succeed concurretly.
+ */
+  @Test public void testConcurrentSnapshottingAttempts() throws IOException, InterruptedException {
+    final TableName TABLE2_NAME=TableName.valueOf(TABLE_NAME + "2");
+    int ssNum=20;
+    SnapshotTestingUtils.assertNoSnapshots(admin);
+    SnapshotTestingUtils.createTable(UTIL,TABLE2_NAME,TEST_FAM);
+    SnapshotTestingUtils.loadData(UTIL,TABLE_NAME,DEFAULT_NUM_ROWS,TEST_FAM);
+    SnapshotTestingUtils.loadData(UTIL,TABLE2_NAME,DEFAULT_NUM_ROWS,TEST_FAM);
+    final CountDownLatch toBeSubmitted=new CountDownLatch(ssNum);
+class SSRunnable implements Runnable {
+      SnapshotDescription ss;
+      SSRunnable(      SnapshotDescription ss){
+        this.ss=ss;
+      }
+      @Override public void run(){
+        try {
+          LOG.info("Submitting snapshot request: " + ClientSnapshotDescriptionUtils.toString(ProtobufUtil.createHBaseProtosSnapshotDesc(ss)));
+          admin.takeSnapshotAsync(ss);
+        }
+ catch (        Exception e) {
+          LOG.info("Exception during snapshot request: " + ClientSnapshotDescriptionUtils.toString(ProtobufUtil.createHBaseProtosSnapshotDesc(ss)) + ".  This is ok, we expect some",e);
+        }
+        LOG.info("Submitted snapshot request: " + ClientSnapshotDescriptionUtils.toString(ProtobufUtil.createHBaseProtosSnapshotDesc(ss)));
+        toBeSubmitted.countDown();
+      }
+    }
+    ;
+    SnapshotDescription[] descs=new SnapshotDescription[ssNum];
+    for (int i=0; i < ssNum; i++) {
+      if (i % 2 == 0) {
+        descs[i]=new SnapshotDescription("ss" + i,TABLE_NAME,SnapshotType.FLUSH);
+      }
+ else {
+        descs[i]=new SnapshotDescription("ss" + i,TABLE2_NAME,SnapshotType.FLUSH);
+      }
+    }
+    for (int i=0; i < ssNum; i++) {
+      new Thread(new SSRunnable(descs[i])).start();
+    }
+    toBeSubmitted.await();
+    while (true) {
+      int doneCount=0;
+      for (      SnapshotDescription ss : descs) {
+        try {
+          if (admin.isSnapshotFinished(ss)) {
+            doneCount++;
+          }
+        }
+ catch (        Exception e) {
+          LOG.warn("Got an exception when checking for snapshot " + ss.getName(),e);
+          doneCount++;
+        }
+      }
+      if (doneCount == descs.length) {
+        break;
+      }
+      Thread.sleep(100);
+    }
+    UTIL.getHBaseCluster().getMaster().getMasterFileSystem().logFileSystemState(LOG);
+    List<SnapshotDescription> taken=admin.listSnapshots();
+    int takenSize=taken.size();
+    LOG.info("Taken " + takenSize + " snapshots:  "+ taken);
+    assertTrue("We expect at least 1 request to be rejected because of we concurrently" + " issued many requests",takenSize < ssNum && takenSize > 0);
+    int t1SnapshotsCount=0;
+    int t2SnapshotsCount=0;
+    for (    SnapshotDescription ss : taken) {
+      if (ss.getTableName().equals(TABLE_NAME)) {
+        t1SnapshotsCount++;
+      }
+ else       if (ss.getTableName().equals(TABLE2_NAME)) {
+        t2SnapshotsCount++;
+      }
+    }
+    assertTrue("We expect at least 1 snapshot of table1 ",t1SnapshotsCount > 0);
+    assertTrue("We expect at least 1 snapshot of table2 ",t2SnapshotsCount > 0);
+    UTIL.deleteTable(TABLE2_NAME);
+  }
+  private void waitRegionsAfterMerge(  final long numRegionsAfterMerge) throws IOException, InterruptedException {
+    long startTime=System.currentTimeMillis();
+    while (admin.getTableRegions(TABLE_NAME).size() != numRegionsAfterMerge) {
+      if ((System.currentTimeMillis() - startTime) > 15000)       break;
+      Thread.sleep(100);
+    }
+    SnapshotTestingUtils.waitForTableToBeOnline(UTIL,TABLE_NAME);
+  }
+  protected void verifyRowCount(  final HBaseTestingUtility util,  final TableName tableName,  long expectedRows) throws IOException {
+    SnapshotTestingUtils.verifyRowCount(util,tableName,expectedRows);
+  }
+  protected int countRows(  final Table table,  final byte[]... families) throws IOException {
+    return UTIL.countRows(table,families);
+  }
+}

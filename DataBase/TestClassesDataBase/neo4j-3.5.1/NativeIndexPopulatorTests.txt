@@ -1,0 +1,389 @@
+public abstract class NativeIndexPopulatorTests<KEY extends NativeIndexKey<KEY>,VALUE extends NativeIndexValue> extends NativeIndexTestUtil<KEY,VALUE> {
+  private static final int LARGE_AMOUNT_OF_UPDATES=1_000;
+  static final NodePropertyAccessor null_property_accessor=(nodeId,propKeyId) -> {
+    throw new RuntimeException("Did not expect an attempt to go to store");
+  }
+;
+  NativeIndexPopulator<KEY,VALUE> populator;
+  @Before public void setupPopulator() throws IOException {
+    populator=createPopulator();
+  }
+  abstract NativeIndexPopulator<KEY,VALUE> createPopulator() throws IOException ;
+  @Test public void createShouldCreateFile(){
+    assertFileNotPresent();
+    populator.create();
+    assertFilePresent();
+    populator.close(true);
+  }
+  @Test public void createShouldClearExistingFile() throws Exception {
+    byte[] someBytes=fileWithContent();
+    populator.create();
+    try (StoreChannel r=fs.open(getIndexFile(),OpenMode.READ)){
+      byte[] firstBytes=new byte[someBytes.length];
+      r.readAll(ByteBuffer.wrap(firstBytes));
+      assertNotEquals("Expected previous file content to have been cleared but was still there",someBytes,firstBytes);
+    }
+     populator.close(true);
+  }
+  @Test public void dropShouldDeleteExistingFile(){
+    populator.create();
+    populator.drop();
+    assertFileNotPresent();
+  }
+  @Test public void dropShouldSucceedOnNonExistentFile(){
+    assertFileNotPresent();
+    populator.drop();
+    assertFileNotPresent();
+  }
+  @Test public void addShouldHandleEmptyCollection() throws Exception {
+    populator.create();
+    List<IndexEntryUpdate<?>> updates=Collections.emptyList();
+    populator.add(updates);
+    populator.close(true);
+  }
+  @Test public void addShouldApplyAllUpdatesOnce() throws Exception {
+    populator.create();
+    @SuppressWarnings("unchecked") IndexEntryUpdate<IndexDescriptor>[] updates=valueCreatorUtil.someUpdates(random);
+    populator.add(Arrays.asList(updates));
+    populator.close(true);
+    verifyUpdates(updates);
+  }
+  @Test public void updaterShouldApplyUpdates() throws Exception {
+    populator.create();
+    IndexEntryUpdate<IndexDescriptor>[] updates=valueCreatorUtil.someUpdates(random);
+    try (IndexUpdater updater=populator.newPopulatingUpdater(null_property_accessor)){
+      for (      IndexEntryUpdate<IndexDescriptor> update : updates) {
+        updater.process(update);
+      }
+    }
+     populator.close(true);
+    verifyUpdates(updates);
+  }
+  @Test public void updaterMustThrowIfProcessAfterClose() throws Exception {
+    populator.create();
+    IndexUpdater updater=populator.newPopulatingUpdater(null_property_accessor);
+    updater.close();
+    try {
+      updater.process(valueCreatorUtil.add(1,Values.of(Long.MAX_VALUE)));
+      fail("Expected process to throw on closed updater");
+    }
+ catch (    IllegalStateException e) {
+    }
+    populator.close(true);
+  }
+  @Test public void shouldApplyInterleavedUpdatesFromAddAndUpdater() throws Exception {
+    populator.create();
+    @SuppressWarnings("unchecked") IndexEntryUpdate<IndexDescriptor>[] updates=valueCreatorUtil.someUpdates(random);
+    applyInterleaved(updates,populator);
+    populator.close(true);
+    verifyUpdates(updates);
+  }
+  @Test public void successfulCloseMustCloseGBPTree() throws Exception {
+    populator.create();
+    Optional<PagedFile> existingMapping=pageCache.getExistingMapping(getIndexFile());
+    if (existingMapping.isPresent()) {
+      existingMapping.get().close();
+    }
+ else {
+      fail("Expected underlying GBPTree to have a mapping for this file");
+    }
+    populator.close(true);
+    existingMapping=pageCache.getExistingMapping(getIndexFile());
+    assertFalse(existingMapping.isPresent());
+  }
+  @Test public void successfulCloseMustMarkIndexAsOnline() throws Exception {
+    populator.create();
+    populator.close(true);
+    assertHeader(true,null,false);
+  }
+  @Test public void unsuccessfulCloseMustSucceedWithoutMarkAsFailed(){
+    populator.create();
+    populator.close(false);
+  }
+  @Test public void unsuccessfulCloseMustCloseGBPTree() throws Exception {
+    populator.create();
+    Optional<PagedFile> existingMapping=pageCache.getExistingMapping(getIndexFile());
+    if (existingMapping.isPresent()) {
+      existingMapping.get().close();
+    }
+ else {
+      fail("Expected underlying GBPTree to have a mapping for this file");
+    }
+    populator.close(false);
+    existingMapping=pageCache.getExistingMapping(getIndexFile());
+    assertFalse(existingMapping.isPresent());
+  }
+  @Test public void unsuccessfulCloseMustNotMarkIndexAsOnline() throws Exception {
+    populator.create();
+    populator.close(false);
+    assertHeader(false,"",false);
+  }
+  @Test public void closeMustWriteFailureMessageAfterMarkedAsFailed() throws Exception {
+    populator.create();
+    String failureMessage="Fly, you fools!";
+    populator.markAsFailed(failureMessage);
+    populator.close(false);
+    assertHeader(false,failureMessage,false);
+  }
+  @Test public void closeMustWriteFailureMessageAfterMarkedAsFailedWithLongMessage() throws Exception {
+    populator.create();
+    String failureMessage=longString(pageCache.pageSize());
+    populator.markAsFailed(failureMessage);
+    populator.close(false);
+    assertHeader(false,failureMessage,true);
+  }
+  @Test public void successfulCloseMustThrowIfMarkedAsFailed(){
+    populator.create();
+    populator.markAsFailed("");
+    try {
+      populator.close(true);
+      fail("Expected successful close to fail after markedAsFailed");
+    }
+ catch (    IllegalStateException e) {
+    }
+    populator.close(false);
+  }
+  @Test public void shouldApplyLargeAmountOfInterleavedRandomUpdates() throws Exception {
+    populator.create();
+    random.reset();
+    Random updaterRandom=new Random(random.seed());
+    Iterator<IndexEntryUpdate<IndexDescriptor>> updates=valueCreatorUtil.randomUpdateGenerator(random);
+    int count=interleaveLargeAmountOfUpdates(updaterRandom,updates);
+    populator.close(true);
+    random.reset();
+    verifyUpdates(valueCreatorUtil.randomUpdateGenerator(random),count);
+  }
+  @Test public void dropMustSucceedAfterSuccessfulClose(){
+    populator.create();
+    populator.close(true);
+    populator.drop();
+    assertFileNotPresent();
+  }
+  @Test public void dropMustSucceedAfterUnsuccessfulClose(){
+    populator.create();
+    populator.close(false);
+    populator.drop();
+    assertFileNotPresent();
+  }
+  @Test public void successfulCloseMustThrowWithoutPriorSuccessfulCreate(){
+    assertFileNotPresent();
+    try {
+      populator.close(true);
+      fail("Should have failed");
+    }
+ catch (    IllegalStateException e) {
+    }
+  }
+  @Test public void unsuccessfulCloseMustSucceedWithoutSuccessfulPriorCreate() throws Exception {
+    assertFileNotPresent();
+    String failureMessage="There is no spoon";
+    populator.markAsFailed(failureMessage);
+    populator.close(false);
+    assertHeader(false,failureMessage,false);
+  }
+  @Test public void successfulCloseMustThrowAfterDrop(){
+    populator.create();
+    populator.drop();
+    try {
+      populator.close(true);
+      fail("Should have failed");
+    }
+ catch (    IllegalStateException e) {
+    }
+  }
+  @Test public void unsuccessfulCloseMustThrowAfterDrop(){
+    populator.create();
+    populator.drop();
+    try {
+      populator.close(false);
+      fail("Should have failed");
+    }
+ catch (    IllegalStateException e) {
+    }
+  }
+public abstract static class Unique<K extends NativeIndexKey<K>,V extends NativeIndexValue> extends NativeIndexPopulatorTests<K,V> {
+    @Test public void addShouldThrowOnDuplicateValues(){
+      populator.create();
+      IndexEntryUpdate<IndexDescriptor>[] updates=valueCreatorUtil.someUpdatesWithDuplicateValues(random);
+      try {
+        populator.add(Arrays.asList(updates));
+        fail("Updates should have conflicted");
+      }
+ catch (      IndexEntryConflictException e) {
+      }
+ finally {
+        populator.close(true);
+      }
+    }
+    @Test public void updaterShouldThrowOnDuplicateValues() throws Exception {
+      populator.create();
+      IndexEntryUpdate<IndexDescriptor>[] updates=valueCreatorUtil.someUpdatesWithDuplicateValues(random);
+      IndexUpdater updater=populator.newPopulatingUpdater(null_property_accessor);
+      for (      IndexEntryUpdate<IndexDescriptor> update : updates) {
+        updater.process(update);
+      }
+      try {
+        updater.close();
+        fail("Updates should have conflicted");
+      }
+ catch (      Exception e) {
+        assertTrue(e.getMessage(),Exceptions.contains(e,IndexEntryConflictException.class));
+      }
+ finally {
+        populator.close(true);
+      }
+    }
+    @Test public void shouldSampleUpdates() throws Exception {
+      populator.create();
+      IndexEntryUpdate<IndexDescriptor>[] updates=valueCreatorUtil.someUpdates(random);
+      populator.add(asList(updates));
+      for (      IndexEntryUpdate<IndexDescriptor> update : updates) {
+        populator.includeSample(update);
+      }
+      IndexSample sample=populator.sampleResult();
+      assertEquals(updates.length,sample.sampleSize());
+      assertEquals(updates.length,sample.uniqueValues());
+      assertEquals(updates.length,sample.indexSize());
+      populator.close(true);
+    }
+  }
+public abstract static class NonUnique<K extends NativeIndexKey<K>,V extends NativeIndexValue> extends NativeIndexPopulatorTests<K,V> {
+    @Test public void addShouldApplyDuplicateValues() throws Exception {
+      populator.create();
+      IndexEntryUpdate<IndexDescriptor>[] updates=valueCreatorUtil.someUpdatesWithDuplicateValues(random);
+      populator.add(Arrays.asList(updates));
+      populator.close(true);
+      verifyUpdates(updates);
+    }
+    @Test public void updaterShouldApplyDuplicateValues() throws Exception {
+      populator.create();
+      IndexEntryUpdate<IndexDescriptor>[] updates=valueCreatorUtil.someUpdatesWithDuplicateValues(random);
+      try (IndexUpdater updater=populator.newPopulatingUpdater(null_property_accessor)){
+        for (        IndexEntryUpdate<IndexDescriptor> update : updates) {
+          updater.process(update);
+        }
+      }
+       populator.close(true);
+      verifyUpdates(updates);
+    }
+    @Test public void shouldSampleUpdatesIfConfiguredForOnlineSampling() throws Exception {
+      populator.create();
+      IndexEntryUpdate<IndexDescriptor>[] scanUpdates=valueCreatorUtil.someUpdates(random);
+      populator.add(Arrays.asList(scanUpdates));
+      Iterator<IndexEntryUpdate<IndexDescriptor>> generator=valueCreatorUtil.randomUpdateGenerator(random);
+      Object[] updates=new Object[5];
+      updates[0]=generator.next().values()[0].asObject();
+      updates[1]=generator.next().values()[0].asObject();
+      updates[2]=updates[1];
+      updates[3]=generator.next().values()[0].asObject();
+      updates[4]=updates[3];
+      try (IndexUpdater updater=populator.newPopulatingUpdater(null_property_accessor)){
+        long nodeId=1000;
+        for (        Object value : updates) {
+          IndexEntryUpdate<IndexDescriptor> update=valueCreatorUtil.add(nodeId++,Values.of(value));
+          updater.process(update);
+        }
+      }
+       IndexSample sample=populator.sampleResult();
+      Object[] allValues=Arrays.copyOf(updates,updates.length + scanUpdates.length);
+      System.arraycopy(asValues(scanUpdates),0,allValues,updates.length,scanUpdates.length);
+      assertEquals(updates.length + scanUpdates.length,sample.sampleSize());
+      assertEquals(countUniqueValues(allValues),sample.uniqueValues());
+      assertEquals(updates.length + scanUpdates.length,sample.indexSize());
+      populator.close(true);
+    }
+    private Object[] asValues(    IndexEntryUpdate<IndexDescriptor>[] updates){
+      Object[] values=new Object[updates.length];
+      for (int i=0; i < updates.length; i++) {
+        values[i]=updates[i].values()[0].asObject();
+      }
+      return values;
+    }
+  }
+  private int interleaveLargeAmountOfUpdates(  Random updaterRandom,  Iterator<IndexEntryUpdate<IndexDescriptor>> updates) throws IndexEntryConflictException {
+    int count=0;
+    for (int i=0; i < LARGE_AMOUNT_OF_UPDATES; i++) {
+      if (updaterRandom.nextFloat() < 0.1) {
+        try (IndexUpdater indexUpdater=populator.newPopulatingUpdater(null_property_accessor)){
+          int numberOfUpdaterUpdates=updaterRandom.nextInt(100);
+          for (int j=0; j < numberOfUpdaterUpdates; j++) {
+            indexUpdater.process(updates.next());
+            count++;
+          }
+        }
+       }
+      populator.add(Collections.singletonList(updates.next()));
+      count++;
+    }
+    return count;
+  }
+  private void assertHeader(  boolean online,  String failureMessage,  boolean messageTruncated) throws IOException {
+    NativeIndexHeaderReader headerReader=new NativeIndexHeaderReader(NO_HEADER_READER);
+    try (GBPTree<KEY,VALUE> ignored=new GBPTree<>(pageCache,getIndexFile(),layout,0,GBPTree.NO_MONITOR,headerReader,NO_HEADER_WRITER,RecoveryCleanupWorkCollector.immediate())){
+      if (online) {
+        assertEquals("Index was not marked as online when expected not to be.",BYTE_ONLINE,headerReader.state);
+        assertNull("Expected failure message to be null when marked as online.",headerReader.failureMessage);
+      }
+ else {
+        assertEquals("Index was marked as online when expected not to be.",BYTE_FAILED,headerReader.state);
+        if (messageTruncated) {
+          assertTrue(headerReader.failureMessage.length() < failureMessage.length());
+          assertTrue(failureMessage.startsWith(headerReader.failureMessage));
+        }
+ else {
+          assertEquals(failureMessage,headerReader.failureMessage);
+        }
+      }
+    }
+   }
+  private String longString(  int length){
+    return RandomStringUtils.random(length,true,true);
+  }
+  private void applyInterleaved(  IndexEntryUpdate<IndexDescriptor>[] updates,  NativeIndexPopulator<KEY,VALUE> populator) throws IndexEntryConflictException {
+    boolean useUpdater=true;
+    Collection<IndexEntryUpdate<IndexDescriptor>> populatorBatch=new ArrayList<>();
+    IndexUpdater updater=populator.newPopulatingUpdater(null_property_accessor);
+    for (    IndexEntryUpdate<IndexDescriptor> update : updates) {
+      if (random.nextInt(100) < 20) {
+        if (useUpdater) {
+          updater.close();
+          populatorBatch=new ArrayList<>();
+        }
+ else {
+          populator.add(populatorBatch);
+          updater=populator.newPopulatingUpdater(null_property_accessor);
+        }
+        useUpdater=!useUpdater;
+      }
+      if (useUpdater) {
+        updater.process(update);
+      }
+ else {
+        populatorBatch.add(update);
+      }
+    }
+    if (useUpdater) {
+      updater.close();
+    }
+ else {
+      populator.add(populatorBatch);
+    }
+  }
+  private void verifyUpdates(  Iterator<IndexEntryUpdate<IndexDescriptor>> indexEntryUpdateIterator,  int count) throws IOException {
+    @SuppressWarnings("unchecked") IndexEntryUpdate<IndexDescriptor>[] updates=new IndexEntryUpdate[count];
+    for (int i=0; i < count; i++) {
+      updates[i]=indexEntryUpdateIterator.next();
+    }
+    verifyUpdates(updates);
+  }
+  private byte[] fileWithContent() throws IOException {
+    int size=1000;
+    fs.mkdirs(getIndexFile().getParentFile());
+    try (StoreChannel storeChannel=fs.create(getIndexFile())){
+      byte[] someBytes=new byte[size];
+      random.nextBytes(someBytes);
+      storeChannel.writeAll(ByteBuffer.wrap(someBytes));
+      return someBytes;
+    }
+   }
+}

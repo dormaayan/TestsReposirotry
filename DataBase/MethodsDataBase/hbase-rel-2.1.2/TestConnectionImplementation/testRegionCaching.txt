@@ -1,0 +1,112 @@
+/** 
+ * Test that when we delete a location using the first row of a region that we really delete it.
+ * @throws Exception
+ */
+@Test public void testRegionCaching() throws Exception {
+  TEST_UTIL.createMultiRegionTable(TABLE_NAME,FAM_NAM).close();
+  Configuration conf=new Configuration(TEST_UTIL.getConfiguration());
+  conf.setInt(HConstants.HBASE_CLIENT_RETRIES_NUMBER,0);
+  Connection connection=ConnectionFactory.createConnection(conf);
+  final Table table=connection.getTable(TABLE_NAME);
+  TEST_UTIL.waitUntilAllRegionsAssigned(table.getName());
+  Put put=new Put(ROW);
+  put.addColumn(FAM_NAM,ROW,ROW);
+  table.put(put);
+  ConnectionImplementation conn=(ConnectionImplementation)connection;
+  assertNotNull(conn.getCachedLocation(TABLE_NAME,ROW));
+  HRegionLocation loc=conn.getCachedLocation(TABLE_NAME,ROW).getRegionLocation();
+  final int nextPort=loc.getPort() + 1;
+  conn.updateCachedLocation(loc.getRegionInfo(),loc.getServerName(),ServerName.valueOf("127.0.0.1",nextPort,HConstants.LATEST_TIMESTAMP),HConstants.LATEST_TIMESTAMP);
+  Assert.assertEquals(conn.getCachedLocation(TABLE_NAME,ROW).getRegionLocation().getPort(),nextPort);
+  conn.clearRegionCache(TABLE_NAME,ROW.clone());
+  RegionLocations rl=conn.getCachedLocation(TABLE_NAME,ROW);
+  assertNull("What is this location?? " + rl,rl);
+  conn.clearRegionCache(TABLE_NAME);
+  Assert.assertEquals(0,conn.getNumberOfCachedRegionLocations(TABLE_NAME));
+  Put put2=new Put(ROW);
+  put2.addColumn(FAM_NAM,ROW,ROW);
+  table.put(put2);
+  assertNotNull(conn.getCachedLocation(TABLE_NAME,ROW));
+  assertNotNull(conn.getCachedLocation(TableName.valueOf(TABLE_NAME.getName()),ROW.clone()));
+  TEST_UTIL.getAdmin().setBalancerRunning(false,false);
+  HMaster master=TEST_UTIL.getMiniHBaseCluster().getMaster();
+  TEST_UTIL.waitUntilNoRegionsInTransition();
+  HRegionLocation toMove=conn.getCachedLocation(TABLE_NAME,ROW).getRegionLocation();
+  byte[] regionName=toMove.getRegionInfo().getRegionName();
+  byte[] encodedRegionNameBytes=toMove.getRegionInfo().getEncodedNameAsBytes();
+  int curServerId=TEST_UTIL.getHBaseCluster().getServerWith(regionName);
+  int destServerId=curServerId == 0 ? 1 : 0;
+  HRegionServer curServer=TEST_UTIL.getHBaseCluster().getRegionServer(curServerId);
+  HRegionServer destServer=TEST_UTIL.getHBaseCluster().getRegionServer(destServerId);
+  ServerName destServerName=destServer.getServerName();
+  Assert.assertTrue(curServer != destServer);
+  Assert.assertFalse(curServer.getServerName().equals(destServer.getServerName()));
+  Assert.assertFalse(toMove.getPort() == destServerName.getPort());
+  Assert.assertNotNull(curServer.getOnlineRegion(regionName));
+  Assert.assertNull(destServer.getOnlineRegion(regionName));
+  Assert.assertFalse(TEST_UTIL.getMiniHBaseCluster().getMaster().getAssignmentManager().hasRegionsInTransition());
+  LOG.info("Move starting region=" + toMove.getRegionInfo().getRegionNameAsString());
+  TEST_UTIL.getAdmin().move(toMove.getRegionInfo().getEncodedNameAsBytes(),destServerName.getServerName().getBytes());
+  while (destServer.getOnlineRegion(regionName) == null || destServer.getRegionsInTransitionInRS().containsKey(encodedRegionNameBytes) || curServer.getRegionsInTransitionInRS().containsKey(encodedRegionNameBytes) || master.getAssignmentManager().hasRegionsInTransition()) {
+    Thread.sleep(1);
+  }
+  LOG.info("Move finished for region=" + toMove.getRegionInfo().getRegionNameAsString());
+  Assert.assertNull(curServer.getOnlineRegion(regionName));
+  Assert.assertNotNull(destServer.getOnlineRegion(regionName));
+  Assert.assertFalse(destServer.getRegionsInTransitionInRS().containsKey(encodedRegionNameBytes));
+  Assert.assertFalse(curServer.getRegionsInTransitionInRS().containsKey(encodedRegionNameBytes));
+  Assert.assertFalse(conn.getCachedLocation(TABLE_NAME,ROW).getRegionLocation().getPort() == destServerName.getPort());
+  LOG.info("Put starting");
+  Put put3=new Put(ROW);
+  put3.addColumn(FAM_NAM,ROW,ROW);
+  try {
+    table.put(put3);
+    Assert.fail("Unreachable point");
+  }
+ catch (  RetriesExhaustedWithDetailsException e) {
+    LOG.info("Put done, exception caught: " + e.getClass());
+    Assert.assertEquals(1,e.getNumExceptions());
+    Assert.assertEquals(1,e.getCauses().size());
+    Assert.assertArrayEquals(ROW,e.getRow(0).getRow());
+    Throwable cause=ClientExceptionsUtil.findException(e.getCause(0));
+    Assert.assertNotNull(cause);
+    Assert.assertTrue(cause instanceof RegionMovedException);
+  }
+catch (  RetriesExhaustedException ree) {
+    LOG.info("Put done, exception caught: " + ree.getClass());
+    Throwable cause=ClientExceptionsUtil.findException(ree.getCause());
+    Assert.assertNotNull(cause);
+    Assert.assertTrue(cause instanceof RegionMovedException);
+  }
+  Assert.assertNotNull("Cached connection is null",conn.getCachedLocation(TABLE_NAME,ROW));
+  Assert.assertEquals("Previous server was " + curServer.getServerName().getHostAndPort(),destServerName.getPort(),conn.getCachedLocation(TABLE_NAME,ROW).getRegionLocation().getPort());
+  Assert.assertFalse(destServer.getRegionsInTransitionInRS().containsKey(encodedRegionNameBytes));
+  Assert.assertFalse(curServer.getRegionsInTransitionInRS().containsKey(encodedRegionNameBytes));
+  LOG.info("Move starting region=" + toMove.getRegionInfo().getRegionNameAsString());
+  TEST_UTIL.getAdmin().move(toMove.getRegionInfo().getEncodedNameAsBytes(),curServer.getServerName().getServerName().getBytes());
+  while (curServer.getOnlineRegion(regionName) == null || destServer.getRegionsInTransitionInRS().containsKey(encodedRegionNameBytes) || curServer.getRegionsInTransitionInRS().containsKey(encodedRegionNameBytes) || master.getAssignmentManager().hasRegionsInTransition()) {
+    Thread.sleep(1);
+  }
+  Assert.assertNotNull(curServer.getOnlineRegion(regionName));
+  Assert.assertNull(destServer.getOnlineRegion(regionName));
+  LOG.info("Move finished for region=" + toMove.getRegionInfo().getRegionNameAsString());
+  Assert.assertFalse(conn.getCachedLocation(TABLE_NAME,ROW).getRegionLocation().getPort() == curServer.getServerName().getPort());
+  Scan sc=new Scan();
+  sc.setStopRow(ROW);
+  sc.setStartRow(ROW);
+  TEST_UTIL.getConfiguration().setInt(HConstants.HBASE_CLIENT_RETRIES_NUMBER,1);
+  try {
+    ResultScanner rs=table.getScanner(sc);
+    while (rs.next() != null) {
+    }
+    Assert.fail("Unreachable point");
+  }
+ catch (  RetriesExhaustedException e) {
+    LOG.info("Scan done, expected exception caught: " + e.getClass());
+  }
+  Assert.assertNotNull(conn.getCachedLocation(TABLE_NAME,ROW));
+  Assert.assertEquals("Previous server was " + destServer.getServerName().getHostAndPort(),curServer.getServerName().getPort(),conn.getCachedLocation(TABLE_NAME,ROW).getRegionLocation().getPort());
+  TEST_UTIL.getConfiguration().setInt(HConstants.HBASE_CLIENT_RETRIES_NUMBER,RPC_RETRY);
+  table.close();
+  connection.close();
+}

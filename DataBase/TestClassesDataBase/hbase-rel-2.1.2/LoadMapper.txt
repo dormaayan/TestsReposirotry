@@ -1,0 +1,59 @@
+public static class LoadMapper extends Mapper<NullWritable,NullWritable,NullWritable,NullWritable> {
+  protected long recordsToWrite;
+  protected Connection connection;
+  protected BufferedMutator mutator;
+  protected Configuration conf;
+  protected int numBackReferencesPerRow;
+  protected String shortTaskId;
+  protected Random rand=new Random();
+  protected Counter rowsWritten, refsWritten;
+  @Override public void setup(  Context context) throws IOException {
+    conf=context.getConfiguration();
+    recordsToWrite=conf.getLong(NUM_TO_WRITE_KEY,NUM_TO_WRITE_DEFAULT);
+    String tableName=conf.get(TABLE_NAME_KEY,TABLE_NAME_DEFAULT);
+    numBackReferencesPerRow=conf.getInt(NUM_BACKREFS_KEY,NUM_BACKREFS_DEFAULT);
+    this.connection=ConnectionFactory.createConnection(conf);
+    mutator=connection.getBufferedMutator(new BufferedMutatorParams(TableName.valueOf(tableName)).writeBufferSize(4 * 1024 * 1024));
+    String taskId=conf.get("mapreduce.task.attempt.id");
+    Matcher matcher=Pattern.compile(".+_m_(\\d+_\\d+)").matcher(taskId);
+    if (!matcher.matches()) {
+      throw new RuntimeException("Strange task ID: " + taskId);
+    }
+    shortTaskId=matcher.group(1);
+    rowsWritten=context.getCounter(Counters.ROWS_WRITTEN);
+    refsWritten=context.getCounter(Counters.REFERENCES_WRITTEN);
+  }
+  @Override public void cleanup(  Context context) throws IOException {
+    mutator.close();
+    connection.close();
+  }
+  @Override protected void map(  NullWritable key,  NullWritable value,  Context context) throws IOException, InterruptedException {
+    String suffix="/" + shortTaskId;
+    byte[] row=Bytes.add(new byte[8],Bytes.toBytes(suffix));
+    int BLOCK_SIZE=(int)(recordsToWrite / 100);
+    for (long i=0; i < recordsToWrite; ) {
+      long blockStart=i;
+      for (long idxInBlock=0; idxInBlock < BLOCK_SIZE && i < recordsToWrite; idxInBlock++, i++) {
+        long byteSwapped=swapLong(i);
+        Bytes.putLong(row,0,byteSwapped);
+        Put p=new Put(row);
+        p.addColumn(TEST_FAMILY,TEST_QUALIFIER,HConstants.EMPTY_BYTE_ARRAY);
+        if (blockStart > 0) {
+          for (int j=0; j < numBackReferencesPerRow; j++) {
+            long referredRow=blockStart - BLOCK_SIZE + rand.nextInt(BLOCK_SIZE);
+            Bytes.putLong(row,0,swapLong(referredRow));
+            p.addColumn(TEST_FAMILY,row,HConstants.EMPTY_BYTE_ARRAY);
+          }
+          refsWritten.increment(1);
+        }
+        rowsWritten.increment(1);
+        mutator.mutate(p);
+        if (i % 100 == 0) {
+          context.setStatus("Written " + i + "/"+ recordsToWrite+ " records");
+          context.progress();
+        }
+      }
+      mutator.flush();
+    }
+  }
+}

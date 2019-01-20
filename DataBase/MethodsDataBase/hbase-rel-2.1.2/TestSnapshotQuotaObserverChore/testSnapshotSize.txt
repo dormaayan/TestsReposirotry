@@ -1,0 +1,41 @@
+@Test public void testSnapshotSize() throws Exception {
+  TableName tn1=helper.createTableWithRegions(5);
+  admin.setQuota(QuotaSettingsFactory.limitTableSpace(tn1,SpaceQuotaHelperForTests.ONE_GIGABYTE,SpaceViolationPolicy.NO_INSERTS));
+  helper.writeData(tn1,256L * SpaceQuotaHelperForTests.ONE_KILOBYTE);
+  admin.flush(tn1);
+  final long snapshotSize=TEST_UTIL.getMiniHBaseCluster().getRegions(tn1).stream().flatMap(r -> r.getStores().stream()).mapToLong(HStore::getHFilesSize).sum();
+  TEST_UTIL.waitFor(30_000,new SpaceQuotaSnapshotPredicate(conn,tn1){
+    @Override boolean evaluate(    SpaceQuotaSnapshot snapshot) throws Exception {
+      return snapshot.getUsage() == snapshotSize;
+    }
+  }
+);
+  final String snapshotName=tn1 + "snapshot";
+  admin.snapshot(new SnapshotDescription(snapshotName,tn1,SnapshotType.SKIPFLUSH));
+  Multimap<TableName,String> snapshotsToCompute=testChore.getSnapshotsToComputeSize();
+  assertEquals("Expected to see the single snapshot: " + snapshotsToCompute,1,snapshotsToCompute.size());
+  Multimap<TableName,SnapshotWithSize> snapshotsWithSize=testChore.computeSnapshotSizes(snapshotsToCompute);
+  assertEquals(1,snapshotsWithSize.size());
+  SnapshotWithSize sws=Iterables.getOnlyElement(snapshotsWithSize.get(tn1));
+  assertEquals(snapshotName,sws.getName());
+  assertEquals(0,sws.getSize());
+  helper.writeData(tn1,256L * SpaceQuotaHelperForTests.ONE_KILOBYTE);
+  admin.flush(tn1);
+  TEST_UTIL.compact(tn1,true);
+  TEST_UTIL.waitFor(30_000,new SpaceQuotaSnapshotPredicate(conn,tn1){
+    private final long regionSize=TEST_UTIL.getMiniHBaseCluster().getRegions(tn1).stream().flatMap(r -> r.getStores().stream()).mapToLong(HStore::getHFilesSize).sum();
+    @Override boolean evaluate(    SpaceQuotaSnapshot snapshot) throws Exception {
+      LOG.debug("Current usage=" + snapshot.getUsage() + " snapshotSize="+ snapshotSize);
+      return closeInSize(snapshot.getUsage(),snapshotSize + regionSize,SpaceQuotaHelperForTests.ONE_KILOBYTE);
+    }
+  }
+);
+  TEST_UTIL.waitFor(30_000,new NoFilesToDischarge(TEST_UTIL.getMiniHBaseCluster(),tn1));
+  snapshotsToCompute=testChore.getSnapshotsToComputeSize();
+  assertEquals("Expected to see the single snapshot: " + snapshotsToCompute,1,snapshotsToCompute.size());
+  snapshotsWithSize=testChore.computeSnapshotSizes(snapshotsToCompute);
+  assertEquals(1,snapshotsWithSize.size());
+  sws=Iterables.getOnlyElement(snapshotsWithSize.get(tn1));
+  assertEquals(snapshotName,sws.getName());
+  assertEquals(snapshotSize,sws.getSize());
+}

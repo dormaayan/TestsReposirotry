@@ -1,0 +1,199 @@
+@Category({ReplicationTests.class,LargeTests.class}) public class TestReplicationDroppedTables extends TestReplicationBase {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestReplicationDroppedTables.class);
+  private static final Logger LOG=LoggerFactory.getLogger(TestReplicationDroppedTables.class);
+  private static final int ROWS_COUNT=1000;
+  @Before public void setUpBase() throws Exception {
+    for (    JVMClusterUtil.RegionServerThread r : utility1.getHBaseCluster().getRegionServerThreads()) {
+      utility1.getAdmin().rollWALWriter(r.getRegionServer().getServerName());
+    }
+    super.setUpBase();
+    int rowCount=utility1.countRows(tableName);
+    utility1.deleteTableData(tableName);
+    Scan scan=new Scan();
+    int lastCount=0;
+    for (int i=0; i < NB_RETRIES; i++) {
+      if (i == NB_RETRIES - 1) {
+        fail("Waited too much time for truncate");
+      }
+      ResultScanner scanner=htable2.getScanner(scan);
+      Result[] res=scanner.next(rowCount);
+      scanner.close();
+      if (res.length != 0) {
+        if (res.length < lastCount) {
+          i--;
+        }
+        lastCount=res.length;
+        LOG.info("Still got " + res.length + " rows");
+        Thread.sleep(SLEEP_TIME);
+      }
+ else {
+        break;
+      }
+    }
+    conf1.setInt(RpcServer.MAX_REQUEST_SIZE,10 * 1024);
+  }
+  @Test public void testEditsStuckBehindDroppedTable() throws Exception {
+    testEditsBehindDroppedTable(false,"test_dropped");
+  }
+  @Test public void testEditsDroppedWithDroppedTable() throws Exception {
+    testEditsBehindDroppedTable(true,"test_dropped");
+  }
+  @Test public void testEditsDroppedWithDroppedTableNS() throws Exception {
+    Connection connection1=ConnectionFactory.createConnection(conf1);
+    try (Admin admin1=connection1.getAdmin()){
+      admin1.createNamespace(NamespaceDescriptor.create("NS").build());
+    }
+     Connection connection2=ConnectionFactory.createConnection(conf2);
+    try (Admin admin2=connection2.getAdmin()){
+      admin2.createNamespace(NamespaceDescriptor.create("NS").build());
+    }
+     testEditsBehindDroppedTable(true,"NS:test_dropped");
+    try (Admin admin1=connection1.getAdmin()){
+      admin1.deleteNamespace("NS");
+    }
+     try (Admin admin2=connection2.getAdmin()){
+      admin2.deleteNamespace("NS");
+    }
+   }
+  private byte[] generateRowKey(  int id){
+    return Bytes.toBytes(String.format("NormalPut%03d",id));
+  }
+  private void testEditsBehindDroppedTable(  boolean allowProceeding,  String tName) throws Exception {
+    conf1.setBoolean(HConstants.REPLICATION_DROP_ON_DELETED_TABLE_KEY,allowProceeding);
+    conf1.setInt(HConstants.REPLICATION_SOURCE_MAXTHREADS_KEY,1);
+    utility1.shutdownMiniHBaseCluster();
+    utility1.startMiniHBaseCluster(1,1);
+    TableName tablename=TableName.valueOf(tName);
+    byte[] familyName=Bytes.toBytes("fam");
+    byte[] row=Bytes.toBytes("row");
+    TableDescriptor table=TableDescriptorBuilder.newBuilder(tablename).setColumnFamily(ColumnFamilyDescriptorBuilder.newBuilder(familyName).setScope(HConstants.REPLICATION_SCOPE_GLOBAL).build()).build();
+    Connection connection1=ConnectionFactory.createConnection(conf1);
+    Connection connection2=ConnectionFactory.createConnection(conf2);
+    try (Admin admin1=connection1.getAdmin()){
+      admin1.createTable(table);
+    }
+     try (Admin admin2=connection2.getAdmin()){
+      admin2.createTable(table);
+    }
+     utility1.waitUntilAllRegionsAssigned(tablename);
+    utility2.waitUntilAllRegionsAssigned(tablename);
+    try (Admin admin1=connection1.getAdmin()){
+      admin1.disableReplicationPeer(PEER_ID2);
+    }
+     try (Table droppedTable=connection1.getTable(tablename)){
+      byte[] rowKey=Bytes.toBytes(0 + " put on table to be dropped");
+      Put put=new Put(rowKey);
+      put.addColumn(familyName,row,row);
+      droppedTable.put(put);
+    }
+     try (Table table1=connection1.getTable(tableName)){
+      for (int i=0; i < ROWS_COUNT; i++) {
+        Put put=new Put(generateRowKey(i)).addColumn(famName,row,row);
+        table1.put(put);
+      }
+    }
+     try (Admin admin1=connection1.getAdmin()){
+      admin1.disableTable(tablename);
+      admin1.deleteTable(tablename);
+    }
+     try (Admin admin2=connection2.getAdmin()){
+      admin2.disableTable(tablename);
+      admin2.deleteTable(tablename);
+    }
+     try (Admin admin1=connection1.getAdmin()){
+      admin1.enableReplicationPeer(PEER_ID2);
+    }
+     if (allowProceeding) {
+      verifyReplicationProceeded();
+    }
+ else {
+      verifyReplicationStuck();
+    }
+    conf1.setBoolean(HConstants.REPLICATION_DROP_ON_DELETED_TABLE_KEY,false);
+  }
+  @Test public void testEditsBehindDroppedTableTiming() throws Exception {
+    conf1.setBoolean(HConstants.REPLICATION_DROP_ON_DELETED_TABLE_KEY,true);
+    conf1.setInt(HConstants.REPLICATION_SOURCE_MAXTHREADS_KEY,1);
+    utility1.shutdownMiniHBaseCluster();
+    utility1.startMiniHBaseCluster(1,1);
+    TableName tablename=TableName.valueOf("testdroppedtimed");
+    byte[] familyName=Bytes.toBytes("fam");
+    byte[] row=Bytes.toBytes("row");
+    TableDescriptor table=TableDescriptorBuilder.newBuilder(tablename).setColumnFamily(ColumnFamilyDescriptorBuilder.newBuilder(familyName).setScope(HConstants.REPLICATION_SCOPE_GLOBAL).build()).build();
+    Connection connection1=ConnectionFactory.createConnection(conf1);
+    Connection connection2=ConnectionFactory.createConnection(conf2);
+    try (Admin admin1=connection1.getAdmin()){
+      admin1.createTable(table);
+    }
+     try (Admin admin2=connection2.getAdmin()){
+      admin2.createTable(table);
+    }
+     utility1.waitUntilAllRegionsAssigned(tablename);
+    utility2.waitUntilAllRegionsAssigned(tablename);
+    try (Admin admin1=connection1.getAdmin()){
+      admin1.disableReplicationPeer(PEER_ID2);
+    }
+     try (Table droppedTable=connection1.getTable(tablename)){
+      byte[] rowKey=Bytes.toBytes(0 + " put on table to be dropped");
+      Put put=new Put(rowKey);
+      put.addColumn(familyName,row,row);
+      droppedTable.put(put);
+    }
+     try (Table table1=connection1.getTable(tableName)){
+      for (int i=0; i < ROWS_COUNT; i++) {
+        Put put=new Put(generateRowKey(i)).addColumn(famName,row,row);
+        table1.put(put);
+      }
+    }
+     try (Admin admin2=connection2.getAdmin()){
+      admin2.disableTable(tablename);
+      admin2.deleteTable(tablename);
+    }
+     try (Admin admin1=connection1.getAdmin()){
+      admin1.enableReplicationPeer(PEER_ID2);
+      verifyReplicationStuck();
+      admin1.disableTable(tablename);
+      verifyReplicationStuck();
+      admin1.deleteTable(tablename);
+      verifyReplicationProceeded();
+    }
+     conf1.setBoolean(HConstants.REPLICATION_DROP_ON_DELETED_TABLE_KEY,false);
+  }
+  private boolean peerHasAllNormalRows() throws IOException {
+    try (ResultScanner scanner=htable2.getScanner(new Scan())){
+      Result[] results=scanner.next(ROWS_COUNT);
+      if (results.length != ROWS_COUNT) {
+        return false;
+      }
+      for (int i=0; i < results.length; i++) {
+        Assert.assertArrayEquals(generateRowKey(i),results[i].getRow());
+      }
+      return true;
+    }
+   }
+  private void verifyReplicationProceeded() throws Exception {
+    for (int i=0; i < NB_RETRIES; i++) {
+      if (i == NB_RETRIES - 1) {
+        fail("Waited too much time for put replication");
+      }
+      if (!peerHasAllNormalRows()) {
+        LOG.info("Row not available");
+        Thread.sleep(SLEEP_TIME);
+      }
+ else {
+        break;
+      }
+    }
+  }
+  private void verifyReplicationStuck() throws Exception {
+    for (int i=0; i < NB_RETRIES; i++) {
+      if (peerHasAllNormalRows()) {
+        fail("Edit should have been stuck behind dropped tables");
+      }
+ else {
+        LOG.info("Row not replicated, let's wait a bit more...");
+        Thread.sleep(SLEEP_TIME);
+      }
+    }
+  }
+}

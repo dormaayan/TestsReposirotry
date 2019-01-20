@@ -1,0 +1,66 @@
+static class TestFetch extends AsyncShardFetch<Response> {
+static class Entry {
+    public final Response response;
+    public final Throwable failure;
+    private final CountDownLatch executeLatch=new CountDownLatch(1);
+    private final CountDownLatch waitLatch=new CountDownLatch(1);
+    Entry(    Response response,    Throwable failure){
+      this.response=response;
+      this.failure=failure;
+    }
+  }
+  private final ThreadPool threadPool;
+  private final Map<String,Entry> simulations=new ConcurrentHashMap<>();
+  private AtomicInteger reroute=new AtomicInteger();
+  TestFetch(  ThreadPool threadPool){
+    super(Loggers.getLogger(TestFetch.class),"test",new ShardId("test","_na_",1),null);
+    this.threadPool=threadPool;
+  }
+  public void addSimulation(  String nodeId,  Response response){
+    simulations.put(nodeId,new Entry(response,null));
+  }
+  public void addSimulation(  String nodeId,  Throwable t){
+    simulations.put(nodeId,new Entry(null,t));
+  }
+  public void fireSimulationAndWait(  String nodeId) throws InterruptedException {
+    simulations.get(nodeId).executeLatch.countDown();
+    simulations.get(nodeId).waitLatch.await();
+    simulations.remove(nodeId);
+  }
+  @Override protected void reroute(  ShardId shardId,  String reason){
+    reroute.incrementAndGet();
+  }
+  @Override protected void asyncFetch(  DiscoveryNode[] nodes,  long fetchingRound){
+    for (    final DiscoveryNode node : nodes) {
+      final String nodeId=node.getId();
+      threadPool.generic().execute(new Runnable(){
+        @Override public void run(){
+          Entry entry=null;
+          try {
+            entry=simulations.get(nodeId);
+            if (entry == null) {
+              awaitBusy(() -> simulations.containsKey(nodeId));
+            }
+            assert entry != null;
+            entry.executeLatch.await();
+            if (entry.failure != null) {
+              processAsyncFetch(null,Collections.singletonList(new FailedNodeException(nodeId,"unexpected",entry.failure)),fetchingRound);
+            }
+ else {
+              processAsyncFetch(Collections.singletonList(entry.response),null,fetchingRound);
+            }
+          }
+ catch (          Exception e) {
+            logger.error("unexpected failure",e);
+          }
+ finally {
+            if (entry != null) {
+              entry.waitLatch.countDown();
+            }
+          }
+        }
+      }
+);
+    }
+  }
+}

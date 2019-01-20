@@ -1,0 +1,55 @@
+/** 
+ * Test a drop timeout request. This test used to be in TestHCM but it has particulare requirements -- i.e. one handler only -- so run it apart from the rest of TestHCM.
+ */
+@Category({MediumTests.class}) public class TestDropTimeoutRequest {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestDropTimeoutRequest.class);
+  @Rule public TestName name=new TestName();
+  private static final Logger LOG=LoggerFactory.getLogger(TestDropTimeoutRequest.class);
+  private final static HBaseTestingUtility TEST_UTIL=new HBaseTestingUtility();
+  private static final byte[] FAM_NAM=Bytes.toBytes("f");
+  private static final int RPC_RETRY=5;
+  /** 
+ * Coprocessor that sleeps a while the first time you do a Get
+ */
+public static class SleepLongerAtFirstCoprocessor implements RegionCoprocessor, RegionObserver {
+    public static final int SLEEP_TIME=2000;
+    static final AtomicLong ct=new AtomicLong(0);
+    @Override public Optional<RegionObserver> getRegionObserver(){
+      return Optional.of(this);
+    }
+    @Override public void preGetOp(    final ObserverContext<RegionCoprocessorEnvironment> e,    final Get get,    final List<Cell> results) throws IOException {
+      if (ct.incrementAndGet() <= 1) {
+        Threads.sleep(SLEEP_TIME * RPC_RETRY * 2);
+      }
+ else {
+        Threads.sleep(SLEEP_TIME);
+      }
+    }
+  }
+  @BeforeClass public static void setUpBeforeClass() throws Exception {
+    TEST_UTIL.getConfiguration().setBoolean(HConstants.STATUS_PUBLISHED,true);
+    TEST_UTIL.getConfiguration().setInt(HConstants.REGION_SERVER_HIGH_PRIORITY_HANDLER_COUNT,10);
+    TEST_UTIL.getConfiguration().setInt(HConstants.HBASE_CLIENT_RETRIES_NUMBER,RPC_RETRY);
+    TEST_UTIL.getConfiguration().setInt(HConstants.REGION_SERVER_HANDLER_COUNT,1);
+    TEST_UTIL.startMiniCluster(2);
+  }
+  @AfterClass public static void tearDownAfterClass() throws Exception {
+    TEST_UTIL.shutdownMiniCluster();
+  }
+  @Test public void testDropTimeoutRequest() throws Exception {
+    TableDescriptorBuilder builder=TableDescriptorBuilder.newBuilder(TableName.valueOf(name.getMethodName()));
+    builder.setCoprocessor(SleepLongerAtFirstCoprocessor.class.getName());
+    ColumnFamilyDescriptor cfd=ColumnFamilyDescriptorBuilder.newBuilder(FAM_NAM).build();
+    builder.setColumnFamily(cfd);
+    TableDescriptor td=builder.build();
+    try (Admin admin=TEST_UTIL.getConnection().getAdmin()){
+      admin.createTable(td);
+    }
+     TableBuilder tb=TEST_UTIL.getConnection().getTableBuilder(td.getTableName(),null);
+    tb.setReadRpcTimeout(SleepLongerAtFirstCoprocessor.SLEEP_TIME * 2);
+    tb.setWriteRpcTimeout(SleepLongerAtFirstCoprocessor.SLEEP_TIME * 2);
+    try (Table table=tb.build()){
+      table.get(new Get(FAM_NAM));
+    }
+   }
+}

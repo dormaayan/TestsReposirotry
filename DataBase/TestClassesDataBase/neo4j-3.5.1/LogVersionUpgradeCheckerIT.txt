@@ -1,0 +1,49 @@
+public class LogVersionUpgradeCheckerIT {
+  private final TestDirectory storeDirectory=TestDirectory.testDirectory();
+  private final DefaultFileSystemRule fs=new DefaultFileSystemRule();
+  private final PageCacheRule pageCacheRule=new PageCacheRule();
+  @Rule public RuleChain ruleChain=RuleChain.outerRule(storeDirectory).around(fs).around(pageCacheRule);
+  @Rule public ExpectedException expect=ExpectedException.none();
+  @Test public void startAsNormalWhenUpgradeIsNotAllowed(){
+    createGraphDbAndKillIt();
+    final GraphDatabaseService db=new TestGraphDatabaseFactory().setFileSystem(fs.get()).newImpermanentDatabaseBuilder(storeDirectory.databaseDir()).setConfig(GraphDatabaseSettings.allow_upgrade,"false").newGraphDatabase();
+    db.shutdown();
+  }
+  @Test public void failToStartFromOlderTransactionLogsIfNotAllowed() throws Exception {
+    createStoreWithLogEntryVersion(LogEntryVersion.V2_3);
+    expect.expect(new NestedThrowableMatcher(UpgradeNotAllowedByConfigurationException.class));
+    final GraphDatabaseService db=new TestGraphDatabaseFactory().setFileSystem(fs.get()).newImpermanentDatabaseBuilder(storeDirectory.databaseDir()).setConfig(GraphDatabaseSettings.allow_upgrade,"false").newGraphDatabase();
+    db.shutdown();
+  }
+  @Test public void startFromOlderTransactionLogsIfAllowed() throws Exception {
+    createStoreWithLogEntryVersion(LogEntryVersion.V2_3);
+    final GraphDatabaseService db=new TestGraphDatabaseFactory().setFileSystem(fs.get()).newImpermanentDatabaseBuilder(storeDirectory.databaseDir()).setConfig(GraphDatabaseSettings.allow_upgrade,"true").newGraphDatabase();
+    db.shutdown();
+  }
+  private void createGraphDbAndKillIt(){
+    final GraphDatabaseService db=new TestGraphDatabaseFactory().setFileSystem(fs).newImpermanentDatabaseBuilder(storeDirectory.databaseDir()).newGraphDatabase();
+    try (Transaction tx=db.beginTx()){
+      db.createNode(label("FOO"));
+      db.createNode(label("BAR"));
+      tx.success();
+    }
+     db.shutdown();
+  }
+  private void createStoreWithLogEntryVersion(  LogEntryVersion logEntryVersion) throws Exception {
+    createGraphDbAndKillIt();
+    appendCheckpoint(logEntryVersion);
+  }
+  private void appendCheckpoint(  LogEntryVersion logVersion) throws IOException {
+    PageCache pageCache=pageCacheRule.getPageCache(fs);
+    VersionAwareLogEntryReader<ReadableClosablePositionAwareChannel> logEntryReader=new VersionAwareLogEntryReader<>();
+    LogFiles logFiles=LogFilesBuilder.activeFilesBuilder(storeDirectory.databaseLayout(),fs,pageCache).withLogEntryReader(logEntryReader).build();
+    LogTailScanner tailScanner=new LogTailScanner(logFiles,logEntryReader,new Monitors());
+    LogTailScanner.LogTailInformation tailInformation=tailScanner.getTailInformation();
+    try (Lifespan lifespan=new Lifespan(logFiles)){
+      FlushablePositionAwareChannel channel=logFiles.getLogFile().getWriter();
+      LogPosition logPosition=tailInformation.lastCheckPoint.getLogPosition();
+      channel.put(logVersion.byteCode()).put(CHECK_POINT).putLong(logPosition.getLogVersion()).putLong(logPosition.getByteOffset());
+      channel.prepareForFlush().flush();
+    }
+   }
+}

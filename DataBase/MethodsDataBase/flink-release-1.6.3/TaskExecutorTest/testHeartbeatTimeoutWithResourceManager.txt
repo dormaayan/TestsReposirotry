@@ -1,0 +1,37 @@
+@Test public void testHeartbeatTimeoutWithResourceManager() throws Exception {
+  final String rmAddress="rm";
+  final ResourceID rmResourceId=new ResourceID(rmAddress);
+  final long heartbeatInterval=1L;
+  final long heartbeatTimeout=3L;
+  final ResourceManagerId rmLeaderId=ResourceManagerId.generate();
+  TestingResourceManagerGateway rmGateway=new TestingResourceManagerGateway(rmLeaderId,rmResourceId,heartbeatInterval,rmAddress,rmAddress);
+  final TaskExecutorRegistrationSuccess registrationResponse=new TaskExecutorRegistrationSuccess(new InstanceID(),rmResourceId,heartbeatInterval,new ClusterInformation("localhost",1234));
+  final CompletableFuture<ResourceID> taskExecutorRegistrationFuture=new CompletableFuture<>();
+  final CountDownLatch registrationAttempts=new CountDownLatch(2);
+  rmGateway.setRegisterTaskExecutorFunction(registration -> {
+    taskExecutorRegistrationFuture.complete(registration.f1);
+    registrationAttempts.countDown();
+    return CompletableFuture.completedFuture(registrationResponse);
+  }
+);
+  final CompletableFuture<ResourceID> taskExecutorDisconnectFuture=new CompletableFuture<>();
+  rmGateway.setDisconnectTaskExecutorConsumer(disconnectInfo -> taskExecutorDisconnectFuture.complete(disconnectInfo.f0));
+  rpc.registerGateway(rmAddress,rmGateway);
+  final TaskSlotTable taskSlotTable=mock(TaskSlotTable.class);
+  final SlotReport slotReport=new SlotReport();
+  when(taskSlotTable.createSlotReport(any(ResourceID.class))).thenReturn(slotReport);
+  HeartbeatServices heartbeatServices=new HeartbeatServices(heartbeatInterval,heartbeatTimeout);
+  TaskExecutorLocalStateStoresManager localStateStoresManager=new TaskExecutorLocalStateStoresManager(false,new File[]{tmp.newFolder()},Executors.directExecutor());
+  final TaskManagerServices taskManagerServices=new TaskManagerServicesBuilder().setTaskManagerLocation(taskManagerLocation).setTaskSlotTable(taskSlotTable).setTaskStateManager(localStateStoresManager).build();
+  final TaskExecutor taskManager=new TaskExecutor(rpc,taskManagerConfiguration,haServices,taskManagerServices,heartbeatServices,UnregisteredMetricGroups.createUnregisteredTaskManagerMetricGroup(),dummyBlobCacheService,testingFatalErrorHandler);
+  try {
+    taskManager.start();
+    resourceManagerLeaderRetriever.notifyListener(rmAddress,rmLeaderId.toUUID());
+    assertThat(taskExecutorRegistrationFuture.get(timeout.toMilliseconds(),TimeUnit.MILLISECONDS),equalTo(taskManagerLocation.getResourceID()));
+    assertThat(taskExecutorDisconnectFuture.get(heartbeatTimeout * 50L,TimeUnit.MILLISECONDS),equalTo(taskManagerLocation.getResourceID()));
+    registrationAttempts.await();
+  }
+  finally {
+    RpcUtils.terminateRpcEndpoint(taskManager,timeout);
+  }
+}

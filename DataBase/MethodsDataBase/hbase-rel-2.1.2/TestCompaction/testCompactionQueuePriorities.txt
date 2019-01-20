@@ -1,0 +1,56 @@
+/** 
+ * Test compaction priority management and multiple compactions per store (HBASE-8665). 
+ */
+@Test public void testCompactionQueuePriorities() throws Exception {
+  final Configuration conf=HBaseConfiguration.create();
+  HRegionServer mockServer=mock(HRegionServer.class);
+  when(mockServer.isStopped()).thenReturn(false);
+  when(mockServer.getConfiguration()).thenReturn(conf);
+  when(mockServer.getChoreService()).thenReturn(new ChoreService("test"));
+  CompactSplit cst=new CompactSplit(mockServer);
+  when(mockServer.getCompactSplitThread()).thenReturn(cst);
+  cst.shutdownLongCompactions();
+  HRegion r=mock(HRegion.class);
+  when(r.compact(any(),any(),any(),any())).then(new Answer<Boolean>(){
+    @Override public Boolean answer(    InvocationOnMock invocation) throws Throwable {
+      invocation.<CompactionContext>getArgument(0).compact(invocation.getArgument(2),null);
+      return true;
+    }
+  }
+);
+  ArrayList<Integer> results=new ArrayList<>();
+  StoreMockMaker sm=new StoreMockMaker(results), sm2=new StoreMockMaker(results);
+  HStore store=sm.createStoreMock("store1");
+  HStore store2=sm2.createStoreMock("store2");
+  BlockingStoreMockMaker blocker=new BlockingStoreMockMaker();
+  cst.requestSystemCompaction(r,blocker.createStoreMock(1,"b-pri1"),"b-pri1");
+  BlockingStoreMockMaker.BlockingCompactionContext currentBlock=blocker.waitForBlocking();
+  for (int i=0; i < 4; ++i) {
+    sm.notCompacting.add(createFile());
+  }
+  cst.requestSystemCompaction(r,store,"s1-pri3");
+  for (int i=0; i < 3; ++i) {
+    sm2.notCompacting.add(createFile());
+  }
+  cst.requestSystemCompaction(r,store2,"s2-pri4");
+  for (int i=0; i < 2; ++i) {
+    sm.notCompacting.add(createFile());
+  }
+  cst.requestSystemCompaction(r,store,"s1-pri1");
+  cst.requestSystemCompaction(r,blocker.createStoreMock(2,"b-pri2"),"b-pri2");
+  currentBlock.unblock();
+  currentBlock=blocker.waitForBlocking();
+  assertEquals(1,results.size());
+  assertEquals(6,results.get(0).intValue());
+  for (int i=0; i < 2; ++i) {
+    sm.notCompacting.add(createFile());
+  }
+  cst.requestSystemCompaction(r,blocker.createStoreMock(7,"b-pri7"),"b-pri7");
+  currentBlock.unblock();
+  currentBlock=blocker.waitForBlocking();
+  assertEquals(3,results.size());
+  assertEquals(3,results.get(1).intValue());
+  assertEquals(2,results.get(2).intValue());
+  currentBlock.unblock();
+  cst.interruptIfNecessary();
+}

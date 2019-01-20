@@ -1,0 +1,42 @@
+@Test(timeout=15000) public void commitDuringContinuousCheckpointing() throws Exception {
+  final Index<Node> index;
+  try (Transaction tx=db.beginTx()){
+    index=db.index().forNodes(INDEX_NAME,stringMap(IndexManager.PROVIDER,DummyIndexExtensionFactory.IDENTIFIER));
+    tx.success();
+  }
+   final AtomicBoolean done=new AtomicBoolean();
+  Workers<Runnable> workers=new Workers<>(getClass().getSimpleName());
+  for (int i=0; i < TOTAL_ACTIVE_THREADS; i++) {
+    workers.start(new Runnable(){
+      private final ThreadLocalRandom random=ThreadLocalRandom.current();
+      @Override public void run(){
+        while (!done.get()) {
+          try (Transaction tx=db.beginTx()){
+            Node node=db.createNode();
+            index.add(node,"key",node.getId());
+            tx.success();
+          }
+           randomSleep();
+        }
+      }
+      private void randomSleep(){
+        try {
+          Thread.sleep(random.nextInt(50));
+        }
+ catch (        InterruptedException e) {
+          throw new RuntimeException(e);
+        }
+      }
+    }
+);
+  }
+  Thread.sleep(SECONDS.toMillis(2));
+  done.set(true);
+  workers.awaitAndThrowOnError();
+  NeoStores neoStores=getDependency(RecordStorageEngine.class).testAccessNeoStores();
+  assertThat("Count store should be rotated once at least",neoStores.getCounts().txId(),greaterThan(0L));
+  long lastRotationTx=getDependency(CheckPointer.class).forceCheckPoint(new SimpleTriggerInfo("test"));
+  TransactionIdStore txIdStore=getDependency(TransactionIdStore.class);
+  assertEquals("NeoStore last closed transaction id should be equal last count store rotation transaction id.",txIdStore.getLastClosedTransactionId(),lastRotationTx);
+  assertEquals("Last closed transaction should be last rotated tx in count store",txIdStore.getLastClosedTransactionId(),neoStores.getCounts().txId());
+}

@@ -1,0 +1,77 @@
+public class KernelTransactionTimeoutMonitorIT {
+  @Rule public DatabaseRule database=createDatabaseRule();
+  @Rule public ExpectedException expectedException=ExpectedException.none();
+  private static final int NODE_ID=0;
+  private ExecutorService executor;
+  protected DatabaseRule createDatabaseRule(){
+    return new EmbeddedDatabaseRule().withSetting(GraphDatabaseSettings.transaction_monitor_check_interval,"100ms");
+  }
+  @Before public void setUp(){
+    executor=Executors.newSingleThreadExecutor();
+  }
+  @After public void tearDown(){
+    executor.shutdown();
+  }
+  @Test(timeout=30_000) public void terminateExpiredTransaction() throws Exception {
+    try (Transaction transaction=database.beginTx()){
+      database.createNode();
+      transaction.success();
+    }
+     expectedException.expectMessage("The transaction has been terminated.");
+    try (Transaction transaction=database.beginTx()){
+      Node nodeById=database.getNodeById(NODE_ID);
+      nodeById.setProperty("a","b");
+      executor.submit(startAnotherTransaction()).get();
+    }
+   }
+  @Test(timeout=30_000) public void terminatingTransactionMustEagerlyReleaseTheirLocks() throws Exception {
+    AtomicBoolean nodeLockAcquired=new AtomicBoolean();
+    AtomicBoolean lockerDone=new AtomicBoolean();
+    BinaryLatch lockerPause=new BinaryLatch();
+    long nodeId;
+    try (Transaction tx=database.beginTx()){
+      nodeId=database.createNode().getId();
+      tx.success();
+    }
+     Future<?> locker=executor.submit(() -> {
+      try (Transaction tx=database.beginTx()){
+        Node node=database.getNodeById(nodeId);
+        tx.acquireReadLock(node);
+        nodeLockAcquired.set(true);
+        lockerPause.await();
+      }
+       lockerDone.set(true);
+    }
+);
+    boolean proceed;
+    do {
+      proceed=nodeLockAcquired.get();
+    }
+ while (!proceed);
+    terminateOngoingTransaction();
+    assertFalse(lockerDone.get());
+    try (Transaction tx=database.beginTx()){
+      tx.acquireWriteLock(database.getNodeById(nodeId));
+      tx.success();
+    }
+     lockerPause.release();
+    locker.get();
+    assertTrue(lockerDone.get());
+  }
+  private void terminateOngoingTransaction(){
+    Set<KernelTransactionHandle> kernelTransactionHandles=database.resolveDependency(KernelTransactions.class).activeTransactions();
+    assertThat(kernelTransactionHandles,hasSize(1));
+    for (    KernelTransactionHandle kernelTransactionHandle : kernelTransactionHandles) {
+      kernelTransactionHandle.markForTermination(Status.Transaction.Terminated);
+    }
+  }
+  private Runnable startAnotherTransaction(){
+    return () -> {
+      try (InternalTransaction ignored=database.beginTransaction(KernelTransaction.Type.implicit,LoginContext.AUTH_DISABLED,1,TimeUnit.SECONDS)){
+        Node node=database.getNodeById(NODE_ID);
+        node.setProperty("c","d");
+      }
+     }
+;
+  }
+}

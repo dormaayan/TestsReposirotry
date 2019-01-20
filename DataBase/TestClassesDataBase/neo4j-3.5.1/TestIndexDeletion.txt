@@ -1,0 +1,167 @@
+public class TestIndexDeletion {
+  private static final String INDEX_NAME="index";
+  private static GraphDatabaseService graphDb;
+  private Index<Node> index;
+  private Transaction tx;
+  private String key;
+  private Node node;
+  private String value;
+  private List<WorkThread> workers;
+  @BeforeClass public static void setUpStuff(){
+    graphDb=new TestGraphDatabaseFactory().newImpermanentDatabase();
+  }
+  @AfterClass public static void tearDownStuff(){
+    graphDb.shutdown();
+  }
+  @After public void commitTx() throws Exception {
+    finishTx(true);
+    for (    WorkThread worker : workers) {
+      worker.rollback();
+      worker.die();
+      worker.close();
+    }
+  }
+  public void rollbackTx(){
+    finishTx(false);
+  }
+  public void finishTx(  boolean success){
+    if (tx != null) {
+      if (success) {
+        tx.success();
+      }
+      tx.close();
+      tx=null;
+    }
+  }
+  @Before public void createInitialData(){
+    beginTx();
+    index=graphDb.index().forNodes(INDEX_NAME);
+    index.delete();
+    restartTx();
+    index=graphDb.index().forNodes(INDEX_NAME);
+    key="key";
+    value="my own value";
+    node=graphDb.createNode();
+    index.add(node,key,value);
+    workers=new ArrayList<>();
+  }
+  public void beginTx(){
+    if (tx == null) {
+      tx=graphDb.beginTx();
+    }
+  }
+  void restartTx(){
+    finishTx(true);
+    beginTx();
+  }
+  @Test public void shouldBeAbleToDeleteAndRecreateIndex(){
+    restartTx();
+    assertContains(index.query(key,"own"));
+    index.delete();
+    restartTx();
+    Index<Node> recreatedIndex=graphDb.index().forNodes(INDEX_NAME,LuceneIndexImplementation.FULLTEXT_CONFIG);
+    assertNull(recreatedIndex.get(key,value).getSingle());
+    recreatedIndex.add(node,key,value);
+    restartTx();
+    assertContains(recreatedIndex.query(key,"own"),node);
+    recreatedIndex.delete();
+  }
+  @Test public void shouldNotBeDeletedWhenDeletionRolledBack(){
+    restartTx();
+    index.delete();
+    rollbackTx();
+    beginTx();
+    try (IndexHits<Node> indexHits=index.get(key,value)){
+    }
+   }
+  @Test public void shouldThrowIllegalStateForActionsAfterDeletedOnIndex(){
+    restartTx();
+    index.delete();
+    restartTx();
+    try {
+      index.query(key,"own");
+      fail("Should fail");
+    }
+ catch (    NotFoundException e) {
+      assertThat(e.getMessage(),containsString("doesn't exist"));
+    }
+  }
+  @Test public void shouldThrowIllegalStateForActionsAfterDeletedOnIndex2(){
+    restartTx();
+    index.delete();
+    restartTx();
+    try {
+      index.add(node,key,value);
+      fail();
+    }
+ catch (    NotFoundException e) {
+      assertThat(e.getMessage(),containsString("doesn't exist"));
+    }
+  }
+  @Test(expected=IllegalStateException.class) public void shouldThrowIllegalStateForActionsAfterDeletedOnIndex3(){
+    restartTx();
+    index.delete();
+    index.query(key,"own");
+  }
+  @Test(expected=IllegalStateException.class) public void shouldThrowIllegalStateForActionsAfterDeletedOnIndex4(){
+    restartTx();
+    index.delete();
+    Index<Node> newIndex=graphDb.index().forNodes(INDEX_NAME);
+    newIndex.query(key,"own");
+  }
+  @Test public void deleteInOneTxShouldNotAffectTheOther() throws Exception {
+    index.delete();
+    WorkThread firstTx=createWorker("Single");
+    firstTx.beginTransaction();
+    firstTx.createNodeAndIndexBy(key,"another value");
+    firstTx.commit();
+  }
+  @Test public void deleteAndCommitShouldBePublishedToOtherTransaction2() throws Exception {
+    WorkThread firstTx=createWorker("First");
+    WorkThread secondTx=createWorker("Second");
+    firstTx.beginTransaction();
+    secondTx.beginTransaction();
+    firstTx.createNodeAndIndexBy(key,"some value");
+    secondTx.createNodeAndIndexBy(key,"some other value");
+    firstTx.deleteIndex();
+    firstTx.commit();
+    try {
+      secondTx.queryIndex(key,"some other value");
+      fail("Should throw exception");
+    }
+ catch (    ExecutionException e) {
+      assertThat(e.getCause(),instanceOf(NotFoundException.class));
+      assertThat(e.getCause().getMessage().toLowerCase(),containsString("index 'index' doesn't exist"));
+    }
+    secondTx.rollback();
+    rollbackTx();
+  }
+  @Test public void indexDeletesShouldNotByVisibleUntilCommit() throws Exception {
+    commitTx();
+    WorkThread firstTx=createWorker("First");
+    firstTx.beginTransaction();
+    firstTx.removeFromIndex(key,value);
+    try (Transaction transaction=graphDb.beginTx()){
+      IndexHits<Node> indexHits=index.get(key,value);
+      assertThat(indexHits,Contains.contains(node));
+    }
+     firstTx.rollback();
+  }
+  @Test public void canDeleteIndexEvenIfEntitiesAreFoundToBeAbandonedInTheSameTx(){
+    Index<Node> nodeIndex=graphDb.index().forNodes("index");
+    Node node=graphDb.createNode();
+    nodeIndex.add(node,"key","value");
+    restartTx();
+    node.delete();
+    restartTx();
+    for (    Node ignore : nodeIndex.get("key","value")) {
+    }
+    nodeIndex.delete();
+    restartTx();
+  }
+  private WorkThread createWorker(  String name){
+    WorkThread workThread=new WorkThread(name,index,graphDb,node);
+    workers.add(workThread);
+    return workThread;
+  }
+}

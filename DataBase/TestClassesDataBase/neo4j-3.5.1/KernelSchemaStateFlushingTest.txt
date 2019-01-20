@@ -1,0 +1,96 @@
+public class KernelSchemaStateFlushingTest {
+  @Rule public ImpermanentDatabaseRule dbRule=new ImpermanentDatabaseRule();
+  private GraphDatabaseAPI db;
+  private Kernel kernel;
+  @Before public void setup(){
+    db=dbRule.getGraphDatabaseAPI();
+    kernel=db.getDependencyResolver().resolveDependency(Kernel.class);
+  }
+  @After public void after(){
+    db.shutdown();
+  }
+  @Test public void shouldKeepSchemaStateIfSchemaIsNotModified() throws TransactionFailureException {
+    String before=commitToSchemaState("test","before");
+    assertEquals("before",before);
+    String after=commitToSchemaState("test","after");
+    assertEquals("before",after);
+  }
+  @Test public void shouldInvalidateSchemaStateOnCreateIndex() throws Exception {
+    commitToSchemaState("test","before");
+    awaitIndexOnline(createIndex(),"test");
+    String after=commitToSchemaState("test","after");
+    assertEquals("after",after);
+  }
+  @Test public void shouldInvalidateSchemaStateOnDropIndex() throws Exception {
+    IndexReference ref=createIndex();
+    awaitIndexOnline(ref,"test");
+    commitToSchemaState("test","before");
+    dropIndex(ref);
+    String after=commitToSchemaState("test","after");
+    assertEquals("after",after);
+  }
+  @Test public void shouldInvalidateSchemaStateOnCreateConstraint() throws Exception {
+    commitToSchemaState("test","before");
+    createConstraint();
+    String after=commitToSchemaState("test","after");
+    assertEquals("after",after);
+  }
+  @Test public void shouldInvalidateSchemaStateOnDropConstraint() throws Exception {
+    ConstraintDescriptor descriptor=createConstraint();
+    commitToSchemaState("test","before");
+    dropConstraint(descriptor);
+    String after=commitToSchemaState("test","after");
+    assertEquals("after",after);
+  }
+  private ConstraintDescriptor createConstraint() throws KernelException {
+    try (Transaction transaction=kernel.beginTransaction(implicit,AUTH_DISABLED)){
+      ConstraintDescriptor descriptor=transaction.schemaWrite().uniquePropertyConstraintCreate(SchemaDescriptorFactory.forLabel(1,1));
+      transaction.success();
+      return descriptor;
+    }
+   }
+  private void dropConstraint(  ConstraintDescriptor descriptor) throws KernelException {
+    try (Transaction transaction=kernel.beginTransaction(implicit,AUTH_DISABLED)){
+      transaction.schemaWrite().constraintDrop(descriptor);
+      transaction.success();
+    }
+   }
+  private IndexReference createIndex() throws KernelException {
+    try (Transaction transaction=kernel.beginTransaction(implicit,AUTH_DISABLED)){
+      IndexReference reference=transaction.schemaWrite().indexCreate(SchemaDescriptorFactory.forLabel(1,1));
+      transaction.success();
+      return reference;
+    }
+   }
+  private void dropIndex(  IndexReference reference) throws KernelException {
+    try (Transaction transaction=kernel.beginTransaction(implicit,AUTH_DISABLED)){
+      transaction.schemaWrite().indexDrop(reference);
+      transaction.success();
+    }
+   }
+  private void awaitIndexOnline(  IndexReference descriptor,  String keyForProbing) throws IndexNotFoundKernelException, TransactionFailureException {
+    try (Transaction transaction=kernel.beginTransaction(implicit,AUTH_DISABLED)){
+      SchemaIndexTestHelper.awaitIndexOnline(transaction.schemaRead(),descriptor);
+      transaction.success();
+    }
+     awaitSchemaStateCleared(keyForProbing);
+  }
+  private void awaitSchemaStateCleared(  String keyForProbing) throws TransactionFailureException {
+    try (Transaction transaction=kernel.beginTransaction(implicit,AUTH_DISABLED)){
+      while (transaction.schemaRead().schemaStateGetOrCreate(keyForProbing,ignored -> null) != null) {
+        LockSupport.parkNanos(MILLISECONDS.toNanos(10));
+      }
+      transaction.success();
+    }
+   }
+  private String commitToSchemaState(  String key,  String value) throws TransactionFailureException {
+    try (Transaction transaction=kernel.beginTransaction(implicit,AUTH_DISABLED)){
+      String result=getOrCreateFromState(transaction,key,value);
+      transaction.success();
+      return result;
+    }
+   }
+  private String getOrCreateFromState(  Transaction tx,  String key,  final String value){
+    return tx.schemaRead().schemaStateGetOrCreate(key,from -> value);
+  }
+}

@@ -1,0 +1,66 @@
+/** 
+ * Verify that we don't start a job from scratch if we cannot restore any of the CompletedCheckpoints. <p>Synchronization for the different steps and things we want to observe happens via latches in the test method and the methods of  {@link CheckpointBlockingFunction}. <p>The test follows these steps: <ol> <li>Start job and block on a latch until we have done some checkpoints <li>Block in the special function <li>Move away the contents of the ZooKeeper HA directory to make restoring from checkpoints impossible <li>Unblock the special function, which now induces a failure <li>Make sure that the job does not recover successfully <li>Move back the HA directory <li>Make sure that the job recovers, we use a latch to ensure that the operator restored successfully </ol>
+ */
+@Test(timeout=120_000L) public void testRestoreBehaviourWithFaultyStateHandles() throws Exception {
+  CheckpointBlockingFunction.allowedInitializeCallsWithoutRestore.set(1);
+  CheckpointBlockingFunction.successfulRestores.set(0);
+  CheckpointBlockingFunction.illegalRestores.set(0);
+  CheckpointBlockingFunction.afterMessWithZooKeeper.set(false);
+  CheckpointBlockingFunction.failedAlready.set(false);
+  waitForCheckpointLatch=new OneShotLatch();
+  failInCheckpointLatch=new OneShotLatch();
+  ClusterClient<?> clusterClient=miniClusterResource.getClusterClient();
+  final Deadline deadline=Deadline.now().plus(TEST_TIMEOUT);
+  StreamExecutionEnvironment env=StreamExecutionEnvironment.getExecutionEnvironment();
+  env.setParallelism(1);
+  env.setRestartStrategy(RestartStrategies.fixedDelayRestart(Integer.MAX_VALUE,0));
+  env.enableCheckpointing(10);
+  File checkpointLocation=TEMPORARY_FOLDER.newFolder();
+  env.setStateBackend((StateBackend)new FsStateBackend(checkpointLocation.toURI()));
+  DataStreamSource<String> source=env.addSource(new UnboundedSource());
+  source.keyBy((str) -> str).map(new CheckpointBlockingFunction());
+  JobGraph jobGraph=env.getStreamGraph().getJobGraph();
+  JobID jobID=Preconditions.checkNotNull(jobGraph.getJobID());
+  clusterClient.setDetached(true);
+  clusterClient.submitJob(jobGraph,ZooKeeperHighAvailabilityITCase.class.getClassLoader());
+  waitForCheckpointLatch.await();
+  log.debug("Messing with HA directory");
+  File movedCheckpointLocation=TEMPORARY_FOLDER.newFolder();
+  AtomicInteger numCheckpoints=new AtomicInteger();
+  Files.walkFileTree(haStorageDir.toPath(),new SimpleFileVisitor<Path>(){
+    @Override public FileVisitResult visitFile(    Path file,    BasicFileAttributes attrs){
+      if (file.getFileName().toString().startsWith("completedCheckpoint")) {
+        log.debug("Moving original checkpoint file {}.",file);
+        try {
+          Files.move(file,movedCheckpointLocation.toPath().resolve(file.getFileName()));
+          numCheckpoints.incrementAndGet();
+        }
+ catch (        IOException ioe) {
+          log.debug("Exception while moving HA files.",ioe);
+        }
+      }
+      return FileVisitResult.CONTINUE;
+    }
+  }
+);
+  assertTrue(numCheckpoints.get() > 0);
+  log.debug("Resuming job");
+  failInCheckpointLatch.trigger();
+  assertNotNull("fullRestarts metric could not be accessed.",RestartReporter.numRestarts);
+  while (RestartReporter.numRestarts.getValue() < 5 && deadline.hasTimeLeft()) {
+    Thread.sleep(50);
+  }
+  assertThat(RestartReporter.numRestarts.getValue(),is(greaterThan(4L)));
+  CheckpointBlockingFunction.afterMessWithZooKeeper.set(true);
+  log.debug("Restored zookeeper");
+  Files.walkFileTree(movedCheckpointLocation.toPath(),new SimpleFileVisitor<Path>(){
+    @Override public FileVisitResult visitFile(    Path file,    BasicFileAttributes attrs) throws IOException {
+      Files.move(file,haStorageDir.toPath().resolve(file.getFileName()));
+      return FileVisitResult.CONTINUE;
+    }
+  }
+);
+  CompletableFuture<JobStatus> jobStatusFuture=FutureUtils.retrySuccesfulWithDelay(() -> clusterClient.getJobStatus(jobID),Time.milliseconds(50),deadline,(jobStatus) -> jobStatus == JobStatus.FINISHED,TestingUtils.defaultScheduledExecutor());
+  assertEquals(JobStatus.FINISHED,jobStatusFuture.get());
+  assertThat("We saw illegal restores.",CheckpointBlockingFunction.illegalRestores.get(),is(0));
+}

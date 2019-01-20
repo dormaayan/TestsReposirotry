@@ -1,0 +1,83 @@
+public class GraphDatabaseShutdownTest {
+  private GraphDatabaseAPI db;
+  @Rule public final OtherThreadRule<Void> t2=new OtherThreadRule<>("T2");
+  @Rule public final OtherThreadRule<Void> t3=new OtherThreadRule<>("T3");
+  @Before public void setUp(){
+    db=newDb();
+  }
+  @After public void tearDown(){
+    db.shutdown();
+  }
+  @Test public void transactionShouldReleaseLocksWhenGraphDbIsBeingShutdown(){
+    final Locks locks=db.getDependencyResolver().resolveDependency(Locks.class);
+    assertEquals(0,lockCount(locks));
+    Exception exceptionThrownByTxClose=null;
+    try (Transaction tx=db.beginTx()){
+      Node node=db.createNode();
+      tx.acquireWriteLock(node);
+      assertThat(lockCount(locks),greaterThanOrEqualTo(1));
+      db.shutdown();
+      db.createNode();
+      tx.success();
+    }
+ catch (    Exception e) {
+      exceptionThrownByTxClose=e;
+    }
+    assertThat(exceptionThrownByTxClose,instanceOf(DatabaseShutdownException.class));
+    assertFalse(db.isAvailable(1));
+    assertEquals(0,lockCount(locks));
+  }
+  @Test public void shouldBeAbleToShutdownWhenThereAreTransactionsWaitingForLocks() throws Exception {
+    final Node node;
+    try (Transaction tx=db.beginTx()){
+      node=db.createNode();
+      tx.success();
+    }
+     final CountDownLatch nodeLockedLatch=new CountDownLatch(1);
+    final CountDownLatch shutdownCalled=new CountDownLatch(1);
+    Future<Void> shutdownFuture=t2.execute(state -> {
+      try (Transaction tx=db.beginTx()){
+        node.addLabel(label("ABC"));
+        nodeLockedLatch.countDown();
+        t3.get().waitUntilWaiting(details -> details.isAt(CommunityLockClient.class,"acquireExclusive"));
+        db.shutdown();
+        shutdownCalled.countDown();
+        tx.success();
+      }
+       return null;
+    }
+);
+    Future<Void> secondTxResult=t3.execute(state -> {
+      try (Transaction tx=db.beginTx()){
+        nodeLockedLatch.await();
+        node.addLabel(label("DEF"));
+        shutdownCalled.await();
+        tx.success();
+      }
+       return null;
+    }
+);
+    try {
+      secondTxResult.get(60,SECONDS);
+      fail("Exception expected");
+    }
+ catch (    Exception e) {
+      assertThat(rootCause(e),instanceOf(TransactionTerminatedException.class));
+    }
+    try {
+      shutdownFuture.get();
+      fail("Should thrown exception since transaction should be canceled.");
+    }
+ catch (    Exception e) {
+      assertThat(rootCause(e),instanceOf(TransactionTerminatedException.class));
+    }
+  }
+  private static int lockCount(  Locks locks){
+    LockCountVisitor lockCountVisitor=new LockCountVisitor();
+    locks.accept(lockCountVisitor);
+    return lockCountVisitor.getLockCount();
+  }
+  private GraphDatabaseAPI newDb(){
+    return (GraphDatabaseAPI)new TestGraphDatabaseFactory().newImpermanentDatabaseBuilder().newGraphDatabase();
+  }
+}

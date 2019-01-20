@@ -1,0 +1,519 @@
+public class TestApplicationMasterService {
+  private static final Log LOG=LogFactory.getLog(TestApplicationMasterService.class);
+  private final int GB=1024;
+  private static YarnConfiguration conf;
+  private static AtomicInteger beforeRegCount=new AtomicInteger(0);
+  private static AtomicInteger afterRegCount=new AtomicInteger(0);
+  private static AtomicInteger beforeAllocCount=new AtomicInteger(0);
+  private static AtomicInteger afterAllocCount=new AtomicInteger(0);
+  private static AtomicInteger beforeFinishCount=new AtomicInteger(0);
+  private static AtomicInteger afterFinishCount=new AtomicInteger(0);
+  private static AtomicInteger initCount=new AtomicInteger(0);
+static class TestInterceptor1 implements ApplicationMasterServiceProcessor {
+    private ApplicationMasterServiceProcessor nextProcessor;
+    @Override public void init(    ApplicationMasterServiceContext amsContext,    ApplicationMasterServiceProcessor next){
+      initCount.incrementAndGet();
+      this.nextProcessor=next;
+    }
+    @Override public void registerApplicationMaster(    ApplicationAttemptId applicationAttemptId,    RegisterApplicationMasterRequest request,    RegisterApplicationMasterResponse response) throws IOException, YarnException {
+      nextProcessor.registerApplicationMaster(applicationAttemptId,request,response);
+    }
+    @Override public void allocate(    ApplicationAttemptId appAttemptId,    AllocateRequest request,    AllocateResponse response) throws YarnException {
+      beforeAllocCount.incrementAndGet();
+      nextProcessor.allocate(appAttemptId,request,response);
+      afterAllocCount.incrementAndGet();
+    }
+    @Override public void finishApplicationMaster(    ApplicationAttemptId applicationAttemptId,    FinishApplicationMasterRequest request,    FinishApplicationMasterResponse response){
+      beforeFinishCount.incrementAndGet();
+      afterFinishCount.incrementAndGet();
+    }
+  }
+static class TestInterceptor2 implements ApplicationMasterServiceProcessor {
+    private ApplicationMasterServiceProcessor nextProcessor;
+    @Override public void init(    ApplicationMasterServiceContext amsContext,    ApplicationMasterServiceProcessor next){
+      initCount.incrementAndGet();
+      this.nextProcessor=next;
+    }
+    @Override public void registerApplicationMaster(    ApplicationAttemptId applicationAttemptId,    RegisterApplicationMasterRequest request,    RegisterApplicationMasterResponse response) throws IOException, YarnException {
+      beforeRegCount.incrementAndGet();
+      nextProcessor.registerApplicationMaster(applicationAttemptId,request,response);
+      afterRegCount.incrementAndGet();
+    }
+    @Override public void allocate(    ApplicationAttemptId appAttemptId,    AllocateRequest request,    AllocateResponse response) throws YarnException {
+      beforeAllocCount.incrementAndGet();
+      nextProcessor.allocate(appAttemptId,request,response);
+      afterAllocCount.incrementAndGet();
+    }
+    @Override public void finishApplicationMaster(    ApplicationAttemptId applicationAttemptId,    FinishApplicationMasterRequest request,    FinishApplicationMasterResponse response){
+      beforeFinishCount.incrementAndGet();
+      nextProcessor.finishApplicationMaster(applicationAttemptId,request,response);
+      afterFinishCount.incrementAndGet();
+    }
+  }
+  @Before public void setup(){
+    conf=new YarnConfiguration();
+    conf.setClass(YarnConfiguration.RM_SCHEDULER,FifoScheduler.class,ResourceScheduler.class);
+  }
+  @Test(timeout=300000) public void testApplicationMasterInterceptor() throws Exception {
+    conf.set(YarnConfiguration.RM_APPLICATION_MASTER_SERVICE_PROCESSORS,TestInterceptor1.class.getName() + "," + TestInterceptor2.class.getName());
+    MockRM rm=new MockRM(conf);
+    rm.start();
+    MockNM nm1=rm.registerNode("127.0.0.1:1234",6 * GB);
+    RMApp app1=rm.submitApp(2048);
+    nm1.nodeHeartbeat(true);
+    RMAppAttempt attempt1=app1.getCurrentAppAttempt();
+    MockAM am1=rm.sendAMLaunched(attempt1.getAppAttemptId());
+    am1.registerAppAttempt();
+    int allocCount=0;
+    am1.addRequests(new String[]{"127.0.0.1"},GB,1,1);
+    AllocateResponse alloc1Response=am1.schedule();
+    allocCount++;
+    nm1.nodeHeartbeat(true);
+    while (alloc1Response.getAllocatedContainers().size() < 1) {
+      LOG.info("Waiting for containers to be created for app 1...");
+      sleep(1000);
+      alloc1Response=am1.schedule();
+      allocCount++;
+    }
+    Container allocatedContainer=alloc1Response.getAllocatedContainers().get(0);
+    ContainerTokenIdentifier tokenId=BuilderUtils.newContainerTokenIdentifier(allocatedContainer.getContainerToken());
+    am1.unregisterAppAttempt();
+    Assert.assertEquals(1,beforeRegCount.get());
+    Assert.assertEquals(1,afterRegCount.get());
+    Assert.assertEquals(allocCount * 2,beforeAllocCount.get());
+    Assert.assertEquals(allocCount * 2,afterAllocCount.get());
+    Assert.assertEquals(1,beforeFinishCount.get());
+    Assert.assertEquals(1,afterFinishCount.get());
+    rm.stop();
+  }
+  @Test(timeout=3000000) public void testRMIdentifierOnContainerAllocation() throws Exception {
+    MockRM rm=new MockRM(conf);
+    rm.start();
+    MockNM nm1=rm.registerNode("127.0.0.1:1234",6 * GB);
+    RMApp app1=rm.submitApp(2048);
+    nm1.nodeHeartbeat(true);
+    RMAppAttempt attempt1=app1.getCurrentAppAttempt();
+    MockAM am1=rm.sendAMLaunched(attempt1.getAppAttemptId());
+    am1.registerAppAttempt();
+    am1.addRequests(new String[]{"127.0.0.1"},GB,1,1);
+    AllocateResponse alloc1Response=am1.schedule();
+    nm1.nodeHeartbeat(true);
+    while (alloc1Response.getAllocatedContainers().size() < 1) {
+      LOG.info("Waiting for containers to be created for app 1...");
+      sleep(1000);
+      alloc1Response=am1.schedule();
+    }
+    Container allocatedContainer=alloc1Response.getAllocatedContainers().get(0);
+    ContainerTokenIdentifier tokenId=BuilderUtils.newContainerTokenIdentifier(allocatedContainer.getContainerToken());
+    Assert.assertEquals(MockRM.getClusterTimeStamp(),tokenId.getRMIdentifier());
+    rm.stop();
+  }
+  @Test(timeout=3000000) public void testAllocateResponseIdOverflow() throws Exception {
+    MockRM rm=new MockRM(conf);
+    try {
+      rm.start();
+      MockNM nm1=rm.registerNode("127.0.0.1:1234",6 * GB);
+      RMApp app1=rm.submitApp(2048);
+      nm1.nodeHeartbeat(true);
+      RMAppAttempt attempt1=app1.getCurrentAppAttempt();
+      MockAM am1=rm.sendAMLaunched(attempt1.getAppAttemptId());
+      am1.registerAppAttempt();
+      Assert.assertTrue(am1.setApplicationLastResponseId(Integer.MAX_VALUE));
+      am1.schedule();
+      Assert.assertEquals(0,am1.getResponseId());
+      am1.schedule();
+      Assert.assertEquals(1,am1.getResponseId());
+    }
+  finally {
+      if (rm != null) {
+        rm.stop();
+      }
+    }
+  }
+  @Test(timeout=600000) public void testInvalidContainerReleaseRequest() throws Exception {
+    MockRM rm=new MockRM(conf);
+    try {
+      rm.start();
+      MockNM nm1=rm.registerNode("127.0.0.1:1234",6 * GB);
+      RMApp app1=rm.submitApp(1024);
+      nm1.nodeHeartbeat(true);
+      RMAppAttempt attempt1=app1.getCurrentAppAttempt();
+      MockAM am1=rm.sendAMLaunched(attempt1.getAppAttemptId());
+      am1.registerAppAttempt();
+      am1.addRequests(new String[]{"127.0.0.1"},GB,1,1);
+      AllocateResponse alloc1Response=am1.schedule();
+      nm1.nodeHeartbeat(true);
+      while (alloc1Response.getAllocatedContainers().size() < 1) {
+        LOG.info("Waiting for containers to be created for app 1...");
+        sleep(1000);
+        alloc1Response=am1.schedule();
+      }
+      Assert.assertTrue(alloc1Response.getAllocatedContainers().size() > 0);
+      RMApp app2=rm.submitApp(1024);
+      nm1.nodeHeartbeat(true);
+      RMAppAttempt attempt2=app2.getCurrentAppAttempt();
+      MockAM am2=rm.sendAMLaunched(attempt2.getAppAttemptId());
+      am2.registerAppAttempt();
+      ContainerId cId=alloc1Response.getAllocatedContainers().get(0).getId();
+      am2.addContainerToBeReleased(cId);
+      try {
+        am2.schedule();
+        fail("Exception was expected!!");
+      }
+ catch (      InvalidContainerReleaseException e) {
+        StringBuilder sb=new StringBuilder("Cannot release container : ");
+        sb.append(cId.toString());
+        sb.append(" not belonging to this application attempt : ");
+        sb.append(attempt2.getAppAttemptId().toString());
+        Assert.assertTrue(e.getMessage().contains(sb.toString()));
+      }
+    }
+  finally {
+      if (rm != null) {
+        rm.stop();
+      }
+    }
+  }
+  @Test(timeout=1200000) public void testProgressFilter() throws Exception {
+    MockRM rm=new MockRM(conf);
+    rm.start();
+    MockNM nm1=rm.registerNode("127.0.0.1:1234",6 * GB);
+    RMApp app1=rm.submitApp(2048);
+    nm1.nodeHeartbeat(true);
+    RMAppAttempt attempt1=app1.getCurrentAppAttempt();
+    MockAM am1=rm.sendAMLaunched(attempt1.getAppAttemptId());
+    am1.registerAppAttempt();
+    AllocateRequestPBImpl allocateRequest=new AllocateRequestPBImpl();
+    List<ContainerId> release=new ArrayList<ContainerId>();
+    List<ResourceRequest> ask=new ArrayList<ResourceRequest>();
+    allocateRequest.setReleaseList(release);
+    allocateRequest.setAskList(ask);
+    allocateRequest.setProgress(Float.POSITIVE_INFINITY);
+    am1.allocate(allocateRequest);
+    while (attempt1.getProgress() != 1) {
+      LOG.info("Waiting for allocate event to be handled ...");
+      sleep(100);
+    }
+    allocateRequest.setProgress(Float.NaN);
+    am1.allocate(allocateRequest);
+    while (attempt1.getProgress() != 0) {
+      LOG.info("Waiting for allocate event to be handled ...");
+      sleep(100);
+    }
+    allocateRequest.setProgress((float)9);
+    am1.allocate(allocateRequest);
+    while (attempt1.getProgress() != 1) {
+      LOG.info("Waiting for allocate event to be handled ...");
+      sleep(100);
+    }
+    allocateRequest.setProgress(Float.NEGATIVE_INFINITY);
+    am1.allocate(allocateRequest);
+    while (attempt1.getProgress() != 0) {
+      LOG.info("Waiting for allocate event to be handled ...");
+      sleep(100);
+    }
+    allocateRequest.setProgress((float)0.5);
+    am1.allocate(allocateRequest);
+    while (attempt1.getProgress() != 0.5) {
+      LOG.info("Waiting for allocate event to be handled ...");
+      sleep(100);
+    }
+    allocateRequest.setProgress((float)-1);
+    am1.allocate(allocateRequest);
+    while (attempt1.getProgress() != 0) {
+      LOG.info("Waiting for allocate event to be handled ...");
+      sleep(100);
+    }
+  }
+  @Test(timeout=1200000) public void testFinishApplicationMasterBeforeRegistering() throws Exception {
+    MockRM rm=new MockRM(conf);
+    try {
+      rm.start();
+      MockNM nm1=rm.registerNode("127.0.0.1:1234",6 * GB);
+      RMApp app1=rm.submitApp(2048);
+      MockAM am1=MockRM.launchAM(app1,rm,nm1);
+      FinishApplicationMasterRequest req=FinishApplicationMasterRequest.newInstance(FinalApplicationStatus.FAILED,"","");
+      try {
+        am1.unregisterAppAttempt(req,false);
+        fail("ApplicationMasterNotRegisteredException should be thrown");
+      }
+ catch (      ApplicationMasterNotRegisteredException e) {
+        Assert.assertNotNull(e);
+        Assert.assertNotNull(e.getMessage());
+        Assert.assertTrue(e.getMessage().contains("Application Master is trying to unregister before registering for:"));
+      }
+catch (      Exception e) {
+        fail("ApplicationMasterNotRegisteredException should be thrown");
+      }
+      am1.registerAppAttempt();
+      am1.unregisterAppAttempt(req,false);
+      rm.waitForState(am1.getApplicationAttemptId(),RMAppAttemptState.FINISHING);
+    }
+  finally {
+      if (rm != null) {
+        rm.stop();
+      }
+    }
+  }
+  @Test(timeout=3000000) public void testResourceTypes() throws Exception {
+    HashMap<YarnConfiguration,EnumSet<SchedulerResourceTypes>> driver=new HashMap<YarnConfiguration,EnumSet<SchedulerResourceTypes>>();
+    CapacitySchedulerConfiguration csconf=new CapacitySchedulerConfiguration();
+    csconf.setResourceComparator(DominantResourceCalculator.class);
+    YarnConfiguration testCapacityDRConf=new YarnConfiguration(csconf);
+    testCapacityDRConf.setClass(YarnConfiguration.RM_SCHEDULER,CapacityScheduler.class,ResourceScheduler.class);
+    YarnConfiguration testCapacityDefConf=new YarnConfiguration();
+    testCapacityDefConf.setClass(YarnConfiguration.RM_SCHEDULER,CapacityScheduler.class,ResourceScheduler.class);
+    YarnConfiguration testFairDefConf=new YarnConfiguration();
+    testFairDefConf.setClass(YarnConfiguration.RM_SCHEDULER,FairScheduler.class,ResourceScheduler.class);
+    driver.put(conf,EnumSet.of(SchedulerResourceTypes.MEMORY));
+    driver.put(testCapacityDRConf,EnumSet.of(SchedulerResourceTypes.CPU,SchedulerResourceTypes.MEMORY));
+    driver.put(testCapacityDefConf,EnumSet.of(SchedulerResourceTypes.MEMORY));
+    driver.put(testFairDefConf,EnumSet.of(SchedulerResourceTypes.MEMORY,SchedulerResourceTypes.CPU));
+    for (    Map.Entry<YarnConfiguration,EnumSet<SchedulerResourceTypes>> entry : driver.entrySet()) {
+      EnumSet<SchedulerResourceTypes> expectedValue=entry.getValue();
+      MockRM rm=new MockRM(entry.getKey());
+      rm.start();
+      MockNM nm1=rm.registerNode("127.0.0.1:1234",6 * GB);
+      RMApp app1=rm.submitApp(2048);
+      Thread.sleep(1000);
+      nm1.nodeHeartbeat(true);
+      RMAppAttempt attempt1=app1.getCurrentAppAttempt();
+      MockAM am1=rm.sendAMLaunched(attempt1.getAppAttemptId());
+      RegisterApplicationMasterResponse resp=am1.registerAppAttempt();
+      EnumSet<SchedulerResourceTypes> types=resp.getSchedulerResourceTypes();
+      LOG.info("types = " + types.toString());
+      Assert.assertEquals(expectedValue,types);
+      rm.stop();
+    }
+  }
+  @Test(timeout=1200000) public void testAllocateAfterUnregister() throws Exception {
+    MockRM rm=new MockRM(conf);
+    rm.start();
+    MockNM nm1=rm.registerNode("127.0.0.1:1234",6 * GB);
+    RMApp app1=rm.submitApp(2048);
+    nm1.nodeHeartbeat(true);
+    RMAppAttempt attempt1=app1.getCurrentAppAttempt();
+    MockAM am1=rm.sendAMLaunched(attempt1.getAppAttemptId());
+    am1.registerAppAttempt();
+    FinishApplicationMasterRequest req=FinishApplicationMasterRequest.newInstance(FinalApplicationStatus.KILLED,"","");
+    am1.unregisterAppAttempt(req,false);
+    am1.addRequests(new String[]{"127.0.0.1"},GB,1,1);
+    AllocateResponse alloc1Response=am1.schedule();
+    nm1.nodeHeartbeat(true);
+    rm.drainEvents();
+    alloc1Response=am1.schedule();
+    Assert.assertEquals(0,alloc1Response.getAllocatedContainers().size());
+  }
+  @Test(timeout=60000) public void testInvalidIncreaseDecreaseRequest() throws Exception {
+    conf=new YarnConfiguration();
+    conf.setClass(YarnConfiguration.RM_SCHEDULER,CapacityScheduler.class,ResourceScheduler.class);
+    MockRM rm=new MockRM(conf);
+    try {
+      rm.start();
+      MockNM nm1=rm.registerNode("127.0.0.1:1234",6 * GB);
+      RMApp app1=rm.submitApp(1024);
+      nm1.nodeHeartbeat(true);
+      RMAppAttempt attempt1=app1.getCurrentAppAttempt();
+      MockAM am1=rm.sendAMLaunched(attempt1.getAppAttemptId());
+      RegisterApplicationMasterResponse registerResponse=am1.registerAppAttempt();
+      sentRMContainerLaunched(rm,ContainerId.newContainerId(am1.getApplicationAttemptId(),1));
+      am1.sendContainerResizingRequest(Arrays.asList(UpdateContainerRequest.newInstance(0,ContainerId.newContainerId(attempt1.getAppAttemptId(),1),ContainerUpdateType.INCREASE_RESOURCE,Resources.createResource(2048),null)));
+      AllocateResponse response=am1.sendContainerResizingRequest(Arrays.asList(UpdateContainerRequest.newInstance(0,ContainerId.newContainerId(attempt1.getAppAttemptId(),1),ContainerUpdateType.INCREASE_RESOURCE,Resources.createResource(-1),null)));
+      Assert.assertEquals(1,response.getUpdateErrors().size());
+      Assert.assertEquals("RESOURCE_OUTSIDE_ALLOWED_RANGE",response.getUpdateErrors().get(0).getReason());
+      response=am1.sendContainerResizingRequest(Arrays.asList(UpdateContainerRequest.newInstance(0,ContainerId.newContainerId(attempt1.getAppAttemptId(),1),ContainerUpdateType.INCREASE_RESOURCE,Resources.add(registerResponse.getMaximumResourceCapability(),Resources.createResource(1)),null)));
+      Assert.assertEquals(1,response.getUpdateErrors().size());
+      Assert.assertEquals("RESOURCE_OUTSIDE_ALLOWED_RANGE",response.getUpdateErrors().get(0).getReason());
+      response=am1.sendContainerResizingRequest(Arrays.asList(UpdateContainerRequest.newInstance(0,ContainerId.newContainerId(attempt1.getAppAttemptId(),1),ContainerUpdateType.INCREASE_RESOURCE,Resources.createResource(2048,4),null),UpdateContainerRequest.newInstance(0,ContainerId.newContainerId(attempt1.getAppAttemptId(),1),ContainerUpdateType.DECREASE_RESOURCE,Resources.createResource(1024,1),null)));
+      Assert.assertEquals(1,response.getUpdateErrors().size());
+      Assert.assertEquals("UPDATE_OUTSTANDING_ERROR",response.getUpdateErrors().get(0).getReason());
+    }
+  finally {
+      rm.close();
+    }
+  }
+  @Test(timeout=300000) public void testPriorityInAllocatedResponse() throws Exception {
+    conf.setClass(YarnConfiguration.RM_SCHEDULER,CapacityScheduler.class,ResourceScheduler.class);
+    conf.setInt(YarnConfiguration.MAX_CLUSTER_LEVEL_APPLICATION_PRIORITY,10);
+    MockRM rm=new MockRM(conf);
+    rm.start();
+    MockNM nm1=rm.registerNode("127.0.0.1:1234",6 * GB);
+    Priority appPriority1=Priority.newInstance(5);
+    RMApp app1=rm.submitApp(2048,appPriority1);
+    nm1.nodeHeartbeat(true);
+    RMAppAttempt attempt1=app1.getCurrentAppAttempt();
+    MockAM am1=rm.sendAMLaunched(attempt1.getAppAttemptId());
+    am1.registerAppAttempt();
+    AllocateRequestPBImpl allocateRequest=new AllocateRequestPBImpl();
+    List<ContainerId> release=new ArrayList<ContainerId>();
+    List<ResourceRequest> ask=new ArrayList<ResourceRequest>();
+    allocateRequest.setReleaseList(release);
+    allocateRequest.setAskList(ask);
+    AllocateResponse response1=am1.allocate(allocateRequest);
+    Assert.assertEquals(appPriority1,response1.getApplicationPriority());
+    Priority appPriority2=Priority.newInstance(8);
+    UserGroupInformation ugi=UserGroupInformation.createRemoteUser(app1.getUser());
+    rm.getRMAppManager().updateApplicationPriority(ugi,app1.getApplicationId(),appPriority2);
+    AllocateResponse response2=am1.allocate(allocateRequest);
+    Assert.assertEquals(appPriority2,response2.getApplicationPriority());
+    rm.stop();
+  }
+  @Test(timeout=300000) public void testCSValidateRequestCapacityAgainstMinMaxAllocation() throws Exception {
+    testValidateRequestCapacityAgainstMinMaxAllocation(CapacityScheduler.class);
+  }
+  @Test(timeout=300000) public void testFSValidateRequestCapacityAgainstMinMaxAllocation() throws Exception {
+    testValidateRequestCapacityAgainstMinMaxAllocation(FairScheduler.class);
+  }
+  private void testValidateRequestCapacityAgainstMinMaxAllocation(  Class<?> schedulerCls) throws Exception {
+    Map<String,ResourceInformation> riMap=new HashMap<>();
+    ResourceInformation memory=ResourceInformation.newInstance(ResourceInformation.MEMORY_MB.getName(),ResourceInformation.MEMORY_MB.getUnits(),YarnConfiguration.DEFAULT_RM_SCHEDULER_MINIMUM_ALLOCATION_MB,DEFAULT_RM_SCHEDULER_MAXIMUM_ALLOCATION_MB);
+    ResourceInformation vcores=ResourceInformation.newInstance(ResourceInformation.VCORES.getName(),ResourceInformation.VCORES.getUnits(),YarnConfiguration.DEFAULT_RM_SCHEDULER_MINIMUM_ALLOCATION_VCORES,DEFAULT_RM_SCHEDULER_MAXIMUM_ALLOCATION_VCORES);
+    riMap.put(ResourceInformation.MEMORY_URI,memory);
+    riMap.put(ResourceInformation.VCORES_URI,vcores);
+    ResourceUtils.initializeResourcesFromResourceInformationMap(riMap);
+    final YarnConfiguration yarnConf;
+    if (schedulerCls.getCanonicalName().equals(CapacityScheduler.class.getCanonicalName())) {
+      CapacitySchedulerConfiguration csConf=new CapacitySchedulerConfiguration();
+      csConf.setResourceComparator(DominantResourceCalculator.class);
+      yarnConf=new YarnConfiguration(csConf);
+    }
+ else     if (schedulerCls.getCanonicalName().equals(FairScheduler.class.getCanonicalName())) {
+      FairSchedulerConfiguration fsConf=new FairSchedulerConfiguration();
+      yarnConf=new YarnConfiguration(fsConf);
+    }
+ else {
+      throw new IllegalStateException("Scheduler class is of wrong type: " + schedulerCls);
+    }
+    yarnConf.setBoolean(TestResourceProfiles.TEST_CONF_RESET_RESOURCE_TYPES,false);
+    yarnConf.setClass(YarnConfiguration.RM_SCHEDULER,schedulerCls,ResourceScheduler.class);
+    yarnConf.setBoolean(YarnConfiguration.RM_RESOURCE_PROFILES_ENABLED,false);
+    MockRM rm=new MockRM(yarnConf);
+    rm.start();
+    MockNM nm1=rm.registerNode("199.99.99.1:1234",TestUtils.createResource(DEFAULT_RM_SCHEDULER_MAXIMUM_ALLOCATION_MB,DEFAULT_RM_SCHEDULER_MAXIMUM_ALLOCATION_VCORES,null));
+    RMApp app1=rm.submitApp(GB,"app","user",null,"default");
+    MockAM am1=MockRM.launchAndRegisterAM(app1,rm,nm1);
+    boolean exception=false;
+    try {
+      am1.allocate(Collections.singletonList(ResourceRequest.newBuilder().capability(Resource.newInstance(9 * GB,1)).numContainers(1).resourceName("*").build()),null);
+    }
+ catch (    InvalidResourceRequestException e) {
+      exception=true;
+    }
+    Assert.assertTrue(exception);
+    exception=false;
+    try {
+      am1.allocate(Collections.singletonList(ResourceRequest.newBuilder().capability(Resource.newInstance(8 * GB,18)).numContainers(1).resourceName("*").build()),null);
+    }
+ catch (    InvalidResourceRequestException e) {
+      exception=true;
+    }
+    Assert.assertTrue(exception);
+    rm.close();
+  }
+  @Test public void testValidateRequestCapacityAgainstMinMaxAllocationWithDifferentUnits() throws Exception {
+    Map<String,ResourceInformation> riMap=new HashMap<>();
+    ResourceInformation memory=ResourceInformation.newInstance(ResourceInformation.MEMORY_MB.getName(),ResourceInformation.MEMORY_MB.getUnits(),YarnConfiguration.DEFAULT_RM_SCHEDULER_MINIMUM_ALLOCATION_MB,YarnConfiguration.DEFAULT_RM_SCHEDULER_MAXIMUM_ALLOCATION_MB);
+    ResourceInformation vcores=ResourceInformation.newInstance(ResourceInformation.VCORES.getName(),ResourceInformation.VCORES.getUnits(),YarnConfiguration.DEFAULT_RM_SCHEDULER_MINIMUM_ALLOCATION_VCORES,DEFAULT_RM_SCHEDULER_MAXIMUM_ALLOCATION_VCORES);
+    ResourceInformation res1=ResourceInformation.newInstance("res_1","G",0,4);
+    riMap.put(ResourceInformation.MEMORY_URI,memory);
+    riMap.put(ResourceInformation.VCORES_URI,vcores);
+    riMap.put("res_1",res1);
+    ResourceUtils.initializeResourcesFromResourceInformationMap(riMap);
+    FairSchedulerConfiguration fsConf=new FairSchedulerConfiguration();
+    YarnConfiguration yarnConf=new YarnConfiguration(fsConf);
+    yarnConf.setBoolean(TestResourceProfiles.TEST_CONF_RESET_RESOURCE_TYPES,false);
+    yarnConf.setClass(YarnConfiguration.RM_SCHEDULER,FairScheduler.class,ResourceScheduler.class);
+    yarnConf.setBoolean(YarnConfiguration.RM_RESOURCE_PROFILES_ENABLED,false);
+    MockRM rm=new MockRM(yarnConf);
+    rm.start();
+    MockNM nm1=rm.registerNode("199.99.99.1:1234",ResourceTypesTestHelper.newResource(DEFAULT_RM_SCHEDULER_MAXIMUM_ALLOCATION_MB,DEFAULT_RM_SCHEDULER_MAXIMUM_ALLOCATION_VCORES,ImmutableMap.<String,String>builder().put("res_1","5G").build()));
+    RMApp app1=rm.submitApp(GB,"app","user",null,"default");
+    MockAM am1=MockRM.launchAndRegisterAM(app1,rm,nm1);
+    try {
+      am1.allocate(Collections.singletonList(ResourceRequest.newBuilder().capability(ResourceTypesTestHelper.newResource(4 * GB,1,ImmutableMap.<String,String>builder().put("res_1","500M").build())).numContainers(1).resourceName("*").build()),null);
+    }
+ catch (    InvalidResourceRequestException e) {
+      fail("Allocate request should be accepted but exception was thrown: " + e);
+    }
+    rm.close();
+  }
+  @Test(timeout=300000) public void testValidateRequestCapacityAgainstMinMaxAllocationFor3rdResourceTypes() throws Exception {
+    Map<String,ResourceInformation> riMap=new HashMap<>();
+    ResourceInformation memory=ResourceInformation.newInstance(ResourceInformation.MEMORY_MB.getName(),ResourceInformation.MEMORY_MB.getUnits(),YarnConfiguration.DEFAULT_RM_SCHEDULER_MINIMUM_ALLOCATION_MB,DEFAULT_RM_SCHEDULER_MAXIMUM_ALLOCATION_MB);
+    ResourceInformation vcores=ResourceInformation.newInstance(ResourceInformation.VCORES.getName(),ResourceInformation.VCORES.getUnits(),YarnConfiguration.DEFAULT_RM_SCHEDULER_MINIMUM_ALLOCATION_VCORES,DEFAULT_RM_SCHEDULER_MAXIMUM_ALLOCATION_VCORES);
+    ResourceInformation res1=ResourceInformation.newInstance("res_1",ResourceInformation.VCORES.getUnits(),0,4);
+    riMap.put(ResourceInformation.MEMORY_URI,memory);
+    riMap.put(ResourceInformation.VCORES_URI,vcores);
+    riMap.put("res_1",res1);
+    ResourceUtils.initializeResourcesFromResourceInformationMap(riMap);
+    CapacitySchedulerConfiguration csconf=new CapacitySchedulerConfiguration();
+    csconf.setResourceComparator(DominantResourceCalculator.class);
+    YarnConfiguration yarnConf=new YarnConfiguration(csconf);
+    yarnConf.setBoolean(TestResourceProfiles.TEST_CONF_RESET_RESOURCE_TYPES,false);
+    yarnConf.setClass(YarnConfiguration.RM_SCHEDULER,CapacityScheduler.class,ResourceScheduler.class);
+    yarnConf.setBoolean(YarnConfiguration.RM_RESOURCE_PROFILES_ENABLED,false);
+    MockRM rm=new MockRM(yarnConf);
+    rm.start();
+    CapacityScheduler cs=(CapacityScheduler)rm.getResourceScheduler();
+    LeafQueue leafQueue=(LeafQueue)cs.getQueue("default");
+    MockNM nm1=rm.registerNode("199.99.99.1:1234",TestUtils.createResource(DEFAULT_RM_SCHEDULER_MAXIMUM_ALLOCATION_MB,DEFAULT_RM_SCHEDULER_MAXIMUM_ALLOCATION_VCORES,ImmutableMap.of("res_1",4)));
+    RMApp app1=rm.submitApp(GB,"app","user",null,"default");
+    MockAM am1=MockRM.launchAndRegisterAM(app1,rm,nm1);
+    Assert.assertEquals(Resource.newInstance(GB,1),leafQueue.getUsedResources());
+    boolean exception=false;
+    try {
+      am1.allocate(Collections.singletonList(ResourceRequest.newBuilder().capability(TestUtils.createResource(9 * GB,1,ImmutableMap.of("res_1",1))).numContainers(1).resourceName("*").build()),null);
+    }
+ catch (    InvalidResourceRequestException e) {
+      exception=true;
+    }
+    Assert.assertTrue(exception);
+    exception=false;
+    try {
+      am1.allocate(Collections.singletonList(ResourceRequest.newBuilder().capability(TestUtils.createResource(8 * GB,18,ImmutableMap.of("res_1",1))).numContainers(1).resourceName("*").build()),null);
+    }
+ catch (    InvalidResourceRequestException e) {
+      exception=true;
+    }
+    Assert.assertTrue(exception);
+    exception=false;
+    try {
+      am1.allocate(Collections.singletonList(ResourceRequest.newBuilder().capability(TestUtils.createResource(8 * GB,1,ImmutableMap.of("res_1",100))).numContainers(1).resourceName("*").build()),null);
+    }
+ catch (    InvalidResourceRequestException e) {
+      exception=true;
+    }
+    Assert.assertTrue(exception);
+    rm.close();
+  }
+  private void sentRMContainerLaunched(  MockRM rm,  ContainerId containerId){
+    CapacityScheduler cs=(CapacityScheduler)rm.getResourceScheduler();
+    RMContainer rmContainer=cs.getRMContainer(containerId);
+    if (rmContainer != null) {
+      rmContainer.handle(new RMContainerEvent(containerId,RMContainerEventType.LAUNCHED));
+    }
+ else {
+      fail("Cannot find RMContainer");
+    }
+  }
+  @Test(timeout=300000) public void testUpdateTrackingUrl() throws Exception {
+    conf.setClass(YarnConfiguration.RM_SCHEDULER,CapacityScheduler.class,ResourceScheduler.class);
+    MockRM rm=new MockRM(conf);
+    rm.start();
+    MockNM nm1=rm.registerNode("127.0.0.1:1234",6 * GB);
+    RMApp app1=rm.submitApp(2048);
+    nm1.nodeHeartbeat(true);
+    RMAppAttempt attempt1=app1.getCurrentAppAttempt();
+    MockAM am1=rm.sendAMLaunched(attempt1.getAppAttemptId());
+    am1.registerAppAttempt();
+    Assert.assertEquals("N/A",rm.getRMContext().getRMApps().get(app1.getApplicationId()).getOriginalTrackingUrl());
+    AllocateRequestPBImpl allocateRequest=new AllocateRequestPBImpl();
+    String newTrackingUrl="hadoop.apache.org";
+    allocateRequest.setTrackingUrl(newTrackingUrl);
+    am1.allocate(allocateRequest);
+    Assert.assertEquals(newTrackingUrl,rm.getRMContext().getRMApps().get(app1.getApplicationId()).getOriginalTrackingUrl());
+    am1.allocate(allocateRequest);
+    Assert.assertEquals(newTrackingUrl,rm.getRMContext().getRMApps().get(app1.getApplicationId()).getOriginalTrackingUrl());
+    rm.stop();
+  }
+}

@@ -1,0 +1,44 @@
+/** 
+ * Test WAL replay behavior with WALObserver.
+ */
+@Test public void testWALCoprocessorReplay() throws Exception {
+  TableName tableName=TableName.valueOf(currentTest.getMethodName());
+  TableDescriptor htd=getBasic3FamilyHTableDescriptor(tableName);
+  MultiVersionConcurrencyControl mvcc=new MultiVersionConcurrencyControl();
+  RegionInfo hri=RegionInfoBuilder.newBuilder(tableName).build();
+  final Path basedir=FSUtils.getTableDir(this.hbaseRootDir,tableName);
+  deleteDir(basedir);
+  fs.mkdirs(new Path(basedir,hri.getEncodedName()));
+  final Configuration newConf=HBaseConfiguration.create(this.conf);
+  WAL wal=wals.getWAL(null);
+  WALEdit edit=new WALEdit();
+  long now=EnvironmentEdgeManager.currentTime();
+  final int countPerFamily=1000;
+  NavigableMap<byte[],Integer> scopes=new TreeMap<>(Bytes.BYTES_COMPARATOR);
+  for (  byte[] fam : htd.getColumnFamilyNames()) {
+    scopes.put(fam,0);
+  }
+  for (  byte[] fam : htd.getColumnFamilyNames()) {
+    addWALEdits(tableName,hri,TEST_ROW,fam,countPerFamily,EnvironmentEdgeManager.getDelegate(),wal,scopes,mvcc);
+  }
+  wal.append(hri,new WALKeyImpl(hri.getEncodedNameAsBytes(),tableName,now,mvcc,scopes),edit,true);
+  wal.sync();
+  User user=HBaseTestingUtility.getDifferentUser(newConf,".replay.wal.secondtime");
+  user.runAs(new PrivilegedExceptionAction<Void>(){
+    @Override public Void run() throws Exception {
+      Path p=runWALSplit(newConf);
+      LOG.info("WALSplit path == " + p);
+      final WALFactory wals2=new WALFactory(conf,ServerName.valueOf(currentTest.getMethodName() + "2",16010,System.currentTimeMillis()).toString());
+      WAL wal2=wals2.getWAL(null);
+      HRegion region=HRegion.openHRegion(newConf,FileSystem.get(newConf),hbaseRootDir,hri,htd,wal2,TEST_UTIL.getHBaseCluster().getRegionServer(0),null);
+      SampleRegionWALCoprocessor cp2=region.getCoprocessorHost().findCoprocessor(SampleRegionWALCoprocessor.class);
+      assertNotNull(cp2);
+      assertTrue(cp2.isPreWALRestoreCalled());
+      assertTrue(cp2.isPostWALRestoreCalled());
+      region.close();
+      wals2.close();
+      return null;
+    }
+  }
+);
+}

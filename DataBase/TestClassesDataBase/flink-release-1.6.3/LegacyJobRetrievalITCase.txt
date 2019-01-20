@@ -1,0 +1,73 @@
+/** 
+ * Tests retrieval of a job from a running Flink cluster.
+ */
+public class LegacyJobRetrievalITCase extends TestLogger {
+  private static final Semaphore lock=new Semaphore(1);
+  private static FlinkMiniCluster cluster;
+  @BeforeClass public static void before(){
+    Configuration configuration=new Configuration();
+    cluster=new TestingCluster(configuration,false);
+    cluster.start();
+  }
+  @AfterClass public static void after(){
+    cluster.stop();
+    cluster=null;
+  }
+  @Test public void testJobRetrieval() throws Exception {
+    final JobID jobID=new JobID();
+    final JobVertex imalock=new JobVertex("imalock");
+    imalock.setInvokableClass(SemaphoreInvokable.class);
+    final JobGraph jobGraph=new JobGraph(jobID,"testjob",imalock);
+    final ClusterClient<StandaloneClusterId> client=new StandaloneClusterClient(cluster.configuration(),cluster.highAvailabilityServices(),true);
+    lock.acquire();
+    client.runDetached(jobGraph,LegacyJobRetrievalITCase.class.getClassLoader());
+    final AtomicReference<Throwable> error=new AtomicReference<>();
+    final Thread resumingThread=new Thread(new Runnable(){
+      @Override public void run(){
+        try {
+          assertNotNull(client.retrieveJob(jobID));
+        }
+ catch (        Throwable e) {
+          error.set(e);
+        }
+      }
+    }
+,"Flink-Job-Retriever");
+    final Seq<ActorSystem> actorSystemSeq=cluster.jobManagerActorSystems().get();
+    final ActorSystem actorSystem=actorSystemSeq.last();
+    JavaTestKit testkit=new JavaTestKit(actorSystem);
+    final ActorRef jm=cluster.getJobManagersAsJava().get(0);
+    jm.tell(TestingJobManagerMessages.getNotifyWhenClientConnects(),testkit.getRef());
+    testkit.expectMsgEquals(true);
+    resumingThread.start();
+    testkit.expectMsgAllOf(TestingJobManagerMessages.getClientConnected(),TestingJobManagerMessages.getClassLoadingPropsDelivered());
+    lock.release();
+    resumingThread.join();
+    Throwable exception=error.get();
+    if (exception != null) {
+      throw new AssertionError(exception);
+    }
+  }
+  @Test public void testNonExistingJobRetrieval() throws Exception {
+    final JobID jobID=new JobID();
+    ClusterClient<StandaloneClusterId> client=new StandaloneClusterClient(cluster.configuration());
+    try {
+      client.retrieveJob(jobID);
+      fail();
+    }
+ catch (    JobRetrievalException ignored) {
+    }
+  }
+  /** 
+ * Invokable that waits on  {@link #lock} to be released and finishes afterwards.<p>NOTE: needs to be <tt>public</tt> so that a task can be run with this!
+ */
+public static class SemaphoreInvokable extends AbstractInvokable {
+    public SemaphoreInvokable(    Environment environment){
+      super(environment);
+    }
+    @Override public void invoke() throws Exception {
+      lock.acquire();
+      lock.release();
+    }
+  }
+}

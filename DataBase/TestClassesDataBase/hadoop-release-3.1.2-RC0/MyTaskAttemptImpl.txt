@@ -1,0 +1,153 @@
+class MyTaskAttemptImpl implements TaskAttempt {
+  private final TaskAttemptId myAttemptID;
+  long startMockTime=Long.MIN_VALUE;
+  long shuffleCompletedTime=Long.MAX_VALUE;
+  TaskAttemptState overridingState=TaskAttemptState.NEW;
+  MyTaskAttemptImpl(  TaskId taskID,  int index,  Clock clock){
+    myAttemptID=recordFactory.newRecordInstance(TaskAttemptId.class);
+    myAttemptID.setId(index);
+    myAttemptID.setTaskId(taskID);
+  }
+  void startUp(){
+    startMockTime=clock.getTime();
+    overridingState=null;
+    slotsInUse.addAndGet(taskTypeSlots(myAttemptID.getTaskId().getTaskType()));
+    System.out.println("TLTRE.MyTaskAttemptImpl.startUp starting " + getID());
+    SpeculatorEvent event=new SpeculatorEvent(getID().getTaskId(),-1);
+    dispatcher.getEventHandler().handle(event);
+  }
+  @Override public NodeId getNodeId() throws UnsupportedOperationException {
+    throw new UnsupportedOperationException();
+  }
+  @Override public TaskAttemptId getID(){
+    return myAttemptID;
+  }
+  @Override public TaskAttemptReport getReport(){
+    throw new UnsupportedOperationException("Not supported yet.");
+  }
+  @Override public List<String> getDiagnostics(){
+    throw new UnsupportedOperationException("Not supported yet.");
+  }
+  @Override public Counters getCounters(){
+    throw new UnsupportedOperationException("Not supported yet.");
+  }
+  @Override public int getShufflePort(){
+    throw new UnsupportedOperationException("Not supported yet.");
+  }
+  private float getCodeRuntime(){
+    int taskIndex=myAttemptID.getTaskId().getId();
+    int attemptIndex=myAttemptID.getId();
+    float result=200.0F;
+switch (taskIndex % 4) {
+case 0:
+      if (taskIndex % 40 == 0 && attemptIndex == 0) {
+        result=600.0F;
+        break;
+      }
+    break;
+case 2:
+  break;
+case 1:
+result=150.0F;
+break;
+case 3:
+result=250.0F;
+break;
+}
+return result;
+}
+private float getMapProgress(){
+float runtime=getCodeRuntime();
+return Math.min((float)(clock.getTime() - startMockTime) / (runtime * 1000.0F),1.0F);
+}
+private float getReduceProgress(){
+Job job=myAppContext.getJob(myAttemptID.getTaskId().getJobId());
+float runtime=getCodeRuntime();
+Collection<Task> allMapTasks=job.getTasks(TaskType.MAP).values();
+int numberMaps=allMapTasks.size();
+int numberDoneMaps=0;
+for (Task mapTask : allMapTasks) {
+if (mapTask.isFinished()) {
+++numberDoneMaps;
+}
+}
+if (numberMaps == numberDoneMaps) {
+shuffleCompletedTime=Math.min(shuffleCompletedTime,clock.getTime());
+return Math.min((float)(clock.getTime() - shuffleCompletedTime) / (runtime * 2000.0F) + 0.5F,1.0F);
+}
+ else {
+return ((float)numberDoneMaps) / numberMaps * 0.5F;
+}
+}
+@Override public float getProgress(){
+if (overridingState == TaskAttemptState.NEW) {
+return 0.0F;
+}
+return myAttemptID.getTaskId().getTaskType() == TaskType.MAP ? getMapProgress() : getReduceProgress();
+}
+@Override public Phase getPhase(){
+throw new UnsupportedOperationException("Not supported yet.");
+}
+@Override public TaskAttemptState getState(){
+if (overridingState != null) {
+return overridingState;
+}
+TaskAttemptState result=getProgress() < 1.0F ? TaskAttemptState.RUNNING : TaskAttemptState.SUCCEEDED;
+if (result == TaskAttemptState.SUCCEEDED) {
+overridingState=TaskAttemptState.SUCCEEDED;
+System.out.println("MyTaskAttemptImpl.getState() -- attempt " + myAttemptID + " finished.");
+slotsInUse.addAndGet(-taskTypeSlots(myAttemptID.getTaskId().getTaskType()));
+(myAttemptID.getTaskId().getTaskType() == TaskType.MAP ? completedMaps : completedReduces).getAndIncrement();
+TaskId taskID=myAttemptID.getTaskId();
+Task task=myJob.getTask(taskID);
+for (TaskAttempt otherAttempt : task.getAttempts().values()) {
+if (otherAttempt != this && otherAttempt.getState() == TaskAttemptState.RUNNING) {
+if (getID().getId() > otherAttempt.getID().getId()) {
+successfulSpeculations.getAndIncrement();
+float hisProgress=otherAttempt.getProgress();
+long hisStartTime=((MyTaskAttemptImpl)otherAttempt).startMockTime;
+System.out.println("TLTRE:A speculation finished at time " + clock.getTime() + ".  The stalled attempt is at "+ (hisProgress * 100.0)+ "% progress, and it started at "+ hisStartTime+ ", which is "+ (clock.getTime() - hisStartTime)+ " ago.");
+long originalTaskEndEstimate=(hisStartTime + estimator.estimatedRuntime(otherAttempt.getID()));
+System.out.println("TLTRE: We would have expected the original attempt to take " + estimator.estimatedRuntime(otherAttempt.getID()) + ", finishing at "+ originalTaskEndEstimate);
+long estimatedSavings=originalTaskEndEstimate - clock.getTime();
+taskTimeSavedBySpeculation.addAndGet(estimatedSavings);
+System.out.println("TLTRE: The task is " + task.getID());
+slotsInUse.addAndGet(-taskTypeSlots(myAttemptID.getTaskId().getTaskType()));
+((MyTaskAttemptImpl)otherAttempt).overridingState=TaskAttemptState.KILLED;
+}
+ else {
+System.out.println("TLTRE: The normal attempt beat the speculation in " + task.getID());
+}
+}
+}
+}
+return result;
+}
+@Override public boolean isFinished(){
+return getProgress() == 1.0F;
+}
+@Override public ContainerId getAssignedContainerID(){
+throw new UnsupportedOperationException("Not supported yet.");
+}
+@Override public String getNodeHttpAddress(){
+throw new UnsupportedOperationException("Not supported yet.");
+}
+@Override public String getNodeRackName(){
+throw new UnsupportedOperationException("Not supported yet.");
+}
+@Override public long getLaunchTime(){
+return startMockTime;
+}
+@Override public long getFinishTime(){
+throw new UnsupportedOperationException("Not supported yet.");
+}
+@Override public long getShuffleFinishTime(){
+throw new UnsupportedOperationException("Not supported yet.");
+}
+@Override public long getSortFinishTime(){
+throw new UnsupportedOperationException("Not supported yet.");
+}
+@Override public String getAssignedContainerMgrAddress(){
+throw new UnsupportedOperationException("Not supported yet.");
+}
+}

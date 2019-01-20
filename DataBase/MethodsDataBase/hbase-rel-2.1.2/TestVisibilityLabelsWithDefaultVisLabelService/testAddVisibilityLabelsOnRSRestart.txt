@@ -1,0 +1,54 @@
+@Test public void testAddVisibilityLabelsOnRSRestart() throws Exception {
+  List<RegionServerThread> regionServerThreads=TEST_UTIL.getHBaseCluster().getRegionServerThreads();
+  for (  RegionServerThread rsThread : regionServerThreads) {
+    rsThread.getRegionServer().abort("Aborting ");
+  }
+  RegionServerThread rs=TEST_UTIL.getHBaseCluster().startRegionServer();
+  waitForLabelsRegionAvailability(rs.getRegionServer());
+  final AtomicBoolean vcInitialized=new AtomicBoolean(true);
+  do {
+    PrivilegedExceptionAction<VisibilityLabelsResponse> action=new PrivilegedExceptionAction<VisibilityLabelsResponse>(){
+      @Override public VisibilityLabelsResponse run() throws Exception {
+        String[] labels={SECRET,CONFIDENTIAL,PRIVATE,"ABC","XYZ"};
+        try (Connection conn=ConnectionFactory.createConnection(conf)){
+          VisibilityLabelsResponse resp=VisibilityClient.addLabels(conn,labels);
+          List<RegionActionResult> results=resp.getResultList();
+          if (results.get(0).hasException()) {
+            NameBytesPair pair=results.get(0).getException();
+            Throwable t=ProtobufUtil.toException(pair);
+            LOG.debug("Got exception writing labels",t);
+            if (t instanceof VisibilityControllerNotReadyException) {
+              vcInitialized.set(false);
+              LOG.warn("VisibilityController was not yet initialized");
+              Threads.sleep(10);
+            }
+ else {
+              vcInitialized.set(true);
+            }
+          }
+ else           LOG.debug("new labels added: " + resp);
+        }
+ catch (        Throwable t) {
+          throw new IOException(t);
+        }
+        return null;
+      }
+    }
+;
+    SUPERUSER.runAs(action);
+  }
+ while (!vcInitialized.get());
+  Scan s=new Scan();
+  s.setAuthorizations(new Authorizations(VisibilityUtils.SYSTEM_LABEL));
+  int i=0;
+  try (Table ht=TEST_UTIL.getConnection().getTable(LABELS_TABLE_NAME);ResultScanner scanner=ht.getScanner(s)){
+    while (true) {
+      Result next=scanner.next();
+      if (next == null) {
+        break;
+      }
+      i++;
+    }
+  }
+   Assert.assertEquals("The count should be 13",13,i);
+}

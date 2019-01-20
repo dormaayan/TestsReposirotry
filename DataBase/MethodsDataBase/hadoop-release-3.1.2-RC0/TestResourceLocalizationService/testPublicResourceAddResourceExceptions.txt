@@ -1,0 +1,69 @@
+@Test @SuppressWarnings("unchecked") public void testPublicResourceAddResourceExceptions() throws Exception {
+  List<Path> localDirs=new ArrayList<Path>();
+  String[] sDirs=new String[4];
+  for (int i=0; i < 4; ++i) {
+    localDirs.add(lfs.makeQualified(new Path(basedir,i + "")));
+    sDirs[i]=localDirs.get(i).toString();
+  }
+  conf.setStrings(YarnConfiguration.NM_LOCAL_DIRS,sDirs);
+  DrainDispatcher dispatcher=new DrainDispatcher();
+  EventHandler<ApplicationEvent> applicationBus=mock(EventHandler.class);
+  dispatcher.register(ApplicationEventType.class,applicationBus);
+  EventHandler<ContainerEvent> containerBus=mock(EventHandler.class);
+  dispatcher.register(ContainerEventType.class,containerBus);
+  ContainerExecutor exec=mock(ContainerExecutor.class);
+  DeletionService delService=mock(DeletionService.class);
+  LocalDirsHandlerService dirsHandler=new LocalDirsHandlerService();
+  LocalDirsHandlerService dirsHandlerSpy=spy(dirsHandler);
+  dirsHandlerSpy.init(conf);
+  dispatcher.init(conf);
+  dispatcher.start();
+  try {
+    ResourceLocalizationService rawService=new ResourceLocalizationService(dispatcher,exec,delService,dirsHandlerSpy,nmContext,metrics);
+    ResourceLocalizationService spyService=spy(rawService);
+    doReturn(mockServer).when(spyService).createServer();
+    doReturn(lfs).when(spyService).getLocalFileContext(isA(Configuration.class));
+    spyService.init(conf);
+    spyService.start();
+    final String user="user0";
+    final Application app=mock(Application.class);
+    final ApplicationId appId=BuilderUtils.newApplicationId(314159265358979L,3);
+    when(app.getUser()).thenReturn(user);
+    when(app.getAppId()).thenReturn(appId);
+    spyService.handle(new ApplicationLocalizationEvent(LocalizationEventType.INIT_APPLICATION_RESOURCES,app));
+    dispatcher.await();
+    Random r=new Random();
+    r.setSeed(r.nextLong());
+    final LocalResource pubResource=getPublicMockedResource(r);
+    final LocalResourceRequest pubReq=new LocalResourceRequest(pubResource);
+    Map<LocalResourceVisibility,Collection<LocalResourceRequest>> req=new HashMap<LocalResourceVisibility,Collection<LocalResourceRequest>>();
+    req.put(LocalResourceVisibility.PUBLIC,Collections.singletonList(pubReq));
+    final Container c=getMockContainer(appId,42,user);
+    Mockito.doThrow(new IOException()).when(dirsHandlerSpy).getLocalPathForWrite(isA(String.class),Mockito.anyLong(),Mockito.anyBoolean());
+    spyService.handle(new ContainerLocalizationRequestEvent(c,req));
+    dispatcher.await();
+    LocalResourcesTracker tracker=spyService.getLocalResourcesTracker(LocalResourceVisibility.PUBLIC,user,appId);
+    Assert.assertNull(tracker.getLocalizedResource(pubReq));
+    String name=Long.toHexString(r.nextLong());
+    URL url=getPath("/local/PRIVATE/" + name + "/");
+    final LocalResource rsrc=BuilderUtils.newLocalResource(url,LocalResourceType.FILE,LocalResourceVisibility.PUBLIC,r.nextInt(1024) + 1024L,r.nextInt(1024) + 2048L,false);
+    final LocalResourceRequest pubReq1=new LocalResourceRequest(rsrc);
+    Map<LocalResourceVisibility,Collection<LocalResourceRequest>> req1=new HashMap<LocalResourceVisibility,Collection<LocalResourceRequest>>();
+    req1.put(LocalResourceVisibility.PUBLIC,Collections.singletonList(pubReq1));
+    Mockito.doCallRealMethod().when(dirsHandlerSpy).getLocalPathForWrite(isA(String.class),Mockito.anyLong(),Mockito.anyBoolean());
+    spyService.handle(new ContainerLocalizationRequestEvent(c,req1));
+    dispatcher.await();
+    tracker=spyService.getLocalResourcesTracker(LocalResourceVisibility.PUBLIC,user,appId);
+    Assert.assertNull(tracker.getLocalizedResource(pubReq));
+    PublicLocalizer publicLocalizer=spyService.getPublicLocalizer();
+    publicLocalizer.threadPool.shutdown();
+    spyService.handle(new ContainerLocalizationRequestEvent(c,req));
+    dispatcher.await();
+    tracker=spyService.getLocalResourcesTracker(LocalResourceVisibility.PUBLIC,user,appId);
+    Assert.assertNull(tracker.getLocalizedResource(pubReq));
+  }
+  finally {
+    dispatcher.await();
+    dispatcher.stop();
+  }
+}

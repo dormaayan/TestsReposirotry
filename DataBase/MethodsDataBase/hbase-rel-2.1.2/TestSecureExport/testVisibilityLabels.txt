@@ -1,0 +1,94 @@
+@Test public void testVisibilityLabels() throws IOException, Throwable {
+  final String exportTable=name.getMethodName() + "_export";
+  final String importTable=name.getMethodName() + "_import";
+  final TableDescriptor exportHtd=TableDescriptorBuilder.newBuilder(TableName.valueOf(exportTable)).setColumnFamily(ColumnFamilyDescriptorBuilder.of(FAMILYA)).setOwnerString(USER_OWNER).build();
+  SecureTestUtil.createTable(UTIL,exportHtd,new byte[][]{Bytes.toBytes("s")});
+  AccessTestAction putAction=() -> {
+    Put p1=new Put(ROW1);
+    p1.addColumn(FAMILYA,QUAL,NOW,QUAL);
+    p1.setCellVisibility(new CellVisibility(SECRET));
+    Put p2=new Put(ROW2);
+    p2.addColumn(FAMILYA,QUAL,NOW,QUAL);
+    p2.setCellVisibility(new CellVisibility(PRIVATE + " & " + CONFIDENTIAL));
+    Put p3=new Put(ROW3);
+    p3.addColumn(FAMILYA,QUAL,NOW,QUAL);
+    p3.setCellVisibility(new CellVisibility("!" + CONFIDENTIAL + " & "+ TOPSECRET));
+    try (Connection conn=ConnectionFactory.createConnection(UTIL.getConfiguration());Table t=conn.getTable(TableName.valueOf(exportTable))){
+      t.put(p1);
+      t.put(p2);
+      t.put(p3);
+    }
+     return null;
+  }
+;
+  SecureTestUtil.verifyAllowed(putAction,getUserByLogin(USER_OWNER));
+  List<Pair<List<String>,Integer>> labelsAndRowCounts=new LinkedList<>();
+  labelsAndRowCounts.add(new Pair<>(Arrays.asList(SECRET),1));
+  labelsAndRowCounts.add(new Pair<>(Arrays.asList(PRIVATE,CONFIDENTIAL),1));
+  labelsAndRowCounts.add(new Pair<>(Arrays.asList(TOPSECRET),1));
+  labelsAndRowCounts.add(new Pair<>(Arrays.asList(TOPSECRET,CONFIDENTIAL),0));
+  labelsAndRowCounts.add(new Pair<>(Arrays.asList(TOPSECRET,CONFIDENTIAL,PRIVATE,SECRET),2));
+  for (  final Pair<List<String>,Integer> labelsAndRowCount : labelsAndRowCounts) {
+    final List<String> labels=labelsAndRowCount.getFirst();
+    final int rowCount=labelsAndRowCount.getSecond();
+    final Path openDir=new Path("testAccessCase");
+    final FileSystem fs=openDir.getFileSystem(UTIL.getConfiguration());
+    fs.mkdirs(openDir);
+    fs.setPermission(openDir,new FsPermission(FsAction.ALL,FsAction.ALL,FsAction.ALL));
+    final Path output=fs.makeQualified(new Path(openDir,"output"));
+    AccessTestAction exportAction=() -> {
+      StringBuilder buf=new StringBuilder();
+      labels.forEach(v -> buf.append(v).append(","));
+      buf.deleteCharAt(buf.length() - 1);
+      try {
+        String[] args=new String[]{"-D " + ExportUtils.EXPORT_VISIBILITY_LABELS + "="+ buf.toString(),exportTable,output.toString()};
+        Export.run(new Configuration(UTIL.getConfiguration()),args);
+        return null;
+      }
+ catch (      ServiceException|IOException ex) {
+        throw ex;
+      }
+catch (      Throwable ex) {
+        throw new Exception(ex);
+      }
+    }
+;
+    SecureTestUtil.verifyAllowed(exportAction,getUserByLogin(USER_OWNER));
+    final TableDescriptor importHtd=TableDescriptorBuilder.newBuilder(TableName.valueOf(importTable)).setColumnFamily(ColumnFamilyDescriptorBuilder.of(FAMILYB)).setOwnerString(USER_OWNER).build();
+    SecureTestUtil.createTable(UTIL,importHtd,new byte[][]{Bytes.toBytes("s")});
+    AccessTestAction importAction=() -> {
+      String[] args=new String[]{"-D" + Import.CF_RENAME_PROP + "="+ FAMILYA_STRING+ ":"+ FAMILYB_STRING,importTable,output.toString()};
+      assertEquals(0,ToolRunner.run(new Configuration(UTIL.getConfiguration()),new Import(),args));
+      return null;
+    }
+;
+    SecureTestUtil.verifyAllowed(importAction,getUserByLogin(USER_OWNER));
+    AccessTestAction scanAction=() -> {
+      Scan scan=new Scan();
+      scan.setAuthorizations(new Authorizations(labels));
+      try (Connection conn=ConnectionFactory.createConnection(UTIL.getConfiguration());Table table=conn.getTable(importHtd.getTableName());ResultScanner scanner=table.getScanner(scan)){
+        int count=0;
+        for (        Result r : scanner) {
+          ++count;
+        }
+        assertEquals(rowCount,count);
+      }
+       return null;
+    }
+;
+    SecureTestUtil.verifyAllowed(scanAction,getUserByLogin(USER_OWNER));
+    AccessTestAction deleteAction=() -> {
+      UTIL.deleteTable(importHtd.getTableName());
+      return null;
+    }
+;
+    SecureTestUtil.verifyAllowed(deleteAction,getUserByLogin(USER_OWNER));
+    clearOutput(output);
+  }
+  AccessTestAction deleteAction=() -> {
+    UTIL.deleteTable(exportHtd.getTableName());
+    return null;
+  }
+;
+  SecureTestUtil.verifyAllowed(deleteAction,getUserByLogin(USER_OWNER));
+}

@@ -1,0 +1,36 @@
+/** 
+ * Tests that a failing execution does not affect a restarted job. This is important if a callback handler fails an execution after it has already reached a final state and the job has been restarted.
+ */
+@Test public void testFailingExecutionAfterRestart() throws Exception {
+  Instance instance=ExecutionGraphTestUtils.getInstance(new ActorTaskManagerGateway(new SimpleActorGateway(TestingUtils.directExecutionContext())),2);
+  Scheduler scheduler=new Scheduler(TestingUtils.defaultExecutionContext());
+  scheduler.newInstanceAvailable(instance);
+  JobVertex sender=ExecutionGraphTestUtils.createJobVertex("Task1",1,NoOpInvokable.class);
+  JobVertex receiver=ExecutionGraphTestUtils.createJobVertex("Task2",1,NoOpInvokable.class);
+  JobGraph jobGraph=new JobGraph("Pointwise job",sender,receiver);
+  ExecutionGraph eg=newExecutionGraph(new FixedDelayRestartStrategy(1,0L),scheduler);
+  eg.attachJobGraph(jobGraph.getVerticesSortedTopologicallyFromSources());
+  assertEquals(JobStatus.CREATED,eg.getState());
+  eg.scheduleForExecution();
+  assertEquals(JobStatus.RUNNING,eg.getState());
+  Iterator<ExecutionVertex> executionVertices=eg.getAllExecutionVertices().iterator();
+  Execution finishedExecution=executionVertices.next().getCurrentExecutionAttempt();
+  Execution failedExecution=executionVertices.next().getCurrentExecutionAttempt();
+  finishedExecution.markFinished();
+  failedExecution.fail(new Exception("Test Exception"));
+  failedExecution.cancelingComplete();
+  FiniteDuration timeout=new FiniteDuration(2,TimeUnit.MINUTES);
+  waitForAsyncRestart(eg,timeout);
+  assertEquals(JobStatus.RUNNING,eg.getState());
+  waitForAllResourcesToBeAssignedAfterAsyncRestart(eg,timeout.fromNow());
+  for (  ExecutionVertex vertex : eg.getAllExecutionVertices()) {
+    assertNotNull("No assigned resource (test instability).",vertex.getCurrentAssignedResource());
+    vertex.getCurrentExecutionAttempt().switchToRunning();
+  }
+  finishedExecution.fail(new Exception("This should have no effect"));
+  for (  ExecutionVertex vertex : eg.getAllExecutionVertices()) {
+    vertex.getCurrentExecutionAttempt().markFinished();
+  }
+  assertEquals(ExecutionState.FINISHED,finishedExecution.getState());
+  assertEquals(JobStatus.FINISHED,eg.getState());
+}

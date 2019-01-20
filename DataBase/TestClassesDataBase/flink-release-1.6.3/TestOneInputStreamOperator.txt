@@ -1,0 +1,68 @@
+static class TestOneInputStreamOperator extends AbstractStreamOperator<Integer> implements OneInputStreamOperator<Integer,Integer> {
+  private static final long serialVersionUID=-8942866418598856475L;
+  public TestOneInputStreamOperator(  boolean verifyRestore){
+    this.verifyRestore=verifyRestore;
+  }
+  private boolean verifyRestore;
+  private ValueState<Integer> keyedState;
+  private ListState<Integer> opState;
+  @Override public void processElement(  StreamRecord<Integer> element) throws Exception {
+    if (verifyRestore) {
+      long exp=element.getValue() + 1;
+      long act=keyedState.value();
+      Assert.assertEquals(exp,act);
+    }
+ else {
+      keyedState.update(element.getValue() + 1);
+      opState.add(element.getValue());
+    }
+  }
+  @Override public void processWatermark(  Watermark mark) throws Exception {
+  }
+  @Override public void snapshotState(  StateSnapshotContext context) throws Exception {
+    KeyedStateCheckpointOutputStream out=context.getRawKeyedOperatorStateOutput();
+    DataOutputView dov=new DataOutputViewStreamWrapper(out);
+    int count=0;
+    for (    int kg : out.getKeyGroupList()) {
+      out.startNewKeyGroup(kg);
+      dov.writeInt(kg + 2);
+      ++count;
+    }
+    Assert.assertEquals(MAX_PARALLELISM,count);
+    OperatorStateCheckpointOutputStream outOp=context.getRawOperatorStateOutput();
+    dov=new DataOutputViewStreamWrapper(outOp);
+    for (int i=0; i < 13; ++i) {
+      outOp.startNewPartition();
+      dov.writeInt(42 + i);
+    }
+  }
+  @Override public void initializeState(  StateInitializationContext context) throws Exception {
+    Assert.assertEquals(verifyRestore,context.isRestored());
+    keyedState=context.getKeyedStateStore().getState(new ValueStateDescriptor<>("managed-keyed",Integer.class,0));
+    opState=context.getOperatorStateStore().getListState(new ListStateDescriptor<>("managed-op-state",IntSerializer.INSTANCE));
+    if (context.isRestored()) {
+      int count=0;
+      for (      KeyGroupStatePartitionStreamProvider streamProvider : context.getRawKeyedStateInputs()) {
+        try (InputStream in=streamProvider.getStream()){
+          DataInputView div=new DataInputViewStreamWrapper(in);
+          Assert.assertEquals(streamProvider.getKeyGroupId() + 2,div.readInt());
+          ++count;
+        }
+       }
+      Assert.assertEquals(MAX_PARALLELISM,count);
+      BitSet check=new BitSet(10);
+      for (      int v : opState.get()) {
+        check.set(v);
+      }
+      Assert.assertEquals(10,check.cardinality());
+      check=new BitSet(13);
+      for (      StatePartitionStreamProvider streamProvider : context.getRawOperatorStateInputs()) {
+        try (InputStream in=streamProvider.getStream()){
+          DataInputView div=new DataInputViewStreamWrapper(in);
+          check.set(div.readInt() - 42);
+        }
+       }
+      Assert.assertEquals(13,check.cardinality());
+    }
+  }
+}

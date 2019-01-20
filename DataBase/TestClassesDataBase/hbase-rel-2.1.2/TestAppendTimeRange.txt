@@ -1,0 +1,75 @@
+@Category({CoprocessorTests.class,MediumTests.class}) public class TestAppendTimeRange {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestAppendTimeRange.class);
+  @Rule public TestName name=new TestName();
+  private static final HBaseTestingUtility util=new HBaseTestingUtility();
+  private static final ManualEnvironmentEdge mee=new ManualEnvironmentEdge();
+  private static final byte[] TEST_FAMILY=Bytes.toBytes("f1");
+  private static final byte[] ROW=Bytes.toBytes("aaa");
+  private static final byte[] QUAL=Bytes.toBytes("col1");
+  private static final byte[] VALUE=Bytes.toBytes("1");
+  @BeforeClass public static void setupBeforeClass() throws Exception {
+    util.getConfiguration().set(CoprocessorHost.REGION_COPROCESSOR_CONF_KEY,MyObserver.class.getName());
+    util.getConfiguration().setInt(RemoteProcedureDispatcher.DISPATCH_DELAY_CONF_KEY,0);
+    util.startMiniCluster();
+    EnvironmentEdgeManager.injectEdge(mee);
+  }
+  @AfterClass public static void tearDownAfterClass() throws Exception {
+    util.shutdownMiniCluster();
+  }
+public static class MyObserver implements RegionCoprocessor, RegionObserver {
+    private static TimeRange tr10=null;
+    private static TimeRange tr2=null;
+    @Override public Optional<RegionObserver> getRegionObserver(){
+      return Optional.of(this);
+    }
+    @Override public Result preAppend(    final ObserverContext<RegionCoprocessorEnvironment> e,    final Append append) throws IOException {
+      NavigableMap<byte[],List<Cell>> map=append.getFamilyCellMap();
+      for (      Map.Entry<byte[],List<Cell>> entry : map.entrySet()) {
+        for (        Cell cell : entry.getValue()) {
+          String appendStr=Bytes.toString(cell.getValueArray(),cell.getValueOffset(),cell.getValueLength());
+          if (appendStr.equals("b")) {
+            tr10=append.getTimeRange();
+          }
+ else           if (appendStr.equals("c") && !append.getTimeRange().isAllTime()) {
+            tr2=append.getTimeRange();
+          }
+        }
+      }
+      return null;
+    }
+  }
+  @Test public void testHTableInterfaceMethods() throws Exception {
+    try (Table table=util.createTable(TableName.valueOf(name.getMethodName()),TEST_FAMILY)){
+      table.put(new Put(ROW).addColumn(TEST_FAMILY,QUAL,VALUE));
+      long time=EnvironmentEdgeManager.currentTime();
+      mee.setValue(time);
+      table.put(new Put(ROW).addColumn(TEST_FAMILY,QUAL,Bytes.toBytes("a")));
+      checkRowValue(table,ROW,Bytes.toBytes("a"));
+      time=EnvironmentEdgeManager.currentTime();
+      mee.setValue(time);
+      TimeRange range10=new TimeRange(1,time + 10);
+      Result r=table.append(new Append(ROW).addColumn(TEST_FAMILY,QUAL,Bytes.toBytes("b")).setTimeRange(range10.getMin(),range10.getMax()));
+      checkRowValue(table,ROW,Bytes.toBytes("ab"));
+      assertEquals(MyObserver.tr10.getMin(),range10.getMin());
+      assertEquals(MyObserver.tr10.getMax(),range10.getMax());
+      time=EnvironmentEdgeManager.currentTime();
+      mee.setValue(time);
+      TimeRange range2=new TimeRange(1,time + 20);
+      List<Row> actions=Arrays.asList(new Row[]{new Append(ROW).addColumn(TEST_FAMILY,QUAL,Bytes.toBytes("c")).setTimeRange(range2.getMin(),range2.getMax()),new Append(ROW).addColumn(TEST_FAMILY,QUAL,Bytes.toBytes("c")).setTimeRange(range2.getMin(),range2.getMax())});
+      Object[] results1=new Object[actions.size()];
+      table.batch(actions,results1);
+      assertEquals(MyObserver.tr2.getMin(),range2.getMin());
+      assertEquals(MyObserver.tr2.getMax(),range2.getMax());
+      for (      Object r2 : results1) {
+        assertTrue(r2 instanceof Result);
+      }
+      checkRowValue(table,ROW,Bytes.toBytes("abcc"));
+    }
+   }
+  private void checkRowValue(  Table table,  byte[] row,  byte[] expectedValue) throws IOException {
+    Get get=new Get(row).addColumn(TEST_FAMILY,QUAL);
+    Result result=table.get(get);
+    byte[] actualValue=result.getValue(TEST_FAMILY,QUAL);
+    assertArrayEquals(expectedValue,actualValue);
+  }
+}

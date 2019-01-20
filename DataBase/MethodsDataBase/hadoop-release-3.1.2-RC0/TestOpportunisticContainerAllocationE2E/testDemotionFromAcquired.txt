@@ -1,0 +1,77 @@
+@Test(timeout=60000) public void testDemotionFromAcquired() throws YarnException, IOException {
+  assertEquals(0,amClient.ask.size());
+  assertEquals(0,amClient.release.size());
+  amClient.addContainerRequest(new AMRMClient.ContainerRequest(capability,null,null,priority3));
+  int guarContainersRequestedAny=amClient.getTable(0).get(priority3,ResourceRequest.ANY,ExecutionType.GUARANTEED,capability).remoteRequest.getNumContainers();
+  assertEquals(1,guarContainersRequestedAny);
+  assertEquals(1,amClient.ask.size());
+  assertEquals(0,amClient.release.size());
+  int allocatedContainerCount=0;
+  Map<ContainerId,Container> allocatedGuarContainers=new HashMap<>();
+  int iterationsLeft=50;
+  amClient.getNMTokenCache().clearCache();
+  Assert.assertEquals(0,amClient.getNMTokenCache().numberOfTokensInCache());
+  HashMap<String,Token> receivedNMTokens=new HashMap<>();
+  updateMetrics("Before Guar Allocation");
+  while (allocatedContainerCount < guarContainersRequestedAny && iterationsLeft-- > 0) {
+    AllocateResponse allocResponse=amClient.allocate(0.1f);
+    assertEquals(0,amClient.ask.size());
+    assertEquals(0,amClient.release.size());
+    allocatedContainerCount+=allocResponse.getAllocatedContainers().size();
+    for (    Container container : allocResponse.getAllocatedContainers()) {
+      if (container.getExecutionType() == ExecutionType.GUARANTEED) {
+        allocatedGuarContainers.put(container.getId(),container);
+        removeCR(container);
+      }
+    }
+    for (    NMToken token : allocResponse.getNMTokens()) {
+      String nodeID=token.getNodeId().toString();
+      receivedNMTokens.put(nodeID,token.getToken());
+    }
+    if (allocatedContainerCount < guarContainersRequestedAny) {
+      sleep(100);
+    }
+  }
+  assertEquals(guarContainersRequestedAny,allocatedContainerCount);
+  assertEquals(guarContainersRequestedAny,allocatedGuarContainers.size());
+  updateMetrics("After Guar Allocation / Before Demotion");
+  try {
+    Container c=allocatedGuarContainers.values().iterator().next();
+    amClient.requestContainerUpdate(c,UpdateContainerRequest.newInstance(c.getVersion(),c.getId(),ContainerUpdateType.DEMOTE_EXECUTION_TYPE,null,ExecutionType.GUARANTEED));
+    Assert.fail("Should throw Exception..");
+  }
+ catch (  IllegalArgumentException e) {
+    System.out.println("## " + e.getMessage());
+    Assert.assertTrue(e.getMessage().contains("target should be OPPORTUNISTIC and original should be GUARANTEED"));
+  }
+  Container c=allocatedGuarContainers.values().iterator().next();
+  amClient.requestContainerUpdate(c,UpdateContainerRequest.newInstance(c.getVersion(),c.getId(),ContainerUpdateType.DEMOTE_EXECUTION_TYPE,null,ExecutionType.OPPORTUNISTIC));
+  iterationsLeft=120;
+  Map<ContainerId,UpdatedContainer> updatedContainers=new HashMap<>();
+  while (iterationsLeft-- > 0 && updatedContainers.isEmpty()) {
+    AllocateResponse allocResponse=amClient.allocate(0.1f);
+    if (allocResponse.getUpdatedContainers() != null) {
+      for (      UpdatedContainer updatedContainer : allocResponse.getUpdatedContainers()) {
+        System.out.println("Got update..");
+        updatedContainers.put(updatedContainer.getContainer().getId(),updatedContainer);
+      }
+    }
+    if (iterationsLeft > 0) {
+      sleep(100);
+    }
+  }
+  updateMetrics("After Demotion");
+  assertEquals(1,updatedContainers.size());
+  for (  ContainerId cId : allocatedGuarContainers.keySet()) {
+    Container orig=allocatedGuarContainers.get(cId);
+    UpdatedContainer updatedContainer=updatedContainers.get(cId);
+    assertNotNull(updatedContainer);
+    assertEquals(ExecutionType.OPPORTUNISTIC,updatedContainer.getContainer().getExecutionType());
+    assertEquals(orig.getResource(),updatedContainer.getContainer().getResource());
+    assertEquals(orig.getNodeId(),updatedContainer.getContainer().getNodeId());
+    assertEquals(orig.getVersion() + 1,updatedContainer.getContainer().getVersion());
+  }
+  assertEquals(0,amClient.ask.size());
+  assertEquals(0,amClient.release.size());
+  amClient.ask.clear();
+}

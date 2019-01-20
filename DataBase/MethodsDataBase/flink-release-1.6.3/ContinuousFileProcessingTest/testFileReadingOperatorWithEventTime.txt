@@ -1,0 +1,63 @@
+@Test public void testFileReadingOperatorWithEventTime() throws Exception {
+  String testBasePath=hdfsURI + "/" + UUID.randomUUID()+ "/";
+  Set<org.apache.hadoop.fs.Path> filesCreated=new HashSet<>();
+  Map<String,Long> modTimes=new HashMap<>();
+  Map<Integer,String> expectedFileContents=new HashMap<>();
+  for (int i=0; i < NO_OF_FILES; i++) {
+    Tuple2<org.apache.hadoop.fs.Path,String> file=createFileAndFillWithData(testBasePath,"file",i,"This is test line.");
+    modTimes.put(file.f0.getName(),hdfs.getFileStatus(file.f0).getModificationTime());
+    filesCreated.add(file.f0);
+    expectedFileContents.put(i,file.f1);
+  }
+  TextInputFormat format=new TextInputFormat(new Path(testBasePath));
+  TypeInformation<String> typeInfo=TypeExtractor.getInputFormatTypes(format);
+  ContinuousFileReaderOperator<String> reader=new ContinuousFileReaderOperator<>(format);
+  reader.setOutputType(typeInfo,new ExecutionConfig());
+  OneInputStreamOperatorTestHarness<TimestampedFileInputSplit,String> tester=new OneInputStreamOperatorTestHarness<>(reader);
+  tester.setTimeCharacteristic(TimeCharacteristic.EventTime);
+  tester.open();
+  FileInputSplit[] splits=format.createInputSplits(reader.getRuntimeContext().getNumberOfParallelSubtasks());
+  for (  FileInputSplit split : splits) {
+    tester.processElement(new StreamRecord<>(new TimestampedFileInputSplit(modTimes.get(split.getPath().getName()),split.getSplitNumber(),split.getPath(),split.getStart(),split.getLength(),split.getHostnames())));
+  }
+synchronized (tester.getCheckpointLock()) {
+    tester.close();
+  }
+  Assert.assertEquals(NO_OF_FILES * LINES_PER_FILE + 1,tester.getOutput().size());
+  Map<Integer,List<String>> actualFileContents=new HashMap<>();
+  Object lastElement=null;
+  for (  Object line : tester.getOutput()) {
+    lastElement=line;
+    if (line instanceof StreamRecord) {
+      @SuppressWarnings("unchecked") StreamRecord<String> element=(StreamRecord<String>)line;
+      int fileIdx=Character.getNumericValue(element.getValue().charAt(0));
+      List<String> content=actualFileContents.get(fileIdx);
+      if (content == null) {
+        content=new ArrayList<>();
+        actualFileContents.put(fileIdx,content);
+      }
+      content.add(element.getValue() + "\n");
+    }
+  }
+  Assert.assertTrue(lastElement instanceof Watermark);
+  Assert.assertEquals(Long.MAX_VALUE,((Watermark)lastElement).getTimestamp());
+  Assert.assertEquals(expectedFileContents.size(),actualFileContents.size());
+  for (  Integer fileIdx : expectedFileContents.keySet()) {
+    Assert.assertTrue("file" + fileIdx + " not found",actualFileContents.keySet().contains(fileIdx));
+    List<String> cntnt=actualFileContents.get(fileIdx);
+    Collections.sort(cntnt,new Comparator<String>(){
+      @Override public int compare(      String o1,      String o2){
+        return getLineNo(o1) - getLineNo(o2);
+      }
+    }
+);
+    StringBuilder cntntStr=new StringBuilder();
+    for (    String line : cntnt) {
+      cntntStr.append(line);
+    }
+    Assert.assertEquals(expectedFileContents.get(fileIdx),cntntStr.toString());
+  }
+  for (  org.apache.hadoop.fs.Path file : filesCreated) {
+    hdfs.delete(file,false);
+  }
+}

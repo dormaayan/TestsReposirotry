@@ -1,0 +1,81 @@
+/** 
+ * Test class for  {@link NamespaceQuotaSnapshotStore}.
+ */
+@Category(SmallTests.class) public class TestNamespaceQuotaViolationStore {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestNamespaceQuotaViolationStore.class);
+  private static final long ONE_MEGABYTE=1024L * 1024L;
+  private Connection conn;
+  private QuotaObserverChore chore;
+  private Map<RegionInfo,Long> regionReports;
+  private NamespaceQuotaSnapshotStore store;
+  @Before public void setup(){
+    conn=mock(Connection.class);
+    chore=mock(QuotaObserverChore.class);
+    regionReports=new HashMap<>();
+    store=new NamespaceQuotaSnapshotStore(conn,chore,regionReports);
+  }
+  @Test public void testGetSpaceQuota() throws Exception {
+    NamespaceQuotaSnapshotStore mockStore=mock(NamespaceQuotaSnapshotStore.class);
+    when(mockStore.getSpaceQuota(any())).thenCallRealMethod();
+    Quotas quotaWithSpace=Quotas.newBuilder().setSpace(SpaceQuota.newBuilder().setSoftLimit(1024L).setViolationPolicy(QuotaProtos.SpaceViolationPolicy.DISABLE).build()).build();
+    Quotas quotaWithoutSpace=Quotas.newBuilder().build();
+    AtomicReference<Quotas> quotaRef=new AtomicReference<>();
+    when(mockStore.getQuotaForNamespace(any())).then(new Answer<Quotas>(){
+      @Override public Quotas answer(      InvocationOnMock invocation) throws Throwable {
+        return quotaRef.get();
+      }
+    }
+);
+    quotaRef.set(quotaWithSpace);
+    assertEquals(quotaWithSpace.getSpace(),mockStore.getSpaceQuota("ns"));
+    quotaRef.set(quotaWithoutSpace);
+    assertNull(mockStore.getSpaceQuota("ns"));
+  }
+  @Test public void testTargetViolationState() throws IOException {
+    mockNoSnapshotSizes();
+    final String NS="ns";
+    TableName tn1=TableName.valueOf(NS,"tn1");
+    TableName tn2=TableName.valueOf(NS,"tn2");
+    TableName tn3=TableName.valueOf("tn3");
+    SpaceQuota quota=SpaceQuota.newBuilder().setSoftLimit(ONE_MEGABYTE).setViolationPolicy(ProtobufUtil.toProtoViolationPolicy(SpaceViolationPolicy.DISABLE)).build();
+    for (int i=0; i < 3; i++) {
+      regionReports.put(RegionInfoBuilder.newBuilder(tn3).setStartKey(Bytes.toBytes(i)).setEndKey(Bytes.toBytes(i + 1)).build(),5L * ONE_MEGABYTE);
+    }
+    regionReports.put(RegionInfoBuilder.newBuilder(tn1).setStartKey(Bytes.toBytes(0)).setEndKey(Bytes.toBytes(1)).build(),1024L * 512L);
+    regionReports.put(RegionInfoBuilder.newBuilder(tn1).setStartKey(Bytes.toBytes(1)).setEndKey(Bytes.toBytes(2)).build(),1024L * 256L);
+    assertEquals(false,store.getTargetState(NS,quota).getQuotaStatus().isInViolation());
+    regionReports.put(RegionInfoBuilder.newBuilder(tn2).setStartKey(Bytes.toBytes(2)).setEndKey(Bytes.toBytes(3)).build(),1024L * 256L);
+    assertEquals(false,store.getTargetState(NS,quota).getQuotaStatus().isInViolation());
+    regionReports.put(RegionInfoBuilder.newBuilder(tn2).setStartKey(Bytes.toBytes(3)).setEndKey(Bytes.toBytes(4)).build(),1024L);
+    assertEquals(true,store.getTargetState(NS,quota).getQuotaStatus().isInViolation());
+    assertEquals(SpaceViolationPolicy.DISABLE,store.getTargetState(NS,quota).getQuotaStatus().getPolicy());
+  }
+  @Test public void testFilterRegionsByNamespace(){
+    TableName tn1=TableName.valueOf("foo");
+    TableName tn2=TableName.valueOf("sn","bar");
+    TableName tn3=TableName.valueOf("ns","foo");
+    TableName tn4=TableName.valueOf("ns","bar");
+    assertEquals(0,size(store.filterBySubject("asdf")));
+    for (int i=0; i < 5; i++) {
+      regionReports.put(RegionInfoBuilder.newBuilder(tn1).setStartKey(Bytes.toBytes(i)).setEndKey(Bytes.toBytes(i + 1)).build(),0L);
+    }
+    for (int i=0; i < 3; i++) {
+      regionReports.put(RegionInfoBuilder.newBuilder(tn2).setStartKey(Bytes.toBytes(i)).setEndKey(Bytes.toBytes(i + 1)).build(),0L);
+    }
+    for (int i=0; i < 10; i++) {
+      regionReports.put(RegionInfoBuilder.newBuilder(tn3).setStartKey(Bytes.toBytes(i)).setEndKey(Bytes.toBytes(i + 1)).build(),0L);
+    }
+    for (int i=0; i < 8; i++) {
+      regionReports.put(RegionInfoBuilder.newBuilder(tn4).setStartKey(Bytes.toBytes(i)).setEndKey(Bytes.toBytes(i + 1)).build(),0L);
+    }
+    assertEquals(26,regionReports.size());
+    assertEquals(5,size(store.filterBySubject(NamespaceDescriptor.DEFAULT_NAMESPACE_NAME_STR)));
+    assertEquals(3,size(store.filterBySubject("sn")));
+    assertEquals(18,size(store.filterBySubject("ns")));
+  }
+  void mockNoSnapshotSizes() throws IOException {
+    Table quotaTable=mock(Table.class);
+    when(conn.getTable(QuotaTableUtil.QUOTA_TABLE_NAME)).thenReturn(quotaTable);
+    when(quotaTable.get(any(Get.class))).thenReturn(new Result());
+  }
+}

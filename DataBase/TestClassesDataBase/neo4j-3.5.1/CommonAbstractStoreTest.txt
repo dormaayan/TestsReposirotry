@@ -1,0 +1,131 @@
+public class CommonAbstractStoreTest {
+  private static final int PAGE_SIZE=32;
+  private static final int RECORD_SIZE=10;
+  private static final int HIGH_ID=42;
+  private final IdGenerator idGenerator=mock(IdGenerator.class);
+  private final IdGeneratorFactory idGeneratorFactory=mock(IdGeneratorFactory.class);
+  private final PageCursor pageCursor=mock(PageCursor.class);
+  private final PagedFile pageFile=mock(PagedFile.class);
+  private final PageCache pageCache=mock(PageCache.class);
+  private final Config config=Config.defaults();
+  private final File storeFile=new File("store");
+  private final File idStoreFile=new File("isStore");
+  private final RecordFormat<TheRecord> recordFormat=mock(RecordFormat.class);
+  private final IdType idType=IdType.RELATIONSHIP;
+  private static final DefaultFileSystemRule fileSystemRule=new DefaultFileSystemRule();
+  private static final TestDirectory dir=testDirectory(fileSystemRule.get());
+  private static final ConfigurablePageCacheRule pageCacheRule=new ConfigurablePageCacheRule();
+  @ClassRule public static final RuleChain ruleChain=RuleChain.outerRule(fileSystemRule).around(dir).around(pageCacheRule);
+  @Rule public ExpectedException expectedException=ExpectedException.none();
+  @Before public void setUpMocks() throws IOException {
+    when(idGeneratorFactory.open(any(File.class),eq(idType),any(LongSupplier.class),anyLong())).thenReturn(idGenerator);
+    when(pageFile.pageSize()).thenReturn(PAGE_SIZE);
+    when(pageFile.io(anyLong(),anyInt())).thenReturn(pageCursor);
+    when(pageCache.map(eq(storeFile),anyInt())).thenReturn(pageFile);
+  }
+  @Test public void shouldCloseStoreFileFirstAndIdGeneratorAfter() throws Throwable {
+    TheStore store=newStore();
+    InOrder inOrder=inOrder(pageFile,idGenerator);
+    store.close();
+    inOrder.verify(pageFile,times(1)).close();
+    inOrder.verify(idGenerator,times(1)).close();
+  }
+  @Test public void failStoreInitializationWhenHeaderRecordCantBeRead() throws IOException {
+    File storeFile=dir.file("a");
+    File idFile=dir.file("idFile");
+    PageCache pageCache=mock(PageCache.class);
+    PagedFile pagedFile=mock(PagedFile.class);
+    PageCursor pageCursor=mock(PageCursor.class);
+    when(pageCache.map(eq(storeFile),anyInt(),any(OpenOption.class))).thenReturn(pagedFile);
+    when(pagedFile.io(0L,PagedFile.PF_SHARED_READ_LOCK)).thenReturn(pageCursor);
+    when(pageCursor.next()).thenReturn(false);
+    RecordFormats recordFormats=Standard.LATEST_RECORD_FORMATS;
+    expectedException.expect(StoreNotFoundException.class);
+    expectedException.expectMessage("Fail to read header record of store file: " + storeFile.getAbsolutePath());
+    try (DynamicArrayStore dynamicArrayStore=new DynamicArrayStore(storeFile,idFile,config,IdType.NODE_LABELS,idGeneratorFactory,pageCache,NullLogProvider.getInstance(),Settings.INTEGER.apply(GraphDatabaseSettings.label_block_size.getDefaultValue()),recordFormats)){
+      dynamicArrayStore.initialise(false);
+    }
+   }
+  @Test public void throwsWhenRecordWithNegativeIdIsUpdated(){
+    TheStore store=newStore();
+    TheRecord record=newRecord(-1);
+    try {
+      store.updateRecord(record);
+      fail("Should have failed");
+    }
+ catch (    Exception e) {
+      assertThat(e,instanceOf(NegativeIdException.class));
+    }
+  }
+  @Test public void throwsWhenRecordWithTooHighIdIsUpdated(){
+    long maxFormatId=42;
+    when(recordFormat.getMaxId()).thenReturn(maxFormatId);
+    TheStore store=newStore();
+    TheRecord record=newRecord(maxFormatId + 1);
+    try {
+      store.updateRecord(record);
+      fail("Should have failed");
+    }
+ catch (    Exception e) {
+      assertThat(e,instanceOf(IdCapacityExceededException.class));
+    }
+  }
+  @Test public void throwsWhenRecordWithReservedIdIsUpdated(){
+    TheStore store=newStore();
+    TheRecord record=newRecord(IdGeneratorImpl.INTEGER_MINUS_ONE);
+    try {
+      store.updateRecord(record);
+      fail("Should have failed");
+    }
+ catch (    Exception e) {
+      assertThat(e,instanceOf(ReservedIdException.class));
+    }
+  }
+  @Test public void shouldDeleteOnCloseIfOpenOptionsSaysSo(){
+    DatabaseLayout databaseLayout=dir.databaseLayout();
+    File nodeStore=databaseLayout.nodeStore();
+    File idFile=databaseLayout.idFile(DatabaseFile.NODE_STORE).orElseThrow(() -> new IllegalStateException("Node store id file not found."));
+    FileSystemAbstraction fs=fileSystemRule.get();
+    PageCache pageCache=pageCacheRule.getPageCache(fs,Config.defaults());
+    TheStore store=new TheStore(nodeStore,databaseLayout.idNodeStore(),config,idType,new DefaultIdGeneratorFactory(fs),pageCache,NullLogProvider.getInstance(),recordFormat,DELETE_ON_CLOSE);
+    store.initialise(true);
+    store.makeStoreOk();
+    assertTrue(fs.fileExists(nodeStore));
+    assertTrue(fs.fileExists(idFile));
+    store.close();
+    assertFalse(fs.fileExists(nodeStore));
+    assertFalse(fs.fileExists(idFile));
+  }
+  private TheStore newStore(){
+    LogProvider log=NullLogProvider.getInstance();
+    TheStore store=new TheStore(storeFile,idStoreFile,config,idType,idGeneratorFactory,pageCache,log,recordFormat);
+    store.initialise(false);
+    return store;
+  }
+  private TheRecord newRecord(  long id){
+    return new TheRecord(id);
+  }
+private static class TheStore extends CommonAbstractStore<TheRecord,NoStoreHeader> {
+    TheStore(    File file,    File idFile,    Config configuration,    IdType idType,    IdGeneratorFactory idGeneratorFactory,    PageCache pageCache,    LogProvider logProvider,    RecordFormat<TheRecord> recordFormat,    OpenOption... openOptions){
+      super(file,idFile,configuration,idType,idGeneratorFactory,pageCache,logProvider,"TheType",recordFormat,NoStoreHeaderFormat.NO_STORE_HEADER_FORMAT,"v1",openOptions);
+    }
+    @Override protected void initialiseNewStoreFile(    PagedFile file){
+    }
+    @Override protected int determineRecordSize(){
+      return RECORD_SIZE;
+    }
+    @Override public long scanForHighId(){
+      return HIGH_ID;
+    }
+    @Override public <FAILURE extends Exception>void accept(    Processor<FAILURE> processor,    TheRecord record){
+    }
+  }
+private static class TheRecord extends AbstractBaseRecord {
+    TheRecord(    long id){
+      super(id);
+    }
+    @Override public TheRecord clone(){
+      return new TheRecord(getId());
+    }
+  }
+}

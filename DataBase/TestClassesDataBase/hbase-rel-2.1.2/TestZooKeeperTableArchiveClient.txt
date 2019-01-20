@@ -1,0 +1,274 @@
+/** 
+ * Spin up a small cluster and check that the hfiles of region are properly long-term archived as specified via the  {@link ZKTableArchiveClient}.
+ */
+@Category({MiscTests.class,MediumTests.class}) public class TestZooKeeperTableArchiveClient {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestZooKeeperTableArchiveClient.class);
+  private static final Logger LOG=LoggerFactory.getLogger(TestZooKeeperTableArchiveClient.class);
+  private static final HBaseTestingUtility UTIL=HBaseTestingUtility.createLocalHTU();
+  private static final String STRING_TABLE_NAME="test";
+  private static final byte[] TEST_FAM=Bytes.toBytes("fam");
+  private static final byte[] TABLE_NAME=Bytes.toBytes(STRING_TABLE_NAME);
+  private static ZKTableArchiveClient archivingClient;
+  private final List<Path> toCleanup=new ArrayList<>();
+  private static ClusterConnection CONNECTION;
+  private static RegionServerServices rss;
+  /** 
+ * Setup the config for the cluster
+ */
+  @BeforeClass public static void setupCluster() throws Exception {
+    setupConf(UTIL.getConfiguration());
+    UTIL.startMiniZKCluster();
+    CONNECTION=(ClusterConnection)ConnectionFactory.createConnection(UTIL.getConfiguration());
+    archivingClient=new ZKTableArchiveClient(UTIL.getConfiguration(),CONNECTION);
+    ZKWatcher watcher=UTIL.getZooKeeperWatcher();
+    String archivingZNode=ZKTableArchiveClient.getArchiveZNode(UTIL.getConfiguration(),watcher);
+    ZKUtil.createWithParents(watcher,archivingZNode);
+    rss=mock(RegionServerServices.class);
+  }
+  private static void setupConf(  Configuration conf){
+    conf.setInt("hbase.hstore.compaction.min",3);
+  }
+  @After public void tearDown() throws Exception {
+    try {
+      FileSystem fs=UTIL.getTestFileSystem();
+      for (      Path file : toCleanup) {
+        FSUtils.delete(fs,file,true);
+      }
+    }
+ catch (    IOException e) {
+      LOG.warn("Failure to delete archive directory",e);
+    }
+ finally {
+      toCleanup.clear();
+    }
+    archivingClient.disableHFileBackup();
+  }
+  @AfterClass public static void cleanupTest() throws Exception {
+    try {
+      CONNECTION.close();
+      UTIL.shutdownMiniZKCluster();
+    }
+ catch (    Exception e) {
+      LOG.warn("problem shutting down cluster",e);
+    }
+  }
+  /** 
+ * Test turning on/off archiving
+ */
+  @Test public void testArchivingEnableDisable() throws Exception {
+    LOG.debug("----Starting archiving");
+    archivingClient.enableHFileBackupAsync(TABLE_NAME);
+    assertTrue("Archving didn't get turned on",archivingClient.getArchivingEnabled(TABLE_NAME));
+    archivingClient.disableHFileBackup();
+    assertFalse("Archving didn't get turned off.",archivingClient.getArchivingEnabled(TABLE_NAME));
+    archivingClient.enableHFileBackupAsync(TABLE_NAME);
+    assertTrue("Archving didn't get turned on",archivingClient.getArchivingEnabled(TABLE_NAME));
+    archivingClient.disableHFileBackup(TABLE_NAME);
+    assertFalse("Archving didn't get turned off for " + STRING_TABLE_NAME,archivingClient.getArchivingEnabled(TABLE_NAME));
+  }
+  @Test public void testArchivingOnSingleTable() throws Exception {
+    createArchiveDirectory();
+    FileSystem fs=UTIL.getTestFileSystem();
+    Path archiveDir=getArchiveDir();
+    Path tableDir=getTableDir(STRING_TABLE_NAME);
+    toCleanup.add(archiveDir);
+    toCleanup.add(tableDir);
+    Configuration conf=UTIL.getConfiguration();
+    Stoppable stop=new StoppableImplementation();
+    CleanerChore.initChorePool(conf);
+    HFileCleaner cleaner=setupAndCreateCleaner(conf,fs,archiveDir,stop);
+    List<BaseHFileCleanerDelegate> cleaners=turnOnArchiving(STRING_TABLE_NAME,cleaner);
+    final LongTermArchivingHFileCleaner delegate=(LongTermArchivingHFileCleaner)cleaners.get(0);
+    ColumnFamilyDescriptor hcd=ColumnFamilyDescriptorBuilder.of(TEST_FAM);
+    HRegion region=UTIL.createTestRegion(STRING_TABLE_NAME,hcd);
+    List<HRegion> regions=new ArrayList<>();
+    regions.add(region);
+    Mockito.doReturn(regions).when(rss).getRegions();
+    final CompactedHFilesDischarger compactionCleaner=new CompactedHFilesDischarger(100,stop,rss,false);
+    loadFlushAndCompact(region,TEST_FAM);
+    compactionCleaner.chore();
+    List<Path> files=getAllFiles(fs,archiveDir);
+    if (files == null) {
+      FSUtils.logFileSystemState(fs,UTIL.getDataTestDir(),LOG);
+      throw new RuntimeException("Didn't archive any files!");
+    }
+    CountDownLatch finished=setupCleanerWatching(delegate,cleaners,files.size());
+    runCleaner(cleaner,finished,stop);
+    List<Path> archivedFiles=getAllFiles(fs,archiveDir);
+    assertEquals("Archived files changed after running archive cleaner.",files,archivedFiles);
+    assertTrue(fs.exists(HFileArchiveUtil.getArchivePath(UTIL.getConfiguration())));
+  }
+  /** 
+ * Test archiving/cleaning across multiple tables, where some are retained, and others aren't
+ * @throws Exception on failure
+ */
+  @Test public void testMultipleTables() throws Exception {
+    createArchiveDirectory();
+    String otherTable="otherTable";
+    FileSystem fs=UTIL.getTestFileSystem();
+    Path archiveDir=getArchiveDir();
+    Path tableDir=getTableDir(STRING_TABLE_NAME);
+    Path otherTableDir=getTableDir(otherTable);
+    toCleanup.add(archiveDir);
+    toCleanup.add(tableDir);
+    toCleanup.add(otherTableDir);
+    Configuration conf=UTIL.getConfiguration();
+    Stoppable stop=new StoppableImplementation();
+    final ChoreService choreService=new ChoreService("TEST_SERVER_NAME");
+    CleanerChore.initChorePool(conf);
+    HFileCleaner cleaner=setupAndCreateCleaner(conf,fs,archiveDir,stop);
+    List<BaseHFileCleanerDelegate> cleaners=turnOnArchiving(STRING_TABLE_NAME,cleaner);
+    final LongTermArchivingHFileCleaner delegate=(LongTermArchivingHFileCleaner)cleaners.get(0);
+    ColumnFamilyDescriptor hcd=ColumnFamilyDescriptorBuilder.of(TEST_FAM);
+    HRegion region=UTIL.createTestRegion(STRING_TABLE_NAME,hcd);
+    List<HRegion> regions=new ArrayList<>();
+    regions.add(region);
+    Mockito.doReturn(regions).when(rss).getRegions();
+    final CompactedHFilesDischarger compactionCleaner=new CompactedHFilesDischarger(100,stop,rss,false);
+    loadFlushAndCompact(region,TEST_FAM);
+    compactionCleaner.chore();
+    hcd=ColumnFamilyDescriptorBuilder.of(TEST_FAM);
+    HRegion otherRegion=UTIL.createTestRegion(otherTable,hcd);
+    regions=new ArrayList<>();
+    regions.add(otherRegion);
+    Mockito.doReturn(regions).when(rss).getRegions();
+    final CompactedHFilesDischarger compactionCleaner1=new CompactedHFilesDischarger(100,stop,rss,false);
+    loadFlushAndCompact(otherRegion,TEST_FAM);
+    compactionCleaner1.chore();
+    List<Path> files=getAllFiles(fs,archiveDir);
+    if (files == null) {
+      FSUtils.logFileSystemState(fs,archiveDir,LOG);
+      throw new RuntimeException("Didn't load archive any files!");
+    }
+    int initialCountForPrimary=0;
+    int initialCountForOtherTable=0;
+    for (    Path file : files) {
+      String tableName=file.getParent().getParent().getParent().getName();
+      if (tableName.equals(otherTable))       initialCountForOtherTable++;
+ else       if (tableName.equals(STRING_TABLE_NAME))       initialCountForPrimary++;
+    }
+    assertTrue("Didn't archive files for:" + STRING_TABLE_NAME,initialCountForPrimary > 0);
+    assertTrue("Didn't archive files for:" + otherTable,initialCountForOtherTable > 0);
+    CountDownLatch finished=setupCleanerWatching(delegate,cleaners,files.size() + 3);
+    choreService.scheduleChore(cleaner);
+    finished.await();
+    stop.stop("");
+    List<Path> archivedFiles=getAllFiles(fs,archiveDir);
+    int archivedForPrimary=0;
+    for (    Path file : archivedFiles) {
+      String tableName=file.getParent().getParent().getParent().getName();
+      assertFalse("Have a file from the non-archived table: " + file,tableName.equals(otherTable));
+      if (tableName.equals(STRING_TABLE_NAME))       archivedForPrimary++;
+    }
+    assertEquals("Not all archived files for the primary table were retained.",initialCountForPrimary,archivedForPrimary);
+    assertTrue("Archive directory was deleted via archiver",fs.exists(archiveDir));
+  }
+  private void createArchiveDirectory() throws IOException {
+    FileSystem fs=UTIL.getTestFileSystem();
+    Path archiveDir=getArchiveDir();
+    fs.mkdirs(archiveDir);
+  }
+  private Path getArchiveDir() throws IOException {
+    return new Path(UTIL.getDataTestDir(),HConstants.HFILE_ARCHIVE_DIRECTORY);
+  }
+  private Path getTableDir(  String tableName) throws IOException {
+    Path testDataDir=UTIL.getDataTestDir();
+    FSUtils.setRootDir(UTIL.getConfiguration(),testDataDir);
+    return new Path(testDataDir,tableName);
+  }
+  private HFileCleaner setupAndCreateCleaner(  Configuration conf,  FileSystem fs,  Path archiveDir,  Stoppable stop){
+    conf.setStrings(HFileCleaner.MASTER_HFILE_CLEANER_PLUGINS,LongTermArchivingHFileCleaner.class.getCanonicalName());
+    return new HFileCleaner(1000,stop,conf,fs,archiveDir);
+  }
+  /** 
+ * Start archiving table for given hfile cleaner
+ * @param tableName table to archive
+ * @param cleaner cleaner to check to make sure change propagated
+ * @return underlying {@link LongTermArchivingHFileCleaner} that is managing archiving
+ * @throws IOException on failure
+ * @throws KeeperException on failure
+ */
+  private List<BaseHFileCleanerDelegate> turnOnArchiving(  String tableName,  HFileCleaner cleaner) throws IOException, KeeperException {
+    LOG.debug("----Starting archiving for table:" + tableName);
+    archivingClient.enableHFileBackupAsync(Bytes.toBytes(tableName));
+    assertTrue("Archving didn't get turned on",archivingClient.getArchivingEnabled(tableName));
+    List<BaseHFileCleanerDelegate> cleaners=cleaner.getDelegatesForTesting();
+    LongTermArchivingHFileCleaner delegate=(LongTermArchivingHFileCleaner)cleaners.get(0);
+    while (!delegate.archiveTracker.keepHFiles(STRING_TABLE_NAME)) {
+    }
+    return cleaners;
+  }
+  /** 
+ * Spy on the  {@link LongTermArchivingHFileCleaner} to ensure we can catch when the cleaner hasseen all the files
+ * @return a {@link CountDownLatch} to wait on that releases when the cleaner has been called atleast the expected number of times.
+ */
+  private CountDownLatch setupCleanerWatching(  LongTermArchivingHFileCleaner cleaner,  List<BaseHFileCleanerDelegate> cleaners,  final int expected){
+    BaseHFileCleanerDelegate delegateSpy=Mockito.spy(cleaner);
+    final int[] counter=new int[]{0};
+    final CountDownLatch finished=new CountDownLatch(1);
+    Mockito.doAnswer(new Answer<Iterable<FileStatus>>(){
+      @Override public Iterable<FileStatus> answer(      InvocationOnMock invocation) throws Throwable {
+        counter[0]++;
+        LOG.debug(counter[0] + "/ " + expected+ ") Wrapping call to getDeletableFiles for files: "+ invocation.getArgument(0));
+        @SuppressWarnings("unchecked") Iterable<FileStatus> ret=(Iterable<FileStatus>)invocation.callRealMethod();
+        if (counter[0] >= expected)         finished.countDown();
+        return ret;
+      }
+    }
+).when(delegateSpy).getDeletableFiles(Mockito.anyListOf(FileStatus.class));
+    cleaners.set(0,delegateSpy);
+    return finished;
+  }
+  /** 
+ * Get all the files (non-directory entries) in the file system under the passed directory
+ * @param dir directory to investigate
+ * @return all files under the directory
+ */
+  private List<Path> getAllFiles(  FileSystem fs,  Path dir) throws IOException {
+    FileStatus[] files=FSUtils.listStatus(fs,dir,null);
+    if (files == null) {
+      LOG.warn("No files under:" + dir);
+      return null;
+    }
+    List<Path> allFiles=new ArrayList<>();
+    for (    FileStatus file : files) {
+      if (file.isDirectory()) {
+        List<Path> subFiles=getAllFiles(fs,file.getPath());
+        if (subFiles != null)         allFiles.addAll(subFiles);
+        continue;
+      }
+      allFiles.add(file.getPath());
+    }
+    return allFiles;
+  }
+  private void loadFlushAndCompact(  HRegion region,  byte[] family) throws IOException {
+    createHFileInRegion(region,family);
+    createHFileInRegion(region,family);
+    HStore s=region.getStore(family);
+    int count=s.getStorefilesCount();
+    assertTrue("Don't have the expected store files, wanted >= 2 store files, but was:" + count,count >= 2);
+    LOG.debug("Compacting stores");
+    region.compact(true);
+  }
+  /** 
+ * Create a new hfile in the passed region
+ * @param region region to operate on
+ * @param columnFamily family for which to add data
+ * @throws IOException
+ */
+  private void createHFileInRegion(  HRegion region,  byte[] columnFamily) throws IOException {
+    Put p=new Put(Bytes.toBytes("row"));
+    p.addColumn(columnFamily,Bytes.toBytes("Qual"),Bytes.toBytes("v1"));
+    region.put(p);
+    region.flush(true);
+  }
+  /** 
+ * @param cleaner
+ */
+  private void runCleaner(  HFileCleaner cleaner,  CountDownLatch finished,  Stoppable stop) throws InterruptedException {
+    final ChoreService choreService=new ChoreService("CLEANER_SERVER_NAME");
+    choreService.scheduleChore(cleaner);
+    finished.await();
+    stop.stop("");
+  }
+}

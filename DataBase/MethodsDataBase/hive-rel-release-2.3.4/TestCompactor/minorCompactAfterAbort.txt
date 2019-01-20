@@ -1,0 +1,53 @@
+@Test public void minorCompactAfterAbort() throws Exception {
+  String agentInfo="UT_" + Thread.currentThread().getName();
+  String dbName="default";
+  String tblName="cws";
+  List<String> colNames=Arrays.asList("a","b");
+  String columnNamesProperty="a,b";
+  String columnTypesProperty="int:string";
+  executeStatementOnDriver("drop table if exists " + tblName,driver);
+  executeStatementOnDriver("CREATE TABLE " + tblName + "(a INT, b STRING) "+ " CLUSTERED BY(a) INTO 1 BUCKETS"+ " STORED AS ORC  TBLPROPERTIES ('transactional'='true')",driver);
+  HiveEndPoint endPt=new HiveEndPoint(null,dbName,tblName,null);
+  DelimitedInputWriter writer=new DelimitedInputWriter(new String[]{"a","b"},",",endPt);
+  StreamingConnection connection=endPt.newConnection(false,"UT_" + Thread.currentThread().getName());
+  try {
+    for (int i=0; i < 2; i++) {
+      writeBatch(connection,writer,false);
+    }
+    TransactionBatch txnBatch=connection.fetchTransactionBatch(2,writer);
+    txnBatch.beginNextTransaction();
+    txnBatch.abort();
+    txnBatch.beginNextTransaction();
+    txnBatch.abort();
+    TxnStore txnHandler=TxnUtils.getTxnStore(conf);
+    txnHandler.compact(new CompactionRequest(dbName,tblName,CompactionType.MINOR));
+    Worker t=new Worker();
+    t.setThreadId((int)t.getId());
+    t.setHiveConf(conf);
+    AtomicBoolean stop=new AtomicBoolean(true);
+    AtomicBoolean looped=new AtomicBoolean();
+    t.init(stop,looped);
+    t.run();
+    IMetaStoreClient msClient=new HiveMetaStoreClient(conf);
+    Table table=msClient.getTable(dbName,tblName);
+    FileSystem fs=FileSystem.get(conf);
+    FileStatus[] stat=fs.listStatus(new Path(table.getSd().getLocation()),AcidUtils.deltaFileFilter);
+    String[] names=new String[stat.length];
+    Path resultDelta=null;
+    for (int i=0; i < names.length; i++) {
+      names[i]=stat[i].getPath().getName();
+      if (names[i].equals("delta_0000001_0000004")) {
+        resultDelta=stat[i].getPath();
+      }
+    }
+    Arrays.sort(names);
+    String[] expected=new String[]{"delta_0000001_0000002","delta_0000001_0000004","delta_0000003_0000004"};
+    if (!Arrays.deepEquals(expected,names)) {
+      Assert.fail("Expected: " + Arrays.toString(expected) + ", found: "+ Arrays.toString(names));
+    }
+    checkExpectedTxnsPresent(null,new Path[]{resultDelta},columnNamesProperty,columnTypesProperty,0,1L,4L);
+  }
+  finally {
+    connection.close();
+  }
+}

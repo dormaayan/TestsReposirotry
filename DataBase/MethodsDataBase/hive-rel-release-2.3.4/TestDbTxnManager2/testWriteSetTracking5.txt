@@ -1,0 +1,32 @@
+/** 
+ * overlapping txns updating the same resource but 1st one rolls back; 2nd commits
+ * @throws Exception
+ */
+@Test public void testWriteSetTracking5() throws Exception {
+  dropTable(new String[]{"TAB_PART"});
+  Assert.assertEquals(0,TxnDbUtil.countQueryAgent("select count(*) from WRITE_SET"));
+  CommandProcessorResponse cpr=driver.run("create table if not exists TAB_PART (a int, b int) " + "partitioned by (p string) clustered by (a) into 2  buckets stored as orc TBLPROPERTIES ('transactional'='true')");
+  checkCmdOnDriver(cpr);
+  checkCmdOnDriver(driver.run("insert into TAB_PART partition(p='blah') values(1,2)"));
+  HiveTxnManager txnMgr2=TxnManagerFactory.getTxnManagerFactory().getTxnManager(conf);
+  txnMgr.openTxn(ctx,"Known");
+  long txnId=txnMgr2.openTxn(ctx,"Unknown");
+  checkCmdOnDriver(driver.compileAndRespond("update TAB_PART set b = 7 where p = 'blah'"));
+  txnMgr.acquireLocks(driver.getPlan(),ctx,"Known");
+  List<ShowLocksResponseElement> locks=getLocks(txnMgr);
+  Assert.assertEquals("Unexpected lock count",1,locks.size());
+  checkLock(LockType.SHARED_WRITE,LockState.ACQUIRED,"default","TAB_PART","p=blah",locks);
+  checkCmdOnDriver(driver.compileAndRespond("update TAB_PART set b = 7 where p = 'blah'"));
+  ((DbTxnManager)txnMgr2).acquireLocks(driver.getPlan(),ctx,"Unknown",false);
+  locks=getLocks(txnMgr2);
+  Assert.assertEquals("Unexpected lock count",2,locks.size());
+  checkLock(LockType.SHARED_WRITE,LockState.ACQUIRED,"default","TAB_PART","p=blah",locks);
+  checkLock(LockType.SHARED_WRITE,LockState.WAITING,"default","TAB_PART","p=blah",locks);
+  txnMgr.rollbackTxn();
+  AddDynamicPartitions adp=new AddDynamicPartitions(txnId,"default","TAB_PART",Arrays.asList("p=blah"));
+  adp.setOperationType(DataOperationType.UPDATE);
+  txnHandler.addDynamicPartitions(adp);
+  Assert.assertEquals(0,TxnDbUtil.countQueryAgent("select count(*) from WRITE_SET"));
+  txnMgr2.commitTxn();
+  Assert.assertEquals(1,TxnDbUtil.countQueryAgent("select count(*) from WRITE_SET"));
+}

@@ -1,0 +1,167 @@
+public class NodeStoreTest {
+  @ClassRule public static final PageCacheRule pageCacheRule=new PageCacheRule();
+  private final EphemeralFileSystemRule efs=new EphemeralFileSystemRule();
+  private final TestDirectory testDirectory=TestDirectory.testDirectory(efs);
+  @Rule public final RuleChain ruleChain=RuleChain.outerRule(efs).around(testDirectory);
+  private NodeStore nodeStore;
+  private NeoStores neoStores;
+  private IdGeneratorFactory idGeneratorFactory;
+  @After public void tearDown(){
+    if (neoStores != null) {
+      neoStores.close();
+    }
+  }
+  @Test public void shouldReadFirstFromSingleRecordDynamicLongArray(){
+    Long expectedId=12L;
+    long[] ids=new long[]{expectedId,23L,42L};
+    DynamicRecord firstRecord=new DynamicRecord(0L);
+    allocateFromNumbers(new ArrayList<>(),ids,new ReusableRecordsAllocator(60,firstRecord));
+    Long firstId=readOwnerFromDynamicLabelsRecord(firstRecord);
+    assertEquals(expectedId,firstId);
+  }
+  @Test public void shouldReadFirstAsNullFromEmptyDynamicLongArray(){
+    Long expectedId=null;
+    long[] ids=new long[]{};
+    DynamicRecord firstRecord=new DynamicRecord(0L);
+    allocateFromNumbers(new ArrayList<>(),ids,new ReusableRecordsAllocator(60,firstRecord));
+    Long firstId=readOwnerFromDynamicLabelsRecord(firstRecord);
+    assertEquals(expectedId,firstId);
+  }
+  @Test public void shouldReadFirstFromTwoRecordDynamicLongArray(){
+    Long expectedId=12L;
+    long[] ids=new long[]{expectedId,1L,2L,3L,4L,5L,6L,7L,8L,9L,10L,11L};
+    DynamicRecord firstRecord=new DynamicRecord(0L);
+    allocateFromNumbers(new ArrayList<>(),ids,new ReusableRecordsAllocator(8,firstRecord,new DynamicRecord(1L)));
+    Long firstId=readOwnerFromDynamicLabelsRecord(firstRecord);
+    assertEquals(expectedId,firstId);
+  }
+  @Test public void shouldCombineProperFiveByteLabelField() throws Exception {
+    EphemeralFileSystemAbstraction fs=efs.get();
+    nodeStore=newNodeStore(fs);
+    long nodeId=0;
+    long labels=0x8000000001L;
+    NodeRecord record=new NodeRecord(nodeId,false,NO_NEXT_RELATIONSHIP.intValue(),NO_NEXT_PROPERTY.intValue());
+    record.setInUse(true);
+    record.setLabelField(labels,Collections.emptyList());
+    nodeStore.updateRecord(record);
+    NodeRecord readRecord=nodeStore.getRecord(nodeId,nodeStore.newRecord(),NORMAL);
+    assertEquals(labels,readRecord.getLabelField());
+  }
+  @Test public void shouldKeepRecordLightWhenSettingLabelFieldWithoutDynamicRecords(){
+    NodeRecord record=new NodeRecord(0,false,NO_NEXT_RELATIONSHIP.intValue(),NO_NEXT_PROPERTY.intValue());
+    record.setLabelField(0,Collections.emptyList());
+    assertTrue(record.isLight());
+  }
+  @Test public void shouldMarkRecordHeavyWhenSettingLabelFieldWithDynamicRecords(){
+    NodeRecord record=new NodeRecord(0,false,NO_NEXT_RELATIONSHIP.intValue(),NO_NEXT_PROPERTY.intValue());
+    DynamicRecord dynamicRecord=new DynamicRecord(1);
+    record.setLabelField(0x8000000001L,asList(dynamicRecord));
+    assertFalse(record.isLight());
+  }
+  @Test public void shouldTellNodeInUse() throws Exception {
+    EphemeralFileSystemAbstraction fs=efs.get();
+    NodeStore store=newNodeStore(fs);
+    long exists=store.nextId();
+    store.updateRecord(new NodeRecord(exists,false,10,20,true));
+    long deleted=store.nextId();
+    store.updateRecord(new NodeRecord(deleted,false,10,20,true));
+    store.updateRecord(new NodeRecord(deleted,false,10,20,false));
+    assertTrue(store.isInUse(exists));
+    assertFalse(store.isInUse(deleted));
+    assertFalse(store.isInUse(nodeStore.recordFormat.getMaxId()));
+  }
+  @Test public void scanningRecordsShouldVisitEachInUseRecordOnce() throws IOException {
+    EphemeralFileSystemAbstraction fs=efs.get();
+    nodeStore=newNodeStore(fs);
+    ThreadLocalRandom rng=ThreadLocalRandom.current();
+    final MutableLongSet nextRelSet=new LongHashSet();
+    for (int i=0; i < 10_000; i++) {
+      int nextRelCandidate=rng.nextInt(0,Integer.MAX_VALUE);
+      if (nextRelSet.add(nextRelCandidate)) {
+        long nodeId=nodeStore.nextId();
+        NodeRecord record=new NodeRecord(nodeId,false,nextRelCandidate,20,true);
+        nodeStore.updateRecord(record);
+        if (rng.nextInt(0,10) < 3) {
+          nextRelSet.remove(nextRelCandidate);
+          record.setInUse(false);
+          nodeStore.updateRecord(record);
+        }
+      }
+    }
+    Visitor<NodeRecord,IOException> scanner=record -> {
+      assertTrue(nextRelSet.remove(record.getNextRel()));
+      return false;
+    }
+;
+    nodeStore.scanAllRecords(scanner);
+    assertTrue(nextRelSet.isEmpty());
+  }
+  @Test public void shouldCloseStoreFileOnFailureToOpen(){
+    final MutableBoolean fired=new MutableBoolean();
+    FileSystemAbstraction fs=new DelegatingFileSystemAbstraction(efs.get()){
+      @Override public StoreChannel open(      File fileName,      OpenMode openMode) throws IOException {
+        return new DelegatingStoreChannel(super.open(fileName,openMode)){
+          @Override public void readAll(          ByteBuffer dst) throws IOException {
+            fired.setValue(true);
+            throw new IOException("Proving a point here");
+          }
+        }
+;
+      }
+    }
+;
+    try (PageCache pageCache=pageCacheRule.getPageCache(fs)){
+      newNodeStore(fs);
+      fail("Should fail");
+    }
+ catch (    Exception e) {
+      assertTrue(contains(e,IOException.class));
+      assertTrue(fired.booleanValue());
+    }
+  }
+  @Test public void shouldFreeSecondaryUnitIdOfDeletedRecord() throws Exception {
+    EphemeralFileSystemAbstraction fs=efs.get();
+    nodeStore=newNodeStore(fs);
+    NodeRecord record=new NodeRecord(5L);
+    record.setRequiresSecondaryUnit(true);
+    record.setSecondaryUnitId(10L);
+    record.setInUse(true);
+    nodeStore.updateRecord(record);
+    nodeStore.setHighestPossibleIdInUse(10L);
+    record.setInUse(false);
+    nodeStore.updateRecord(record);
+    IdGenerator idGenerator=idGeneratorFactory.get(IdType.NODE);
+    verify(idGenerator).freeId(5L);
+    verify(idGenerator).freeId(10L);
+  }
+  @Test public void shouldFreeSecondaryUnitIdOfShrunkRecord() throws Exception {
+    EphemeralFileSystemAbstraction fs=efs.get();
+    nodeStore=newNodeStore(fs);
+    NodeRecord record=new NodeRecord(5L);
+    record.setRequiresSecondaryUnit(true);
+    record.setSecondaryUnitId(10L);
+    record.setInUse(true);
+    nodeStore.updateRecord(record);
+    nodeStore.setHighestPossibleIdInUse(10L);
+    record.setRequiresSecondaryUnit(false);
+    nodeStore.updateRecord(record);
+    IdGenerator idGenerator=idGeneratorFactory.get(IdType.NODE);
+    verify(idGenerator,never()).freeId(5L);
+    verify(idGenerator).freeId(10L);
+  }
+  private NodeStore newNodeStore(  FileSystemAbstraction fs) throws IOException {
+    return newNodeStore(fs,pageCacheRule.getPageCache(fs));
+  }
+  private NodeStore newNodeStore(  FileSystemAbstraction fs,  PageCache pageCache) throws IOException {
+    idGeneratorFactory=spy(new DefaultIdGeneratorFactory(fs){
+      @Override protected IdGenerator instantiate(      FileSystemAbstraction fs,      File fileName,      int grabSize,      long maxValue,      boolean aggressiveReuse,      IdType idType,      LongSupplier highId){
+        return spy(super.instantiate(fs,fileName,grabSize,maxValue,aggressiveReuse,idType,highId));
+      }
+    }
+);
+    StoreFactory factory=new StoreFactory(testDirectory.databaseLayout("new"),Config.defaults(),idGeneratorFactory,pageCache,fs,NullLogProvider.getInstance(),EmptyVersionContextSupplier.EMPTY);
+    neoStores=factory.openAllNeoStores(true);
+    nodeStore=neoStores.getNodeStore();
+    return nodeStore;
+  }
+}

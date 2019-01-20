@@ -1,0 +1,40 @@
+@Test public void shouldPropagateStoreCopyActionFailureToOtherStoreCopyRequests() throws Exception {
+  Barrier.Control barrier=new Barrier.Control();
+  IOException controlledFailure=new IOException("My own fault");
+  AtomicReference<Future<Object>> secondRequest=new AtomicReference<>();
+  ThrowingAction<IOException> controllableAndFailingAction=() -> {
+    secondRequest.set(t3.execute(state -> mutex.storeCopy(ASSERT_NOT_CALLED)));
+    barrier.awaitUninterruptibly();
+    try {
+      throw controlledFailure;
+    }
+  finally {
+      barrier.release();
+    }
+  }
+;
+  Future<Object> firstRequest=t2.execute(state -> mutex.storeCopy(controllableAndFailingAction));
+  while (secondRequest.get() == null) {
+    parkARandomWhile();
+  }
+  t3.get().waitUntilWaiting(details -> details.isAt(StoreCopyCheckPointMutex.class,"waitForFirstStoreCopyActionToComplete"));
+  barrier.reached();
+  try {
+    firstRequest.get();
+  }
+ catch (  ExecutionException e) {
+    assertSame(controlledFailure,e.getCause());
+  }
+  try {
+    secondRequest.get().get();
+  }
+ catch (  ExecutionException e) {
+    Throwable cooperativeActionFailure=e.getCause();
+    assertThat(cooperativeActionFailure.getMessage(),containsString("Co-operative"));
+    assertSame(controlledFailure,cooperativeActionFailure.getCause());
+  }
+  CountingAction action=new CountingAction();
+  try (Resource lock=mutex.storeCopy(action)){
+    assertEquals(1,action.count());
+  }
+ }

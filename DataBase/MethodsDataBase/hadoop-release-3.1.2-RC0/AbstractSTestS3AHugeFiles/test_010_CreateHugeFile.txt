@@ -1,0 +1,65 @@
+@Test public void test_010_CreateHugeFile() throws IOException {
+  assertFalse("Please run this test sequentially to avoid timeouts" + " and bandwidth problems",isParallelExecution());
+  long filesizeMB=filesize / _1MB;
+  deleteHugeFile();
+  Path fileToCreate=getPathOfFileToCreate();
+  describe("Creating file %s of size %d MB" + " with partition size %d buffered by %s",fileToCreate,filesizeMB,partitionSize,getBlockOutputBufferName());
+  int timeout=getTestTimeoutSeconds();
+  int bandwidth=_1MB;
+  long uploadTime=filesize / bandwidth;
+  assertTrue(String.format("Timeout set in %s seconds is too low;" + " estimating upload time of %d seconds at 1 MB/s." + " Rerun tests with -D%s=%d",timeout,uploadTime,KEY_TEST_TIMEOUT,uploadTime * 2),uploadTime < timeout);
+  assertEquals("File size set in " + KEY_HUGE_FILESIZE + " = "+ filesize+ " is not a multiple of "+ uploadBlockSize,0,filesize % uploadBlockSize);
+  byte[] data=new byte[uploadBlockSize];
+  for (int i=0; i < uploadBlockSize; i++) {
+    data[i]=(byte)(i % 256);
+  }
+  long blocks=filesize / uploadBlockSize;
+  long blocksPerMB=_1MB / uploadBlockSize;
+  S3AFileSystem fs=getFileSystem();
+  StorageStatistics storageStatistics=fs.getStorageStatistics();
+  String putRequests=Statistic.OBJECT_PUT_REQUESTS.getSymbol();
+  String putBytes=Statistic.OBJECT_PUT_BYTES.getSymbol();
+  Statistic putRequestsActive=Statistic.OBJECT_PUT_REQUESTS_ACTIVE;
+  Statistic putBytesPending=Statistic.OBJECT_PUT_BYTES_PENDING;
+  ContractTestUtils.NanoTimer timer=new ContractTestUtils.NanoTimer();
+  S3AInstrumentation.OutputStreamStatistics streamStatistics;
+  long blocksPer10MB=blocksPerMB * 10;
+  ProgressCallback progress=new ProgressCallback(timer);
+  try (FSDataOutputStream out=fs.create(fileToCreate,true,uploadBlockSize,progress)){
+    try {
+      streamStatistics=getOutputStreamStatistics(out);
+    }
+ catch (    ClassCastException e) {
+      LOG.info("Wrapped output stream is not block stream: {}",out.getWrappedStream());
+      streamStatistics=null;
+    }
+    for (long block=1; block <= blocks; block++) {
+      out.write(data);
+      long written=block * uploadBlockSize;
+      if (block % blocksPer10MB == 0 || written == filesize) {
+        long percentage=written * 100 / filesize;
+        double elapsedTime=timer.elapsedTime() / 1.0e9;
+        double writtenMB=1.0 * written / _1MB;
+        LOG.info(String.format("[%02d%%] Buffered %.2f MB out of %d MB;" + " PUT %d bytes (%d pending) in %d operations (%d active);" + " elapsedTime=%.2fs; write to buffer bandwidth=%.2f MB/s",percentage,writtenMB,filesizeMB,storageStatistics.getLong(putBytes),gaugeValue(putBytesPending),storageStatistics.getLong(putRequests),gaugeValue(putRequestsActive),elapsedTime,writtenMB / elapsedTime));
+      }
+    }
+    LOG.info("Closing stream {}",out);
+    LOG.info("Statistics : {}",streamStatistics);
+    ContractTestUtils.NanoTimer closeTimer=new ContractTestUtils.NanoTimer();
+    out.close();
+    closeTimer.end("time to close() output stream");
+  }
+   timer.end("time to write %d MB in blocks of %d",filesizeMB,uploadBlockSize);
+  logFSState();
+  bandwidth(timer,filesize);
+  LOG.info("Statistics after stream closed: {}",streamStatistics);
+  long putRequestCount=storageStatistics.getLong(putRequests);
+  Long putByteCount=storageStatistics.getLong(putBytes);
+  LOG.info("PUT {} bytes in {} operations; {} MB/operation",putByteCount,putRequestCount,putByteCount / (putRequestCount * _1MB));
+  LOG.info("Time per PUT {} nS",toHuman(timer.nanosPerOperation(putRequestCount)));
+  assertEquals("active put requests in \n" + fs,0,gaugeValue(putRequestsActive));
+  progress.verifyNoFailures("Put file " + fileToCreate + " of size "+ filesize);
+  if (streamStatistics != null) {
+    assertEquals("actively allocated blocks in " + streamStatistics,0,streamStatistics.blocksActivelyAllocated());
+  }
+}

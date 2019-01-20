@@ -1,0 +1,133 @@
+@Test public void testMTTWithCleanup(){
+  final LowLevelCacheImpl cache=new LowLevelCacheImpl(LlapDaemonCacheMetrics.create("test","1"),new DummyCachePolicy(),new DummyAllocator(),true,1);
+  final long fn1=1, fn2=2;
+  final int offsetsToUse=8;
+  final CountDownLatch cdlIn=new CountDownLatch(4), cdlOut=new CountDownLatch(1);
+  final AtomicInteger rdmsDone=new AtomicInteger(0);
+  Callable<Long> rdmCall=new Callable<Long>(){
+    public Long call(){
+      int gets=0, puts=0;
+      try {
+        Random rdm=new Random(1234 + Thread.currentThread().getId());
+        syncThreadStart(cdlIn,cdlOut);
+        for (int i=0; i < 20000; ++i) {
+          boolean isGet=rdm.nextBoolean(), isFn1=rdm.nextBoolean();
+          long fileName=isFn1 ? fn1 : fn2;
+          int fileIndex=isFn1 ? 1 : 2;
+          int count=rdm.nextInt(offsetsToUse);
+          if (isGet) {
+            int[] offsets=new int[count];
+            count=generateOffsets(offsetsToUse,rdm,offsets);
+            CreateHelper list=new CreateHelper();
+            for (int j=0; i < count; ++i) {
+              list.addOrMerge(offsets[j],offsets[j] + 1,true,false);
+            }
+            DiskRangeList iter=cache.getFileData(fileName,list.get(),0,testFactory,null,null);
+            int j=-1;
+            while (iter != null) {
+              ++j;
+              if (!(iter instanceof CacheChunk)) {
+                iter=iter.next;
+                continue;
+              }
+              ++gets;
+              LlapDataBuffer result=(LlapDataBuffer)((CacheChunk)iter).getBuffer();
+              assertEquals(makeFakeArenaIndex(fileIndex,offsets[j]),result.arenaIndex);
+              cache.decRefBuffer(result);
+              iter=iter.next;
+            }
+          }
+ else {
+            DiskRange[] ranges=new DiskRange[count];
+            int[] offsets=new int[count];
+            for (int j=0; j < count; ++j) {
+              int next=rdm.nextInt(offsetsToUse);
+              ranges[j]=dr(next,next + 1);
+              offsets[j]=next;
+            }
+            MemoryBuffer[] buffers=new MemoryBuffer[count];
+            for (int j=0; j < offsets.length; ++j) {
+              LlapDataBuffer buf=LowLevelCacheImpl.allocateFake();
+              buf.arenaIndex=makeFakeArenaIndex(fileIndex,offsets[j]);
+              buffers[j]=buf;
+            }
+            long[] mask=cache.putFileData(fileName,ranges,buffers,0,Priority.NORMAL,null);
+            puts+=buffers.length;
+            long maskVal=0;
+            if (mask != null) {
+              assertEquals(1,mask.length);
+              maskVal=mask[0];
+            }
+            for (int j=0; j < offsets.length; ++j) {
+              LlapDataBuffer buf=(LlapDataBuffer)(buffers[j]);
+              if ((maskVal & 1) == 1) {
+                assertEquals(makeFakeArenaIndex(fileIndex,offsets[j]),buf.arenaIndex);
+              }
+              maskVal>>=1;
+              cache.decRefBuffer(buf);
+            }
+          }
+        }
+      }
+  finally {
+        rdmsDone.incrementAndGet();
+      }
+      return (((long)gets) << 32) | puts;
+    }
+    private int makeFakeArenaIndex(    int fileIndex,    long offset){
+      return (int)((fileIndex << 16) + offset);
+    }
+  }
+;
+  FutureTask<Integer> evictionTask=new FutureTask<Integer>(new Callable<Integer>(){
+    public Integer call(){
+      boolean isFirstFile=false;
+      Random rdm=new Random(1234 + Thread.currentThread().getId());
+      int evictions=0;
+      syncThreadStart(cdlIn,cdlOut);
+      while (rdmsDone.get() < 3) {
+        DiskRangeList head=new DiskRangeList(0,offsetsToUse + 1);
+        isFirstFile=!isFirstFile;
+        long fileId=isFirstFile ? fn1 : fn2;
+        head=cache.getFileData(fileId,head,0,testFactory,null,null);
+        DiskRange[] results=head.listToArray();
+        int startIndex=rdm.nextInt(results.length), index=startIndex;
+        LlapDataBuffer victim=null;
+        do {
+          DiskRange r=results[index];
+          if (r instanceof CacheChunk) {
+            LlapDataBuffer result=(LlapDataBuffer)((CacheChunk)r).getBuffer();
+            cache.decRefBuffer(result);
+            if (victim == null && result.invalidate()) {
+              ++evictions;
+              victim=result;
+            }
+          }
+          ++index;
+          if (index == results.length)           index=0;
+        }
+ while (index != startIndex);
+        if (victim == null)         continue;
+        cache.notifyEvicted(victim);
+      }
+      return evictions;
+    }
+  }
+);
+  FutureTask<Long> rdmTask1=new FutureTask<Long>(rdmCall), rdmTask2=new FutureTask<Long>(rdmCall), rdmTask3=new FutureTask<Long>(rdmCall);
+  Executor threadPool=Executors.newFixedThreadPool(4);
+  threadPool.execute(rdmTask1);
+  threadPool.execute(rdmTask2);
+  threadPool.execute(rdmTask3);
+  threadPool.execute(evictionTask);
+  try {
+    cdlIn.await();
+    cdlOut.countDown();
+    long result1=rdmTask1.get(), result2=rdmTask2.get(), result3=rdmTask3.get();
+    int evictions=evictionTask.get();
+    LOG.info("MTT test: task 1: " + descRdmTask(result1) + ", task 2: "+ descRdmTask(result2)+ ", task 3: "+ descRdmTask(result3)+ "; "+ evictions+ " evictions");
+  }
+ catch (  Throwable t) {
+    throw new RuntimeException(t);
+  }
+}

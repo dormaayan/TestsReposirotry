@@ -1,0 +1,116 @@
+/** 
+ * Test a router end-to-end including the MountTable.
+ */
+public class TestRouterMountTable {
+  private static StateStoreDFSCluster cluster;
+  private static NamenodeContext nnContext;
+  private static RouterContext routerContext;
+  private static MountTableResolver mountTable;
+  private static ClientProtocol routerProtocol;
+  @BeforeClass public static void globalSetUp() throws Exception {
+    cluster=new StateStoreDFSCluster(false,1);
+    Configuration conf=new RouterConfigBuilder().stateStore().admin().rpc().build();
+    cluster.addRouterOverrides(conf);
+    cluster.startCluster();
+    cluster.startRouters();
+    cluster.waitClusterUp();
+    nnContext=cluster.getRandomNamenode();
+    routerContext=cluster.getRandomRouter();
+    Router router=routerContext.getRouter();
+    routerProtocol=routerContext.getClient().getNamenode();
+    mountTable=(MountTableResolver)router.getSubclusterResolver();
+  }
+  @AfterClass public static void tearDown(){
+    if (cluster != null) {
+      cluster.stopRouter(routerContext);
+      cluster.shutdown();
+      cluster=null;
+    }
+  }
+  @Test public void testReadOnly() throws Exception {
+    MountTable readOnlyEntry=MountTable.newInstance("/readonly",Collections.singletonMap("ns0","/testdir"));
+    readOnlyEntry.setReadOnly(true);
+    assertTrue(addMountTable(readOnlyEntry));
+    MountTable regularEntry=MountTable.newInstance("/regular",Collections.singletonMap("ns0","/testdir"));
+    assertTrue(addMountTable(regularEntry));
+    final FileSystem nnFs=nnContext.getFileSystem();
+    final FileSystem routerFs=routerContext.getFileSystem();
+    assertTrue(routerFs.mkdirs(new Path("/regular/newdir")));
+    FileStatus dirStatusNn=nnFs.getFileStatus(new Path("/testdir/newdir"));
+    assertTrue(dirStatusNn.isDirectory());
+    FileStatus dirStatusRegular=routerFs.getFileStatus(new Path("/regular/newdir"));
+    assertTrue(dirStatusRegular.isDirectory());
+    FileStatus dirStatusReadOnly=routerFs.getFileStatus(new Path("/readonly/newdir"));
+    assertTrue(dirStatusReadOnly.isDirectory());
+    try {
+      routerFs.mkdirs(new Path("/readonly/newdirfail"));
+      fail("We should not be able to write into a read only mount point");
+    }
+ catch (    IOException ioe) {
+      String msg=ioe.getMessage();
+      assertTrue(msg.startsWith("/readonly/newdirfail is in a read only mount point"));
+    }
+  }
+  /** 
+ * Add a mount table entry to the mount table through the admin API.
+ * @param entry Mount table entry to add.
+ * @return If it was succesfully added.
+ * @throws IOException Problems adding entries.
+ */
+  private boolean addMountTable(  final MountTable entry) throws IOException {
+    RouterClient client=routerContext.getAdminClient();
+    MountTableManager mountTableManager=client.getMountTableManager();
+    AddMountTableEntryRequest addRequest=AddMountTableEntryRequest.newInstance(entry);
+    AddMountTableEntryResponse addResponse=mountTableManager.addMountTableEntry(addRequest);
+    mountTable.loadCache(true);
+    return addResponse.getStatus();
+  }
+  /** 
+ * Verify that the file/dir listing contains correct date/time information.
+ */
+  @Test public void testListFilesTime() throws Exception {
+    Long beforeCreatingTime=Time.now();
+    MountTable addEntry=MountTable.newInstance("/testdir",Collections.singletonMap("ns0","/testdir"));
+    assertTrue(addMountTable(addEntry));
+    addEntry=MountTable.newInstance("/testdir2",Collections.singletonMap("ns0","/testdir2"));
+    assertTrue(addMountTable(addEntry));
+    addEntry=MountTable.newInstance("/testdir/subdir",Collections.singletonMap("ns0","/testdir/subdir"));
+    assertTrue(addMountTable(addEntry));
+    addEntry=MountTable.newInstance("/testdir3/subdir1",Collections.singletonMap("ns0","/testdir3"));
+    assertTrue(addMountTable(addEntry));
+    addEntry=MountTable.newInstance("/testA/testB/testC/testD",Collections.singletonMap("ns0","/test"));
+    assertTrue(addMountTable(addEntry));
+    final FileSystem nnFs=nnContext.getFileSystem();
+    assertTrue(nnFs.mkdirs(new Path("/newdir")));
+    Map<String,Long> pathModTime=new TreeMap<>();
+    for (    String mount : mountTable.getMountPoints("/")) {
+      if (mountTable.getMountPoint("/" + mount) != null) {
+        pathModTime.put(mount,mountTable.getMountPoint("/" + mount).getDateModified());
+      }
+ else {
+        List<MountTable> entries=mountTable.getMounts("/" + mount);
+        for (        MountTable entry : entries) {
+          if (pathModTime.get(mount) == null || pathModTime.get(mount) < entry.getDateModified()) {
+            pathModTime.put(mount,entry.getDateModified());
+          }
+        }
+      }
+    }
+    FileStatus[] iterator=nnFs.listStatus(new Path("/"));
+    for (    FileStatus file : iterator) {
+      pathModTime.put(file.getPath().getName(),file.getModificationTime());
+    }
+    DirectoryListing listing=routerProtocol.getListing("/",HdfsFileStatus.EMPTY_NAME,false);
+    Iterator<String> pathModTimeIterator=pathModTime.keySet().iterator();
+    for (    HdfsFileStatus f : listing.getPartialListing()) {
+      String fileName=pathModTimeIterator.next();
+      String currentFile=f.getFullPath(new Path("/")).getName();
+      Long currentTime=f.getModificationTime();
+      Long expectedTime=pathModTime.get(currentFile);
+      assertEquals(currentFile,fileName);
+      assertTrue(currentTime > beforeCreatingTime);
+      assertEquals(currentTime,expectedTime);
+    }
+    assertEquals(pathModTime.size(),listing.getPartialListing().length);
+  }
+}

@@ -1,0 +1,238 @@
+@ExtendWith(TestDirectoryExtension.class) class StartOldDbOnCurrentVersionAndCreateFusionIndexIT {
+  private static final String ZIP_FILE_3_2="3_2-db.zip";
+  private static final String ZIP_FILE_3_3="3_3-db.zip";
+  private static final String ZIP_FILE_3_4="3_4-db.zip";
+  private static final String KEY1="key1";
+  private static final String KEY2="key2";
+  private enum Provider {  LUCENE_10("Label1",GraphDatabaseSettings.SchemaIndex.LUCENE10,LuceneIndexProviderFactory.PROVIDER_DESCRIPTOR),   FUSION_10("Label2",GraphDatabaseSettings.SchemaIndex.NATIVE10,NativeLuceneFusionIndexProviderFactory10.DESCRIPTOR),   FUSION_20("Label3",GraphDatabaseSettings.SchemaIndex.NATIVE20,NativeLuceneFusionIndexProviderFactory20.DESCRIPTOR),   BTREE_10("Label4",GraphDatabaseSettings.SchemaIndex.NATIVE_BTREE10,GenericNativeIndexProvider.DESCRIPTOR);   private final Label label;
+  private final GraphDatabaseSettings.SchemaIndex setting;
+  private final IndexProviderDescriptor descriptor;
+  Provider(  String labelName,  GraphDatabaseSettings.SchemaIndex setting,  IndexProviderDescriptor descriptor){
+    this.label=Label.label(labelName);
+    this.setting=setting;
+    this.descriptor=descriptor;
+  }
+}
+  private static final Provider DEFAULT_PROVIDER=Provider.BTREE_10;
+  @Inject private TestDirectory directory;
+  @Disabled("Here as reference for how 3.2 db was created") @Test void create3_2Database() throws Exception {
+    File storeDir=tempStoreDirectory();
+    GraphDatabaseService db=new GraphDatabaseFactory().newEmbeddedDatabase(storeDir);
+    createIndexDataAndShutdown(db,Provider.LUCENE_10.label);
+    System.out.println("Db created in " + storeDir.getAbsolutePath());
+  }
+  @Disabled("Here as reference for how 3.3 db was created") @Test void create3_3Database() throws Exception {
+    File storeDir=tempStoreDirectory();
+    GraphDatabaseFactory factory=new GraphDatabaseFactory();
+    GraphDatabaseBuilder builder=factory.newEmbeddedDatabaseBuilder(storeDir);
+    builder.setConfig(GraphDatabaseSettings.enable_native_schema_index,Settings.FALSE);
+    GraphDatabaseService db=builder.newGraphDatabase();
+    createIndexDataAndShutdown(db,Provider.LUCENE_10.label);
+    builder.setConfig(GraphDatabaseSettings.enable_native_schema_index,Settings.TRUE);
+    db=builder.newGraphDatabase();
+    createIndexDataAndShutdown(db,Provider.FUSION_10.label);
+    System.out.println("Db created in " + storeDir.getAbsolutePath());
+  }
+  @Disabled("Here as reference for how 3.4 db was created") @Test void create3_4Database() throws Exception {
+    File storeDir=tempStoreDirectory();
+    GraphDatabaseFactory factory=new GraphDatabaseFactory();
+    GraphDatabaseBuilder builder=factory.newEmbeddedDatabaseBuilder(storeDir);
+    builder.setConfig(GraphDatabaseSettings.default_schema_provider,GraphDatabaseSettings.SchemaIndex.LUCENE10.providerName());
+    GraphDatabaseService db=builder.newGraphDatabase();
+    createIndexDataAndShutdown(db,Provider.LUCENE_10.label);
+    builder.setConfig(GraphDatabaseSettings.default_schema_provider,GraphDatabaseSettings.SchemaIndex.NATIVE10.providerName());
+    db=builder.newGraphDatabase();
+    createIndexDataAndShutdown(db,Provider.FUSION_10.label);
+    builder.setConfig(GraphDatabaseSettings.default_schema_provider,GraphDatabaseSettings.SchemaIndex.NATIVE20.providerName());
+    db=builder.newGraphDatabase();
+    createIndexDataAndShutdown(db,Provider.FUSION_20.label);
+    System.out.println("Db created in " + storeDir.getAbsolutePath());
+  }
+  @Test void shouldOpen3_2DbAndCreateAndWorkWithSomeFusionIndexes() throws Exception {
+    shouldOpenOldDbAndCreateAndWorkWithSomeFusionIndexes(ZIP_FILE_3_2,Provider.LUCENE_10);
+  }
+  @Test void shouldOpen3_3DbAndCreateAndWorkWithSomeFusionIndexes() throws Exception {
+    shouldOpenOldDbAndCreateAndWorkWithSomeFusionIndexes(ZIP_FILE_3_3,Provider.FUSION_10);
+  }
+  @Test void shouldOpen3_4DbAndCreateAndWorkWithSomeFusionIndexes() throws Exception {
+    shouldOpenOldDbAndCreateAndWorkWithSomeFusionIndexes(ZIP_FILE_3_4,Provider.FUSION_20);
+  }
+  private void shouldOpenOldDbAndCreateAndWorkWithSomeFusionIndexes(  String zippedDbName,  Provider highestProviderInOldVersion) throws Exception {
+    unzip(getClass(),zippedDbName,directory.databaseDir());
+    IndexRecoveryTracker indexRecoveryTracker=new IndexRecoveryTracker();
+    GraphDatabaseAPI db=setupDb(directory.databaseDir(),indexRecoveryTracker);
+    Provider[] providers=providersUpToAndIncluding(highestProviderInOldVersion);
+    Provider[] providersIncludingSubject=concat(providers,DEFAULT_PROVIDER);
+    int expectedNumberOfIndexes=providers.length * 2;
+    try {
+      verifyInitialState(indexRecoveryTracker,expectedNumberOfIndexes,InternalIndexState.ONLINE);
+      for (      Provider provider : providers) {
+        verifyIndexes(db,provider.label);
+      }
+      createIndexesAndData(db,DEFAULT_PROVIDER.label);
+      verifyIndexes(db,DEFAULT_PROVIDER.label);
+      for (      Provider provider : providersIncludingSubject) {
+        additionalUpdates(db,provider.label);
+        verifyAfterAdditionalUpdate(db,provider.label);
+      }
+      for (      Provider provider : providersIncludingSubject) {
+        verifyExpectedProvider(db,provider.label,provider.descriptor);
+      }
+    }
+  finally {
+      db.shutdown();
+    }
+    db=setupDb(directory.databaseDir(),indexRecoveryTracker);
+    try {
+      verifyInitialState(indexRecoveryTracker,expectedNumberOfIndexes + 2,InternalIndexState.ONLINE);
+    }
+  finally {
+      db.shutdown();
+    }
+  }
+  private Provider[] providersUpToAndIncluding(  Provider provider){
+    return Stream.of(Provider.values()).filter(p -> p.ordinal() <= provider.ordinal()).toArray(Provider[]::new);
+  }
+  private GraphDatabaseAPI setupDb(  File storeDir,  IndexRecoveryTracker indexRecoveryTracker){
+    Monitors monitors=new Monitors();
+    monitors.addMonitorListener(indexRecoveryTracker);
+    return (GraphDatabaseAPI)new GraphDatabaseFactory().setMonitors(monitors).newEmbeddedDatabaseBuilder(storeDir).setConfig(GraphDatabaseSettings.allow_upgrade,Settings.TRUE).newGraphDatabase();
+  }
+  private void verifyInitialState(  IndexRecoveryTracker indexRecoveryTracker,  int expectedNumberOfIndexes,  InternalIndexState expectedInitialState){
+    assertEquals(expectedNumberOfIndexes,indexRecoveryTracker.initialStateMap.size(),"exactly " + expectedNumberOfIndexes + " indexes ");
+    for (    InternalIndexState actualInitialState : indexRecoveryTracker.initialStateMap.values()) {
+      assertEquals(expectedInitialState,actualInitialState,"initial state is online, don't do recovery");
+    }
+  }
+  private static void verifyExpectedProvider(  GraphDatabaseAPI db,  Label label,  IndexProviderDescriptor expectedDescriptor) throws TransactionFailureException {
+    try (Transaction tx=db.beginTx();KernelTransaction kernelTransaction=db.getDependencyResolver().resolveDependency(ThreadToStatementContextBridge.class).getKernelTransactionBoundToThisThread(true)){
+      TokenRead tokenRead=kernelTransaction.tokenRead();
+      SchemaRead schemaRead=kernelTransaction.schemaRead();
+      int labelId=tokenRead.nodeLabel(label.name());
+      int key1Id=tokenRead.propertyKey(KEY1);
+      int key2Id=tokenRead.propertyKey(KEY2);
+      IndexReference index=schemaRead.index(labelId,key1Id);
+      assertIndexHasExpectedProvider(expectedDescriptor,index);
+      index=schemaRead.index(labelId,key1Id,key2Id);
+      assertIndexHasExpectedProvider(expectedDescriptor,index);
+      tx.success();
+    }
+   }
+  private static void assertIndexHasExpectedProvider(  IndexProviderDescriptor expectedDescriptor,  IndexReference index){
+    assertEquals(expectedDescriptor.getKey(),index.providerKey(),"same key");
+    assertEquals(expectedDescriptor.getVersion(),index.providerVersion(),"same version");
+  }
+  private static void createIndexDataAndShutdown(  GraphDatabaseService db,  Label label){
+    try {
+      createIndexesAndData(db,label);
+    }
+  finally {
+      db.shutdown();
+    }
+  }
+  private static File tempStoreDirectory() throws IOException {
+    File file=File.createTempFile("create-db","neo4j");
+    File storeDir=new File(file.getAbsoluteFile().getParentFile(),file.getName());
+    FileUtils.deleteFile(file);
+    return storeDir;
+  }
+  private static void createIndexesAndData(  GraphDatabaseService db,  Label label){
+    try (Transaction tx=db.beginTx()){
+      db.schema().indexFor(label).on(KEY1).create();
+      db.schema().indexFor(label).on(KEY1).on(KEY2).create();
+      tx.success();
+    }
+     try (Transaction tx=db.beginTx()){
+      db.schema().awaitIndexesOnline(10,TimeUnit.SECONDS);
+      tx.success();
+    }
+     createData(db,label);
+  }
+  private static void createData(  GraphDatabaseService db,  Label label){
+    try (Transaction tx=db.beginTx()){
+      for (int i=0; i < 100; i++) {
+        Node node=db.createNode(label);
+        Object value=i % 2 == 0 ? i : String.valueOf(i);
+        node.setProperty(KEY1,value);
+        if (i % 3 == 0) {
+          node.setProperty(KEY2,value);
+        }
+      }
+      tx.success();
+    }
+   }
+  private static void createSpatialAndTemporalData(  GraphDatabaseAPI db,  Label label){
+    try (Transaction tx=db.beginTx()){
+      for (int i=0; i < 100; i++) {
+        Node node=db.createNode(label);
+        Object value=i % 2 == 0 ? Values.pointValue(CoordinateReferenceSystem.Cartesian,i,i) : DurationValue.duration(0,0,i,0);
+        node.setProperty(KEY1,value);
+        if (i % 3 == 0) {
+          node.setProperty(KEY2,value);
+        }
+      }
+      tx.success();
+    }
+   }
+  private static void additionalUpdates(  GraphDatabaseAPI db,  Label label){
+    createData(db,label);
+    createSpatialAndTemporalData(db,label);
+  }
+  private static void verifyIndexes(  GraphDatabaseAPI db,  Label label) throws Exception {
+    assertTrue(hasIndex(db,label,KEY1));
+    assertEquals(100,countIndexedNodes(db,label,KEY1));
+    assertTrue(hasIndex(db,label,KEY1,KEY2));
+    assertEquals(34,countIndexedNodes(db,label,KEY1,KEY2));
+  }
+  private static void verifyAfterAdditionalUpdate(  GraphDatabaseAPI db,  Label label) throws Exception {
+    assertTrue(hasIndex(db,label,KEY1));
+    assertEquals(300,countIndexedNodes(db,label,KEY1));
+    assertTrue(hasIndex(db,label,KEY1,KEY2));
+    assertEquals(102,countIndexedNodes(db,label,KEY1,KEY2));
+  }
+  private static int countIndexedNodes(  GraphDatabaseAPI db,  Label label,  String... keys) throws Exception {
+    try (Transaction tx=db.beginTx()){
+      KernelTransaction ktx=db.getDependencyResolver().resolveDependency(ThreadToStatementContextBridge.class).getKernelTransactionBoundToThisThread(true);
+      TokenRead tokenRead=ktx.tokenRead();
+      int labelId=tokenRead.nodeLabel(label.name());
+      int[] propertyKeyIds=new int[keys.length];
+      for (int i=0; i < propertyKeyIds.length; i++) {
+        propertyKeyIds[i]=tokenRead.propertyKey(keys[i]);
+      }
+      IndexQuery[] predicates=new IndexQuery[propertyKeyIds.length];
+      for (int i=0; i < propertyKeyIds.length; i++) {
+        predicates[i]=IndexQuery.exists(propertyKeyIds[i]);
+      }
+      IndexReference index=ktx.schemaRead().index(labelId,propertyKeyIds);
+      NodeValueIndexCursor cursor=ktx.cursors().allocateNodeValueIndexCursor();
+      ktx.dataRead().nodeIndexSeek(index,cursor,IndexOrder.NONE,false,predicates);
+      int count=0;
+      while (cursor.next()) {
+        count++;
+      }
+      tx.success();
+      return count;
+    }
+   }
+  private static boolean hasIndex(  GraphDatabaseService db,  Label label,  String... keys){
+    try (Transaction tx=db.beginTx()){
+      List<String> keyList=asList(keys);
+      for (      IndexDefinition index : db.schema().getIndexes(label)) {
+        if (asList(index.getPropertyKeys()).equals(keyList)) {
+          return true;
+        }
+      }
+      tx.success();
+    }
+     return false;
+  }
+private class IndexRecoveryTracker extends IndexingService.MonitorAdapter {
+    Map<IndexDescriptor,InternalIndexState> initialStateMap=new HashMap<>();
+    @Override public void initialState(    StoreIndexDescriptor descriptor,    InternalIndexState state){
+      initialStateMap.put(descriptor,state);
+    }
+    public void reset(){
+      initialStateMap=new HashMap<>();
+    }
+  }
+}

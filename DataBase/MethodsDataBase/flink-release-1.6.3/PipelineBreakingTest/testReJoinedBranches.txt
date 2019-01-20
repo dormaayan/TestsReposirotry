@@ -1,0 +1,56 @@
+/** 
+ * Tests that branches that are re-joined have place pipeline breakers. <pre> /-> (sink) / /-> (reduce) -+          /-> (flatmap) -> (sink) /               \        / (source) -> (map) -                (join) -+-----\ \               /              \ \-> (filter) -+                \ \                (co group) -> (sink) \                / \-> (reduce) - / </pre>
+ */
+@Test public void testReJoinedBranches(){
+  try {
+    ExecutionEnvironment env=ExecutionEnvironment.getExecutionEnvironment();
+    DataSet<Tuple2<Long,Long>> data=env.fromElements(33L,44L).map(new MapFunction<Long,Tuple2<Long,Long>>(){
+      @Override public Tuple2<Long,Long> map(      Long value){
+        return new Tuple2<Long,Long>(value,value);
+      }
+    }
+);
+    DataSet<Tuple2<Long,Long>> reduced=data.groupBy(0).reduce(new SelectOneReducer<Tuple2<Long,Long>>());
+    reduced.output(new DiscardingOutputFormat<Tuple2<Long,Long>>());
+    DataSet<Tuple2<Long,Long>> filtered=data.filter(new FilterFunction<Tuple2<Long,Long>>(){
+      @Override public boolean filter(      Tuple2<Long,Long> value) throws Exception {
+        return false;
+      }
+    }
+);
+    DataSet<Tuple2<Long,Long>> joined=reduced.join(filtered).where(1).equalTo(1).with(new DummyFlatJoinFunction<Tuple2<Long,Long>>());
+    joined.flatMap(new IdentityFlatMapper<Tuple2<Long,Long>>()).output(new DiscardingOutputFormat<Tuple2<Long,Long>>());
+    joined.coGroup(filtered.groupBy(1).reduceGroup(new Top1GroupReducer<Tuple2<Long,Long>>())).where(0).equalTo(0).with(new DummyCoGroupFunction<Tuple2<Long,Long>,Tuple2<Long,Long>>()).output(new DiscardingOutputFormat<Tuple2<Tuple2<Long,Long>,Tuple2<Long,Long>>>());
+    List<DataSinkNode> sinks=convertPlan(env.createProgramPlan());
+    DataSinkNode sinkAfterReduce=sinks.get(0);
+    DataSinkNode sinkAfterFlatMap=sinks.get(1);
+    DataSinkNode sinkAfterCoGroup=sinks.get(2);
+    SingleInputNode reduceNode=(SingleInputNode)sinkAfterReduce.getPredecessorNode();
+    SingleInputNode mapNode=(SingleInputNode)reduceNode.getPredecessorNode();
+    SingleInputNode flatMapNode=(SingleInputNode)sinkAfterFlatMap.getPredecessorNode();
+    TwoInputNode joinNode=(TwoInputNode)flatMapNode.getPredecessorNode();
+    SingleInputNode filterNode=(SingleInputNode)joinNode.getSecondPredecessorNode();
+    TwoInputNode coGroupNode=(TwoInputNode)sinkAfterCoGroup.getPredecessorNode();
+    SingleInputNode otherReduceNode=(SingleInputNode)coGroupNode.getSecondPredecessorNode();
+    assertEquals(reduceNode,joinNode.getFirstPredecessorNode());
+    assertEquals(mapNode,filterNode.getPredecessorNode());
+    assertEquals(joinNode,coGroupNode.getFirstPredecessorNode());
+    assertEquals(filterNode,otherReduceNode.getPredecessorNode());
+    assertFalse(sinkAfterReduce.getInputConnection().isBreakingPipeline());
+    assertFalse(sinkAfterFlatMap.getInputConnection().isBreakingPipeline());
+    assertFalse(sinkAfterCoGroup.getInputConnection().isBreakingPipeline());
+    assertFalse(mapNode.getIncomingConnection().isBreakingPipeline());
+    assertFalse(flatMapNode.getIncomingConnection().isBreakingPipeline());
+    assertFalse(joinNode.getFirstIncomingConnection().isBreakingPipeline());
+    assertFalse(coGroupNode.getFirstIncomingConnection().isBreakingPipeline());
+    assertFalse(coGroupNode.getSecondIncomingConnection().isBreakingPipeline());
+    assertTrue(reduceNode.getIncomingConnection().isBreakingPipeline());
+    assertTrue(filterNode.getIncomingConnection().isBreakingPipeline());
+    assertTrue(otherReduceNode.getIncomingConnection().isBreakingPipeline());
+    assertTrue(joinNode.getSecondIncomingConnection().isBreakingPipeline());
+  }
+ catch (  Exception e) {
+    e.printStackTrace();
+    fail(e.getMessage());
+  }
+}

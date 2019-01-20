@@ -1,0 +1,105 @@
+public class RelationshipIT extends KernelIntegrationTest {
+  @Rule public OtherThreadRule<Object> otherThread=new OtherThreadRule<>(10,TimeUnit.SECONDS);
+  @Test public void shouldListRelationshipsInCurrentAndSubsequentTx() throws Exception {
+    Transaction transaction=newTransaction(AnonymousContext.writeToken());
+    int relType1=transaction.tokenWrite().relationshipTypeGetOrCreateForName("Type1");
+    int relType2=transaction.tokenWrite().relationshipTypeGetOrCreateForName("Type2");
+    long refNode=transaction.dataWrite().nodeCreate();
+    long otherNode=transaction.dataWrite().nodeCreate();
+    long fromRefToOther1=transaction.dataWrite().relationshipCreate(refNode,relType1,otherNode);
+    long fromRefToOther2=transaction.dataWrite().relationshipCreate(refNode,relType2,otherNode);
+    long fromOtherToRef=transaction.dataWrite().relationshipCreate(otherNode,relType1,refNode);
+    long fromRefToRef=transaction.dataWrite().relationshipCreate(refNode,relType2,refNode);
+    long endNode=transaction.dataWrite().nodeCreate();
+    long fromRefToThird=transaction.dataWrite().relationshipCreate(refNode,relType2,endNode);
+    assertRels(nodeGetRelationships(transaction,refNode,BOTH),fromRefToOther1,fromRefToOther2,fromRefToRef,fromRefToThird,fromOtherToRef);
+    assertRels(nodeGetRelationships(transaction,refNode,BOTH,new int[]{relType1}),fromRefToOther1,fromOtherToRef);
+    assertRels(nodeGetRelationships(transaction,refNode,BOTH,new int[]{relType1,relType2}),fromRefToOther1,fromRefToOther2,fromRefToRef,fromRefToThird,fromOtherToRef);
+    assertRels(nodeGetRelationships(transaction,refNode,INCOMING),fromOtherToRef);
+    assertRels(nodeGetRelationships(transaction,refNode,INCOMING,new int[]{relType1}));
+    assertRels(nodeGetRelationships(transaction,refNode,OUTGOING,new int[]{relType1,relType2}),fromRefToOther1,fromRefToOther2,fromRefToThird,fromRefToRef);
+    commit();
+    transaction=newTransaction();
+    assertRels(nodeGetRelationships(transaction,refNode,BOTH),fromRefToOther1,fromRefToOther2,fromRefToRef,fromRefToThird,fromOtherToRef);
+    assertRels(nodeGetRelationships(transaction,refNode,BOTH,new int[]{relType1}),fromRefToOther1,fromOtherToRef);
+    assertRels(nodeGetRelationships(transaction,refNode,BOTH,new int[]{relType1,relType2}),fromRefToOther1,fromRefToOther2,fromRefToRef,fromRefToThird,fromOtherToRef);
+    assertRels(nodeGetRelationships(transaction,refNode,INCOMING),fromOtherToRef);
+    assertRels(nodeGetRelationships(transaction,refNode,INCOMING,new int[]{relType1}));
+    assertRels(nodeGetRelationships(transaction,refNode,OUTGOING,new int[]{relType1,relType2}),fromRefToOther1,fromRefToOther2,fromRefToThird,fromRefToRef);
+    commit();
+  }
+  @Test public void shouldInterleaveModifiedRelationshipsWithExistingOnes() throws Exception {
+    long refNode;
+    long fromRefToOther1;
+    long fromRefToOther2;
+    int relType1;
+    int relType2;
+{
+      Transaction transaction=newTransaction(AnonymousContext.writeToken());
+      relType1=transaction.tokenWrite().relationshipTypeGetOrCreateForName("Type1");
+      relType2=transaction.tokenWrite().relationshipTypeGetOrCreateForName("Type2");
+      refNode=transaction.dataWrite().nodeCreate();
+      long otherNode=transaction.dataWrite().nodeCreate();
+      fromRefToOther1=transaction.dataWrite().relationshipCreate(refNode,relType1,otherNode);
+      fromRefToOther2=transaction.dataWrite().relationshipCreate(refNode,relType2,otherNode);
+      commit();
+    }
+{
+      Transaction transaction=newTransaction(AnonymousContext.writeToken());
+      transaction.dataWrite().relationshipDelete(fromRefToOther1);
+      long endNode=transaction.dataWrite().nodeCreate();
+      long localTxRel=transaction.dataWrite().relationshipCreate(refNode,relType1,endNode);
+      assertRels(nodeGetRelationships(transaction,refNode,BOTH),fromRefToOther2,localTxRel);
+      assertRelsInSeparateTx(refNode,BOTH,fromRefToOther1,fromRefToOther2);
+      commit();
+    }
+  }
+  @Test public void shouldReturnRelsWhenAskingForRelsWhereOnlySomeTypesExistInCurrentRel() throws Exception {
+    Transaction transaction=newTransaction(AnonymousContext.writeToken());
+    int relType1=transaction.tokenWrite().relationshipTypeGetOrCreateForName("Type1");
+    int relType2=transaction.tokenWrite().relationshipTypeGetOrCreateForName("Type2");
+    long refNode=transaction.dataWrite().nodeCreate();
+    long otherNode=transaction.dataWrite().nodeCreate();
+    long theRel=transaction.dataWrite().relationshipCreate(refNode,relType1,otherNode);
+    assertRels(nodeGetRelationships(transaction,refNode,OUTGOING,new int[]{relType2,relType1}),theRel);
+    commit();
+  }
+  @Test public void askingForNonExistantReltypeOnDenseNodeShouldNotCorruptState() throws Exception {
+    long[] rels=new long[200];
+    long refNode;
+    int relTypeTheNodeDoesUse;
+    int relTypeTheNodeDoesNotUse;
+{
+      Transaction transaction=newTransaction(AnonymousContext.writeToken());
+      relTypeTheNodeDoesUse=transaction.tokenWrite().relationshipTypeGetOrCreateForName("Type1");
+      relTypeTheNodeDoesNotUse=transaction.tokenWrite().relationshipTypeGetOrCreateForName("Type2");
+      refNode=transaction.dataWrite().nodeCreate();
+      long otherNode=transaction.dataWrite().nodeCreate();
+      for (int i=0; i < rels.length; i++) {
+        rels[i]=transaction.dataWrite().relationshipCreate(refNode,relTypeTheNodeDoesUse,otherNode);
+      }
+      commit();
+    }
+    Transaction transaction=newTransaction();
+    assertRels(nodeGetRelationships(transaction,refNode,Direction.INCOMING,new int[]{relTypeTheNodeDoesNotUse}));
+    assertRels(nodeGetRelationships(transaction,refNode,Direction.BOTH,new int[]{relTypeTheNodeDoesUse}),rels);
+    commit();
+  }
+  private void assertRelsInSeparateTx(  final long refNode,  final Direction both,  final long... longs) throws InterruptedException, ExecutionException, TimeoutException {
+    assertTrue(otherThread.execute(state -> {
+      try (Transaction ktx=kernel.beginTransaction(implicit,LoginContext.AUTH_DISABLED)){
+        assertRels(nodeGetRelationships(ktx,refNode,both),longs);
+      }
+       return true;
+    }
+).get(10,TimeUnit.SECONDS));
+  }
+  private void assertRels(  Iterator<Long> it,  long... rels){
+    List<Matcher<? super Iterable<Long>>> all=new ArrayList<>(rels.length);
+    for (    long element : rels) {
+      all.add(hasItem(element));
+    }
+    List<Long> list=Iterators.asList(it);
+    assertThat(list,allOf(all));
+  }
+}

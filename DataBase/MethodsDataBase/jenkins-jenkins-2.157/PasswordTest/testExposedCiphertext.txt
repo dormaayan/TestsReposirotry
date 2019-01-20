@@ -1,0 +1,69 @@
+@Issue({"SECURITY-266","SECURITY-304"}) @Test public void testExposedCiphertext() throws Exception {
+  ApiTokenTestHelper.enableLegacyBehavior();
+  boolean saveEnabled=Item.EXTENDED_READ.getEnabled();
+  Item.EXTENDED_READ.setEnabled(true);
+  try {
+    final String xml_regex_match="\\{[A-Za-z0-9+/]+={0,2}}";
+    final Pattern xml_regex_pattern=Pattern.compile(xml_regex_match);
+    final String staticTest="\n\nvalue=\"{AQAAABAAAAAgXhXgopokysZkduhl+v1gm0UhUBBbjKDVpKz7bGk3mIO53cNTRdlu7LC4jZYEc+vF}\"\n";
+    assertThat(xml_regex_pattern.matcher(staticTest).find(),is(true));
+    j.jenkins.setSecurityRealm(new JenkinsRule().createDummySecurityRealm());
+    j.jenkins.setAuthorizationStrategy(new MockAuthorizationStrategy().grant(Jenkins.ADMINISTER).everywhere().to("admin").grant(Jenkins.READ,Item.READ,Item.EXTENDED_READ,Item.CREATE).everywhere().to("dev"));
+    Secret s=Secret.fromString("s3cr3t");
+    FreeStyleProject p=j.createFreeStyleProject("p");
+    p.setDisplayName("Unicode here ←");
+    p.setDescription("This+looks+like+Base64+but+is+not+a+secret");
+    p.addProperty(new VulnerableProperty(s));
+    User admin=User.getById("admin",true);
+    User dev=User.getById("dev",true);
+    JenkinsRule.WebClient wc=j.createWebClient();
+    wc.withBasicApiToken(admin);
+    HtmlPage configure=wc.getPage(p,"configure");
+    assertThat(xml_regex_pattern.matcher(configure.getWebResponse().getContentAsString()).find(),is(true));
+    j.submit(configure.getFormByName("config"));
+    VulnerableProperty vp=p.getProperty(VulnerableProperty.class);
+    assertNotNull(vp);
+    assertEquals(s,vp.secret);
+    Page configXml=wc.goTo(p.getUrl() + "config.xml","application/xml");
+    String xmlAdmin=configXml.getWebResponse().getContentAsString();
+    assertThat(Pattern.compile("<secret>" + xml_regex_match + "</secret>").matcher(xmlAdmin).find(),is(true));
+    assertThat(xmlAdmin,containsString("<displayName>" + p.getDisplayName() + "</displayName>"));
+    assertThat(xmlAdmin,containsString("<description>" + p.getDescription() + "</description>"));
+    GetJobCommand getJobCommand=new GetJobCommand();
+    Authentication adminAuth=User.get("admin").impersonate();
+    getJobCommand.setTransportAuth(adminAuth);
+    ByteArrayOutputStream baos=new ByteArrayOutputStream();
+    String pName=p.getFullName();
+    getJobCommand.main(Collections.singletonList(pName),Locale.ENGLISH,System.in,new PrintStream(baos),System.err);
+    assertEquals(xmlAdmin,baos.toString(configXml.getWebResponse().getContentCharset()));
+    CopyJobCommand copyJobCommand=new CopyJobCommand();
+    copyJobCommand.setTransportAuth(adminAuth);
+    String pAdminName=pName + "-admin";
+    assertEquals(0,copyJobCommand.main(Arrays.asList(pName,pAdminName),Locale.ENGLISH,System.in,System.out,System.err));
+    FreeStyleProject pAdmin=j.jenkins.getItemByFullName(pAdminName,FreeStyleProject.class);
+    assertNotNull(pAdmin);
+    pAdmin.setDisplayName(p.getDisplayName());
+    assertEquals(p.getConfigFile().asString(),pAdmin.getConfigFile().asString());
+    wc.withBasicApiToken(dev);
+    configure=wc.getPage(p,"configure");
+    assertThat(xml_regex_pattern.matcher(configure.getWebResponse().getContentAsString()).find(),is(false));
+    configXml=wc.goTo(p.getUrl() + "config.xml","application/xml");
+    String xmlDev=configXml.getWebResponse().getContentAsString();
+    assertThat(xml_regex_pattern.matcher(xmlDev).find(),is(false));
+    assertEquals(xmlAdmin.replaceAll(xml_regex_match,"********"),xmlDev);
+    getJobCommand=new GetJobCommand();
+    Authentication devAuth=User.get("dev").impersonate();
+    getJobCommand.setTransportAuth(devAuth);
+    baos=new ByteArrayOutputStream();
+    getJobCommand.main(Collections.singletonList(pName),Locale.ENGLISH,System.in,new PrintStream(baos),System.err);
+    assertEquals(xmlDev,baos.toString(configXml.getWebResponse().getContentCharset()));
+    copyJobCommand=new CopyJobCommand();
+    copyJobCommand.setTransportAuth(devAuth);
+    String pDevName=pName + "-dev";
+    assertThat(copyJobCommand.main(Arrays.asList(pName,pDevName),Locale.ENGLISH,System.in,System.out,System.err),not(0));
+    assertNull(j.jenkins.getItemByFullName(pDevName,FreeStyleProject.class));
+  }
+  finally {
+    Item.EXTENDED_READ.setEnabled(saveEnabled);
+  }
+}

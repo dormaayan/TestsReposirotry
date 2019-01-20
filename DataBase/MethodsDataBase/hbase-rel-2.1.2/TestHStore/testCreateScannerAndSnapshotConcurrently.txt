@@ -1,0 +1,46 @@
+@Test public void testCreateScannerAndSnapshotConcurrently() throws IOException, InterruptedException {
+  Configuration conf=HBaseConfiguration.create();
+  conf.set(HStore.MEMSTORE_CLASS_NAME,MyCompactingMemStore.class.getName());
+  init(name.getMethodName(),conf,ColumnFamilyDescriptorBuilder.newBuilder(family).setInMemoryCompaction(MemoryCompactionPolicy.BASIC).build());
+  byte[] value=Bytes.toBytes("value");
+  MemStoreSizing memStoreSizing=new NonThreadSafeMemStoreSizing();
+  long ts=EnvironmentEdgeManager.currentTime();
+  long seqId=100;
+  store.add(createCell(qf1,ts,seqId,value),memStoreSizing);
+  store.add(createCell(qf2,ts,seqId,value),memStoreSizing);
+  store.add(createCell(qf3,ts,seqId,value),memStoreSizing);
+  TreeSet<byte[]> quals=new TreeSet<>(Bytes.BYTES_COMPARATOR);
+  quals.add(qf1);
+  quals.add(qf2);
+  quals.add(qf3);
+  StoreFlushContext storeFlushCtx=store.createFlushContext(id++,FlushLifeCycleTracker.DUMMY);
+  MyCompactingMemStore.START_TEST.set(true);
+  Runnable flush=() -> {
+    storeFlushCtx.prepare();
+  }
+;
+  ExecutorService service=Executors.newSingleThreadExecutor();
+  service.submit(flush);
+  InternalScanner scanner=(InternalScanner)store.getScanner(new Scan(new Get(row)),quals,seqId + 1);
+  service.shutdown();
+  service.awaitTermination(20,TimeUnit.SECONDS);
+  try {
+    try {
+      List<Cell> results=new ArrayList<>();
+      scanner.next(results);
+      assertEquals(3,results.size());
+      for (      Cell c : results) {
+        byte[] actualValue=CellUtil.cloneValue(c);
+        assertTrue("expected:" + Bytes.toStringBinary(value) + ", actual:"+ Bytes.toStringBinary(actualValue),Bytes.equals(actualValue,value));
+      }
+    }
+  finally {
+      scanner.close();
+    }
+  }
+  finally {
+    MyCompactingMemStore.START_TEST.set(false);
+    storeFlushCtx.flushCache(Mockito.mock(MonitoredTask.class));
+    storeFlushCtx.commit(Mockito.mock(MonitoredTask.class));
+  }
+}

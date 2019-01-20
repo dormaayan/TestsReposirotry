@@ -1,0 +1,88 @@
+/** 
+ * This class tests Trash functionality in Encryption Zones.
+ */
+public class TestTrashWithEncryptionZones {
+  private Configuration conf;
+  private FileSystemTestHelper fsHelper;
+  private MiniDFSCluster cluster;
+  private HdfsAdmin dfsAdmin;
+  private DistributedFileSystem fs;
+  private File testRootDir;
+  private static final String TEST_KEY="test_key";
+  private FileSystemTestWrapper fsWrapper;
+  private static Configuration clientConf;
+  private static FsShell shell;
+  private static AtomicInteger zoneCounter=new AtomicInteger(1);
+  private static AtomicInteger fileCounter=new AtomicInteger(1);
+  private static final int LEN=8192;
+  private static final EnumSet<CreateEncryptionZoneFlag> NO_TRASH=EnumSet.of(CreateEncryptionZoneFlag.NO_TRASH);
+  private static final EnumSet<CreateEncryptionZoneFlag> PROVISION_TRASH=EnumSet.of(CreateEncryptionZoneFlag.PROVISION_TRASH);
+  private String getKeyProviderURI(){
+    return JavaKeyStoreProvider.SCHEME_NAME + "://file" + new Path(testRootDir.toString(),"test.jks").toUri();
+  }
+  @Before public void setup() throws Exception {
+    conf=new HdfsConfiguration();
+    fsHelper=new FileSystemTestHelper();
+    String testRoot=fsHelper.getTestRootDir();
+    testRootDir=new File(testRoot).getAbsoluteFile();
+    conf.set(CommonConfigurationKeysPublic.HADOOP_SECURITY_KEY_PROVIDER_PATH,getKeyProviderURI());
+    conf.setBoolean(DFSConfigKeys.DFS_NAMENODE_DELEGATION_TOKEN_ALWAYS_USE_KEY,true);
+    conf.setInt(DFSConfigKeys.DFS_NAMENODE_LIST_ENCRYPTION_ZONES_NUM_RESPONSES,2);
+    cluster=new MiniDFSCluster.Builder(conf).numDataNodes(1).build();
+    org.apache.log4j.Logger.getLogger(EncryptionZoneManager.class).setLevel(Level.TRACE);
+    fs=cluster.getFileSystem();
+    fsWrapper=new FileSystemTestWrapper(fs);
+    dfsAdmin=new HdfsAdmin(cluster.getURI(),conf);
+    setProvider();
+    DFSTestUtil.createKey(TEST_KEY,cluster,conf);
+    clientConf=new Configuration(conf);
+    clientConf.setLong(FS_TRASH_INTERVAL_KEY,1);
+    shell=new FsShell(clientConf);
+  }
+  protected void setProvider(){
+    fs.getClient().setKeyProvider(cluster.getNameNode().getNamesystem().getProvider());
+  }
+  @After public void teardown(){
+    if (cluster != null) {
+      cluster.shutdown();
+      cluster=null;
+    }
+  }
+  @Test public void testDeleteWithinEncryptionZone() throws Exception {
+    final Path zone=new Path("/zones");
+    fs.mkdirs(zone);
+    final Path zone1=new Path("/zones/zone" + zoneCounter.getAndIncrement());
+    fs.mkdirs(zone1);
+    dfsAdmin.createEncryptionZone(zone1,TEST_KEY,PROVISION_TRASH);
+    final Path encFile1=new Path(zone1,"encFile" + fileCounter.getAndIncrement());
+    DFSTestUtil.createFile(fs,encFile1,LEN,(short)1,0xFEED);
+    DFSTestUtil.verifyDelete(shell,fs,encFile1,true);
+    DFSTestUtil.verifyDelete(shell,fs,zone1,true);
+  }
+  @Test public void testDeleteEZWithMultipleUsers() throws Exception {
+    final Path zone=new Path("/zones");
+    fs.mkdirs(zone);
+    final Path zone1=new Path("/zones/zone" + zoneCounter.getAndIncrement());
+    fs.mkdirs(zone1);
+    dfsAdmin.createEncryptionZone(zone1,TEST_KEY,NO_TRASH);
+    fsWrapper.setPermission(zone1,new FsPermission(FsAction.ALL,FsAction.ALL,FsAction.ALL));
+    final Path encFile1=new Path(zone1,"encFile" + fileCounter.getAndIncrement());
+    DFSTestUtil.createFile(fs,encFile1,LEN,(short)1,0xFEED);
+    final UserGroupInformation user=UserGroupInformation.createUserForTesting("user",new String[]{"mygroup"});
+    final Path encFile2=new Path(zone1,"encFile" + fileCounter.getAndIncrement());
+    user.doAs(new PrivilegedExceptionAction<Object>(){
+      @Override public Object run() throws Exception {
+        FileSystem fs2=FileSystem.get(cluster.getConfiguration(0));
+        DFSTestUtil.createFile(fs2,encFile2,LEN,(short)1,0xFEED);
+        DFSTestUtil.verifyDelete(shell,fs,encFile2,true);
+        String[] argv=new String[]{"-rm","-r",zone1.toString()};
+        int res=ToolRunner.run(shell,argv);
+        assertEquals("Non-admin could delete an encryption zone with multiple" + " users : " + zone1,1,res);
+        return null;
+      }
+    }
+);
+    shell=new FsShell(clientConf);
+    DFSTestUtil.verifyDelete(shell,fs,zone1,true);
+  }
+}

@@ -1,0 +1,83 @@
+@Test public void testRestartWithFailingTaskManager(){
+  final int parallelism=4;
+  LocalFlinkMiniCluster cluster=null;
+  ActorSystem additionalSystem=null;
+  try {
+    Configuration config=new Configuration();
+    config.setInteger(ConfigConstants.LOCAL_NUMBER_TASK_MANAGER,2);
+    config.setInteger(TaskManagerOptions.NUM_TASK_SLOTS,parallelism);
+    config.setString(TaskManagerOptions.MANAGED_MEMORY_SIZE,"16m");
+    config.setString(AkkaOptions.WATCH_HEARTBEAT_INTERVAL,"500 ms");
+    config.setString(AkkaOptions.WATCH_HEARTBEAT_PAUSE,"20 s");
+    config.setInteger(AkkaOptions.WATCH_THRESHOLD,20);
+    cluster=new LocalFlinkMiniCluster(config,false);
+    cluster.start();
+    List<Long> resultCollection=new ArrayList<Long>();
+    final ExecutionEnvironment env=new TestEnvironment(cluster,parallelism,false);
+    env.setParallelism(parallelism);
+    env.setRestartStrategy(RestartStrategies.fixedDelayRestart(1,1000));
+    env.getConfig().disableSysoutLogging();
+    env.generateSequence(1,10).map(new FailingMapper<Long>()).reduce(new ReduceFunction<Long>(){
+      @Override public Long reduce(      Long value1,      Long value2){
+        return value1 + value2;
+      }
+    }
+).output(new LocalCollectionOutputFormat<Long>(resultCollection));
+    final AtomicReference<Throwable> ref=new AtomicReference<Throwable>();
+    Thread trigger=new Thread("program trigger"){
+      @Override public void run(){
+        try {
+          env.execute();
+        }
+ catch (        Throwable t) {
+          ref.set(t);
+        }
+      }
+    }
+;
+    trigger.setDaemon(true);
+    trigger.start();
+    for (int i=0; i < parallelism; i++) {
+      FailingMapper.TASK_TO_COORD_QUEUE.take();
+    }
+{
+      additionalSystem=cluster.startTaskManagerActorSystem(2);
+      ActorRef additionalTaskManager=cluster.startTaskManager(2,additionalSystem);
+      Object message=TaskManagerMessages.getNotifyWhenRegisteredAtJobManagerMessage();
+      Future<Object> future=Patterns.ask(additionalTaskManager,message,30000);
+      try {
+        Await.result(future,new FiniteDuration(30000,TimeUnit.MILLISECONDS));
+      }
+ catch (      TimeoutException e) {
+        fail("The additional TaskManager did not come up within 30 seconds");
+      }
+    }
+    for (    ActorRef tm : cluster.getTaskManagersAsJava()) {
+      tm.tell(PoisonPill.getInstance(),null);
+    }
+    for (int i=0; i < parallelism; i++) {
+      FailingMapper.TASK_TO_COORD_QUEUE.take();
+    }
+    for (int i=0; i < parallelism; i++) {
+      FailingMapper.COORD_TO_TASK_QUEUE.add(new Object());
+    }
+    trigger.join();
+    if (ref.get() != null) {
+      Throwable t=ref.get();
+      t.printStackTrace();
+      fail("Program execution caused an exception: " + t.getMessage());
+    }
+  }
+ catch (  Exception e) {
+    e.printStackTrace();
+    fail(e.getMessage());
+  }
+ finally {
+    if (additionalSystem != null) {
+      additionalSystem.shutdown();
+    }
+    if (cluster != null) {
+      cluster.stop();
+    }
+  }
+}

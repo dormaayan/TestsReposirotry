@@ -1,0 +1,60 @@
+@Test public void testCompressionIncreasesEffectiveBlockCacheSize() throws Exception {
+  int maxSize=(int)(HConstants.DEFAULT_BLOCKSIZE * 2.1);
+  Path hfilePath=new Path(TEST_UTIL.getDataTestDir(),"testCompressionIncreasesEffectiveBlockcacheSize");
+  HFileContext context=new HFileContextBuilder().withCompression(Compression.Algorithm.GZ).build();
+  LOG.info("context=" + context);
+  Configuration lazyCompressDisabled=HBaseConfiguration.create(TEST_UTIL.getConfiguration());
+  lazyCompressDisabled.setBoolean(CacheConfig.CACHE_BLOCKS_ON_WRITE_KEY,cacheOnWrite);
+  lazyCompressDisabled.setBoolean(CacheConfig.CACHE_BLOOM_BLOCKS_ON_WRITE_KEY,cacheOnWrite);
+  lazyCompressDisabled.setBoolean(CacheConfig.CACHE_INDEX_BLOCKS_ON_WRITE_KEY,cacheOnWrite);
+  lazyCompressDisabled.setBoolean(CacheConfig.CACHE_DATA_BLOCKS_COMPRESSED_KEY,false);
+  CacheConfig.GLOBAL_BLOCK_CACHE_INSTANCE=new LruBlockCache(maxSize,HConstants.DEFAULT_BLOCKSIZE,false,lazyCompressDisabled);
+  CacheConfig cc=new CacheConfig(lazyCompressDisabled);
+  assertFalse(cc.shouldCacheDataCompressed());
+  assertTrue(cc.getBlockCache() instanceof LruBlockCache);
+  LruBlockCache disabledBlockCache=(LruBlockCache)cc.getBlockCache();
+  LOG.info("disabledBlockCache=" + disabledBlockCache);
+  assertEquals("test inconsistency detected.",maxSize,disabledBlockCache.getMaxSize());
+  assertTrue("eviction thread spawned unintentionally.",disabledBlockCache.getEvictionThread() == null);
+  assertEquals("freshly created blockcache contains blocks.",0,disabledBlockCache.getBlockCount());
+  writeHFile(lazyCompressDisabled,cc,fs,hfilePath,context,2000);
+  cacheBlocks(lazyCompressDisabled,cc,fs,hfilePath,context);
+  long disabledBlockCount=disabledBlockCache.getBlockCount();
+  assertTrue("blockcache should contain blocks. disabledBlockCount=" + disabledBlockCount,disabledBlockCount > 0);
+  long disabledEvictedCount=disabledBlockCache.getStats().getEvictedCount();
+  for (  Map.Entry<BlockCacheKey,LruCachedBlock> e : disabledBlockCache.getMapForTests().entrySet()) {
+    HFileBlock block=(HFileBlock)e.getValue().getBuffer();
+    assertTrue("found a packed block, block=" + block,block.isUnpacked());
+  }
+  Configuration lazyCompressEnabled=HBaseConfiguration.create(TEST_UTIL.getConfiguration());
+  lazyCompressEnabled.setBoolean(CacheConfig.CACHE_BLOCKS_ON_WRITE_KEY,cacheOnWrite);
+  lazyCompressEnabled.setBoolean(CacheConfig.CACHE_BLOOM_BLOCKS_ON_WRITE_KEY,cacheOnWrite);
+  lazyCompressEnabled.setBoolean(CacheConfig.CACHE_INDEX_BLOCKS_ON_WRITE_KEY,cacheOnWrite);
+  lazyCompressEnabled.setBoolean(CacheConfig.CACHE_DATA_BLOCKS_COMPRESSED_KEY,true);
+  CacheConfig.GLOBAL_BLOCK_CACHE_INSTANCE=new LruBlockCache(maxSize,HConstants.DEFAULT_BLOCKSIZE,false,lazyCompressEnabled);
+  cc=new CacheConfig(lazyCompressEnabled);
+  assertTrue("test improperly configured.",cc.shouldCacheDataCompressed());
+  assertTrue(cc.getBlockCache() instanceof LruBlockCache);
+  LruBlockCache enabledBlockCache=(LruBlockCache)cc.getBlockCache();
+  LOG.info("enabledBlockCache=" + enabledBlockCache);
+  assertEquals("test inconsistency detected",maxSize,enabledBlockCache.getMaxSize());
+  assertTrue("eviction thread spawned unintentionally.",enabledBlockCache.getEvictionThread() == null);
+  assertEquals("freshly created blockcache contains blocks.",0,enabledBlockCache.getBlockCount());
+  cacheBlocks(lazyCompressEnabled,cc,fs,hfilePath,context);
+  long enabledBlockCount=enabledBlockCache.getBlockCount();
+  assertTrue("blockcache should contain blocks. enabledBlockCount=" + enabledBlockCount,enabledBlockCount > 0);
+  long enabledEvictedCount=enabledBlockCache.getStats().getEvictedCount();
+  int candidatesFound=0;
+  for (  Map.Entry<BlockCacheKey,LruCachedBlock> e : enabledBlockCache.getMapForTests().entrySet()) {
+    candidatesFound++;
+    HFileBlock block=(HFileBlock)e.getValue().getBuffer();
+    if (cc.shouldCacheCompressed(block.getBlockType().getCategory())) {
+      assertFalse("found an unpacked block, block=" + block + ", block buffer capacity="+ block.getBufferWithoutHeader().capacity(),block.isUnpacked());
+    }
+  }
+  assertTrue("did not find any candidates for compressed caching. Invalid test.",candidatesFound > 0);
+  LOG.info("disabledBlockCount=" + disabledBlockCount + ", enabledBlockCount="+ enabledBlockCount);
+  assertTrue("enabling compressed data blocks should increase the effective cache size. " + "disabledBlockCount=" + disabledBlockCount + ", enabledBlockCount="+ enabledBlockCount,disabledBlockCount < enabledBlockCount);
+  LOG.info("disabledEvictedCount=" + disabledEvictedCount + ", enabledEvictedCount="+ enabledEvictedCount);
+  assertTrue("enabling compressed data blocks should reduce the number of evictions. " + "disabledEvictedCount=" + disabledEvictedCount + ", enabledEvictedCount="+ enabledEvictedCount,enabledEvictedCount < disabledEvictedCount);
+}

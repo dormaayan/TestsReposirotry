@@ -1,0 +1,212 @@
+class DataMover {
+  private final MiniDFSCluster cluster;
+  private final int sourceDiskIndex;
+  private final int dataNodeIndex;
+  private final Configuration conf;
+  private final int blockCount;
+  private final int blockSize;
+  private DataNode node;
+  /** 
+ * Constructs a DataMover class.
+ * @param cluster         - MiniDFSCluster.
+ * @param dataNodeIndex   - Datanode to operate against.
+ * @param sourceDiskIndex - source Disk Index.
+ */
+  public DataMover(  MiniDFSCluster cluster,  int dataNodeIndex,  int sourceDiskIndex,  Configuration conf,  int blockSize,  int blockCount){
+    this.cluster=cluster;
+    this.dataNodeIndex=dataNodeIndex;
+    this.node=cluster.getDataNodes().get(dataNodeIndex);
+    this.sourceDiskIndex=sourceDiskIndex;
+    this.conf=conf;
+    this.blockCount=blockCount;
+    this.blockSize=blockSize;
+  }
+  /** 
+ * Moves all data to a source disk to create disk imbalance so we can run a planner.
+ * @throws IOException
+ */
+  public void moveDataToSourceDisk() throws IOException {
+    moveAllDataToDestDisk(this.node,sourceDiskIndex);
+    cluster.restartDataNodes();
+    cluster.waitActive();
+  }
+  /** 
+ * Moves all data in the data node to one disk.
+ * @param dataNode      - Datanode
+ * @param destDiskindex - Index of the destination disk.
+ */
+  private void moveAllDataToDestDisk(  DataNode dataNode,  int destDiskindex) throws IOException {
+    Preconditions.checkNotNull(dataNode);
+    Preconditions.checkState(destDiskindex >= 0);
+    try (FsDatasetSpi.FsVolumeReferences refs=dataNode.getFSDataset().getFsVolumeReferences()){
+      if (refs.size() <= destDiskindex) {
+        throw new IllegalArgumentException("Invalid Disk index.");
+      }
+      FsVolumeImpl dest=(FsVolumeImpl)refs.get(destDiskindex);
+      for (int x=0; x < refs.size(); x++) {
+        if (x == destDiskindex) {
+          continue;
+        }
+        FsVolumeImpl source=(FsVolumeImpl)refs.get(x);
+        DiskBalancerTestUtil.moveAllDataToDestVolume(dataNode.getFSDataset(),source,dest);
+      }
+    }
+   }
+  /** 
+ * Generates a NodePlan for the datanode specified.
+ * @return NodePlan.
+ */
+  public NodePlan generatePlan() throws Exception {
+    node=cluster.getDataNodes().get(dataNodeIndex);
+    ClusterConnector nameNodeConnector=ConnectorFactory.getCluster(cluster.getFileSystem(dataNodeIndex).getUri(),conf);
+    DiskBalancerCluster diskBalancerCluster=new DiskBalancerCluster(nameNodeConnector);
+    diskBalancerCluster.readClusterInfo();
+    List<DiskBalancerDataNode> nodesToProcess=new LinkedList<>();
+    nodesToProcess.add(diskBalancerCluster.getNodeByUUID(node.getDatanodeUuid()));
+    diskBalancerCluster.setNodesToProcess(nodesToProcess);
+    List<NodePlan> clusterplan=diskBalancerCluster.computePlan(0.0f);
+    assertTrue(clusterplan.size() == 1);
+    NodePlan plan=clusterplan.get(0);
+    plan.setNodeUUID(node.getDatanodeUuid());
+    plan.setTimeStamp(Time.now());
+    assertNotNull(plan.getVolumeSetPlans());
+    assertTrue(plan.getVolumeSetPlans().size() > 0);
+    plan.getVolumeSetPlans().get(0).setTolerancePercent(10);
+    return plan;
+  }
+  /** 
+ * Waits for a plan executing to finish.
+ */
+  public void executePlan(  NodePlan plan) throws IOException, TimeoutException, InterruptedException {
+    node=cluster.getDataNodes().get(dataNodeIndex);
+    String planJson=plan.toJson();
+    String planID=DigestUtils.shaHex(planJson);
+    node.submitDiskBalancerPlan(planID,1,PLAN_FILE,planJson,false);
+    String jmxString=node.getDiskBalancerStatus();
+    assertNotNull(jmxString);
+    DiskBalancerWorkStatus status=DiskBalancerWorkStatus.parseJson(jmxString);
+    DiskBalancerWorkStatus realStatus=node.queryDiskBalancerPlan();
+    assertEquals(realStatus.getPlanID(),status.getPlanID());
+    GenericTestUtils.waitFor(new Supplier<Boolean>(){
+      @Override public Boolean get(){
+        try {
+          return node.queryDiskBalancerPlan().getResult() == DiskBalancerWorkStatus.Result.PLAN_DONE;
+        }
+ catch (        IOException ex) {
+          return false;
+        }
+      }
+    }
+,1000,100000);
+  }
+  public void executePlanDuringDiskRemove(  NodePlan plan) throws IOException, TimeoutException, InterruptedException {
+    CountDownLatch createWorkPlanLatch=new CountDownLatch(1);
+    CountDownLatch removeDiskLatch=new CountDownLatch(1);
+    AtomicInteger errorCount=new AtomicInteger(0);
+    LOG.info("FSDataSet: " + node.getFSDataset());
+    final FsDatasetSpi<?> fsDatasetSpy=Mockito.spy(node.getFSDataset());
+    doAnswer(new Answer<Object>(){
+      public Object answer(      InvocationOnMock invocation){
+        try {
+          node.getFSDataset().moveBlockAcrossVolumes((ExtendedBlock)invocation.getArguments()[0],(FsVolumeSpi)invocation.getArguments()[1]);
+        }
+ catch (        Exception e) {
+          errorCount.incrementAndGet();
+        }
+        return null;
+      }
+    }
+).when(fsDatasetSpy).moveBlockAcrossVolumes(any(ExtendedBlock.class),any(FsVolumeSpi.class));
+    DiskBalancerMover diskBalancerMover=new DiskBalancerMover(fsDatasetSpy,conf);
+    diskBalancerMover.setRunnable();
+    DiskBalancerMover diskBalancerMoverSpy=Mockito.spy(diskBalancerMover);
+    doAnswer(new Answer<Object>(){
+      public Object answer(      InvocationOnMock invocation){
+        createWorkPlanLatch.countDown();
+        LOG.info("Waiting for the disk removal!");
+        try {
+          removeDiskLatch.await();
+        }
+ catch (        InterruptedException e) {
+          LOG.info("Encountered " + e);
+        }
+        LOG.info("Got disk removal notification, resuming copyBlocks!");
+        diskBalancerMover.copyBlocks((VolumePair)(invocation.getArguments()[0]),(DiskBalancerWorkItem)(invocation.getArguments()[1]));
+        return null;
+      }
+    }
+).when(diskBalancerMoverSpy).copyBlocks(any(VolumePair.class),any(DiskBalancerWorkItem.class));
+    DiskBalancer diskBalancer=new DiskBalancer(node.getDatanodeUuid(),conf,diskBalancerMoverSpy);
+    List<String> oldDirs=new ArrayList<String>(node.getConf().getTrimmedStringCollection(DFSConfigKeys.DFS_DATANODE_DATA_DIR_KEY));
+    final String newDirs=oldDirs.get(0);
+    LOG.info("Reconfigure newDirs:" + newDirs);
+    Thread reconfigThread=new Thread(){
+      public void run(){
+        try {
+          LOG.info("Waiting for work plan creation!");
+          createWorkPlanLatch.await();
+          LOG.info("Work plan created. Removing disk!");
+          assertThat("DN did not update its own config",node.reconfigurePropertyImpl(DFS_DATANODE_DATA_DIR_KEY,newDirs),is(node.getConf().get(DFS_DATANODE_DATA_DIR_KEY)));
+          Thread.sleep(1000);
+          LOG.info("Removed disk!");
+          removeDiskLatch.countDown();
+        }
+ catch (        ReconfigurationException|InterruptedException e) {
+          Assert.fail("Unexpected error while reconfiguring: " + e);
+        }
+      }
+    }
+;
+    reconfigThread.start();
+    String planJson=plan.toJson();
+    String planID=DigestUtils.shaHex(planJson);
+    diskBalancer.submitPlan(planID,1,PLAN_FILE,planJson,false);
+    GenericTestUtils.waitFor(new Supplier<Boolean>(){
+      @Override public Boolean get(){
+        try {
+          LOG.info("Work Status: " + diskBalancer.queryWorkStatus().toJsonString());
+          Result result=diskBalancer.queryWorkStatus().getResult();
+          return (result == Result.PLAN_DONE);
+        }
+ catch (        IOException e) {
+          return false;
+        }
+      }
+    }
+,1000,100000);
+    assertTrue("Disk balancer operation hit max errors!",errorCount.get() < DFSConfigKeys.DFS_DISK_BALANCER_MAX_DISK_ERRORS_DEFAULT);
+    createWorkPlanLatch.await();
+    removeDiskLatch.await();
+  }
+  /** 
+ * Verifies the Plan Execution has been done.
+ */
+  public void verifyPlanExectionDone() throws IOException {
+    node=cluster.getDataNodes().get(dataNodeIndex);
+    assertEquals(node.queryDiskBalancerPlan().getResult(),DiskBalancerWorkStatus.Result.PLAN_DONE);
+  }
+  /** 
+ * Once diskBalancer is run, all volumes mush has some data.
+ */
+  public void verifyAllVolumesHaveData(  boolean checkblockPoolCount) throws IOException {
+    node=cluster.getDataNodes().get(dataNodeIndex);
+    try (FsDatasetSpi.FsVolumeReferences refs=node.getFSDataset().getFsVolumeReferences()){
+      for (      FsVolumeSpi volume : refs) {
+        assertTrue(DiskBalancerTestUtil.getBlockCount(volume,checkblockPoolCount) > 0);
+        LOG.info("{} : Block Count : {}",refs,DiskBalancerTestUtil.getBlockCount(volume,checkblockPoolCount));
+      }
+    }
+   }
+  /** 
+ * Verifies that tolerance values are honored correctly.
+ */
+  public void verifyTolerance(  NodePlan plan,  int planIndex,  int sourceDiskIndex,  int tolerance) throws IOException {
+    long delta=(plan.getVolumeSetPlans().get(planIndex).getBytesToMove() * tolerance) / 100;
+    FsVolumeImpl volume=null;
+    try (FsDatasetSpi.FsVolumeReferences refs=node.getFSDataset().getFsVolumeReferences()){
+      volume=(FsVolumeImpl)refs.get(sourceDiskIndex);
+      assertTrue(DiskBalancerTestUtil.getBlockCount(volume,true) > 0);
+      assertTrue((DiskBalancerTestUtil.getBlockCount(volume,true) * (blockSize + delta)) >= plan.getVolumeSetPlans().get(0).getBytesToMove());
+    }
+   }
+}

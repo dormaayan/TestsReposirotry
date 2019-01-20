@@ -1,0 +1,81 @@
+@Test public void testMRJob() throws Exception {
+  S3AFileSystem fs=getFileSystem();
+  Path outputPath=path("testMRJob");
+  String commitUUID=UUID.randomUUID().toString();
+  String suffix=uniqueFilenames ? ("-" + commitUUID) : "";
+  int numFiles=getTestFileCount();
+  List<String> expectedFiles=new ArrayList<>(numFiles);
+  Set<String> expectedKeys=Sets.newHashSet();
+  for (int i=0; i < numFiles; i+=1) {
+    File file=temp.newFile(String.valueOf(i) + ".text");
+    try (FileOutputStream out=new FileOutputStream(file)){
+      out.write(("file " + i).getBytes(StandardCharsets.UTF_8));
+    }
+     String filename=String.format("part-m-%05d%s",i,suffix);
+    Path path=new Path(outputPath,filename);
+    expectedFiles.add(path.toString());
+    expectedKeys.add("/" + fs.pathToKey(path));
+  }
+  Collections.sort(expectedFiles);
+  Job mrJob=Job.getInstance(yarn.getConfig(),"test-committer-job");
+  JobConf jobConf=(JobConf)mrJob.getConfiguration();
+  jobConf.setBoolean(FS_S3A_COMMITTER_STAGING_UNIQUE_FILENAMES,uniqueFilenames);
+  bindCommitter(jobConf,CommitConstants.S3A_COMMITTER_FACTORY,committerName());
+  jobConf.setBoolean(KEY_SCALE_TESTS_ENABLED,scaleTest);
+  mrJob.setOutputFormatClass(LoggingTextOutputFormat.class);
+  FileOutputFormat.setOutputPath(mrJob,outputPath);
+  File mockResultsFile=temp.newFile("committer.bin");
+  mockResultsFile.delete();
+  String committerPath="file:" + mockResultsFile;
+  jobConf.set("mock-results-file",committerPath);
+  jobConf.set(FS_S3A_COMMITTER_STAGING_UUID,commitUUID);
+  mrJob.setInputFormatClass(TextInputFormat.class);
+  FileInputFormat.addInputPath(mrJob,new Path(temp.getRoot().toURI()));
+  mrJob.setMapperClass(MapClass.class);
+  mrJob.setNumReduceTasks(0);
+  URL log4j=getClass().getClassLoader().getResource("log4j.properties");
+  if (log4j != null && log4j.getProtocol().equals("file")) {
+    Path log4jPath=new Path(log4j.toURI());
+    LOG.debug("Using log4j path {}",log4jPath);
+    mrJob.addFileToClassPath(log4jPath);
+    String sysprops=String.format("-Xmx256m -Dlog4j.configuration=%s",log4j);
+    jobConf.set(JobConf.MAPRED_MAP_TASK_JAVA_OPTS,sysprops);
+    jobConf.set("yarn.app.mapreduce.am.command-opts",sysprops);
+  }
+  applyCustomConfigOptions(jobConf);
+  mrJob.setMaxMapAttempts(1);
+  mrJob.submit();
+  try (DurationInfo d=new DurationInfo(LOG,"Job Execution")){
+    boolean succeeded=mrJob.waitForCompletion(true);
+    assertTrue("MR job failed",succeeded);
+  }
+   waitForConsistency();
+  assertIsDirectory(outputPath);
+  FileStatus[] results=fs.listStatus(outputPath,S3AUtils.HIDDEN_FILE_FILTER);
+  int fileCount=results.length;
+  List<String> actualFiles=new ArrayList<>(fileCount);
+  assertTrue("No files in output directory",fileCount != 0);
+  LOG.info("Found {} files",fileCount);
+  for (  FileStatus result : results) {
+    LOG.debug("result: {}",result);
+    actualFiles.add(result.getPath().toString());
+  }
+  Collections.sort(actualFiles);
+  Path success=new Path(outputPath,_SUCCESS);
+  FileStatus status=fs.getFileStatus(success);
+  assertTrue("0 byte success file - not a s3guard committer " + success,status.getLen() > 0);
+  SuccessData successData=SuccessData.load(fs,success);
+  String commitDetails=successData.toString();
+  LOG.info("Committer name " + committerName() + "\n{}",commitDetails);
+  LOG.info("Committer statistics: \n{}",successData.dumpMetrics("  "," = ","\n"));
+  LOG.info("Diagnostics\n{}",successData.dumpDiagnostics("  "," = ","\n"));
+  assertEquals("Wrong committer in " + commitDetails,committerName(),successData.getCommitter());
+  List<String> successFiles=successData.getFilenames();
+  assertTrue("No filenames in " + commitDetails,!successFiles.isEmpty());
+  assertEquals("Should commit the expected files",expectedFiles,actualFiles);
+  Set<String> summaryKeys=Sets.newHashSet();
+  summaryKeys.addAll(successFiles);
+  assertEquals("Summary keyset doesn't list the the expected paths " + commitDetails,expectedKeys,summaryKeys);
+  assertPathDoesNotExist("temporary dir",new Path(outputPath,CommitConstants.TEMPORARY));
+  customPostExecutionValidation(outputPath,successData);
+}

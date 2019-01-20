@@ -1,0 +1,129 @@
+/** 
+ * All the modification method will fail once in the test and should finally succeed.
+ */
+@Category({ReplicationTests.class,MediumTests.class}) public class TestReplicationProcedureRetry {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestReplicationProcedureRetry.class);
+  private static final HBaseTestingUtility UTIL=new HBaseTestingUtility();
+  @BeforeClass public static void setUp() throws Exception {
+    UTIL.getConfiguration().setClass(HConstants.MASTER_IMPL,MockHMaster.class,HMaster.class);
+    UTIL.startMiniCluster(3);
+  }
+  @AfterClass public static void tearDown() throws Exception {
+    UTIL.shutdownMiniCluster();
+  }
+  @After public void tearDownAfterTest() throws IOException {
+    for (    ReplicationPeerDescription desc : UTIL.getAdmin().listReplicationPeers()) {
+      UTIL.getAdmin().removeReplicationPeer(desc.getPeerId());
+    }
+  }
+  private void doTest() throws IOException {
+    Admin admin=UTIL.getAdmin();
+    String peerId="1";
+    ReplicationPeerConfig peerConfig=ReplicationPeerConfig.newBuilder().setClusterKey("localhost:" + UTIL.getZkCluster().getClientPort() + ":/hbase2").build();
+    admin.addReplicationPeer(peerId,peerConfig,true);
+    assertEquals(peerConfig.getClusterKey(),admin.getReplicationPeerConfig(peerId).getClusterKey());
+    ReplicationPeerConfig newPeerConfig=ReplicationPeerConfig.newBuilder(peerConfig).setBandwidth(123456).build();
+    admin.updateReplicationPeerConfig(peerId,newPeerConfig);
+    assertEquals(newPeerConfig.getBandwidth(),admin.getReplicationPeerConfig(peerId).getBandwidth());
+    admin.disableReplicationPeer(peerId);
+    assertFalse(admin.listReplicationPeers().get(0).isEnabled());
+    admin.enableReplicationPeer(peerId);
+    assertTrue(admin.listReplicationPeers().get(0).isEnabled());
+    admin.removeReplicationPeer(peerId);
+    assertTrue(admin.listReplicationPeers().isEmpty());
+    MockHMaster master=(MockHMaster)UTIL.getHBaseCluster().getMaster();
+    assertTrue(master.addPeerCalled);
+    assertTrue(master.removePeerCalled);
+    assertTrue(master.updatePeerConfigCalled);
+    assertTrue(master.enablePeerCalled);
+    assertTrue(master.disablePeerCalled);
+  }
+  @Test public void testErrorBeforeUpdate() throws IOException, ReplicationException {
+    ((MockHMaster)UTIL.getHBaseCluster().getMaster()).reset(true);
+    doTest();
+  }
+  @Test public void testErrorAfterUpdate() throws IOException, ReplicationException {
+    ((MockHMaster)UTIL.getHBaseCluster().getMaster()).reset(false);
+    doTest();
+  }
+public static final class MockHMaster extends HMaster {
+    volatile boolean addPeerCalled;
+    volatile boolean removePeerCalled;
+    volatile boolean updatePeerConfigCalled;
+    volatile boolean enablePeerCalled;
+    volatile boolean disablePeerCalled;
+    private ReplicationPeerManager manager;
+    public MockHMaster(    Configuration conf) throws IOException, KeeperException {
+      super(conf);
+    }
+    private Object invokeWithError(    InvocationOnMock invocation,    boolean errorBeforeUpdate) throws Throwable {
+      if (errorBeforeUpdate) {
+        throw new ReplicationException("mock error before update");
+      }
+      invocation.callRealMethod();
+      throw new ReplicationException("mock error after update");
+    }
+    public void reset(    boolean errorBeforeUpdate) throws ReplicationException {
+      addPeerCalled=false;
+      removePeerCalled=false;
+      updatePeerConfigCalled=false;
+      enablePeerCalled=false;
+      disablePeerCalled=false;
+      ReplicationPeerManager m=super.getReplicationPeerManager();
+      manager=spy(m);
+      doAnswer(invocation -> {
+        if (!addPeerCalled) {
+          addPeerCalled=true;
+          return invokeWithError(invocation,errorBeforeUpdate);
+        }
+ else {
+          return invocation.callRealMethod();
+        }
+      }
+).when(manager).addPeer(anyString(),any(ReplicationPeerConfig.class),anyBoolean());
+      doAnswer(invocation -> {
+        if (!removePeerCalled) {
+          removePeerCalled=true;
+          return invokeWithError(invocation,errorBeforeUpdate);
+        }
+ else {
+          return invocation.callRealMethod();
+        }
+      }
+).when(manager).removePeer(anyString());
+      doAnswer(invocation -> {
+        if (!updatePeerConfigCalled) {
+          updatePeerConfigCalled=true;
+          return invokeWithError(invocation,errorBeforeUpdate);
+        }
+ else {
+          return invocation.callRealMethod();
+        }
+      }
+).when(manager).updatePeerConfig(anyString(),any(ReplicationPeerConfig.class));
+      doAnswer(invocation -> {
+        if (!enablePeerCalled) {
+          enablePeerCalled=true;
+          return invokeWithError(invocation,errorBeforeUpdate);
+        }
+ else {
+          return invocation.callRealMethod();
+        }
+      }
+).when(manager).enablePeer(anyString());
+      doAnswer(invocation -> {
+        if (!disablePeerCalled) {
+          disablePeerCalled=true;
+          return invokeWithError(invocation,errorBeforeUpdate);
+        }
+ else {
+          return invocation.callRealMethod();
+        }
+      }
+).when(manager).disablePeer(anyString());
+    }
+    @Override public ReplicationPeerManager getReplicationPeerManager(){
+      return manager;
+    }
+  }
+}

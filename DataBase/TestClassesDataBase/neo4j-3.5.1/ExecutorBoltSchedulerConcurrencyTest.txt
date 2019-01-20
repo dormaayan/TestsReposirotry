@@ -1,0 +1,108 @@
+public class ExecutorBoltSchedulerConcurrencyTest {
+  private static final String CONNECTOR_KEY="connector-id";
+  private static final int maxPoolSize=5;
+  private final CountDownLatch beforeExecuteEvent=new CountDownLatch(1);
+  private final CountDownLatch beforeExecuteBarrier=new CountDownLatch(maxPoolSize);
+  private final CountDownLatch afterExecuteEvent=new CountDownLatch(1);
+  private final CountDownLatch afterExecuteBarrier=new CountDownLatch(maxPoolSize);
+  private final AssertableLogProvider logProvider=new AssertableLogProvider();
+  private final LogService logService=new SimpleLogService(logProvider,logProvider);
+  private final ExecutorFactory executorFactory=new NotifyingThreadPoolFactory();
+  private final JobScheduler jobScheduler=mock(JobScheduler.class);
+  private final ExecutorBoltScheduler boltScheduler=new ExecutorBoltScheduler(CONNECTOR_KEY,executorFactory,jobScheduler,logService,maxPoolSize,maxPoolSize,Duration.ofMinutes(1),0,ForkJoinPool.commonPool());
+  @Before public void setup() throws Throwable {
+    when(jobScheduler.threadFactory(any())).thenReturn(Executors.defaultThreadFactory());
+    boltScheduler.start();
+  }
+  @After public void cleanup() throws Throwable {
+    boltScheduler.stop();
+  }
+  @Test public void shouldInvokeHandleSchedulingErrorIfNoThreadsAvailable() throws Throwable {
+    AtomicInteger handleSchedulingErrorCounter=new AtomicInteger(0);
+    BoltConnection newConnection=newConnection(UUID.randomUUID().toString());
+    doAnswer(newCountingAnswer(handleSchedulingErrorCounter)).when(newConnection).handleSchedulingError(any());
+    blockAllThreads();
+    boltScheduler.created(newConnection);
+    CompletableFuture.runAsync(() -> boltScheduler.enqueued(newConnection,Jobs.noop()));
+    Predicates.awaitForever(() -> handleSchedulingErrorCounter.get() > 0,500,MILLISECONDS);
+    assertEquals(1,handleSchedulingErrorCounter.get());
+    afterExecuteEvent.countDown();
+    afterExecuteBarrier.await();
+  }
+  @Test public void shouldNotScheduleNewJobIfHandlingSchedulingError() throws Throwable {
+    AtomicInteger handleSchedulingErrorCounter=new AtomicInteger(0);
+    AtomicBoolean exitCondition=new AtomicBoolean();
+    BoltConnection newConnection=newConnection(UUID.randomUUID().toString());
+    doAnswer(newBlockingAnswer(handleSchedulingErrorCounter,exitCondition)).when(newConnection).handleSchedulingError(any());
+    blockAllThreads();
+    boltScheduler.created(newConnection);
+    CompletableFuture.runAsync(() -> boltScheduler.enqueued(newConnection,Jobs.noop()));
+    Predicates.awaitForever(() -> handleSchedulingErrorCounter.get() > 0,500,MILLISECONDS);
+    afterExecuteEvent.countDown();
+    afterExecuteBarrier.await();
+    boltScheduler.enqueued(newConnection,Jobs.noop());
+    exitCondition.set(true);
+    assertEquals(1,handleSchedulingErrorCounter.get());
+    verify(newConnection,never()).processNextBatch();
+  }
+  private void blockAllThreads() throws InterruptedException {
+    for (int i=0; i < maxPoolSize; i++) {
+      BoltConnection connection=newConnection(UUID.randomUUID().toString());
+      boltScheduler.created(connection);
+      boltScheduler.enqueued(connection,Jobs.noop());
+    }
+    beforeExecuteEvent.countDown();
+    beforeExecuteBarrier.await();
+  }
+  private <T>Answer<T> newCountingAnswer(  AtomicInteger counter){
+    return invocationOnMock -> {
+      counter.incrementAndGet();
+      return null;
+    }
+;
+  }
+  private <T>Answer<T> newBlockingAnswer(  AtomicInteger counter,  AtomicBoolean exitCondition){
+    return invocationOnMock -> {
+      counter.incrementAndGet();
+      Predicates.awaitForever(() -> Thread.currentThread().isInterrupted() || exitCondition.get(),500,MILLISECONDS);
+      return null;
+    }
+;
+  }
+  private BoltConnection newConnection(  String id){
+    BoltConnection result=mock(BoltConnection.class);
+    when(result.id()).thenReturn(id);
+    when(result.remoteAddress()).thenReturn(new InetSocketAddress("localhost",32_000));
+    return result;
+  }
+private class NotifyingThreadPoolFactory implements ExecutorFactory {
+    @Override public ExecutorService create(    int corePoolSize,    int maxPoolSize,    Duration keepAlive,    int queueSize,    boolean startCoreThreads,    ThreadFactory threadFactory){
+      return new NotifyingThreadPoolExecutor(corePoolSize,maxPoolSize,keepAlive,new SynchronousQueue<>(),threadFactory,new ThreadPoolExecutor.AbortPolicy());
+    }
+  }
+private class NotifyingThreadPoolExecutor extends ThreadPoolExecutor {
+    private NotifyingThreadPoolExecutor(    int corePoolSize,    int maxPoolSize,    Duration keepAlive,    BlockingQueue<Runnable> workQueue,    ThreadFactory threadFactory,    RejectedExecutionHandler rejectionHandler){
+      super(corePoolSize,maxPoolSize,keepAlive.toMillis(),MILLISECONDS,workQueue,threadFactory,rejectionHandler);
+    }
+    @Override protected void beforeExecute(    Thread t,    Runnable r){
+      try {
+        beforeExecuteEvent.await();
+        super.beforeExecute(t,r);
+        beforeExecuteBarrier.countDown();
+      }
+ catch (      Throwable ex) {
+        throw new RuntimeException(ex);
+      }
+    }
+    @Override protected void afterExecute(    Runnable r,    Throwable t){
+      try {
+        afterExecuteEvent.await();
+        super.afterExecute(r,t);
+        afterExecuteBarrier.countDown();
+      }
+ catch (      Throwable ex) {
+        throw new RuntimeException(ex);
+      }
+    }
+  }
+}

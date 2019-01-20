@@ -1,0 +1,37 @@
+/** 
+ * Tests that a job recovery failure terminates the  {@link JobManager}.
+ */
+@Test public void testFailingJobRecovery() throws Exception {
+  final FiniteDuration timeout=new FiniteDuration(10,TimeUnit.SECONDS);
+  final FiniteDuration jobRecoveryTimeout=new FiniteDuration(0,TimeUnit.SECONDS);
+  Deadline deadline=new FiniteDuration(1,TimeUnit.MINUTES).fromNow();
+  final Configuration flinkConfiguration=new Configuration();
+  UUID leaderSessionID=UUID.randomUUID();
+  ActorRef jobManager=null;
+  JobID jobId1=new JobID();
+  JobID jobId2=new JobID();
+  flinkConfiguration.setString(HighAvailabilityOptions.HA_MODE,"zookeeper");
+  try {
+    final SubmittedJobGraphStore submittedJobGraphStore=mock(SubmittedJobGraphStore.class);
+    SubmittedJobGraph submittedJobGraph=mock(SubmittedJobGraph.class);
+    when(submittedJobGraph.getJobId()).thenReturn(jobId2);
+    when(submittedJobGraphStore.getJobIds()).thenReturn(Arrays.asList(jobId1,jobId2));
+    when(submittedJobGraphStore.recoverJobGraph(eq(jobId1))).thenThrow(new Exception("Test exception"));
+    when(submittedJobGraphStore.recoverJobGraph(eq(jobId2))).thenReturn(submittedJobGraph);
+    final TestingLeaderElectionService myLeaderElectionService=new TestingLeaderElectionService();
+    final Collection<JobID> recoveredJobs=new ArrayList<>(2);
+    BlobServer blobServer=mock(BlobServer.class);
+    Props jobManagerProps=Props.create(TestingFailingHAJobManager.class,flinkConfiguration,TestingUtils.defaultExecutor(),TestingUtils.defaultExecutor(),mock(InstanceManager.class),mock(Scheduler.class),blobServer,new BlobLibraryCacheManager(blobServer,FlinkUserCodeClassLoaders.ResolveOrder.CHILD_FIRST,new String[0]),ActorRef.noSender(),new FixedDelayRestartStrategy.FixedDelayRestartStrategyFactory(Int.MaxValue(),100),timeout,myLeaderElectionService,submittedJobGraphStore,mock(CheckpointRecoveryFactory.class),jobRecoveryTimeout,UnregisteredMetricGroups.createUnregisteredJobManagerMetricGroup(),recoveredJobs).withDispatcher(CallingThreadDispatcher.Id());
+    jobManager=system.actorOf(jobManagerProps);
+    final TestProbe testProbe=new TestProbe(system);
+    testProbe.watch(jobManager);
+    Future<Object> started=Patterns.ask(jobManager,new Identify(42),deadline.timeLeft().toMillis());
+    Await.ready(started,deadline.timeLeft());
+    myLeaderElectionService.isLeader(leaderSessionID);
+    assertThat(recoveredJobs,is(empty()));
+    testProbe.expectTerminated(jobManager,timeout);
+  }
+  finally {
+    TestingUtils.stopActor(jobManager);
+  }
+}

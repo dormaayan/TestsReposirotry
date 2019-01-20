@@ -1,0 +1,136 @@
+class TestNodeManager4 extends NodeManager {
+  private Thread containerUpdateResourceThread=null;
+  @Override protected NodeStatusUpdater createNodeStatusUpdater(  Context context,  Dispatcher dispatcher,  NodeHealthCheckerService healthChecker){
+    return new TestNodeStatusUpdaterImpl4(context,dispatcher,healthChecker,metrics);
+  }
+  @Override protected ContainerManagerImpl createContainerManager(  Context context,  ContainerExecutor exec,  DeletionService del,  NodeStatusUpdater nodeStatusUpdater,  ApplicationACLsManager aclsManager,  LocalDirsHandlerService dirsHandler){
+    return new ContainerManagerImpl(context,exec,del,nodeStatusUpdater,metrics,dirsHandler){
+      @Override protected void authorizeGetAndStopContainerRequest(      ContainerId containerId,      Container container,      boolean stopRequest,      NMTokenIdentifier identifier) throws YarnException {
+      }
+      @Override protected void authorizeUser(      UserGroupInformation remoteUgi,      NMTokenIdentifier nmTokenIdentifier){
+      }
+      @Override protected void authorizeStartAndResourceIncreaseRequest(      NMTokenIdentifier nmTokenIdentifier,      ContainerTokenIdentifier containerTokenIdentifier,      boolean startRequest) throws YarnException {
+        try {
+          Thread.sleep(2000);
+        }
+ catch (        InterruptedException e) {
+          e.printStackTrace();
+        }
+      }
+      @Override protected void updateNMTokenIdentifier(      NMTokenIdentifier nmTokenIdentifier) throws SecretManager.InvalidToken {
+      }
+      @Override public Map<String,ByteBuffer> getAuxServiceMetaData(){
+        return new HashMap<>();
+      }
+      @Override protected NMTokenIdentifier selectNMTokenIdentifier(      UserGroupInformation remoteUgi){
+        return new NMTokenIdentifier();
+      }
+    }
+;
+  }
+  public void startContainer() throws IOException, InterruptedException, YarnException {
+    LOG.info("Start a container and wait until it is in RUNNING state");
+    File scriptFile=Shell.appendScriptExtension(tmpDir,"scriptFile");
+    PrintWriter fileWriter=new PrintWriter(scriptFile);
+    if (Shell.WINDOWS) {
+      fileWriter.println("@ping -n 100 127.0.0.1 >nul");
+    }
+ else {
+      fileWriter.write("\numask 0");
+      fileWriter.write("\nexec sleep 100");
+    }
+    fileWriter.close();
+    ContainerLaunchContext containerLaunchContext=recordFactory.newRecordInstance(ContainerLaunchContext.class);
+    URL resource_alpha=URL.fromPath(localFS.makeQualified(new Path(scriptFile.getAbsolutePath())));
+    LocalResource rsrc_alpha=recordFactory.newRecordInstance(LocalResource.class);
+    rsrc_alpha.setResource(resource_alpha);
+    rsrc_alpha.setSize(-1);
+    rsrc_alpha.setVisibility(LocalResourceVisibility.APPLICATION);
+    rsrc_alpha.setType(LocalResourceType.FILE);
+    rsrc_alpha.setTimestamp(scriptFile.lastModified());
+    String destinationFile="dest_file";
+    Map<String,LocalResource> localResources=new HashMap<String,LocalResource>();
+    localResources.put(destinationFile,rsrc_alpha);
+    containerLaunchContext.setLocalResources(localResources);
+    List<String> commands=Arrays.asList(Shell.getRunScriptCommand(scriptFile));
+    containerLaunchContext.setCommands(commands);
+    Resource resource=Resource.newInstance(1024,1);
+    StartContainerRequest scRequest=StartContainerRequest.newInstance(containerLaunchContext,getContainerToken(resource));
+    List<StartContainerRequest> list=new ArrayList<StartContainerRequest>();
+    list.add(scRequest);
+    StartContainersRequest allRequests=StartContainersRequest.newInstance(list);
+    getContainerManager().startContainers(allRequests);
+    ContainerId cId=TestContainerManager.createContainerId(0);
+    BaseContainerManagerTest.waitForNMContainerState(getContainerManager(),cId,org.apache.hadoop.yarn.server.nodemanager.containermanager.container.ContainerState.RUNNING);
+  }
+  public void updateContainerResource() throws InterruptedException {
+    LOG.info("Increase a container resource in a separate thread");
+    containerUpdateResourceThread=new ContainerUpdateResourceThread();
+    containerUpdateResourceThread.start();
+  }
+class TestNodeStatusUpdaterImpl4 extends MockNodeStatusUpdater {
+    public TestNodeStatusUpdaterImpl4(    Context context,    Dispatcher dispatcher,    NodeHealthCheckerService healthChecker,    NodeManagerMetrics metrics){
+      super(context,dispatcher,healthChecker,metrics);
+    }
+    @Override protected void rebootNodeStatusUpdaterAndRegisterWithRM(){
+      try {
+        try {
+          List<ContainerId> containerIds=new ArrayList<>();
+          ContainerId cId=TestContainerManager.createContainerId(0);
+          containerIds.add(cId);
+          GetContainerStatusesRequest gcsRequest=GetContainerStatusesRequest.newInstance(containerIds);
+          ContainerStatus containerStatus=getContainerManager().getContainerStatuses(gcsRequest).getContainerStatuses().get(0);
+          assertEquals(Resource.newInstance(1024,1),containerStatus.getCapability());
+          updateBarrier.await();
+          updateBarrier.await();
+          super.rebootNodeStatusUpdaterAndRegisterWithRM();
+          containerStatus=getContainerManager().getContainerStatuses(gcsRequest).getContainerStatuses().get(0);
+          assertEquals(Resource.newInstance(4096,2),containerStatus.getCapability());
+        }
+ catch (        AssertionError ae) {
+          ae.printStackTrace();
+          assertionFailedInThread.set(true);
+        }
+ finally {
+          syncBarrier.await();
+        }
+      }
+ catch (      Exception e) {
+        e.printStackTrace();
+      }
+    }
+  }
+class ContainerUpdateResourceThread extends Thread {
+    @Override public void run(){
+      List<Token> increaseTokens=new ArrayList<Token>();
+      Resource targetResource=Resource.newInstance(4096,2);
+      try {
+        try {
+          updateBarrier.await();
+          increaseTokens.add(getContainerToken(targetResource,1));
+          ContainerUpdateRequest updateRequest=ContainerUpdateRequest.newInstance(increaseTokens);
+          ContainerUpdateResponse updateResponse=getContainerManager().updateContainer(updateRequest);
+          Assert.assertEquals(1,updateResponse.getSuccessfullyUpdatedContainers().size());
+          Assert.assertTrue(updateResponse.getFailedRequests().isEmpty());
+        }
+ catch (        Exception e) {
+          e.printStackTrace();
+        }
+ finally {
+          updateBarrier.await();
+        }
+      }
+ catch (      Exception e) {
+        e.printStackTrace();
+      }
+    }
+  }
+  private Token getContainerToken(  Resource resource) throws IOException {
+    ContainerId cId=TestContainerManager.createContainerId(0);
+    return TestContainerManager.createContainerToken(cId,DUMMY_RM_IDENTIFIER,getNMContext().getNodeId(),user,resource,getNMContext().getContainerTokenSecretManager(),null);
+  }
+  private Token getContainerToken(  Resource resource,  int version) throws IOException {
+    ContainerId cId=TestContainerManager.createContainerId(0);
+    return TestContainerManager.createContainerToken(cId,version,DUMMY_RM_IDENTIFIER,getNMContext().getNodeId(),user,resource,getNMContext().getContainerTokenSecretManager(),null);
+  }
+}

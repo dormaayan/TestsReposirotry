@@ -1,0 +1,64 @@
+public class TokenBasedRememberMeServices2Test {
+  @Rule public JenkinsRule j=new JenkinsRule();
+  @Rule public LoggerRule logging=new LoggerRule();
+  private static boolean failureInduced;
+  @Before public void resetFailureInduced(){
+    failureInduced=false;
+  }
+  @Test public void rememberMeAutoLoginFailure() throws Exception {
+    j.jenkins.setSecurityRealm(new InvalidUserWhenLoggingBackInRealm());
+    JenkinsRule.WebClient wc=j.createWebClient();
+    wc.login("alice","alice",true);
+    Cookie c=getRememberMeCookie(wc);
+    assertNotNull(c);
+    wc=j.createWebClient();
+    wc.getCookieManager().addCookie(c);
+    logging.capture(1000).record(TokenBasedRememberMeServices.class,FINEST);
+    wc.goTo("");
+    assertTrue(failureInduced);
+    assertTrue(logging.getMessages().stream().anyMatch(m -> m.contains("contained username 'alice' but was not found")));
+    assertNull(getRememberMeCookie(wc));
+  }
+  private Cookie getRememberMeCookie(  JenkinsRule.WebClient wc){
+    return wc.getCookieManager().getCookie(TokenBasedRememberMeServices2.ACEGI_SECURITY_HASHED_REMEMBER_ME_COOKIE_KEY);
+  }
+private static class InvalidUserWhenLoggingBackInRealm extends AbstractPasswordBasedSecurityRealm {
+    @Override protected UserDetails authenticate(    String username,    String password) throws AuthenticationException {
+      if (username.equals(password)) {
+        return new User(username,password,true,new GrantedAuthority[]{new GrantedAuthorityImpl("myteam")});
+      }
+      throw new BadCredentialsException(username);
+    }
+    @Override public GroupDetails loadGroupByGroupname(    String groupname) throws UsernameNotFoundException, DataAccessException {
+      throw new UnsupportedOperationException();
+    }
+    @Override public UserDetails loadUserByUsername(    String username) throws UsernameNotFoundException, DataAccessException {
+      failureInduced=true;
+      throw new UsernameNotFoundException("intentionally not working");
+    }
+  }
+  @Test public void basicFlow() throws Exception {
+    j.jenkins.setSecurityRealm(new StupidRealm());
+    JenkinsRule.WebClient wc=j.createWebClient();
+    wc.login("bob","bob",true);
+    Cookie c=getRememberMeCookie(wc);
+    assertNotNull(c);
+    wc=j.createWebClient();
+    wc.getCookieManager().addCookie(c);
+    wc.goTo("");
+    assertTrue(failureInduced);
+    wc.executeOnServer(() -> {
+      Authentication a=Jenkins.getAuthentication();
+      assertEquals("bob",a.getName());
+      assertEquals(ImmutableList.of("authenticated","myteam"),Arrays.asList(a.getAuthorities()).stream().map(GrantedAuthority::getAuthority).collect(Collectors.toList()));
+      return null;
+    }
+);
+  }
+private static class StupidRealm extends InvalidUserWhenLoggingBackInRealm {
+    @Override public UserDetails loadUserByUsername(    String username) throws UsernameNotFoundException, DataAccessException {
+      failureInduced=true;
+      throw new UserMayOrMayNotExistException("I cannot tell");
+    }
+  }
+}

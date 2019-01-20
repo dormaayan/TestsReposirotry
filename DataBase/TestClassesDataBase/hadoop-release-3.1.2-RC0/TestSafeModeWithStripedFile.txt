@@ -1,0 +1,90 @@
+public class TestSafeModeWithStripedFile {
+  private ErasureCodingPolicy ecPolicy;
+  private short dataBlocks;
+  private short parityBlocks;
+  private int numDNs;
+  private int cellSize;
+  private int blockSize;
+  private MiniDFSCluster cluster;
+  private Configuration conf;
+  @Rule public Timeout globalTimeout=new Timeout(300000);
+  public ErasureCodingPolicy getEcPolicy(){
+    return StripedFileTestUtil.getDefaultECPolicy();
+  }
+  @Before public void setup() throws IOException {
+    ecPolicy=getEcPolicy();
+    dataBlocks=(short)ecPolicy.getNumDataUnits();
+    parityBlocks=(short)ecPolicy.getNumParityUnits();
+    numDNs=dataBlocks + parityBlocks;
+    cellSize=ecPolicy.getCellSize();
+    blockSize=cellSize * 2;
+    conf=new HdfsConfiguration();
+    conf.setLong(DFSConfigKeys.DFS_BLOCK_SIZE_KEY,blockSize);
+    conf.setLong(DFSConfigKeys.DFS_BLOCKREPORT_INTERVAL_MSEC_KEY,100);
+    cluster=new MiniDFSCluster.Builder(conf).numDataNodes(numDNs).build();
+    cluster.getFileSystem().enableErasureCodingPolicy(getEcPolicy().getName());
+    cluster.getFileSystem().getClient().setErasureCodingPolicy("/",getEcPolicy().getName());
+    cluster.waitActive();
+  }
+  @After public void tearDown() throws IOException {
+    if (cluster != null) {
+      cluster.shutdown();
+      cluster=null;
+    }
+  }
+  @Test public void testStripedFile0() throws IOException {
+    doTest(cellSize,1);
+  }
+  @Test public void testStripedFile1() throws IOException {
+    int numCell=dataBlocks - 1;
+    doTest(cellSize * numCell,numCell);
+  }
+  /** 
+ * This util writes a small block group whose size is given by caller. Then write another 2 full stripe blocks. Then shutdown all DNs and start again one by one. and verify the safemode status accordingly.
+ * @param smallSize file size of the small block group
+ * @param minStorages minimum replicas needed by the block so it can be safe
+ */
+  private void doTest(  int smallSize,  int minStorages) throws IOException {
+    FileSystem fs=cluster.getFileSystem();
+    byte[] data=StripedFileTestUtil.generateBytes(smallSize);
+    Path smallFilePath=new Path("/testStripedFile_" + smallSize);
+    DFSTestUtil.writeFile(fs,smallFilePath,data);
+    int bigSize=blockSize * dataBlocks * 2;
+    Path bigFilePath=new Path("/testStripedFile_" + bigSize);
+    data=StripedFileTestUtil.generateBytes(bigSize);
+    DFSTestUtil.writeFile(fs,bigFilePath,data);
+    List<MiniDFSCluster.DataNodeProperties> dnprops=Lists.newArrayList();
+    LocatedBlocks lbs=cluster.getNameNodeRpc().getBlockLocations(smallFilePath.toString(),0,smallSize);
+    DatanodeInfo[] locations=lbs.get(0).getLocations();
+    for (    DatanodeInfo loc : locations) {
+      dnprops.add(cluster.stopDataNode(loc.getName()));
+    }
+    for (int i=0; i < numDNs - locations.length; i++) {
+      dnprops.add(cluster.stopDataNode(0));
+    }
+    cluster.restartNameNode(0);
+    NameNode nn=cluster.getNameNode();
+    assertTrue(cluster.getNameNode().isInSafeMode());
+    assertEquals(0,NameNodeAdapter.getSafeModeSafeBlocks(nn));
+    for (int i=0; i < minStorages - 1; i++) {
+      cluster.restartDataNode(dnprops.remove(0));
+      cluster.waitActive();
+      cluster.triggerBlockReports();
+      assertEquals(0,NameNodeAdapter.getSafeModeSafeBlocks(nn));
+    }
+    cluster.restartDataNode(dnprops.remove(0));
+    cluster.waitActive();
+    cluster.triggerBlockReports();
+    assertEquals(1,NameNodeAdapter.getSafeModeSafeBlocks(nn));
+    for (int i=minStorages; i < dataBlocks - 1; i++) {
+      cluster.restartDataNode(dnprops.remove(0));
+      cluster.waitActive();
+      cluster.triggerBlockReports();
+      assertTrue(nn.isInSafeMode());
+    }
+    cluster.restartDataNode(dnprops.remove(0));
+    cluster.waitActive();
+    cluster.triggerBlockReports();
+    assertFalse(nn.isInSafeMode());
+  }
+}

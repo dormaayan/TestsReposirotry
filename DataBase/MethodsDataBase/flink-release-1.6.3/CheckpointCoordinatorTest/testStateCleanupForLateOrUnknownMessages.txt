@@ -1,0 +1,47 @@
+/** 
+ * Tests that late acknowledge checkpoint messages are properly cleaned up. Furthermore it tests that unknown checkpoint messages for the same job a are cleaned up as well. In contrast checkpointing messages from other jobs should not be touched. A late acknowledge message is an acknowledge message which arrives after the checkpoint has been declined.
+ * @throws Exception
+ */
+@Test public void testStateCleanupForLateOrUnknownMessages() throws Exception {
+  final JobID jobId=new JobID();
+  final ExecutionAttemptID triggerAttemptId=new ExecutionAttemptID();
+  final ExecutionVertex triggerVertex=mockExecutionVertex(triggerAttemptId);
+  final ExecutionAttemptID ackAttemptId1=new ExecutionAttemptID();
+  final ExecutionVertex ackVertex1=mockExecutionVertex(ackAttemptId1);
+  final ExecutionAttemptID ackAttemptId2=new ExecutionAttemptID();
+  final ExecutionVertex ackVertex2=mockExecutionVertex(ackAttemptId2);
+  final long timestamp=1L;
+  CheckpointCoordinator coord=new CheckpointCoordinator(jobId,20000L,20000L,0L,1,CheckpointRetentionPolicy.NEVER_RETAIN_AFTER_TERMINATION,new ExecutionVertex[]{triggerVertex},new ExecutionVertex[]{triggerVertex,ackVertex1,ackVertex2},new ExecutionVertex[0],new StandaloneCheckpointIDCounter(),new StandaloneCompletedCheckpointStore(1),new MemoryStateBackend(),Executors.directExecutor(),SharedStateRegistry.DEFAULT_FACTORY);
+  assertTrue(coord.triggerCheckpoint(timestamp,false));
+  assertEquals(1,coord.getNumberOfPendingCheckpoints());
+  PendingCheckpoint pendingCheckpoint=coord.getPendingCheckpoints().values().iterator().next();
+  long checkpointId=pendingCheckpoint.getCheckpointId();
+  OperatorID opIDtrigger=OperatorID.fromJobVertexID(triggerVertex.getJobvertexId());
+  TaskStateSnapshot taskOperatorSubtaskStatesTrigger=spy(new TaskStateSnapshot());
+  OperatorSubtaskState subtaskStateTrigger=mock(OperatorSubtaskState.class);
+  taskOperatorSubtaskStatesTrigger.putSubtaskStateByOperatorID(opIDtrigger,subtaskStateTrigger);
+  coord.receiveAcknowledgeMessage(new AcknowledgeCheckpoint(jobId,triggerAttemptId,checkpointId,new CheckpointMetrics(),taskOperatorSubtaskStatesTrigger));
+  verify(subtaskStateTrigger,never()).discardState();
+  TaskStateSnapshot unknownSubtaskState=mock(TaskStateSnapshot.class);
+  coord.receiveAcknowledgeMessage(new AcknowledgeCheckpoint(jobId,new ExecutionAttemptID(),checkpointId,new CheckpointMetrics(),unknownSubtaskState));
+  verify(unknownSubtaskState,times(1)).discardState();
+  TaskStateSnapshot differentJobSubtaskState=mock(TaskStateSnapshot.class);
+  coord.receiveAcknowledgeMessage(new AcknowledgeCheckpoint(new JobID(),new ExecutionAttemptID(),checkpointId,new CheckpointMetrics(),differentJobSubtaskState));
+  verify(differentJobSubtaskState,never()).discardState();
+  TaskStateSnapshot triggerSubtaskState=mock(TaskStateSnapshot.class);
+  coord.receiveAcknowledgeMessage(new AcknowledgeCheckpoint(jobId,triggerAttemptId,checkpointId,new CheckpointMetrics(),triggerSubtaskState));
+  verify(triggerSubtaskState,never()).discardState();
+  reset(subtaskStateTrigger);
+  coord.receiveDeclineMessage(new DeclineCheckpoint(jobId,ackAttemptId1,checkpointId));
+  assertTrue(pendingCheckpoint.isDiscarded());
+  verify(subtaskStateTrigger,times(1)).discardState();
+  TaskStateSnapshot ackSubtaskState=mock(TaskStateSnapshot.class);
+  coord.receiveAcknowledgeMessage(new AcknowledgeCheckpoint(jobId,ackAttemptId2,checkpointId,new CheckpointMetrics(),ackSubtaskState));
+  verify(ackSubtaskState,times(1)).discardState();
+  reset(differentJobSubtaskState);
+  coord.receiveAcknowledgeMessage(new AcknowledgeCheckpoint(new JobID(),new ExecutionAttemptID(),checkpointId,new CheckpointMetrics(),differentJobSubtaskState));
+  verify(differentJobSubtaskState,never()).discardState();
+  TaskStateSnapshot unknownSubtaskState2=mock(TaskStateSnapshot.class);
+  coord.receiveAcknowledgeMessage(new AcknowledgeCheckpoint(jobId,new ExecutionAttemptID(),checkpointId,new CheckpointMetrics(),unknownSubtaskState2));
+  verify(unknownSubtaskState2,times(1)).discardState();
+}

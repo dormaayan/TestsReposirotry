@@ -1,0 +1,62 @@
+/** 
+ * A checkpointed source, which emits elements from 0 to a configured number.
+ */
+public static class CheckpointedSequenceSource extends RichParallelSourceFunction<Long> implements ListCheckpointed<Tuple2<Long,Integer>> {
+  private static final Logger LOG=LoggerFactory.getLogger(CheckpointedSequenceSource.class);
+  private static final long serialVersionUID=0L;
+  private static final CountDownLatch sync=new CountDownLatch(Parallelism);
+  private final long end;
+  private int repeat;
+  private long current;
+  private volatile boolean isRunning=true;
+  public CheckpointedSequenceSource(  long end){
+    this(end,1);
+  }
+  public CheckpointedSequenceSource(  long end,  int repeat){
+    checkArgument(end >= 0,"Negative final count");
+    this.current=0;
+    this.end=end;
+    this.repeat=repeat;
+  }
+  @Override public void run(  SourceContext<Long> ctx) throws Exception {
+    while (isRunning) {
+synchronized (ctx.getCheckpointLock()) {
+        if (current <= end) {
+          ctx.collect(current++);
+        }
+ else         if (repeat > 0) {
+          --repeat;
+          current=0;
+        }
+ else {
+          isRunning=false;
+        }
+      }
+      if (sync.getCount() != 0) {
+        Thread.sleep(50);
+      }
+    }
+    completedCheckpointsLatch2.await();
+synchronized (ctx.getCheckpointLock()) {
+      ctx.collect(lastElement);
+    }
+  }
+  @Override public List<Tuple2<Long,Integer>> snapshotState(  long checkpointId,  long timestamp) throws Exception {
+    LOG.debug("Snapshotting state {} @ ID {}.",current,checkpointId);
+    return Collections.singletonList(new Tuple2<>(this.current,this.repeat));
+  }
+  @Override public void restoreState(  List<Tuple2<Long,Integer>> list) throws Exception {
+    if (list.isEmpty() || list.size() > 1) {
+      throw new RuntimeException("Test failed due to unexpected recovered state size " + list.size());
+    }
+    Tuple2<Long,Integer> state=list.get(0);
+    LOG.debug("Restoring state {}",state);
+    recoveredStates.set(getRuntimeContext().getIndexOfThisSubtask(),1);
+    sync.countDown();
+    current=state._1;
+    repeat=state._2;
+  }
+  @Override public void cancel(){
+    isRunning=false;
+  }
+}

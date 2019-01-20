@@ -1,0 +1,93 @@
+public class TestSessionGlobalInitFile extends TestCase {
+  private FakeEmbeddedThriftBinaryCLIService service;
+  private ThriftCLIServiceClient client;
+  private File initFile;
+  private String tmpDir;
+  private HiveConf hiveConf;
+  /** 
+ * This class is almost the same as EmbeddedThriftBinaryCLIService, except its constructor having a HiveConf param for test usage.
+ */
+private class FakeEmbeddedThriftBinaryCLIService extends ThriftBinaryCLIService {
+    public FakeEmbeddedThriftBinaryCLIService(    HiveConf hiveConf){
+      super(new CLIService(null),null);
+      isEmbedded=true;
+      cliService.init(hiveConf);
+      cliService.start();
+    }
+    public CLIService getService(){
+      return cliService;
+    }
+  }
+  @Before public void setUp() throws Exception {
+    super.setUp();
+    initFile=File.createTempFile("test","hive");
+    tmpDir=initFile.getParentFile().getAbsoluteFile() + File.separator + "TestSessionGlobalInitFile";
+    initFile.delete();
+    FileUtils.deleteDirectory(new File(tmpDir));
+    initFile=new File(tmpDir + File.separator + SessionManager.HIVERCFILE);
+    initFile.getParentFile().mkdirs();
+    initFile.createNewFile();
+    String[] fileContent=new String[]{"-- global init hive file for test","set a=1;","set hiveconf:b=1;","set hivevar:c=1;","set d\\","      =1;","add jar " + initFile.getAbsolutePath()};
+    FileUtils.writeLines(initFile,Arrays.asList(fileContent));
+    hiveConf=new HiveConf();
+    hiveConf.setVar(HiveConf.ConfVars.HIVE_SERVER2_GLOBAL_INIT_FILE_LOCATION,initFile.getParentFile().getAbsolutePath());
+    hiveConf.setVar(HiveConf.ConfVars.HIVE_AUTHORIZATION_MANAGER,"org.apache.hadoop.hive.ql.security.authorization.plugin.sqlstd.SQLStdHiveAuthorizerFactory");
+    service=new FakeEmbeddedThriftBinaryCLIService(hiveConf);
+    service.init(new HiveConf());
+    client=new ThriftCLIServiceClient(service);
+  }
+  @After public void tearDown() throws Exception {
+    FileUtils.deleteDirectory(new File(tmpDir));
+  }
+  @Test public void testSessionGlobalInitFile() throws Exception {
+    File tmpInitFile=new File(initFile.getParent(),"hiverc");
+    Assert.assertTrue("Failed to rename " + initFile + " to "+ tmpInitFile,initFile.renameTo(tmpInitFile));
+    initFile=tmpInitFile;
+    hiveConf.setVar(HiveConf.ConfVars.HIVE_SERVER2_GLOBAL_INIT_FILE_LOCATION,initFile.getAbsolutePath());
+    doTestSessionGlobalInitFile();
+  }
+  @Test public void testSessionGlobalInitDir() throws Exception {
+    doTestSessionGlobalInitFile();
+  }
+  /** 
+ * create session, and fetch the property set in global init file. Test if the global init file .hiverc is loaded correctly by checking the expected setting property.
+ */
+  private void doTestSessionGlobalInitFile() throws Exception {
+    OperationManager operationManager=service.getService().getSessionManager().getOperationManager();
+    SessionHandle sessionHandle=client.openSession(null,null,null);
+    Assert.assertEquals("Verifying all operations used for init file are closed",0,operationManager.getOperations().size());
+    verifyInitProperty("a","1",sessionHandle);
+    verifyInitProperty("b","1",sessionHandle);
+    verifyInitProperty("c","1",sessionHandle);
+    verifyInitProperty("hivevar:c","1",sessionHandle);
+    verifyInitProperty("d","1",sessionHandle);
+    Assert.assertEquals("Verifying all operations used for checks are closed",0,operationManager.getOperations().size());
+    client.closeSession(sessionHandle);
+  }
+  @Test public void testSessionGlobalInitFileWithUser() throws Exception {
+    SessionHandle sessionHandle=client.openSession("hive","password",null);
+    verifyInitProperty("a","1",sessionHandle);
+    client.closeSession(sessionHandle);
+  }
+  @Test public void testSessionGlobalInitFileAndConfOverlay() throws Exception {
+    Map<String,String> confOverlay=new HashMap<String,String>();
+    confOverlay.put("a","2");
+    confOverlay.put("set:hiveconf:b","2");
+    confOverlay.put("set:hivevar:c","2");
+    SessionHandle sessionHandle=client.openSession(null,null,confOverlay);
+    verifyInitProperty("a","2",sessionHandle);
+    verifyInitProperty("b","2",sessionHandle);
+    verifyInitProperty("c","2",sessionHandle);
+    client.closeSession(sessionHandle);
+    sessionHandle=client.openSession("hive","password",confOverlay);
+    verifyInitProperty("a","2",sessionHandle);
+    client.closeSession(sessionHandle);
+  }
+  private void verifyInitProperty(  String key,  String value,  SessionHandle sessionHandle) throws Exception {
+    OperationHandle operationHandle=client.executeStatement(sessionHandle,"set " + key,null);
+    RowSet rowSet=client.fetchResults(operationHandle);
+    Assert.assertEquals(1,rowSet.numRows());
+    Assert.assertEquals(key + "=" + value,rowSet.iterator().next()[0]);
+    client.closeOperation(operationHandle);
+  }
+}

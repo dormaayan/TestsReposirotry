@@ -1,0 +1,97 @@
+public class ExpiredResultsRemoverTests extends ESTestCase {
+  private Client client;
+  private ClusterService clusterService;
+  private ClusterState clusterState;
+  private List<DeleteByQueryRequest> capturedDeleteByQueryRequests;
+  private ActionListener<Boolean> listener;
+  @Before public void setUpTests(){
+    capturedDeleteByQueryRequests=new ArrayList<>();
+    clusterService=mock(ClusterService.class);
+    clusterState=mock(ClusterState.class);
+    when(clusterService.state()).thenReturn(clusterState);
+    client=mock(Client.class);
+    ThreadPool threadPool=mock(ThreadPool.class);
+    when(client.threadPool()).thenReturn(threadPool);
+    when(threadPool.getThreadContext()).thenReturn(new ThreadContext(Settings.EMPTY));
+    doAnswer(new Answer<Void>(){
+      @Override public Void answer(      InvocationOnMock invocationOnMock) throws Throwable {
+        capturedDeleteByQueryRequests.add((DeleteByQueryRequest)invocationOnMock.getArguments()[1]);
+        ActionListener<BulkByScrollResponse> listener=(ActionListener<BulkByScrollResponse>)invocationOnMock.getArguments()[2];
+        listener.onResponse(null);
+        return null;
+      }
+    }
+).when(client).execute(same(DeleteByQueryAction.INSTANCE),any(),any());
+    listener=mock(ActionListener.class);
+  }
+  public void testRemove_GivenNoJobs(){
+    givenClientRequestsSucceed();
+    givenJobs(Collections.emptyList());
+    createExpiredResultsRemover().remove(listener);
+    verify(listener).onResponse(true);
+    Mockito.verifyNoMoreInteractions(client);
+  }
+  public void testRemove_GivenJobsWithoutRetentionPolicy(){
+    givenClientRequestsSucceed();
+    givenJobs(Arrays.asList(JobTests.buildJobBuilder("foo").build(),JobTests.buildJobBuilder("bar").build()));
+    createExpiredResultsRemover().remove(listener);
+    verify(listener).onResponse(true);
+    Mockito.verifyNoMoreInteractions(client);
+  }
+  public void testRemove_GivenJobsWithAndWithoutRetentionPolicy() throws Exception {
+    givenClientRequestsSucceed();
+    givenJobs(Arrays.asList(JobTests.buildJobBuilder("none").build(),JobTests.buildJobBuilder("results-1").setResultsRetentionDays(10L).build(),JobTests.buildJobBuilder("results-2").setResultsRetentionDays(20L).build()));
+    createExpiredResultsRemover().remove(listener);
+    assertThat(capturedDeleteByQueryRequests.size(),equalTo(2));
+    DeleteByQueryRequest dbqRequest=capturedDeleteByQueryRequests.get(0);
+    assertThat(dbqRequest.indices(),equalTo(new String[]{AnomalyDetectorsIndex.jobResultsAliasedName("results-1")}));
+    dbqRequest=capturedDeleteByQueryRequests.get(1);
+    assertThat(dbqRequest.indices(),equalTo(new String[]{AnomalyDetectorsIndex.jobResultsAliasedName("results-2")}));
+    verify(listener).onResponse(true);
+  }
+  public void testRemove_GivenClientRequestsFailed() throws IOException {
+    givenClientRequestsFailed();
+    givenJobs(Arrays.asList(JobTests.buildJobBuilder("none").build(),JobTests.buildJobBuilder("results-1").setResultsRetentionDays(10L).build(),JobTests.buildJobBuilder("results-2").setResultsRetentionDays(20L).build()));
+    createExpiredResultsRemover().remove(listener);
+    assertThat(capturedDeleteByQueryRequests.size(),equalTo(1));
+    DeleteByQueryRequest dbqRequest=capturedDeleteByQueryRequests.get(0);
+    assertThat(dbqRequest.indices(),equalTo(new String[]{AnomalyDetectorsIndex.jobResultsAliasedName("results-1")}));
+    verify(listener).onFailure(any());
+  }
+  private void givenClientRequestsSucceed(){
+    givenClientRequests(true);
+  }
+  private void givenClientRequestsFailed(){
+    givenClientRequests(false);
+  }
+  private void givenClientRequests(  boolean shouldSucceed){
+    doAnswer(new Answer<Void>(){
+      @Override public Void answer(      InvocationOnMock invocationOnMock) throws Throwable {
+        capturedDeleteByQueryRequests.add((DeleteByQueryRequest)invocationOnMock.getArguments()[1]);
+        ActionListener<BulkByScrollResponse> listener=(ActionListener<BulkByScrollResponse>)invocationOnMock.getArguments()[2];
+        if (shouldSucceed) {
+          BulkByScrollResponse bulkByScrollResponse=mock(BulkByScrollResponse.class);
+          when(bulkByScrollResponse.getDeleted()).thenReturn(42L);
+          listener.onResponse(bulkByScrollResponse);
+        }
+ else {
+          listener.onFailure(new RuntimeException("failed"));
+        }
+        return null;
+      }
+    }
+).when(client).execute(same(DeleteByQueryAction.INSTANCE),any(),any());
+  }
+  private void givenJobs(  List<Job> jobs){
+    Map<String,Job> jobsMap=new HashMap<>();
+    jobs.stream().forEach(job -> jobsMap.put(job.getId(),job));
+    MlMetadata mlMetadata=mock(MlMetadata.class);
+    when(mlMetadata.getJobs()).thenReturn(jobsMap);
+    MetaData metadata=mock(MetaData.class);
+    when(metadata.custom(MlMetadata.TYPE)).thenReturn(mlMetadata);
+    when(clusterState.getMetaData()).thenReturn(metadata);
+  }
+  private ExpiredResultsRemover createExpiredResultsRemover(){
+    return new ExpiredResultsRemover(client,clusterService,mock(Auditor.class));
+  }
+}

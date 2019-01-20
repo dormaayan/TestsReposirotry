@@ -1,0 +1,52 @@
+@Category({MediumTests.class,ClientTests.class}) public class TestAsyncRegionLocatorTimeout {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestAsyncRegionLocatorTimeout.class);
+  private static final HBaseTestingUtility TEST_UTIL=new HBaseTestingUtility();
+  private static TableName TABLE_NAME=TableName.valueOf("async");
+  private static byte[] FAMILY=Bytes.toBytes("cf");
+  private static AsyncConnectionImpl CONN;
+  private static AsyncRegionLocator LOCATOR;
+  private static volatile long SLEEP_MS=0L;
+public static class SleepRegionObserver implements RegionCoprocessor, RegionObserver {
+    @Override public Optional<RegionObserver> getRegionObserver(){
+      return Optional.of(this);
+    }
+    @Override public void preScannerOpen(    ObserverContext<RegionCoprocessorEnvironment> e,    Scan scan) throws IOException {
+      if (SLEEP_MS > 0) {
+        Threads.sleepWithoutInterrupt(SLEEP_MS);
+      }
+    }
+  }
+  @BeforeClass public static void setUp() throws Exception {
+    Configuration conf=TEST_UTIL.getConfiguration();
+    conf.set(REGION_COPROCESSOR_CONF_KEY,SleepRegionObserver.class.getName());
+    conf.setLong(HBASE_CLIENT_META_OPERATION_TIMEOUT,2000);
+    TEST_UTIL.startMiniCluster(1);
+    TEST_UTIL.createTable(TABLE_NAME,FAMILY);
+    TEST_UTIL.waitTableAvailable(TABLE_NAME);
+    AsyncRegistry registry=AsyncRegistryFactory.getRegistry(TEST_UTIL.getConfiguration());
+    CONN=new AsyncConnectionImpl(TEST_UTIL.getConfiguration(),registry,registry.getClusterId().get(),User.getCurrent());
+    LOCATOR=CONN.getLocator();
+  }
+  @AfterClass public static void tearDown() throws Exception {
+    IOUtils.closeQuietly(CONN);
+    TEST_UTIL.shutdownMiniCluster();
+  }
+  @Test public void test() throws InterruptedException, ExecutionException {
+    SLEEP_MS=1000;
+    long startNs=System.nanoTime();
+    try {
+      LOCATOR.getRegionLocation(TABLE_NAME,EMPTY_START_ROW,RegionLocateType.CURRENT,TimeUnit.MILLISECONDS.toNanos(500)).get();
+      fail();
+    }
+ catch (    ExecutionException e) {
+      e.printStackTrace();
+      assertThat(e.getCause(),instanceOf(TimeoutIOException.class));
+    }
+    long costMs=TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNs);
+    assertTrue(costMs >= 500);
+    assertTrue(costMs < 1000);
+    Thread.sleep(2000);
+    HRegionLocation loc=LOCATOR.getRegionLocation(TABLE_NAME,EMPTY_START_ROW,RegionLocateType.CURRENT,TimeUnit.MILLISECONDS.toNanos(500)).get();
+    assertEquals(loc.getServerName(),TEST_UTIL.getHBaseCluster().getRegionServer(0).getServerName());
+  }
+}

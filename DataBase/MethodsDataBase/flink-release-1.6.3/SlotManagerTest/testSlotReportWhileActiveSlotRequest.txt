@@ -1,0 +1,58 @@
+/** 
+ * Tests that pending slot requests are rejected if a slot report with a different allocation is received.
+ */
+@Test @SuppressWarnings("unchecked") public void testSlotReportWhileActiveSlotRequest() throws Exception {
+  final long verifyTimeout=10000L;
+  final ResourceManagerId resourceManagerId=ResourceManagerId.generate();
+  final ResourceActions resourceManagerActions=mock(ResourceActions.class);
+  final JobID jobId=new JobID();
+  final AllocationID allocationId=new AllocationID();
+  final ResourceProfile resourceProfile=new ResourceProfile(42.0,1337);
+  final SlotRequest slotRequest=new SlotRequest(jobId,allocationId,resourceProfile,"foobar");
+  final CompletableFuture<Acknowledge> slotRequestFuture1=new CompletableFuture<>();
+  final TaskExecutorGateway taskExecutorGateway=mock(TaskExecutorGateway.class);
+  when(taskExecutorGateway.requestSlot(any(SlotID.class),any(JobID.class),eq(allocationId),anyString(),any(ResourceManagerId.class),any(Time.class))).thenReturn(slotRequestFuture1,CompletableFuture.completedFuture(Acknowledge.get()));
+  final ResourceID resourceId=ResourceID.generate();
+  final TaskExecutorConnection taskManagerConnection=new TaskExecutorConnection(resourceId,taskExecutorGateway);
+  final SlotID slotId1=new SlotID(resourceId,0);
+  final SlotID slotId2=new SlotID(resourceId,1);
+  final SlotStatus slotStatus1=new SlotStatus(slotId1,resourceProfile);
+  final SlotStatus slotStatus2=new SlotStatus(slotId2,resourceProfile);
+  final SlotReport slotReport=new SlotReport(Arrays.asList(slotStatus1,slotStatus2));
+  final Executor mainThreadExecutor=TestingUtils.defaultExecutor();
+  try (final SlotManager slotManager=new SlotManager(TestingUtils.defaultScheduledExecutor(),TestingUtils.infiniteTime(),TestingUtils.infiniteTime(),TestingUtils.infiniteTime())){
+    slotManager.start(resourceManagerId,mainThreadExecutor,resourceManagerActions);
+    CompletableFuture<Void> registrationFuture=CompletableFuture.supplyAsync(() -> {
+      slotManager.registerTaskManager(taskManagerConnection,slotReport);
+      return null;
+    }
+,mainThreadExecutor).thenAccept((    Object value) -> {
+      try {
+        slotManager.registerSlotRequest(slotRequest);
+      }
+ catch (      SlotManagerException e) {
+        throw new RuntimeException("Could not register slots.",e);
+      }
+    }
+);
+    registrationFuture.get();
+    ArgumentCaptor<SlotID> slotIdCaptor=ArgumentCaptor.forClass(SlotID.class);
+    verify(taskExecutorGateway,times(1)).requestSlot(slotIdCaptor.capture(),eq(jobId),eq(allocationId),anyString(),eq(resourceManagerId),any(Time.class));
+    final SlotID requestedSlotId=slotIdCaptor.getValue();
+    final SlotID freeSlotId=requestedSlotId.equals(slotId1) ? slotId2 : slotId1;
+    CompletableFuture<Boolean> freeSlotFuture=CompletableFuture.supplyAsync(() -> slotManager.getSlot(freeSlotId).getState() == TaskManagerSlot.State.FREE,mainThreadExecutor);
+    assertTrue(freeSlotFuture.get());
+    final SlotStatus newSlotStatus1=new SlotStatus(slotIdCaptor.getValue(),resourceProfile,new JobID(),new AllocationID());
+    final SlotStatus newSlotStatus2=new SlotStatus(freeSlotId,resourceProfile);
+    final SlotReport newSlotReport=new SlotReport(Arrays.asList(newSlotStatus1,newSlotStatus2));
+    CompletableFuture<Boolean> reportSlotStatusFuture=CompletableFuture.supplyAsync(() -> slotManager.reportSlotStatus(taskManagerConnection.getInstanceID(),newSlotReport),mainThreadExecutor);
+    assertTrue(reportSlotStatusFuture.get());
+    verify(taskExecutorGateway,timeout(verifyTimeout).times(2)).requestSlot(slotIdCaptor.capture(),eq(jobId),eq(allocationId),anyString(),eq(resourceManagerId),any(Time.class));
+    final SlotID requestedSlotId2=slotIdCaptor.getValue();
+    assertEquals(slotId2,requestedSlotId2);
+    CompletableFuture<TaskManagerSlot> requestedSlotFuture=CompletableFuture.supplyAsync(() -> slotManager.getSlot(requestedSlotId2),mainThreadExecutor);
+    TaskManagerSlot slot=requestedSlotFuture.get();
+    assertTrue(slot.getState() == TaskManagerSlot.State.ALLOCATED);
+    assertEquals(allocationId,slot.getAllocationId());
+  }
+ }

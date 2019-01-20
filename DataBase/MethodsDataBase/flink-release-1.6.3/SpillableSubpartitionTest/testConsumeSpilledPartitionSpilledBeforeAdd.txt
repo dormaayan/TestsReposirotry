@@ -1,0 +1,46 @@
+/** 
+ * Tests that a spilled partition is correctly read back in via a spilled read view. The partition went into spilled state before adding buffers and the access pattern resembles the actual use of  {@link org.apache.flink.runtime.io.network.api.writer.RecordWriter}.
+ */
+@Test public void testConsumeSpilledPartitionSpilledBeforeAdd() throws Exception {
+  SpillableSubpartition partition=createSubpartition();
+  assertEquals(0,partition.releaseMemory());
+  BufferBuilder[] bufferBuilders=new BufferBuilder[]{createBufferBuilder(BUFFER_DATA_SIZE),createBufferBuilder(BUFFER_DATA_SIZE),createBufferBuilder(BUFFER_DATA_SIZE),createBufferBuilder(BUFFER_DATA_SIZE)};
+  BufferConsumer[] bufferConsumers=Arrays.stream(bufferBuilders).map(BufferBuilder::createBufferConsumer).toArray(BufferConsumer[]::new);
+  BufferConsumer eventBufferConsumer=EventSerializer.toBufferConsumer(new CancelCheckpointMarker(1));
+  final int eventSize=eventBufferConsumer.getWrittenBytes();
+  partition.add(bufferConsumers[0]);
+  fillBufferBuilder(bufferBuilders[0],BUFFER_DATA_SIZE).finish();
+  partition.add(bufferConsumers[1]);
+  fillBufferBuilder(bufferBuilders[1],BUFFER_DATA_SIZE).finish();
+  partition.add(eventBufferConsumer);
+  partition.add(bufferConsumers[2]);
+  bufferBuilders[2].finish();
+  partition.add(bufferConsumers[3]);
+  fillBufferBuilder(bufferBuilders[3],BUFFER_DATA_SIZE / 2);
+  int expectedSize=BUFFER_DATA_SIZE * 2 + eventSize;
+  assertEquals(5,partition.getTotalNumberOfBuffers());
+  assertEquals(3,partition.getBuffersInBacklog());
+  assertEquals(expectedSize,partition.getTotalNumberOfBytes());
+  partition.finish();
+  expectedSize+=BUFFER_DATA_SIZE / 2;
+  expectedSize+=4;
+  assertEquals(6,partition.getTotalNumberOfBuffers());
+  assertEquals(3,partition.getBuffersInBacklog());
+  assertEquals(expectedSize,partition.getTotalNumberOfBytes());
+  Arrays.stream(bufferConsumers).forEach(bufferConsumer -> assertTrue(bufferConsumer.isRecycled()));
+  AwaitableBufferAvailablityListener listener=new AwaitableBufferAvailablityListener();
+  SpilledSubpartitionView reader=(SpilledSubpartitionView)partition.createReadView(listener);
+  assertEquals(1,listener.getNumNotifications());
+  assertFalse(reader.nextBufferIsEvent());
+  assertNextBuffer(reader,BUFFER_DATA_SIZE,true,2,false,true);
+  assertEquals(2,partition.getBuffersInBacklog());
+  assertNextBuffer(reader,BUFFER_DATA_SIZE,true,1,true,true);
+  assertEquals(1,partition.getBuffersInBacklog());
+  assertNextEvent(reader,eventSize,CancelCheckpointMarker.class,true,1,false,true);
+  assertEquals(1,partition.getBuffersInBacklog());
+  assertNextBuffer(reader,BUFFER_DATA_SIZE / 2,true,0,true,true);
+  assertEquals(0,partition.getBuffersInBacklog());
+  assertNextEvent(reader,4,EndOfPartitionEvent.class,false,0,false,true);
+  assertEquals(0,partition.getBuffersInBacklog());
+  Arrays.stream(bufferConsumers).forEach(bufferConsumer -> bufferConsumer.close());
+}

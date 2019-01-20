@@ -1,0 +1,47 @@
+/** 
+ * Tests that a local failure fails all pending checkpoints which have not been acknowledged by the failing task.
+ */
+@Test public void testLocalFailureFailsPendingCheckpoints() throws Exception {
+  final JobID jid=new JobID();
+  final int parallelism=2;
+  final long verifyTimeout=5000L;
+  final TaskManagerGateway taskManagerGateway=mock(TaskManagerGateway.class);
+  when(taskManagerGateway.submitTask(any(TaskDeploymentDescriptor.class),any(Time.class))).thenReturn(CompletableFuture.completedFuture(Acknowledge.get()));
+  when(taskManagerGateway.cancelTask(any(ExecutionAttemptID.class),any(Time.class))).thenReturn(CompletableFuture.completedFuture(Acknowledge.get()));
+  final SimpleSlotProvider slotProvider=new SimpleSlotProvider(jid,parallelism,taskManagerGateway);
+  final ManuallyTriggeredDirectExecutor executor=new ManuallyTriggeredDirectExecutor();
+  final CheckpointCoordinatorConfiguration checkpointCoordinatorConfiguration=new CheckpointCoordinatorConfiguration(10L,100000L,1L,3,CheckpointRetentionPolicy.NEVER_RETAIN_AFTER_TERMINATION,true);
+  final ExecutionGraph graph=createSampleGraph(jid,new IndividualFailoverWithCustomExecutor(executor),slotProvider,parallelism);
+  final List<ExecutionJobVertex> allVertices=new ArrayList<>(graph.getAllVertices().values());
+  final StandaloneCheckpointIDCounter standaloneCheckpointIDCounter=new StandaloneCheckpointIDCounter();
+  graph.enableCheckpointing(checkpointCoordinatorConfiguration.getCheckpointInterval(),checkpointCoordinatorConfiguration.getCheckpointTimeout(),checkpointCoordinatorConfiguration.getMinPauseBetweenCheckpoints(),checkpointCoordinatorConfiguration.getMaxConcurrentCheckpoints(),checkpointCoordinatorConfiguration.getCheckpointRetentionPolicy(),allVertices,allVertices,allVertices,Collections.emptyList(),standaloneCheckpointIDCounter,new StandaloneCompletedCheckpointStore(1),new MemoryStateBackend(),new CheckpointStatsTracker(1,allVertices,checkpointCoordinatorConfiguration,UnregisteredMetricGroups.createUnregisteredTaskMetricGroup()));
+  final CheckpointCoordinator checkpointCoordinator=graph.getCheckpointCoordinator();
+  final ExecutionJobVertex ejv=graph.getVerticesTopologically().iterator().next();
+  final ExecutionVertex vertex1=ejv.getTaskVertices()[0];
+  final ExecutionVertex vertex2=ejv.getTaskVertices()[1];
+  graph.scheduleForExecution();
+  assertEquals(JobStatus.RUNNING,graph.getState());
+  verify(taskManagerGateway,timeout(verifyTimeout).times(parallelism)).submitTask(any(TaskDeploymentDescriptor.class),any(Time.class));
+  for (  ExecutionVertex executionVertex : graph.getAllExecutionVertices()) {
+    executionVertex.getCurrentExecutionAttempt().switchToRunning();
+  }
+  verify(taskManagerGateway,timeout(verifyTimeout).times(3)).triggerCheckpoint(eq(vertex1.getCurrentExecutionAttempt().getAttemptId()),any(JobID.class),anyLong(),anyLong(),any(CheckpointOptions.class));
+  verify(taskManagerGateway,timeout(verifyTimeout).times(3)).triggerCheckpoint(eq(vertex2.getCurrentExecutionAttempt().getAttemptId()),any(JobID.class),anyLong(),anyLong(),any(CheckpointOptions.class));
+  assertEquals(3,checkpointCoordinator.getNumberOfPendingCheckpoints());
+  long checkpointToAcknowledge=standaloneCheckpointIDCounter.getLast();
+  checkpointCoordinator.receiveAcknowledgeMessage(new AcknowledgeCheckpoint(graph.getJobID(),vertex1.getCurrentExecutionAttempt().getAttemptId(),checkpointToAcknowledge));
+  Map<Long,PendingCheckpoint> oldPendingCheckpoints=new HashMap<>(3);
+  for (  PendingCheckpoint pendingCheckpoint : checkpointCoordinator.getPendingCheckpoints().values()) {
+    assertFalse(pendingCheckpoint.isDiscarded());
+    oldPendingCheckpoints.put(pendingCheckpoint.getCheckpointId(),pendingCheckpoint);
+  }
+  vertex1.getCurrentExecutionAttempt().fail(new Exception("test failure"));
+  for (  PendingCheckpoint pendingCheckpoint : oldPendingCheckpoints.values()) {
+    if (pendingCheckpoint.getCheckpointId() == checkpointToAcknowledge) {
+      assertFalse(pendingCheckpoint.isDiscarded());
+    }
+ else {
+      assertTrue(pendingCheckpoint.isDiscarded());
+    }
+  }
+}

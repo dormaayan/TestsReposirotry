@@ -1,0 +1,321 @@
+public class KernelTransactionsTest {
+  @Rule public final OtherThreadRule<Void> t2=new OtherThreadRule<>("T2-" + getClass().getName());
+  @Rule public final ExpectedException expectedException=ExpectedException.none();
+  private static final long TEST_TIMEOUT=10_000;
+  private static final SystemNanoClock clock=Clocks.nanoClock();
+  private static DatabaseAvailabilityGuard databaseAvailabilityGuard;
+  @Before public void setUp(){
+    databaseAvailabilityGuard=new DatabaseAvailabilityGuard(DEFAULT_DATABASE_NAME,clock,NullLog.getInstance());
+  }
+  @Test public void shouldListActiveTransactions() throws Throwable {
+    KernelTransactions transactions=newTestKernelTransactions();
+    KernelTransaction first=getKernelTransaction(transactions);
+    KernelTransaction second=getKernelTransaction(transactions);
+    KernelTransaction third=getKernelTransaction(transactions);
+    first.close();
+    assertThat(transactions.activeTransactions(),equalTo(asSet(newHandle(second),newHandle(third))));
+  }
+  @Test public void shouldDisposeTransactionsWhenAsked() throws Throwable {
+    KernelTransactions transactions=newKernelTransactions();
+    transactions.disposeAll();
+    KernelTransaction first=getKernelTransaction(transactions);
+    KernelTransaction second=getKernelTransaction(transactions);
+    KernelTransaction leftOpen=getKernelTransaction(transactions);
+    first.close();
+    second.close();
+    transactions.disposeAll();
+    KernelTransaction postDispose=getKernelTransaction(transactions);
+    assertThat(postDispose,not(equalTo(first)));
+    assertThat(postDispose,not(equalTo(second)));
+    assertNotNull(leftOpen.getReasonIfTerminated());
+  }
+  @Test public void shouldIncludeRandomBytesInAdditionalHeader() throws Throwable {
+    TransactionRepresentation[] transactionRepresentation=new TransactionRepresentation[1];
+    KernelTransactions registry=newKernelTransactions(newRememberingCommitProcess(transactionRepresentation));
+    try (KernelTransaction transaction=getKernelTransaction(registry)){
+      ((KernelTransactionImplementation)transaction).txState().nodeDoCreate(0);
+      transaction.success();
+    }
+     byte[] additionalHeader=transactionRepresentation[0].additionalHeader();
+    assertNotNull(additionalHeader);
+    assertTrue(additionalHeader.length > 0);
+  }
+  @Test public void shouldReuseClosedTransactionObjects() throws Throwable {
+    KernelTransactions transactions=newKernelTransactions();
+    KernelTransaction a=getKernelTransaction(transactions);
+    a.close();
+    KernelTransaction b=getKernelTransaction(transactions);
+    assertSame(a,b);
+  }
+  @Test public void shouldTellWhenTransactionsFromSnapshotHaveBeenClosed() throws Throwable {
+    KernelTransactions transactions=newKernelTransactions();
+    KernelTransaction a=getKernelTransaction(transactions);
+    KernelTransaction b=getKernelTransaction(transactions);
+    KernelTransaction c=getKernelTransaction(transactions);
+    KernelTransactionsSnapshot snapshot=transactions.get();
+    assertFalse(snapshot.allClosed());
+    a.close();
+    assertFalse(snapshot.allClosed());
+    c.close();
+    KernelTransaction d=getKernelTransaction(transactions);
+    assertFalse(snapshot.allClosed());
+    b.close();
+    assertTrue(snapshot.allClosed());
+  }
+  @Test public void shouldBeAbleToSnapshotDuringHeavyLoad() throws Throwable {
+    final KernelTransactions transactions=newKernelTransactions();
+    Race race=new Race();
+    final int threads=50;
+    final AtomicBoolean end=new AtomicBoolean();
+    final AtomicReferenceArray<KernelTransactionsSnapshot> snapshots=new AtomicReferenceArray<>(threads);
+    for (int i=0; i < threads; i++) {
+      final int threadIndex=i;
+      race.addContestant(() -> {
+        ThreadLocalRandom random=ThreadLocalRandom.current();
+        while (!end.get()) {
+          try (KernelTransaction transaction=getKernelTransaction(transactions)){
+            KernelTransactionsSnapshot snapshot=null;
+            try {
+              parkNanos(MILLISECONDS.toNanos(random.nextInt(3)));
+              if (snapshots.get(threadIndex) == null) {
+                requireNonNull(transactions,"transactions is null");
+                snapshot=requireNonNull(transactions.get(),"transactions.get() returned null");
+                snapshots.set(threadIndex,snapshot);
+                parkNanos(MILLISECONDS.toNanos(random.nextInt(3)));
+              }
+            }
+ catch (            RuntimeException e) {
+              StringBuilder sb=new StringBuilder("Gotcha!\n").append("threadIndex=").append(threadIndex).append('\n').append("transaction=").append(transaction).append('\n').append("snapshots=").append(snapshots).append('\n').append("snapshot=").append(snapshot).append('\n').append("end=").append(end);
+              throw new RuntimeException(sb.toString(),e);
+            }
+          }
+ catch (          TransactionFailureException e) {
+            throw new RuntimeException(e);
+          }
+        }
+      }
+);
+    }
+    race.addContestant(() -> {
+      ThreadLocalRandom random=ThreadLocalRandom.current();
+      int snapshotsLeft=1_000;
+      while (snapshotsLeft > 0) {
+        int threadIndex=random.nextInt(threads);
+        KernelTransactionsSnapshot snapshot=snapshots.get(threadIndex);
+        if (snapshot != null && snapshot.allClosed()) {
+          snapshotsLeft--;
+          snapshots.set(threadIndex,null);
+        }
+      }
+      end.set(true);
+    }
+);
+    race.go();
+  }
+  @Test public void transactionCloseRemovesTxFromActiveTransactions() throws Throwable {
+    KernelTransactions kernelTransactions=newTestKernelTransactions();
+    KernelTransaction tx1=getKernelTransaction(kernelTransactions);
+    KernelTransaction tx2=getKernelTransaction(kernelTransactions);
+    KernelTransaction tx3=getKernelTransaction(kernelTransactions);
+    tx1.close();
+    tx3.close();
+    assertEquals(asSet(newHandle(tx2)),kernelTransactions.activeTransactions());
+  }
+  @Test public void disposeAllMarksAllTransactionsForTermination() throws Throwable {
+    KernelTransactions kernelTransactions=newKernelTransactions();
+    KernelTransaction tx1=getKernelTransaction(kernelTransactions);
+    KernelTransaction tx2=getKernelTransaction(kernelTransactions);
+    KernelTransaction tx3=getKernelTransaction(kernelTransactions);
+    kernelTransactions.disposeAll();
+    assertEquals(Status.General.DatabaseUnavailable,tx1.getReasonIfTerminated().get());
+    assertEquals(Status.General.DatabaseUnavailable,tx2.getReasonIfTerminated().get());
+    assertEquals(Status.General.DatabaseUnavailable,tx3.getReasonIfTerminated().get());
+  }
+  @Test public void transactionClosesUnderlyingStoreReaderWhenDisposed() throws Throwable {
+    StorageReader storeStatement1=mock(StorageReader.class);
+    StorageReader storeStatement2=mock(StorageReader.class);
+    StorageReader storeStatement3=mock(StorageReader.class);
+    KernelTransactions kernelTransactions=newKernelTransactions(mock(TransactionCommitProcess.class),storeStatement1,storeStatement2,storeStatement3);
+    startAndCloseTransaction(kernelTransactions);
+    Executors.newSingleThreadExecutor().submit(() -> startAndCloseTransaction(kernelTransactions)).get();
+    Executors.newSingleThreadExecutor().submit(() -> startAndCloseTransaction(kernelTransactions)).get();
+    kernelTransactions.disposeAll();
+    verify(storeStatement1).close();
+    verify(storeStatement2).close();
+    verify(storeStatement3).close();
+  }
+  @Test public void threadThatBlocksNewTxsCantStartNewTxs() throws Throwable {
+    KernelTransactions kernelTransactions=newKernelTransactions();
+    kernelTransactions.blockNewTransactions();
+    try {
+      kernelTransactions.newInstance(KernelTransaction.Type.implicit,AnonymousContext.write(),0L);
+      fail("Exception expected");
+    }
+ catch (    Exception e) {
+      assertThat(e,instanceOf(IllegalStateException.class));
+    }
+  }
+  @Test(timeout=TEST_TIMEOUT) public void blockNewTransactions() throws Throwable {
+    KernelTransactions kernelTransactions=newKernelTransactions();
+    kernelTransactions.blockNewTransactions();
+    Future<KernelTransaction> txOpener=t2.execute(state -> kernelTransactions.newInstance(explicit,AnonymousContext.write(),0L));
+    t2.get().waitUntilWaiting(location -> location.isAt(KernelTransactions.class,"newInstance"));
+    assertNotDone(txOpener);
+    kernelTransactions.unblockNewTransactions();
+    assertNotNull(txOpener.get());
+  }
+  @Test(timeout=TEST_TIMEOUT) public void unblockNewTransactionsFromWrongThreadThrows() throws Throwable {
+    KernelTransactions kernelTransactions=newKernelTransactions();
+    kernelTransactions.blockNewTransactions();
+    Future<KernelTransaction> txOpener=t2.execute(state -> kernelTransactions.newInstance(explicit,AnonymousContext.write(),0L));
+    t2.get().waitUntilWaiting(location -> location.isAt(KernelTransactions.class,"newInstance"));
+    assertNotDone(txOpener);
+    Future<?> wrongUnblocker=unblockTxsInSeparateThread(kernelTransactions);
+    try {
+      wrongUnblocker.get();
+    }
+ catch (    Exception e) {
+      assertThat(e,instanceOf(ExecutionException.class));
+      assertThat(e.getCause(),instanceOf(IllegalStateException.class));
+    }
+    assertNotDone(txOpener);
+    kernelTransactions.unblockNewTransactions();
+    assertNotNull(txOpener.get());
+  }
+  @Test public void shouldNotLeakTransactionOnSecurityContextFreezeFailure() throws Throwable {
+    KernelTransactions kernelTransactions=newKernelTransactions();
+    LoginContext loginContext=mock(LoginContext.class);
+    when(loginContext.authorize(any(),any())).thenThrow(new AuthorizationExpiredException("Freeze failed."));
+    assertException(() -> kernelTransactions.newInstance(KernelTransaction.Type.explicit,loginContext,0L),AuthorizationExpiredException.class,"Freeze failed.");
+    assertThat("We should not have any transaction",kernelTransactions.activeTransactions(),is(empty()));
+  }
+  @Test public void exceptionWhenStartingNewTransactionOnShutdownInstance() throws Throwable {
+    KernelTransactions kernelTransactions=newKernelTransactions();
+    databaseAvailabilityGuard.shutdown();
+    expectedException.expect(DatabaseShutdownException.class);
+    kernelTransactions.newInstance(KernelTransaction.Type.explicit,AUTH_DISABLED,0L);
+  }
+  @Test public void exceptionWhenStartingNewTransactionOnStoppedKernelTransactions() throws Throwable {
+    KernelTransactions kernelTransactions=newKernelTransactions();
+    t2.execute((OtherThreadExecutor.WorkerCommand<Void,Void>)state -> {
+      stopKernelTransactions(kernelTransactions);
+      return null;
+    }
+).get();
+    expectedException.expect(IllegalStateException.class);
+    kernelTransactions.newInstance(KernelTransaction.Type.explicit,AUTH_DISABLED,0L);
+  }
+  @Test public void startNewTransactionOnRestartedKErnelTransactions() throws Throwable {
+    KernelTransactions kernelTransactions=newKernelTransactions();
+    kernelTransactions.stop();
+    kernelTransactions.start();
+    assertNotNull("New transaction created by restarted kernel transactions component.",kernelTransactions.newInstance(KernelTransaction.Type.explicit,AUTH_DISABLED,0L));
+  }
+  @Test public void incrementalUserTransactionId() throws Throwable {
+    KernelTransactions kernelTransactions=newKernelTransactions();
+    try (KernelTransaction kernelTransaction=kernelTransactions.newInstance(KernelTransaction.Type.explicit,AnonymousContext.none(),0L)){
+      assertEquals(1,kernelTransactions.activeTransactions().iterator().next().getUserTransactionId());
+    }
+     try (KernelTransaction kernelTransaction=kernelTransactions.newInstance(KernelTransaction.Type.explicit,AnonymousContext.none(),0L)){
+      assertEquals(2,kernelTransactions.activeTransactions().iterator().next().getUserTransactionId());
+    }
+     try (KernelTransaction kernelTransaction=kernelTransactions.newInstance(KernelTransaction.Type.explicit,AnonymousContext.none(),0L)){
+      assertEquals(3,kernelTransactions.activeTransactions().iterator().next().getUserTransactionId());
+    }
+   }
+  private static void stopKernelTransactions(  KernelTransactions kernelTransactions){
+    try {
+      kernelTransactions.stop();
+    }
+ catch (    Throwable t) {
+      throw new RuntimeException(t);
+    }
+  }
+  private static void startAndCloseTransaction(  KernelTransactions kernelTransactions){
+    try {
+      kernelTransactions.newInstance(KernelTransaction.Type.explicit,AUTH_DISABLED,0L).close();
+    }
+ catch (    TransactionFailureException e) {
+      throw new RuntimeException(e);
+    }
+  }
+  private static KernelTransactions newKernelTransactions() throws Throwable {
+    return newKernelTransactions(mock(TransactionCommitProcess.class));
+  }
+  private static KernelTransactions newTestKernelTransactions() throws Throwable {
+    return newKernelTransactions(true,mock(TransactionCommitProcess.class),mock(StorageReader.class));
+  }
+  private static KernelTransactions newKernelTransactions(  TransactionCommitProcess commitProcess) throws Throwable {
+    return newKernelTransactions(false,commitProcess,mock(StorageReader.class));
+  }
+  private static KernelTransactions newKernelTransactions(  TransactionCommitProcess commitProcess,  StorageReader firstReader,  StorageReader... otherReaders) throws Throwable {
+    return newKernelTransactions(false,commitProcess,firstReader,otherReaders);
+  }
+  private static KernelTransactions newKernelTransactions(  boolean testKernelTransactions,  TransactionCommitProcess commitProcess,  StorageReader firstReader,  StorageReader... otherReaders) throws Throwable {
+    Locks locks=mock(Locks.class);
+    Locks.Client client=mock(Locks.Client.class);
+    when(locks.newClient()).thenReturn(client);
+    StorageEngine storageEngine=mock(StorageEngine.class);
+    when(storageEngine.newReader()).thenReturn(firstReader,otherReaders);
+    doAnswer(invocation -> {
+      Collection<StorageCommand> argument=invocation.getArgument(0);
+      argument.add(mock(StorageCommand.class));
+      return null;
+    }
+).when(storageEngine).createCommands(anyCollection(),any(ReadableTransactionState.class),any(StorageReader.class),any(ResourceLocker.class),anyLong(),any(TxStateVisitor.Decorator.class));
+    return newKernelTransactions(locks,storageEngine,commitProcess,testKernelTransactions);
+  }
+  private static KernelTransactions newKernelTransactions(  Locks locks,  StorageEngine storageEngine,  TransactionCommitProcess commitProcess,  boolean testKernelTransactions){
+    LifeSupport life=new LifeSupport();
+    life.start();
+    TransactionIdStore transactionIdStore=mock(TransactionIdStore.class);
+    when(transactionIdStore.getLastCommittedTransaction()).thenReturn(new TransactionId(0,0,0));
+    Tracers tracers=new Tracers("null",NullLog.getInstance(),new Monitors(),mock(JobScheduler.class),clock);
+    StatementLocksFactory statementLocksFactory=new SimpleStatementLocksFactory(locks);
+    StatementOperationParts statementOperations=mock(StatementOperationParts.class);
+    KernelTransactions transactions;
+    if (testKernelTransactions) {
+      transactions=createTestTransactions(storageEngine,commitProcess,transactionIdStore,tracers,statementLocksFactory,statementOperations,clock,databaseAvailabilityGuard);
+    }
+ else {
+      transactions=createTransactions(storageEngine,commitProcess,transactionIdStore,tracers,statementLocksFactory,statementOperations,clock,databaseAvailabilityGuard);
+    }
+    transactions.start();
+    return transactions;
+  }
+  private static KernelTransactions createTransactions(  StorageEngine storageEngine,  TransactionCommitProcess commitProcess,  TransactionIdStore transactionIdStore,  Tracers tracers,  StatementLocksFactory statementLocksFactory,  StatementOperationParts statementOperations,  SystemNanoClock clock,  AvailabilityGuard databaseAvailabilityGuard){
+    return new KernelTransactions(Config.defaults(),statementLocksFactory,null,statementOperations,null,DEFAULT,commitProcess,mock(AuxiliaryTransactionStateManager.class),new TransactionHooks(),mock(TransactionMonitor.class),databaseAvailabilityGuard,tracers,storageEngine,new Procedures(),transactionIdStore,clock,new AtomicReference<>(CpuClock.NOT_AVAILABLE),new AtomicReference<>(HeapAllocation.NOT_AVAILABLE),new CanWrite(),AutoIndexing.UNSUPPORTED,mock(ExplicitIndexStore.class),EmptyVersionContextSupplier.EMPTY,ON_HEAP,mock(ConstraintSemantics.class),mock(SchemaState.class),mock(IndexingProvidersService.class),mockedTokenHolders(),DEFAULT_DATABASE_NAME,new Dependencies());
+  }
+  private static TestKernelTransactions createTestTransactions(  StorageEngine storageEngine,  TransactionCommitProcess commitProcess,  TransactionIdStore transactionIdStore,  Tracers tracers,  StatementLocksFactory statementLocksFactory,  StatementOperationParts statementOperations,  SystemNanoClock clock,  AvailabilityGuard databaseAvailabilityGuard){
+    return new TestKernelTransactions(statementLocksFactory,null,statementOperations,null,DEFAULT,commitProcess,mock(AuxiliaryTransactionStateManager.class),new TransactionHooks(),mock(TransactionMonitor.class),databaseAvailabilityGuard,tracers,storageEngine,new Procedures(),transactionIdStore,clock,new CanWrite(),AutoIndexing.UNSUPPORTED,EmptyVersionContextSupplier.EMPTY,mockedTokenHolders(),new Dependencies());
+  }
+  private static TransactionCommitProcess newRememberingCommitProcess(  final TransactionRepresentation[] slot) throws TransactionFailureException {
+    TransactionCommitProcess commitProcess=mock(TransactionCommitProcess.class);
+    when(commitProcess.commit(any(TransactionToApply.class),any(CommitEvent.class),any(TransactionApplicationMode.class))).then(invocation -> {
+      slot[0]=((TransactionToApply)invocation.getArgument(0)).transactionRepresentation();
+      return 1L;
+    }
+);
+    return commitProcess;
+  }
+  private static Future<?> unblockTxsInSeparateThread(  final KernelTransactions kernelTransactions){
+    return Executors.newSingleThreadExecutor().submit(kernelTransactions::unblockNewTransactions);
+  }
+  private static void assertNotDone(  Future<?> future){
+    assertFalse(future.isDone());
+  }
+  private static KernelTransactionHandle newHandle(  KernelTransaction tx){
+    return new TestKernelTransactionHandle(tx);
+  }
+  private static KernelTransaction getKernelTransaction(  KernelTransactions transactions){
+    return transactions.newInstance(KernelTransaction.Type.implicit,AnonymousContext.none(),0L);
+  }
+private static class TestKernelTransactions extends KernelTransactions {
+    TestKernelTransactions(    StatementLocksFactory statementLocksFactory,    ConstraintIndexCreator constraintIndexCreator,    StatementOperationParts statementOperations,    SchemaWriteGuard schemaWriteGuard,    TransactionHeaderInformationFactory txHeaderFactory,    TransactionCommitProcess transactionCommitProcess,    AuxiliaryTransactionStateManager auxTxStateManager,    TransactionHooks hooks,    TransactionMonitor transactionMonitor,    AvailabilityGuard databaseAvailabilityGuard,    Tracers tracers,    StorageEngine storageEngine,    Procedures procedures,    TransactionIdStore transactionIdStore,    SystemNanoClock clock,    AccessCapability accessCapability,    AutoIndexing autoIndexing,    VersionContextSupplier versionContextSupplier,    TokenHolders tokenHolders,    Dependencies dataSourceDependencies){
+      super(Config.defaults(),statementLocksFactory,constraintIndexCreator,statementOperations,schemaWriteGuard,txHeaderFactory,transactionCommitProcess,auxTxStateManager,hooks,transactionMonitor,databaseAvailabilityGuard,tracers,storageEngine,procedures,transactionIdStore,clock,new AtomicReference<>(CpuClock.NOT_AVAILABLE),new AtomicReference<>(HeapAllocation.NOT_AVAILABLE),accessCapability,autoIndexing,mock(ExplicitIndexStore.class),versionContextSupplier,ON_HEAP,new StandardConstraintSemantics(),mock(SchemaState.class),mock(IndexingProvidersService.class),tokenHolders,DEFAULT_DATABASE_NAME,dataSourceDependencies);
+    }
+    @Override KernelTransactionHandle createHandle(    KernelTransactionImplementation tx){
+      return new TestKernelTransactionHandle(tx);
+    }
+  }
+}

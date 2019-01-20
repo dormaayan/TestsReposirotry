@@ -1,0 +1,48 @@
+/** 
+ * Test the scenario where the NN fails over after issuing a block synchronization request, but before it is committed. The DN running the recovery should then fail to commit the synchronization and a later retry will succeed.
+ */
+@Test(timeout=30000) public void testFailoverRightBeforeCommitSynchronization() throws Exception {
+  final Configuration conf=new Configuration();
+  conf.setBoolean(DFSConfigKeys.DFS_PERMISSIONS_ENABLED_KEY,false);
+  conf.setInt(DFSConfigKeys.DFS_BLOCK_SIZE_KEY,BLOCK_SIZE);
+  FSDataOutputStream stm=null;
+  final MiniDFSCluster cluster=newMiniCluster(conf,3);
+  try {
+    cluster.waitActive();
+    cluster.transitionToActive(0);
+    Thread.sleep(500);
+    LOG.info("Starting with NN 0 active");
+    FileSystem fs=HATestUtil.configureFailoverFs(cluster,conf);
+    stm=fs.create(TEST_PATH);
+    AppendTestUtil.write(stm,0,BLOCK_SIZE / 2);
+    stm.hflush();
+    NameNode nn0=cluster.getNameNode(0);
+    ExtendedBlock blk=DFSTestUtil.getFirstBlock(fs,TEST_PATH);
+    DatanodeDescriptor expectedPrimary=DFSTestUtil.getExpectedPrimaryNode(nn0,blk);
+    LOG.info("Expecting block recovery to be triggered on DN " + expectedPrimary);
+    DataNode primaryDN=cluster.getDataNode(expectedPrimary.getIpcPort());
+    DatanodeProtocolClientSideTranslatorPB nnSpy=InternalDataNodeTestUtils.spyOnBposToNN(primaryDN,nn0);
+    DelayAnswer delayer=new DelayAnswer(LOG);
+    Mockito.doAnswer(delayer).when(nnSpy).commitBlockSynchronization(Mockito.eq(blk),Mockito.anyInt(),Mockito.anyLong(),Mockito.eq(true),Mockito.eq(false),(DatanodeID[])Mockito.anyObject(),(String[])Mockito.anyObject());
+    DistributedFileSystem fsOtherUser=createFsAsOtherUser(cluster,conf);
+    assertFalse(fsOtherUser.recoverLease(TEST_PATH));
+    LOG.info("Waiting for commitBlockSynchronization call from primary");
+    delayer.waitForCall();
+    LOG.info("Failing over to NN 1");
+    cluster.transitionToStandby(0);
+    cluster.transitionToActive(1);
+    delayer.proceed();
+    delayer.waitForResult();
+    Throwable t=delayer.getThrown();
+    if (t == null) {
+      fail("commitBlockSynchronization call did not fail on standby");
+    }
+    GenericTestUtils.assertExceptionContains("Operation category WRITE is not supported",t);
+    loopRecoverLease(fsOtherUser,TEST_PATH);
+    AppendTestUtil.check(fs,TEST_PATH,BLOCK_SIZE / 2);
+  }
+  finally {
+    IOUtils.closeStream(stm);
+    cluster.shutdown();
+  }
+}

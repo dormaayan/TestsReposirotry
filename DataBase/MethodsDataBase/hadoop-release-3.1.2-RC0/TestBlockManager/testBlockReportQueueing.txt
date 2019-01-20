@@ -1,0 +1,62 @@
+@Test public void testBlockReportQueueing() throws Exception {
+  Configuration conf=new HdfsConfiguration();
+  final MiniDFSCluster cluster=new MiniDFSCluster.Builder(conf).build();
+  try {
+    cluster.waitActive();
+    final FSNamesystem fsn=cluster.getNamesystem();
+    final BlockManager bm=fsn.getBlockManager();
+    final ExecutorService executor=Executors.newCachedThreadPool();
+    final CyclicBarrier startBarrier=new CyclicBarrier(2);
+    final CountDownLatch endLatch=new CountDownLatch(3);
+    final CountDownLatch doneLatch=new CountDownLatch(1);
+    FutureTask<?> blockingOp=new FutureTask<Void>(new Callable<Void>(){
+      @Override public Void call() throws IOException {
+        bm.runBlockOp(new Callable<Void>(){
+          @Override public Void call() throws InterruptedException, BrokenBarrierException {
+            startBarrier.await();
+            endLatch.countDown();
+            return null;
+          }
+        }
+);
+        doneLatch.countDown();
+        return null;
+      }
+    }
+);
+    Callable<?> asyncOp=new Callable<Void>(){
+      @Override public Void call() throws IOException {
+        bm.enqueueBlockOp(new Runnable(){
+          @Override public void run(){
+            endLatch.countDown();
+          }
+        }
+);
+        return null;
+      }
+    }
+;
+    Future<?> blockedFuture=executor.submit(blockingOp);
+    boolean isBlocked=false;
+    try {
+      blockedFuture.get(1,TimeUnit.SECONDS);
+    }
+ catch (    TimeoutException te) {
+      isBlocked=true;
+    }
+    assertTrue(isBlocked);
+    executor.submit(asyncOp).get(1,TimeUnit.SECONDS);
+    executor.submit(asyncOp).get(1,TimeUnit.SECONDS);
+    assertEquals(2,bm.getBlockOpQueueLength());
+    assertFalse(blockedFuture.isDone());
+    startBarrier.await(1,TimeUnit.SECONDS);
+    assertTrue(endLatch.await(1,TimeUnit.SECONDS));
+    assertEquals(0,bm.getBlockOpQueueLength());
+    assertTrue(doneLatch.await(1,TimeUnit.SECONDS));
+  }
+  finally {
+    if (cluster != null) {
+      cluster.shutdown();
+    }
+  }
+}

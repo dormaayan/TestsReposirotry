@@ -1,0 +1,347 @@
+@InterfaceAudience.Private public class MasterProcedureTestingUtility {
+  private static final Logger LOG=LoggerFactory.getLogger(MasterProcedureTestingUtility.class);
+  private MasterProcedureTestingUtility(){
+  }
+  public static void restartMasterProcedureExecutor(  ProcedureExecutor<MasterProcedureEnv> procExec) throws Exception {
+    final MasterProcedureEnv env=procExec.getEnvironment();
+    final HMaster master=(HMaster)env.getMasterServices();
+    ProcedureTestingUtility.restart(procExec,true,true,new Callable<Void>(){
+      @Override public Void call() throws Exception {
+        final AssignmentManager am=env.getAssignmentManager();
+        for (        RegionState regionState : am.getRegionStates().getRegionStates()) {
+          env.getMasterServices().getServerManager().removeRegion(regionState.getRegion());
+        }
+        am.stop();
+        master.setInitialized(false);
+        return null;
+      }
+    }
+,new Callable<Void>(){
+      @Override public Void call() throws Exception {
+        final AssignmentManager am=env.getAssignmentManager();
+        am.start();
+        am.joinCluster();
+        master.setInitialized(true);
+        return null;
+      }
+    }
+);
+  }
+  public static void masterFailover(  final HBaseTestingUtility testUtil) throws Exception {
+    MiniHBaseCluster cluster=testUtil.getMiniHBaseCluster();
+    HMaster oldMaster=cluster.getMaster();
+    cluster.killMaster(cluster.getMaster().getServerName());
+    waitBackupMaster(testUtil,oldMaster);
+  }
+  public static void waitBackupMaster(  final HBaseTestingUtility testUtil,  final HMaster oldMaster) throws Exception {
+    MiniHBaseCluster cluster=testUtil.getMiniHBaseCluster();
+    HMaster newMaster=cluster.getMaster();
+    while (newMaster == null || newMaster == oldMaster) {
+      Thread.sleep(250);
+      newMaster=cluster.getMaster();
+    }
+    while (!(newMaster.isActiveMaster() && newMaster.isInitialized())) {
+      Thread.sleep(250);
+    }
+  }
+  public static TableDescriptor createHTD(  final TableName tableName,  final String... family){
+    TableDescriptorBuilder builder=TableDescriptorBuilder.newBuilder(tableName);
+    for (int i=0; i < family.length; ++i) {
+      builder.setColumnFamily(ColumnFamilyDescriptorBuilder.of(family[i]));
+    }
+    return builder.build();
+  }
+  public static RegionInfo[] createTable(  final ProcedureExecutor<MasterProcedureEnv> procExec,  final TableName tableName,  final byte[][] splitKeys,  String... family) throws IOException {
+    TableDescriptor htd=createHTD(tableName,family);
+    RegionInfo[] regions=ModifyRegionUtils.createRegionInfos(htd,splitKeys);
+    long procId=ProcedureTestingUtility.submitAndWait(procExec,new CreateTableProcedure(procExec.getEnvironment(),htd,regions));
+    ProcedureTestingUtility.assertProcNotFailed(procExec.getResult(procId));
+    return regions;
+  }
+  public static void validateTableCreation(  final HMaster master,  final TableName tableName,  final RegionInfo[] regions,  String... family) throws IOException {
+    validateTableCreation(master,tableName,regions,true,family);
+  }
+  public static void validateTableCreation(  final HMaster master,  final TableName tableName,  final RegionInfo[] regions,  boolean hasFamilyDirs,  String... family) throws IOException {
+    final FileSystem fs=master.getMasterFileSystem().getFileSystem();
+    final Path tableDir=FSUtils.getTableDir(master.getMasterFileSystem().getRootDir(),tableName);
+    assertTrue(fs.exists(tableDir));
+    FSUtils.logFileSystemState(fs,tableDir,LOG);
+    List<Path> unwantedRegionDirs=FSUtils.getRegionDirs(fs,tableDir);
+    for (int i=0; i < regions.length; ++i) {
+      Path regionDir=new Path(tableDir,regions[i].getEncodedName());
+      assertTrue(regions[i] + " region dir does not exist",fs.exists(regionDir));
+      assertTrue(unwantedRegionDirs.remove(regionDir));
+      List<Path> allFamilyDirs=FSUtils.getFamilyDirs(fs,regionDir);
+      for (int j=0; j < family.length; ++j) {
+        final Path familyDir=new Path(regionDir,family[j]);
+        if (hasFamilyDirs) {
+          assertTrue(family[j] + " family dir does not exist",fs.exists(familyDir));
+          assertTrue(allFamilyDirs.remove(familyDir));
+        }
+ else {
+          if (!fs.exists(familyDir)) {
+            LOG.warn(family[j] + " family dir does not exist");
+          }
+          allFamilyDirs.remove(familyDir);
+        }
+      }
+      assertTrue("found extraneous families: " + allFamilyDirs,allFamilyDirs.isEmpty());
+    }
+    assertTrue("found extraneous regions: " + unwantedRegionDirs,unwantedRegionDirs.isEmpty());
+    LOG.debug("Table directory layout is as expected.");
+    assertTrue(MetaTableAccessor.tableExists(master.getConnection(),tableName));
+    assertEquals(regions.length,countMetaRegions(master,tableName));
+    TableDescriptor htd=master.getTableDescriptors().get(tableName);
+    assertTrue("table descriptor not found",htd != null);
+    for (int i=0; i < family.length; ++i) {
+      assertTrue("family not found " + family[i],htd.getColumnFamily(Bytes.toBytes(family[i])) != null);
+    }
+    assertEquals(family.length,htd.getColumnFamilyCount());
+  }
+  public static void validateTableDeletion(  final HMaster master,  final TableName tableName) throws IOException {
+    final FileSystem fs=master.getMasterFileSystem().getFileSystem();
+    final Path tableDir=FSUtils.getTableDir(master.getMasterFileSystem().getRootDir(),tableName);
+    assertFalse(fs.exists(tableDir));
+    assertFalse(MetaTableAccessor.tableExists(master.getConnection(),tableName));
+    assertEquals(0,countMetaRegions(master,tableName));
+    assertTrue("found htd of deleted table",master.getTableDescriptors().get(tableName) == null);
+  }
+  private static int countMetaRegions(  final HMaster master,  final TableName tableName) throws IOException {
+    final AtomicInteger actualRegCount=new AtomicInteger(0);
+    final MetaTableAccessor.Visitor visitor=new MetaTableAccessor.Visitor(){
+      @Override public boolean visit(      Result rowResult) throws IOException {
+        RegionLocations list=MetaTableAccessor.getRegionLocations(rowResult);
+        if (list == null) {
+          LOG.warn("No serialized RegionInfo in " + rowResult);
+          return true;
+        }
+        HRegionLocation l=list.getRegionLocation();
+        if (l == null) {
+          return true;
+        }
+        if (!l.getRegionInfo().getTable().equals(tableName)) {
+          return false;
+        }
+        if (l.getRegionInfo().isOffline() || l.getRegionInfo().isSplit())         return true;
+        HRegionLocation[] locations=list.getRegionLocations();
+        for (        HRegionLocation location : locations) {
+          if (location == null)           continue;
+          ServerName serverName=location.getServerName();
+          if (serverName != null && serverName.getHostAndPort() != null) {
+            actualRegCount.incrementAndGet();
+          }
+        }
+        return true;
+      }
+    }
+;
+    MetaTableAccessor.scanMetaForTableRegions(master.getConnection(),visitor,tableName);
+    return actualRegCount.get();
+  }
+  public static void validateTableIsEnabled(  final HMaster master,  final TableName tableName) throws IOException {
+    TableStateManager tsm=master.getTableStateManager();
+    assertTrue(tsm.getTableState(tableName).getState().equals(TableState.State.ENABLED));
+  }
+  public static void validateTableIsDisabled(  final HMaster master,  final TableName tableName) throws IOException {
+    TableStateManager tsm=master.getTableStateManager();
+    assertTrue(tsm.getTableState(tableName).getState().equals(TableState.State.DISABLED));
+  }
+  public static void validateColumnFamilyAddition(  final HMaster master,  final TableName tableName,  final String family) throws IOException {
+    TableDescriptor htd=master.getTableDescriptors().get(tableName);
+    assertTrue(htd != null);
+    assertTrue(htd.hasColumnFamily(family.getBytes()));
+  }
+  public static void validateColumnFamilyDeletion(  final HMaster master,  final TableName tableName,  final String family) throws IOException {
+    TableDescriptor htd=master.getTableDescriptors().get(tableName);
+    assertTrue(htd != null);
+    assertFalse(htd.hasColumnFamily(family.getBytes()));
+    final FileSystem fs=master.getMasterFileSystem().getFileSystem();
+    final Path tableDir=FSUtils.getTableDir(master.getMasterFileSystem().getRootDir(),tableName);
+    for (    Path regionDir : FSUtils.getRegionDirs(fs,tableDir)) {
+      final Path familyDir=new Path(regionDir,family);
+      assertFalse(family + " family dir should not exist",fs.exists(familyDir));
+    }
+  }
+  public static void validateColumnFamilyModification(  final HMaster master,  final TableName tableName,  final String family,  ColumnFamilyDescriptor columnDescriptor) throws IOException {
+    TableDescriptor htd=master.getTableDescriptors().get(tableName);
+    assertTrue(htd != null);
+    ColumnFamilyDescriptor hcfd=htd.getColumnFamily(family.getBytes());
+    assertEquals(0,ColumnFamilyDescriptor.COMPARATOR.compare(hcfd,columnDescriptor));
+  }
+  public static void loadData(  final Connection connection,  final TableName tableName,  int rows,  final byte[][] splitKeys,  final String... sfamilies) throws IOException {
+    byte[][] families=new byte[sfamilies.length][];
+    for (int i=0; i < families.length; ++i) {
+      families[i]=Bytes.toBytes(sfamilies[i]);
+    }
+    BufferedMutator mutator=connection.getBufferedMutator(tableName);
+    assertTrue(rows >= splitKeys.length);
+    for (    byte[] k : splitKeys) {
+      byte[] value=Bytes.add(Bytes.toBytes(System.currentTimeMillis()),k);
+      byte[] key=Bytes.add(k,Bytes.toBytes(MD5Hash.getMD5AsHex(value)));
+      mutator.mutate(createPut(families,key,value));
+      rows--;
+    }
+    while (rows-- > 0) {
+      byte[] value=Bytes.add(Bytes.toBytes(System.currentTimeMillis()),Bytes.toBytes(rows));
+      byte[] key=Bytes.toBytes(MD5Hash.getMD5AsHex(value));
+      mutator.mutate(createPut(families,key,value));
+    }
+    mutator.flush();
+  }
+  private static Put createPut(  final byte[][] families,  final byte[] key,  final byte[] value){
+    byte[] q=Bytes.toBytes("q");
+    Put put=new Put(key);
+    put.setDurability(Durability.SKIP_WAL);
+    for (    byte[] family : families) {
+      put.addColumn(family,q,value);
+    }
+    return put;
+  }
+  public static long generateNonceGroup(  final HMaster master){
+    return master.getClusterConnection().getNonceGenerator().getNonceGroup();
+  }
+  public static long generateNonce(  final HMaster master){
+    return master.getClusterConnection().getNonceGenerator().newNonce();
+  }
+  /** 
+ * Run through all procedure flow states TWICE while also restarting procedure executor at each step; i.e force a reread of procedure store. <p>It does <ol><li>Execute step N - kill the executor before store update <li>Restart executor/store <li>Execute step N - and then save to store </ol> <p>This is a good test for finding state that needs persisting and steps that are not idempotent. Use this version of the test when a procedure executes all flow steps from start to finish.
+ * @see #testRecoveryAndDoubleExecution(ProcedureExecutor,long)
+ */
+  public static void testRecoveryAndDoubleExecution(  final ProcedureExecutor<MasterProcedureEnv> procExec,  final long procId,  final int lastStep,  final boolean expectExecRunning) throws Exception {
+    ProcedureTestingUtility.waitProcedure(procExec,procId);
+    assertEquals(false,procExec.isRunning());
+    Procedure<?> proc=procExec.getProcedure(procId);
+    int stepNum=proc instanceof StateMachineProcedure ? ((StateMachineProcedure)proc).getCurrentStateId() : 0;
+    for (; ; ) {
+      if (stepNum == lastStep) {
+        break;
+      }
+      LOG.info("Restart " + stepNum + " exec state="+ proc);
+      ProcedureTestingUtility.assertProcNotYetCompleted(procExec,procId);
+      restartMasterProcedureExecutor(procExec);
+      ProcedureTestingUtility.waitProcedure(procExec,procId);
+      proc=procExec.getProcedure(procId);
+      stepNum=proc instanceof StateMachineProcedure ? ((StateMachineProcedure)proc).getCurrentStateId() : stepNum + 1;
+    }
+    assertEquals(expectExecRunning,procExec.isRunning());
+  }
+  /** 
+ * Run through all procedure flow states TWICE while also restarting procedure executor at each step; i.e force a reread of procedure store. <p>It does <ol><li>Execute step N - kill the executor before store update <li>Restart executor/store <li>Executes hook for each step twice <li>Execute step N - and then save to store </ol> <p>This is a good test for finding state that needs persisting and steps that are not idempotent. Use this version of the test when the order in which flow steps are executed is not start to finish; where the procedure may vary the flow steps dependent on circumstance found.
+ * @see #testRecoveryAndDoubleExecution(ProcedureExecutor,long,int,boolean)
+ */
+  public static void testRecoveryAndDoubleExecution(  final ProcedureExecutor<MasterProcedureEnv> procExec,  final long procId,  final StepHook hook) throws Exception {
+    ProcedureTestingUtility.waitProcedure(procExec,procId);
+    assertEquals(false,procExec.isRunning());
+    for (int i=0; !procExec.isFinished(procId); ++i) {
+      LOG.info("Restart " + i + " exec state="+ procExec.getProcedure(procId));
+      if (hook != null) {
+        assertTrue(hook.execute(i));
+      }
+      restartMasterProcedureExecutor(procExec);
+      ProcedureTestingUtility.waitProcedure(procExec,procId);
+    }
+    assertEquals(true,procExec.isRunning());
+    ProcedureTestingUtility.assertProcNotFailed(procExec,procId);
+  }
+  public static void testRecoveryAndDoubleExecution(  final ProcedureExecutor<MasterProcedureEnv> procExec,  final long procId) throws Exception {
+    testRecoveryAndDoubleExecution(procExec,procId,null);
+  }
+  /** 
+ * Hook which will be executed on each step
+ */
+public interface StepHook {
+    /** 
+ * @param step Step no. at which this will be executed
+ * @return false if test should fail otherwise true
+ * @throws IOException
+ */
+    boolean execute(    int step) throws IOException ;
+  }
+  /** 
+ * Execute the procedure up to "lastStep" and then the ProcedureExecutor is restarted and an abort() is injected. If the procedure implement abort() this should result in rollback being triggered. Each rollback step is called twice, by restarting the executor after every step. At the end of this call the procedure should be finished and rolledback. This method assert on the procedure being terminated with an AbortException.
+ */
+  public static void testRollbackAndDoubleExecution(  final ProcedureExecutor<MasterProcedureEnv> procExec,  final long procId,  final int lastStep) throws Exception {
+    testRollbackAndDoubleExecution(procExec,procId,lastStep,false);
+  }
+  public static void testRollbackAndDoubleExecution(  final ProcedureExecutor<MasterProcedureEnv> procExec,  final long procId,  final int lastStep,  boolean waitForAsyncProcs) throws Exception {
+    testRecoveryAndDoubleExecution(procExec,procId,lastStep,false);
+    InjectAbortOnLoadListener abortListener=new InjectAbortOnLoadListener(procExec);
+    abortListener.addProcId(procId);
+    procExec.registerListener(abortListener);
+    try {
+      for (int i=0; !procExec.isFinished(procId); ++i) {
+        LOG.info("Restart " + i + " rollback state: "+ procExec.getProcedure(procId));
+        ProcedureTestingUtility.assertProcNotYetCompleted(procExec,procId);
+        restartMasterProcedureExecutor(procExec);
+        ProcedureTestingUtility.waitProcedure(procExec,procId);
+      }
+    }
+  finally {
+      assertTrue(procExec.unregisterListener(abortListener));
+    }
+    if (waitForAsyncProcs) {
+      ProcedureTestingUtility.setKillAndToggleBeforeStoreUpdate(procExec,false);
+      for (int i=0; i < 3; i++) {
+        if (!procExec.isRunning()) {
+          LOG.warn("ProcedureExecutor not running, may have been stopped by pending procedure due" + " to KillAndToggleBeforeStoreUpdate flag.");
+          restartMasterProcedureExecutor(procExec);
+          break;
+        }
+        Thread.sleep(1000);
+      }
+      ProcedureTestingUtility.waitNoProcedureRunning(procExec);
+    }
+    assertEquals(true,procExec.isRunning());
+    ProcedureTestingUtility.assertIsAbortException(procExec.getResult(procId));
+  }
+  /** 
+ * Execute the procedure up to "lastStep" and then the ProcedureExecutor is restarted and an abort() is injected. If the procedure implement abort() this should result in rollback being triggered. At the end of this call the procedure should be finished and rolledback. This method assert on the procedure being terminated with an AbortException.
+ */
+  public static void testRollbackRetriableFailure(  final ProcedureExecutor<MasterProcedureEnv> procExec,  final long procId,  final int lastStep) throws Exception {
+    testRecoveryAndDoubleExecution(procExec,procId,lastStep,false);
+    testRestartWithAbort(procExec,procId);
+    assertEquals(true,procExec.isRunning());
+    ProcedureTestingUtility.assertIsAbortException(procExec.getResult(procId));
+  }
+  /** 
+ * Restart the ProcedureExecutor and inject an abort to the specified procedure. If the procedure implement abort() this should result in rollback being triggered. At the end of this call the procedure should be finished and rolledback, if abort is implemnted
+ */
+  public static void testRestartWithAbort(  ProcedureExecutor<MasterProcedureEnv> procExec,  long procId) throws Exception {
+    ProcedureTestingUtility.setKillAndToggleBeforeStoreUpdate(procExec,false);
+    InjectAbortOnLoadListener abortListener=new InjectAbortOnLoadListener(procExec);
+    abortListener.addProcId(procId);
+    procExec.registerListener(abortListener);
+    try {
+      ProcedureTestingUtility.assertProcNotYetCompleted(procExec,procId);
+      LOG.info("Restart and rollback procId=" + procId);
+      restartMasterProcedureExecutor(procExec);
+      ProcedureTestingUtility.waitProcedure(procExec,procId);
+    }
+  finally {
+      assertTrue(procExec.unregisterListener(abortListener));
+    }
+  }
+public static class InjectAbortOnLoadListener implements ProcedureExecutor.ProcedureExecutorListener {
+    private final ProcedureExecutor<MasterProcedureEnv> procExec;
+    private TreeSet<Long> procsToAbort=null;
+    public InjectAbortOnLoadListener(    final ProcedureExecutor<MasterProcedureEnv> procExec){
+      this.procExec=procExec;
+    }
+    public void addProcId(    long procId){
+      if (procsToAbort == null) {
+        procsToAbort=new TreeSet<>();
+      }
+      procsToAbort.add(procId);
+    }
+    @Override public void procedureLoaded(    long procId){
+      if (procsToAbort != null && !procsToAbort.contains(procId)) {
+        return;
+      }
+      procExec.abort(procId);
+    }
+    @Override public void procedureAdded(    long procId){
+    }
+    @Override public void procedureFinished(    long procId){
+    }
+  }
+}

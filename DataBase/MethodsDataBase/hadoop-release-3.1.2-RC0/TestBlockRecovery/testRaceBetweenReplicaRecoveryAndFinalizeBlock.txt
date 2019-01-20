@@ -1,0 +1,56 @@
+/** 
+ * Test to verify the race between finalizeBlock and Lease recovery
+ * @throws Exception
+ */
+@Test(timeout=20000) public void testRaceBetweenReplicaRecoveryAndFinalizeBlock() throws Exception {
+  tearDown();
+  Configuration conf=new HdfsConfiguration();
+  conf.set(DFSConfigKeys.DFS_DATANODE_XCEIVER_STOP_TIMEOUT_MILLIS_KEY,"1000");
+  MiniDFSCluster cluster=new MiniDFSCluster.Builder(conf).numDataNodes(1).build();
+  try {
+    cluster.waitClusterUp();
+    DistributedFileSystem fs=cluster.getFileSystem();
+    Path path=new Path("/test");
+    FSDataOutputStream out=fs.create(path);
+    out.writeBytes("data");
+    out.hsync();
+    List<LocatedBlock> blocks=DFSTestUtil.getAllBlocks(fs.open(path));
+    final LocatedBlock block=blocks.get(0);
+    final DataNode dataNode=cluster.getDataNodes().get(0);
+    final AtomicBoolean recoveryInitResult=new AtomicBoolean(true);
+    Thread recoveryThread=new Thread(){
+      @Override public void run(){
+        try {
+          DatanodeInfo[] locations=block.getLocations();
+          final RecoveringBlock recoveringBlock=new RecoveringBlock(block.getBlock(),locations,block.getBlock().getGenerationStamp() + 1);
+          try (AutoCloseableLock lock=dataNode.data.acquireDatasetLock()){
+            Thread.sleep(2000);
+            dataNode.initReplicaRecovery(recoveringBlock);
+          }
+         }
+ catch (        Exception e) {
+          recoveryInitResult.set(false);
+        }
+      }
+    }
+;
+    recoveryThread.start();
+    try {
+      out.close();
+    }
+ catch (    IOException e) {
+      Assert.assertTrue("Writing should fail",e.getMessage().contains("are bad. Aborting..."));
+    }
+ finally {
+      recoveryThread.join();
+    }
+    Assert.assertTrue("Recovery should be initiated successfully",recoveryInitResult.get());
+    dataNode.updateReplicaUnderRecovery(block.getBlock(),block.getBlock().getGenerationStamp() + 1,block.getBlock().getBlockId(),block.getBlockSize());
+  }
+  finally {
+    if (null != cluster) {
+      cluster.shutdown();
+      cluster=null;
+    }
+  }
+}

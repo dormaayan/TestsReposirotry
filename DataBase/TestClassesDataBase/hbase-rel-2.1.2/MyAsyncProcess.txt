@@ -1,0 +1,70 @@
+static class MyAsyncProcess extends AsyncProcess {
+  final AtomicInteger nbMultiResponse=new AtomicInteger();
+  final AtomicInteger nbActions=new AtomicInteger();
+  public List<AsyncRequestFuture> allReqs=new ArrayList<>();
+  public AtomicInteger callsCt=new AtomicInteger();
+  private long previousTimeout=-1;
+  final ExecutorService service;
+  @Override protected <Res>AsyncRequestFutureImpl<Res> createAsyncRequestFuture(  AsyncProcessTask task,  List<Action> actions,  long nonceGroup){
+    AsyncProcessTask wrap=new AsyncProcessTask(task){
+      @Override public TableName getTableName(){
+        return DUMMY_TABLE;
+      }
+    }
+;
+    AsyncRequestFutureImpl<Res> r=new MyAsyncRequestFutureImpl<>(wrap,actions,nonceGroup,this);
+    allReqs.add(r);
+    return r;
+  }
+  public MyAsyncProcess(  ClusterConnection hc,  Configuration conf){
+    super(hc,conf,new RpcRetryingCallerFactory(conf),new RpcControllerFactory(conf));
+    service=Executors.newFixedThreadPool(5);
+  }
+  public MyAsyncProcess(  ClusterConnection hc,  Configuration conf,  AtomicInteger nbThreads){
+    super(hc,conf,new RpcRetryingCallerFactory(conf),new RpcControllerFactory(conf));
+    service=new ThreadPoolExecutor(1,20,60,TimeUnit.SECONDS,new SynchronousQueue<>(),new CountingThreadFactory(nbThreads));
+  }
+  public <CResult>AsyncRequestFuture submit(  ExecutorService pool,  TableName tableName,  List<? extends Row> rows,  boolean atLeastOne,  Batch.Callback<CResult> callback,  boolean needResults) throws InterruptedIOException {
+    AsyncProcessTask task=AsyncProcessTask.newBuilder(callback).setPool(pool == null ? service : pool).setTableName(tableName).setRowAccess(rows).setSubmittedRows(atLeastOne ? SubmittedRows.AT_LEAST_ONE : SubmittedRows.NORMAL).setNeedResults(needResults).setRpcTimeout(RPC_TIMEOUT).setOperationTimeout(OPERATION_TIMEOUT).build();
+    return submit(task);
+  }
+  public <CResult>AsyncRequestFuture submit(  TableName tableName,  final List<? extends Row> rows,  boolean atLeastOne,  Batch.Callback<CResult> callback,  boolean needResults) throws InterruptedIOException {
+    return submit(null,tableName,rows,atLeastOne,callback,needResults);
+  }
+  @Override public <Res>AsyncRequestFuture submit(  AsyncProcessTask<Res> task) throws InterruptedIOException {
+    previousTimeout=task.getRpcTimeout();
+    AsyncProcessTask<Res> wrap=new AsyncProcessTask<Res>(task){
+      @Override public boolean getNeedResults(){
+        return true;
+      }
+    }
+;
+    return super.submit(wrap);
+  }
+  @Override protected RpcRetryingCaller<AbstractResponse> createCaller(  CancellableRegionServerCallable callable,  int rpcTimeout){
+    callsCt.incrementAndGet();
+    MultiServerCallable callable1=(MultiServerCallable)callable;
+    final MultiResponse mr=createMultiResponse(callable1.getMulti(),nbMultiResponse,nbActions,new ResponseGenerator(){
+      @Override public void addResponse(      MultiResponse mr,      byte[] regionName,      Action a){
+        if (Arrays.equals(FAILS,a.getAction().getRow())) {
+          mr.add(regionName,a.getOriginalIndex(),failure);
+        }
+ else {
+          mr.add(regionName,a.getOriginalIndex(),success);
+        }
+      }
+    }
+);
+    return new RpcRetryingCallerImpl<AbstractResponse>(100,500,10,9){
+      @Override public AbstractResponse callWithoutRetries(      RetryingCallable<AbstractResponse> callable,      int callTimeout) throws IOException, RuntimeException {
+        try {
+          Thread.sleep(1000);
+        }
+ catch (        InterruptedException e) {
+        }
+        return mr;
+      }
+    }
+;
+  }
+}

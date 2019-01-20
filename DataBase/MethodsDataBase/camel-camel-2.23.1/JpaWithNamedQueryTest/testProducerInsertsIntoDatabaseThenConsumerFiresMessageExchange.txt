@@ -1,0 +1,66 @@
+@Test public void testProducerInsertsIntoDatabaseThenConsumerFiresMessageExchange() throws Exception {
+  transactionTemplate.execute(new TransactionCallback<Object>(){
+    public Object doInTransaction(    TransactionStatus status){
+      entityManager.joinTransaction();
+      entityManager.createQuery("delete from " + entityName).executeUpdate();
+      MultiSteps dummy=new MultiSteps("cheese");
+      dummy.setStep(4);
+      entityManager.persist(dummy);
+      return null;
+    }
+  }
+);
+  List<?> results=entityManager.createQuery(queryText).getResultList();
+  assertEquals("Should have no results: " + results,0,results.size());
+  template.send(endpoint,new Processor(){
+    public void process(    Exchange exchange){
+      exchange.getIn().setBody(new MultiSteps("foo@bar.com"));
+    }
+  }
+);
+  results=entityManager.createQuery(queryText).getResultList();
+  assertEquals("Should have results: " + results,1,results.size());
+  MultiSteps mail=(MultiSteps)results.get(0);
+  assertEquals("address property","foo@bar.com",mail.getAddress());
+  consumer=endpoint.createConsumer(new Processor(){
+    public void process(    Exchange e){
+      LOG.info("Received exchange: " + e.getIn());
+      receivedExchange=e;
+      latch.countDown();
+    }
+  }
+);
+  consumer.start();
+  assertTrue(latch.await(50,TimeUnit.SECONDS));
+  assertReceivedResult(receivedExchange);
+  Thread.sleep(2000);
+  transactionTemplate.execute(new TransactionCallback<Object>(){
+    public Object doInTransaction(    TransactionStatus status){
+      EntityManager entityManager2=receivedExchange.getIn().getHeader(JpaConstants.ENTITY_MANAGER,EntityManager.class);
+      if (!entityManager2.isOpen()) {
+        entityManager2=endpoint.getEntityManagerFactory().createEntityManager();
+      }
+      entityManager2.joinTransaction();
+      List<?> rows=entityManager2.createQuery("select x from MultiSteps x").getResultList();
+      assertEquals("Number of entities: " + rows,2,rows.size());
+      int counter=1;
+      for (      Object rowObj : rows) {
+        assertTrue("Rows are not instances of MultiSteps",rowObj instanceof MultiSteps);
+        final MultiSteps row=(MultiSteps)rowObj;
+        LOG.info("entity: " + counter++ + " = "+ row);
+        if (row.getAddress().equals("foo@bar.com")) {
+          LOG.info("Found updated row: " + row);
+          assertEquals("Updated row step for: " + row,getUpdatedStepValue(),row.getStep());
+        }
+ else {
+          assertEquals("dummy row step for: " + row,4,row.getStep());
+          assertEquals("Not the expected row: " + row,"cheese",row.getAddress());
+        }
+      }
+      return null;
+    }
+  }
+);
+  JpaConsumer jpaConsumer=(JpaConsumer)consumer;
+  assertURIQueryOption(jpaConsumer);
+}

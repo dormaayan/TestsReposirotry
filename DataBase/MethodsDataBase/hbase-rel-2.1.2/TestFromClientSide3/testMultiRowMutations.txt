@@ -1,0 +1,73 @@
+@Test public void testMultiRowMutations() throws Exception, Throwable {
+  final TableName tableName=TableName.valueOf(name.getMethodName());
+  HTableDescriptor desc=new HTableDescriptor(tableName);
+  desc.addCoprocessor(MultiRowMutationEndpoint.class.getName());
+  desc.addCoprocessor(WaitingForMultiMutationsObserver.class.getName());
+  desc.setConfiguration("hbase.rowlock.wait.duration",String.valueOf(5000));
+  desc.addFamily(new HColumnDescriptor(FAMILY));
+  TEST_UTIL.getAdmin().createTable(desc);
+  Configuration copy=new Configuration(TEST_UTIL.getConfiguration());
+  copy.setInt(HConstants.HBASE_CLIENT_RETRIES_NUMBER,2);
+  try (Connection con=ConnectionFactory.createConnection(copy)){
+    byte[] row=Bytes.toBytes("ROW-0");
+    byte[] rowLocked=Bytes.toBytes("ROW-1");
+    byte[] value0=Bytes.toBytes("VALUE-0");
+    byte[] value1=Bytes.toBytes("VALUE-1");
+    byte[] value2=Bytes.toBytes("VALUE-2");
+    assertNoLocks(tableName);
+    ExecutorService putService=Executors.newSingleThreadExecutor();
+    putService.execute(() -> {
+      try (Table table=con.getTable(tableName)){
+        Put put0=new Put(rowLocked);
+        put0.addColumn(FAMILY,QUALIFIER,value0);
+        table.put(put0);
+      }
+ catch (      IOException ex) {
+        throw new RuntimeException(ex);
+      }
+    }
+);
+    ExecutorService cpService=Executors.newSingleThreadExecutor();
+    cpService.execute(() -> {
+      boolean threw;
+      Put put1=new Put(row);
+      Put put2=new Put(rowLocked);
+      put1.addColumn(FAMILY,QUALIFIER,value1);
+      put2.addColumn(FAMILY,QUALIFIER,value2);
+      try (Table table=con.getTable(tableName)){
+        MultiRowMutationProtos.MutateRowsRequest request=MultiRowMutationProtos.MutateRowsRequest.newBuilder().addMutationRequest(org.apache.hadoop.hbase.protobuf.ProtobufUtil.toMutation(org.apache.hadoop.hbase.protobuf.generated.ClientProtos.MutationProto.MutationType.PUT,put1)).addMutationRequest(org.apache.hadoop.hbase.protobuf.ProtobufUtil.toMutation(org.apache.hadoop.hbase.protobuf.generated.ClientProtos.MutationProto.MutationType.PUT,put2)).build();
+        table.coprocessorService(MultiRowMutationProtos.MultiRowMutationService.class,ROW,ROW,(        MultiRowMutationProtos.MultiRowMutationService exe) -> {
+          ServerRpcController controller=new ServerRpcController();
+          CoprocessorRpcUtils.BlockingRpcCallback<MultiRowMutationProtos.MutateRowsResponse> rpcCallback=new CoprocessorRpcUtils.BlockingRpcCallback<>();
+          exe.mutateRows(controller,request,rpcCallback);
+          return rpcCallback.get();
+        }
+);
+        threw=false;
+      }
+ catch (      Throwable ex) {
+        threw=true;
+      }
+      if (!threw) {
+        fail("This cp should fail because the target lock is blocked by previous put");
+      }
+    }
+);
+    cpService.shutdown();
+    cpService.awaitTermination(Long.MAX_VALUE,TimeUnit.DAYS);
+    WaitingForMultiMutationsObserver observer=find(tableName,WaitingForMultiMutationsObserver.class);
+    observer.latch.countDown();
+    putService.shutdown();
+    putService.awaitTermination(Long.MAX_VALUE,TimeUnit.DAYS);
+    try (Table table=con.getTable(tableName)){
+      Get g0=new Get(row);
+      Get g1=new Get(rowLocked);
+      Result r0=table.get(g0);
+      Result r1=table.get(g1);
+      assertTrue(r0.isEmpty());
+      assertFalse(r1.isEmpty());
+      assertTrue(Bytes.equals(r1.getValue(FAMILY,QUALIFIER),value0));
+    }
+     assertNoLocks(tableName);
+  }
+ }

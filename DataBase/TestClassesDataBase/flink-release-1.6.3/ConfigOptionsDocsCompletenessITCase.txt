@@ -1,0 +1,164 @@
+/** 
+ * This test verifies that all  {@link ConfigOption ConfigOptions} in the configured{@link ConfigOptionsDocGenerator#LOCATIONS locations} are documented and well-defined (i.e. no 2 options exist forthe same key with different descriptions/default values), and that the documentation does not refer to non-existent options.
+ */
+public class ConfigOptionsDocsCompletenessITCase {
+  private static final Formatter htmlFormatter=new HtmlFormatter();
+  @Test public void testCommonSectionCompleteness() throws IOException, ClassNotFoundException {
+    Map<String,DocumentedOption> documentedOptions=parseDocumentedCommonOptions();
+    Map<String,ExistingOption> existingOptions=findExistingOptions(optionWithMetaInfo -> optionWithMetaInfo.field.getAnnotation(Documentation.CommonOption.class) != null);
+    compareDocumentedAndExistingOptions(documentedOptions,existingOptions);
+  }
+  @Test public void testFullReferenceCompleteness() throws IOException, ClassNotFoundException {
+    Map<String,DocumentedOption> documentedOptions=parseDocumentedOptions();
+    Map<String,ExistingOption> existingOptions=findExistingOptions(ignored -> true);
+    compareDocumentedAndExistingOptions(documentedOptions,existingOptions);
+  }
+  private static void compareDocumentedAndExistingOptions(  Map<String,DocumentedOption> documentedOptions,  Map<String,ExistingOption> existingOptions){
+    final Collection<String> problems=new ArrayList<>(0);
+    existingOptions.forEach((key,supposedState) -> {
+      DocumentedOption documentedState=documentedOptions.remove(key);
+      if (documentedState == null) {
+        problems.add("Option " + supposedState.key + " in "+ supposedState.containingClass+ " is not documented.");
+      }
+ else       if (!supposedState.defaultValue.equals(documentedState.defaultValue)) {
+        problems.add("Documented default of " + supposedState.key + " in "+ supposedState.containingClass+ " is outdated. Expected: "+ supposedState.defaultValue+ " Actual: "+ documentedState.defaultValue);
+      }
+ else       if (!supposedState.description.equals(documentedState.description)) {
+        problems.add("Documented description of " + supposedState.key + " in "+ supposedState.containingClass+ " is outdated.");
+      }
+    }
+);
+    if (!documentedOptions.isEmpty()) {
+      for (      DocumentedOption documentedOption : documentedOptions.values()) {
+        problems.add("Documented option " + documentedOption.key + " does not exist.");
+      }
+    }
+    if (!problems.isEmpty()) {
+      StringBuilder sb=new StringBuilder("Documentation is outdated, please regenerate it according to the" + " instructions in flink-docs/README.md.");
+      sb.append(System.lineSeparator());
+      sb.append("\tProblems:");
+      for (      String problem : problems) {
+        sb.append(System.lineSeparator());
+        sb.append("\t\t");
+        sb.append(problem);
+      }
+      Assert.fail(sb.toString());
+    }
+  }
+  private static Map<String,DocumentedOption> parseDocumentedCommonOptions() throws IOException {
+    Path commonSection=Paths.get(System.getProperty("rootDir"),"docs","_includes","generated",COMMON_SECTION_FILE_NAME);
+    return parseDocumentedOptionsFromFile(commonSection).stream().collect(Collectors.toMap(option -> option.key,option -> option,(option1,option2) -> {
+      if (option1.equals(option2)) {
+        return option1;
+      }
+ else {
+        if (!option1.defaultValue.equals(option2.defaultValue)) {
+          throw new AssertionError("Documentation contains distinct defaults for " + option1.key + " in "+ option1.containingFile+ " and "+ option2.containingFile+ '.');
+        }
+ else {
+          throw new AssertionError("Documentation contains distinct descriptions for " + option1.key + " in "+ option1.containingFile+ " and "+ option2.containingFile+ '.');
+        }
+      }
+    }
+));
+  }
+  private static Map<String,DocumentedOption> parseDocumentedOptions() throws IOException {
+    Path includeFolder=Paths.get(System.getProperty("rootDir"),"docs","_includes","generated").toAbsolutePath();
+    return Files.list(includeFolder).filter(path -> path.getFileName().toString().contains("configuration")).flatMap(file -> {
+      try {
+        return parseDocumentedOptionsFromFile(file).stream();
+      }
+ catch (      IOException ignored) {
+        return Stream.empty();
+      }
+    }
+).collect(Collectors.toMap(option -> option.key,option -> option,(option1,option2) -> {
+      if (option1.equals(option2)) {
+        return option1;
+      }
+ else {
+        if (!option1.defaultValue.equals(option2.defaultValue)) {
+          throw new AssertionError("Documentation contains distinct defaults for " + option1.key + " in "+ option1.containingFile+ " and "+ option2.containingFile+ '.');
+        }
+ else {
+          throw new AssertionError("Documentation contains distinct descriptions for " + option1.key + " in "+ option1.containingFile+ " and "+ option2.containingFile+ '.');
+        }
+      }
+    }
+));
+  }
+  private static Collection<DocumentedOption> parseDocumentedOptionsFromFile(  Path file) throws IOException {
+    Document document=Jsoup.parse(file.toFile(),StandardCharsets.UTF_8.name());
+    document.outputSettings().prettyPrint(false);
+    return document.getElementsByTag("table").stream().map(element -> element.getElementsByTag("tbody").get(0)).flatMap(element -> element.getElementsByTag("tr").stream()).map(tableRow -> {
+      String key=tableRow.child(0).text();
+      String defaultValue=tableRow.child(1).text();
+      String description=tableRow.child(2).childNodes().stream().map(Object::toString).collect(Collectors.joining());
+      return new DocumentedOption(key,defaultValue,description,file.getName(file.getNameCount() - 1));
+    }
+).collect(Collectors.toList());
+  }
+  private static Map<String,ExistingOption> findExistingOptions(  Predicate<ConfigOptionsDocGenerator.OptionWithMetaInfo> predicate) throws IOException, ClassNotFoundException {
+    Map<String,ExistingOption> existingOptions=new HashMap<>(32);
+    for (    OptionsClassLocation location : LOCATIONS) {
+      processConfigOptions(System.getProperty("rootDir"),location.getModule(),location.getPackage(),DEFAULT_PATH_PREFIX,optionsClass -> {
+        List<ConfigOptionsDocGenerator.OptionWithMetaInfo> configOptions=extractConfigOptions(optionsClass);
+        for (        ConfigOptionsDocGenerator.OptionWithMetaInfo option : configOptions) {
+          if (predicate.test(option)) {
+            String key=option.option.key();
+            String defaultValue=stringifyDefault(option);
+            String description=htmlFormatter.format(option.option.description());
+            ExistingOption duplicate=existingOptions.put(key,new ExistingOption(key,defaultValue,description,optionsClass));
+            if (duplicate != null) {
+              if (!(duplicate.description.equals(description))) {
+                throw new AssertionError("Ambiguous option " + key + " due to distinct descriptions.");
+              }
+ else               if (!duplicate.defaultValue.equals(defaultValue)) {
+                throw new AssertionError("Ambiguous option " + key + " due to distinct default values ("+ defaultValue+ " vs "+ duplicate.defaultValue+ ").");
+              }
+            }
+          }
+        }
+      }
+);
+    }
+    return existingOptions;
+  }
+private static final class ExistingOption extends Option {
+    private final Class<?> containingClass;
+    private ExistingOption(    String key,    String defaultValue,    String description,    Class<?> containingClass){
+      super(key,defaultValue,description);
+      this.containingClass=containingClass;
+    }
+  }
+private static final class DocumentedOption extends Option {
+    private final Path containingFile;
+    private DocumentedOption(    String key,    String defaultValue,    String description,    Path containingFile){
+      super(key,defaultValue,description);
+      this.containingFile=containingFile;
+    }
+  }
+private abstract static class Option {
+    protected final String key;
+    protected final String defaultValue;
+    protected final String description;
+    private Option(    String key,    String defaultValue,    String description){
+      this.key=key;
+      this.defaultValue=defaultValue;
+      this.description=description;
+    }
+    @Override public int hashCode(){
+      return key.hashCode() + defaultValue.hashCode() + description.hashCode();
+    }
+    @Override public boolean equals(    Object obj){
+      if (!(obj instanceof Option)) {
+        return false;
+      }
+      Option other=(Option)obj;
+      return this.key.equals(other.key) && this.defaultValue.equals(other.defaultValue) && this.description.equals(other.description);
+    }
+    @Override public String toString(){
+      return "Option(key=" + key + ", default="+ defaultValue+ ", description="+ description+ ')';
+    }
+  }
+}

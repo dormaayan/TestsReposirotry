@@ -1,0 +1,71 @@
+@SuppressWarnings("deprecation") @Test public void testReplicaAndReplication() throws Exception {
+  HTableDescriptor hdt=HTU.createTableDescriptor("testReplicaAndReplication");
+  hdt.setRegionReplication(NB_SERVERS);
+  HColumnDescriptor fam=new HColumnDescriptor(row);
+  fam.setScope(HConstants.REPLICATION_SCOPE_GLOBAL);
+  hdt.addFamily(fam);
+  hdt.addCoprocessor(SlowMeCopro.class.getName());
+  HTU.getAdmin().createTable(hdt,HBaseTestingUtility.KEYS_FOR_HBA_CREATE_TABLE);
+  Configuration conf2=HBaseConfiguration.create(HTU.getConfiguration());
+  conf2.set(HConstants.HBASE_CLIENT_INSTANCE_ID,String.valueOf(-1));
+  conf2.set(HConstants.ZOOKEEPER_ZNODE_PARENT,"/2");
+  MiniZooKeeperCluster miniZK=HTU.getZkCluster();
+  HTU2=new HBaseTestingUtility(conf2);
+  HTU2.setZkCluster(miniZK);
+  HTU2.startMiniCluster(NB_SERVERS);
+  LOG.info("Setup second Zk");
+  HTU2.getAdmin().createTable(hdt,HBaseTestingUtility.KEYS_FOR_HBA_CREATE_TABLE);
+  ReplicationAdmin admin=new ReplicationAdmin(HTU.getConfiguration());
+  ReplicationPeerConfig rpc=new ReplicationPeerConfig();
+  rpc.setClusterKey(HTU2.getClusterKey());
+  admin.addPeer("2",rpc,null);
+  admin.close();
+  Put p=new Put(row);
+  p.addColumn(row,row,row);
+  final Table table=HTU.getConnection().getTable(hdt.getTableName());
+  table.put(p);
+  HTU.getAdmin().flush(table.getName());
+  LOG.info("Put & flush done on the first cluster. Now doing a get on the same cluster.");
+  Waiter.waitFor(HTU.getConfiguration(),1000,new Waiter.Predicate<Exception>(){
+    @Override public boolean evaluate() throws Exception {
+      try {
+        SlowMeCopro.cdl.set(new CountDownLatch(1));
+        Get g=new Get(row);
+        g.setConsistency(Consistency.TIMELINE);
+        Result r=table.get(g);
+        Assert.assertTrue(r.isStale());
+        return !r.isEmpty();
+      }
+  finally {
+        SlowMeCopro.cdl.get().countDown();
+        SlowMeCopro.sleepTime.set(0);
+      }
+    }
+  }
+);
+  table.close();
+  LOG.info("stale get on the first cluster done. Now for the second.");
+  final Table table2=HTU.getConnection().getTable(hdt.getTableName());
+  Waiter.waitFor(HTU.getConfiguration(),1000,new Waiter.Predicate<Exception>(){
+    @Override public boolean evaluate() throws Exception {
+      try {
+        SlowMeCopro.cdl.set(new CountDownLatch(1));
+        Get g=new Get(row);
+        g.setConsistency(Consistency.TIMELINE);
+        Result r=table2.get(g);
+        Assert.assertTrue(r.isStale());
+        return !r.isEmpty();
+      }
+  finally {
+        SlowMeCopro.cdl.get().countDown();
+        SlowMeCopro.sleepTime.set(0);
+      }
+    }
+  }
+);
+  table2.close();
+  HTU.getAdmin().disableTable(hdt.getTableName());
+  HTU.deleteTable(hdt.getTableName());
+  HTU2.getAdmin().disableTable(hdt.getTableName());
+  HTU2.deleteTable(hdt.getTableName());
+}

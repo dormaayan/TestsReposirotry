@@ -1,0 +1,139 @@
+public class ServicePoolAwareLeakyTest extends ContextTestSupport {
+  private static final String LEAKY_SIEVE_STABLE="leaky://sieve-stable";
+  private static final String LEAKY_SIEVE_TRANSIENT="leaky://sieve-transient";
+  /** 
+ * Component that provides leaks producers.
+ */
+private static class LeakySieveComponent extends DefaultComponent {
+    @Override protected Endpoint createEndpoint(    String uri,    String remaining,    Map<String,Object> parameters) throws Exception {
+      return new LeakySieveEndpoint(uri);
+    }
+  }
+  /** 
+ * Endpoint that provides leaky producers.
+ */
+private static class LeakySieveEndpoint extends DefaultEndpoint {
+    private final String uri;
+    LeakySieveEndpoint(    String uri){
+      this.uri=uri;
+    }
+    @Override public Producer createProducer() throws Exception {
+      return new LeakySieveProducer(this);
+    }
+    @Override public Consumer createConsumer(    Processor processor) throws Exception {
+      throw new UnsupportedOperationException();
+    }
+    @Override public boolean isSingleton(){
+      return true;
+    }
+    @Override protected String createEndpointUri(){
+      return uri;
+    }
+  }
+  /** 
+ * Leaky producer - implements  {@link ServicePoolAware}.
+ */
+private static class LeakySieveProducer extends DefaultProducer implements ServicePoolAware {
+    LeakySieveProducer(    Endpoint endpoint){
+      super(endpoint);
+    }
+    @Override public void process(    Exchange exchange) throws Exception {
+    }
+  }
+  @Override protected boolean useJmx(){
+    return true;
+  }
+  /** 
+ * Returns true if verification of state should be performed during the test as opposed to at the end.
+ */
+  public boolean isFailFast(){
+    return false;
+  }
+  /** 
+ * Returns true if during fast failure we should verify that the service pool remains in the started state.
+ */
+  public boolean isVerifyProducerServicePoolRemainsStarted(){
+    return false;
+  }
+  @Test public void testForMemoryLeak() throws Exception {
+    registerLeakyComponent();
+    final Map<String,AtomicLong> references=new HashMap<>();
+    context.addLifecycleStrategy(new LifecycleStrategySupport(){
+      @Override public void onServiceAdd(      CamelContext context,      Service service,      Route route){
+        if (service instanceof LeakySieveProducer) {
+          String key=((LeakySieveProducer)service).getEndpoint().getEndpointKey();
+          AtomicLong num=references.get(key);
+          if (num == null) {
+            num=new AtomicLong();
+            references.put(key,num);
+          }
+          num.incrementAndGet();
+        }
+      }
+      @Override public void onServiceRemove(      CamelContext context,      Service service,      Route route){
+        if (service instanceof LeakySieveProducer) {
+          String key=((LeakySieveProducer)service).getEndpoint().getEndpointKey();
+          AtomicLong num=references.get(key);
+          if (num == null) {
+            num=new AtomicLong();
+            references.put(key,num);
+          }
+          num.decrementAndGet();
+        }
+      }
+    }
+);
+    context.addRoutes(new RouteBuilder(){
+      @Override public void configure() throws Exception {
+        from("direct:sieve-transient").id("sieve-transient").to(LEAKY_SIEVE_TRANSIENT);
+        from("direct:sieve-stable").id("sieve-stable").to(LEAKY_SIEVE_STABLE);
+      }
+    }
+);
+    context.start();
+    for (int i=0; i < 1000; i++) {
+      ServiceSupport service=(ServiceSupport)context.getProducerServicePool();
+      assertEquals(ServiceStatus.Started,service.getStatus());
+      if (isFailFast()) {
+        assertEquals(2,context.getProducerServicePool().size());
+        assertEquals(1,references.get(LEAKY_SIEVE_TRANSIENT).get());
+        assertEquals(1,references.get(LEAKY_SIEVE_STABLE).get());
+      }
+      context.stopRoute("sieve-transient");
+      if (isFailFast()) {
+        assertEquals("Expected no service references to remain",0,references.get(LEAKY_SIEVE_TRANSIENT));
+      }
+      if (isFailFast()) {
+        if (isVerifyProducerServicePoolRemainsStarted()) {
+          assertEquals(ServiceStatus.Started,service.getStatus());
+        }
+        assertEquals("Expected one stable producer to remain pooled",1,context.getProducerServicePool().size());
+        assertEquals("Expected one stable producer to remain as service",1,references.get(LEAKY_SIEVE_STABLE).get());
+      }
+      sendBody("direct:sieve-stable","");
+      if (isFailFast()) {
+        if (isVerifyProducerServicePoolRemainsStarted()) {
+          assertEquals(ServiceStatus.Started,service.getStatus());
+        }
+        assertEquals("Expected only stable producer in pool",1,context.getProducerServicePool().size());
+        assertEquals("Expected no references to transient producer",0,references.get(LEAKY_SIEVE_TRANSIENT).get());
+        assertEquals("Expected reference to stable producer",1,references.get(LEAKY_SIEVE_STABLE).get());
+      }
+      context.startRoute("sieve-transient");
+      assertEquals(ServiceStatus.Started,service.getStatus());
+      if (isFailFast()) {
+        assertEquals("Expected both producers in pool",2,context.getProducerServicePool().size());
+        assertEquals("Expected one transient producer as service",1,references.get(LEAKY_SIEVE_TRANSIENT).get());
+        assertEquals("Expected one stable producer as service",1,references.get(LEAKY_SIEVE_STABLE).get());
+      }
+    }
+    if (!isFailFast()) {
+      assertEquals("Expected both producers in pool",2,context.getProducerServicePool().size());
+      assertEquals("Expected one transient producer as service",1,references.get(LEAKY_SIEVE_TRANSIENT).get());
+      assertEquals("Expected one stable producer as service",1,references.get(LEAKY_SIEVE_STABLE).get());
+    }
+  }
+  private void registerLeakyComponent(){
+    context.addComponent("leaky",new LeakySieveComponent());
+  }
+}

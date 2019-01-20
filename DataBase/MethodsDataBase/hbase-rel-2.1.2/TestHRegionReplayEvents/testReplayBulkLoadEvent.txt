@@ -1,0 +1,50 @@
+/** 
+ * Tests replaying region open markers from primary region. Checks whether the files are picked up
+ */
+@Test public void testReplayBulkLoadEvent() throws IOException {
+  LOG.info("testReplayBulkLoadEvent starts");
+  putDataWithFlushes(primaryRegion,100,0,100);
+  primaryRegion.close();
+  primaryRegion=HRegion.openHRegion(rootDir,primaryHri,htd,walPrimary,CONF,rss,null);
+  Random random=new Random();
+  byte[] randomValues=new byte[20];
+  random.nextBytes(randomValues);
+  Path testPath=TEST_UTIL.getDataTestDirOnTestFS();
+  List<Pair<byte[],String>> familyPaths=new ArrayList<>();
+  int expectedLoadFileCount=0;
+  for (  byte[] family : families) {
+    familyPaths.add(new Pair<>(family,createHFileForFamilies(testPath,family,randomValues)));
+    expectedLoadFileCount++;
+  }
+  primaryRegion.bulkLoadHFiles(familyPaths,false,null);
+  reader=createWALReaderForPrimary();
+  LOG.info("-- Replaying edits and region events in secondary");
+  BulkLoadDescriptor bulkloadEvent=null;
+  while (true) {
+    WAL.Entry entry=reader.next();
+    if (entry == null) {
+      break;
+    }
+    bulkloadEvent=WALEdit.getBulkLoadDescriptor(entry.getEdit().getCells().get(0));
+    if (bulkloadEvent != null) {
+      break;
+    }
+  }
+  assertTrue(bulkloadEvent != null);
+  assertEquals(expectedLoadFileCount,bulkloadEvent.getStoresCount());
+  secondaryRegion.replayWALBulkLoadEventMarker(bulkloadEvent);
+  List<String> storeFileName=new ArrayList<>();
+  for (  StoreDescriptor storeDesc : bulkloadEvent.getStoresList()) {
+    storeFileName.addAll(storeDesc.getStoreFileList());
+  }
+  for (  HStore s : secondaryRegion.getStores()) {
+    for (    HStoreFile sf : s.getStorefiles()) {
+      storeFileName.remove(sf.getPath().getName());
+    }
+  }
+  assertTrue("Found some store file isn't loaded:" + storeFileName,storeFileName.isEmpty());
+  LOG.info("-- Verifying edits from secondary");
+  for (  byte[] family : families) {
+    assertGet(secondaryRegion,family,randomValues);
+  }
+}

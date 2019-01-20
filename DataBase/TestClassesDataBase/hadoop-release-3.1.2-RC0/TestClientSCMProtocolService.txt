@@ -1,0 +1,134 @@
+/** 
+ * Basic unit tests for the Client to SCM Protocol Service.
+ */
+public class TestClientSCMProtocolService {
+  private static File testDir=null;
+  @BeforeClass public static void setupTestDirs() throws IOException {
+    testDir=new File("target",TestSharedCacheUploaderService.class.getCanonicalName());
+    testDir.delete();
+    testDir.mkdirs();
+    testDir=testDir.getAbsoluteFile();
+  }
+  @AfterClass public static void cleanupTestDirs() throws IOException {
+    if (testDir != null) {
+      testDir.delete();
+    }
+  }
+  private ClientProtocolService service;
+  private ClientSCMProtocol clientSCMProxy;
+  private SCMStore store;
+  private final RecordFactory recordFactory=RecordFactoryProvider.getRecordFactory(null);
+  @Before public void startUp(){
+    Configuration conf=new Configuration();
+    conf.set(YarnConfiguration.SCM_STORE_CLASS,InMemorySCMStore.class.getName());
+    conf.set(YarnConfiguration.SHARED_CACHE_ROOT,testDir.getPath());
+    AppChecker appChecker=spy(new DummyAppChecker());
+    store=new InMemorySCMStore(appChecker);
+    store.init(conf);
+    store.start();
+    service=new ClientProtocolService(store);
+    service.init(conf);
+    service.start();
+    YarnRPC rpc=YarnRPC.create(new Configuration());
+    InetSocketAddress scmAddress=conf.getSocketAddr(YarnConfiguration.SCM_CLIENT_SERVER_ADDRESS,YarnConfiguration.DEFAULT_SCM_CLIENT_SERVER_ADDRESS,YarnConfiguration.DEFAULT_SCM_CLIENT_SERVER_PORT);
+    clientSCMProxy=(ClientSCMProtocol)rpc.getProxy(ClientSCMProtocol.class,scmAddress,conf);
+  }
+  @After public void cleanUp(){
+    if (store != null) {
+      store.stop();
+      store=null;
+    }
+    if (service != null) {
+      service.stop();
+      service=null;
+    }
+    if (clientSCMProxy != null) {
+      RPC.stopProxy(clientSCMProxy);
+      clientSCMProxy=null;
+    }
+  }
+  @Test public void testUse_MissingEntry() throws Exception {
+    long misses=ClientSCMMetrics.getInstance().getCacheMisses();
+    UseSharedCacheResourceRequest request=recordFactory.newRecordInstance(UseSharedCacheResourceRequest.class);
+    request.setResourceKey("key1");
+    request.setAppId(createAppId(1,1L));
+    assertNull(clientSCMProxy.use(request).getPath());
+    assertEquals("Client SCM metrics aren't updated.",1,ClientSCMMetrics.getInstance().getCacheMisses() - misses);
+  }
+  @Test public void testUse_ExistingEntry_NoAppIds() throws Exception {
+    store.addResource("key1","foo.jar");
+    long hits=ClientSCMMetrics.getInstance().getCacheHits();
+    UseSharedCacheResourceRequest request=recordFactory.newRecordInstance(UseSharedCacheResourceRequest.class);
+    request.setResourceKey("key1");
+    request.setAppId(createAppId(2,2L));
+    String expectedPath=testDir.getAbsolutePath() + "/k/e/y/key1/foo.jar";
+    assertEquals(expectedPath,clientSCMProxy.use(request).getPath());
+    assertEquals(1,store.getResourceReferences("key1").size());
+    assertEquals("Client SCM metrics aren't updated.",1,ClientSCMMetrics.getInstance().getCacheHits() - hits);
+  }
+  @Test public void testUse_ExistingEntry_OneId() throws Exception {
+    store.addResource("key1","foo.jar");
+    store.addResourceReference("key1",new SharedCacheResourceReference(createAppId(1,1L),"user"));
+    assertEquals(1,store.getResourceReferences("key1").size());
+    long hits=ClientSCMMetrics.getInstance().getCacheHits();
+    UseSharedCacheResourceRequest request=recordFactory.newRecordInstance(UseSharedCacheResourceRequest.class);
+    request.setResourceKey("key1");
+    request.setAppId(createAppId(2,2L));
+    String expectedPath=testDir.getAbsolutePath() + "/k/e/y/key1/foo.jar";
+    assertEquals(expectedPath,clientSCMProxy.use(request).getPath());
+    assertEquals(2,store.getResourceReferences("key1").size());
+    assertEquals("Client SCM metrics aren't updated.",1,ClientSCMMetrics.getInstance().getCacheHits() - hits);
+  }
+  @Test public void testUse_ExistingEntry_DupId() throws Exception {
+    store.addResource("key1","foo.jar");
+    UserGroupInformation testUGI=UserGroupInformation.getCurrentUser();
+    store.addResourceReference("key1",new SharedCacheResourceReference(createAppId(1,1L),testUGI.getShortUserName()));
+    assertEquals(1,store.getResourceReferences("key1").size());
+    long hits=ClientSCMMetrics.getInstance().getCacheHits();
+    UseSharedCacheResourceRequest request=recordFactory.newRecordInstance(UseSharedCacheResourceRequest.class);
+    request.setResourceKey("key1");
+    request.setAppId(createAppId(1,1L));
+    String expectedPath=testDir.getAbsolutePath() + "/k/e/y/key1/foo.jar";
+    assertEquals(expectedPath,clientSCMProxy.use(request).getPath());
+    assertEquals(1,store.getResourceReferences("key1").size());
+    assertEquals("Client SCM metrics aren't updated.",1,ClientSCMMetrics.getInstance().getCacheHits() - hits);
+  }
+  @Test public void testRelease_ExistingEntry_NonExistantAppId() throws Exception {
+    store.addResource("key1","foo.jar");
+    store.addResourceReference("key1",new SharedCacheResourceReference(createAppId(1,1L),"user"));
+    assertEquals(1,store.getResourceReferences("key1").size());
+    long releases=ClientSCMMetrics.getInstance().getCacheReleases();
+    ReleaseSharedCacheResourceRequest request=recordFactory.newRecordInstance(ReleaseSharedCacheResourceRequest.class);
+    request.setResourceKey("key1");
+    request.setAppId(createAppId(2,2L));
+    clientSCMProxy.release(request);
+    assertEquals(1,store.getResourceReferences("key1").size());
+    assertEquals("Client SCM metrics were updated when a release did not happen",0,ClientSCMMetrics.getInstance().getCacheReleases() - releases);
+  }
+  @Test public void testRelease_ExistingEntry_WithAppId() throws Exception {
+    store.addResource("key1","foo.jar");
+    UserGroupInformation testUGI=UserGroupInformation.getCurrentUser();
+    store.addResourceReference("key1",new SharedCacheResourceReference(createAppId(1,1L),testUGI.getShortUserName()));
+    assertEquals(1,store.getResourceReferences("key1").size());
+    long releases=ClientSCMMetrics.getInstance().getCacheReleases();
+    ReleaseSharedCacheResourceRequest request=recordFactory.newRecordInstance(ReleaseSharedCacheResourceRequest.class);
+    request.setResourceKey("key1");
+    request.setAppId(createAppId(1,1L));
+    clientSCMProxy.release(request);
+    assertEquals(0,store.getResourceReferences("key1").size());
+    assertEquals("Client SCM metrics aren't updated.",1,ClientSCMMetrics.getInstance().getCacheReleases() - releases);
+  }
+  @Test public void testRelease_MissingEntry() throws Exception {
+    long releases=ClientSCMMetrics.getInstance().getCacheReleases();
+    ReleaseSharedCacheResourceRequest request=recordFactory.newRecordInstance(ReleaseSharedCacheResourceRequest.class);
+    request.setResourceKey("key2");
+    request.setAppId(createAppId(2,2L));
+    clientSCMProxy.release(request);
+    assertNotNull(store.getResourceReferences("key2"));
+    assertEquals(0,store.getResourceReferences("key2").size());
+    assertEquals("Client SCM metrics were updated when a release did not happen.",0,ClientSCMMetrics.getInstance().getCacheReleases() - releases);
+  }
+  private ApplicationId createAppId(  int id,  long timestamp){
+    return ApplicationId.newInstance(timestamp,id);
+  }
+}

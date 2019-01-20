@@ -1,0 +1,129 @@
+public class TransactionTemplateTest {
+  @Rule public EmbeddedDatabaseRule databaseRule=new EmbeddedDatabaseRule();
+  @Rule public final ExpectedException expected=ExpectedException.none();
+  private TransactionTemplate template;
+  private CountingMonitor monitor;
+  @Before public void setUp(){
+    monitor=new CountingMonitor();
+    template=new TransactionTemplate().with(databaseRule.getGraphDatabaseAPI()).monitor(monitor).retries(5).backoff(3,TimeUnit.MILLISECONDS);
+  }
+  @Test public void shouldForceUserToCallWith(){
+    expected.expectCause(allOf(instanceOf(IllegalArgumentException.class),hasProperty("message",is("You need to call 'with(GraphDatabaseService)' on the template in order to use it"))));
+    TransactionTemplate transactionTemplate=new TransactionTemplate();
+    transactionTemplate.execute(transaction -> null);
+  }
+  @Test public void validateGraphDatabaseService(){
+    expected.expect(NullPointerException.class);
+    template.with(null);
+  }
+  @Test public void validateRetires(){
+    expected.expect(IllegalArgumentException.class);
+    expected.expectMessage("Number of retries must be greater than or equal to 0");
+    template.retries(-1);
+  }
+  @Test public void validateBackoff(){
+    expected.expect(IllegalArgumentException.class);
+    expected.expectMessage("Backoff time must be a positive number");
+    template.backoff(-10,TimeUnit.SECONDS);
+  }
+  @Test public void validateMonitor(){
+    expected.expect(NullPointerException.class);
+    template.monitor(null);
+  }
+  @Test public void validateRetryOn(){
+    expected.expect(NullPointerException.class);
+    template.retryOn(null);
+  }
+  @Test public void shouldRetryOnError(){
+    IllegalArgumentException ex=new IllegalArgumentException();
+    template.execute(new FailingRetryConsumer(3,ex));
+    assertThat(monitor.numRetry,is(3));
+    assertThat(monitor.failures,contains(ex,ex,ex));
+    assertThat(monitor.fails,empty());
+  }
+  @Test public void shouldFailIfAllRetiresFail(){
+    IllegalArgumentException ex=new IllegalArgumentException();
+    try {
+      template.execute(new FailingRetryConsumer(10,ex));
+    }
+ catch (    TransactionFailureException ignored) {
+    }
+    assertThat(monitor.numRetry,is(5));
+    assertThat(monitor.failures,contains(ex,ex,ex,ex,ex,ex));
+    assertThat(monitor.fails,contains(ex));
+  }
+  @Test public void defaultExceptionsForExit(){
+    Error error=new Error();
+    TransactionTerminatedException terminatedException=new TransactionTerminatedException(Status.Transaction.Terminated);
+    try {
+      template.execute((Consumer<Transaction>)tx -> {
+        throw error;
+      }
+);
+    }
+ catch (    TransactionFailureException ex) {
+    }
+    try {
+      template.execute((Consumer<Transaction>)tx -> {
+        throw terminatedException;
+      }
+);
+    }
+ catch (    TransactionFailureException ignored) {
+    }
+    assertThat(monitor.numRetry,is(0));
+    assertThat(monitor.failures,contains(error,terminatedException));
+    assertThat(monitor.fails,contains(error,terminatedException));
+  }
+  @Test public void overrideRetryExceptions(){
+    template=template.retryOn(e -> !IllegalArgumentException.class.isInstance(e));
+    IllegalArgumentException e=new IllegalArgumentException();
+    try {
+      template.execute((Consumer<Transaction>)tx -> {
+        throw e;
+      }
+);
+    }
+ catch (    TransactionFailureException ignored) {
+    }
+    assertThat(monitor.numRetry,is(0));
+    assertThat(monitor.failures,contains(e));
+    assertThat(monitor.fails,contains(e));
+  }
+  @Test public void overrideRetryShouldOverrideDefaults(){
+    template=template.retryOn(e -> !IllegalArgumentException.class.isInstance(e));
+    TransactionTerminatedException fakeException=new TransactionTerminatedException(Status.Transaction.Terminated);
+    template.execute(new FailingRetryConsumer(1,fakeException));
+    assertThat(monitor.numRetry,is(1));
+    assertThat(monitor.failures,contains(fakeException));
+    assertThat(monitor.fails,empty());
+  }
+private static class FailingRetryConsumer implements Consumer<Transaction> {
+    private final int successAfter;
+    private final RuntimeException fakeException;
+    private int tries;
+    private FailingRetryConsumer(    int successAfter,    RuntimeException fakeException){
+      this.successAfter=successAfter;
+      this.fakeException=fakeException;
+    }
+    @Override public void accept(    Transaction transaction){
+      if (tries++ < successAfter) {
+        throw fakeException;
+      }
+    }
+  }
+private static class CountingMonitor implements TransactionTemplate.Monitor {
+    int numRetry;
+    List<Throwable> fails=new ArrayList<>();
+    List<Throwable> failures=new ArrayList<>();
+    @Override public void failure(    Throwable ex){
+      failures.add(ex);
+    }
+    @Override public void failed(    Throwable ex){
+      fails.add(ex);
+    }
+    @Override public void retrying(){
+      numRetry++;
+    }
+  }
+}

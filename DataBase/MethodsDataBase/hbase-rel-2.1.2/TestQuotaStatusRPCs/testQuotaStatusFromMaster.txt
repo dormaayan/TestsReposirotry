@@ -1,0 +1,66 @@
+@Test public void testQuotaStatusFromMaster() throws Exception {
+  final long sizeLimit=1024L * 25L;
+  final long tableSize=1024L * 1;
+  final long nsLimit=Long.MAX_VALUE;
+  final int numRegions=10;
+  final TableName tn=helper.createTableWithRegions(numRegions);
+  QuotaSettings settings=QuotaSettingsFactory.limitTableSpace(tn,sizeLimit,SpaceViolationPolicy.NO_INSERTS);
+  TEST_UTIL.getAdmin().setQuota(settings);
+  QuotaSettings nsSettings=QuotaSettingsFactory.limitNamespaceSpace(tn.getNamespaceAsString(),nsLimit,SpaceViolationPolicy.NO_INSERTS);
+  TEST_UTIL.getAdmin().setQuota(nsSettings);
+  helper.writeData(tn,tableSize);
+  final Connection conn=TEST_UTIL.getConnection();
+  Waiter.waitFor(TEST_UTIL.getConfiguration(),30 * 1000,new Predicate<Exception>(){
+    @Override public boolean evaluate() throws Exception {
+      SpaceQuotaSnapshot snapshot=QuotaTableUtil.getCurrentSnapshot(conn,tn);
+      LOG.info("Table snapshot after initial ingest: " + snapshot);
+      if (snapshot == null) {
+        return false;
+      }
+      return snapshot.getLimit() == sizeLimit && snapshot.getUsage() > 0L;
+    }
+  }
+);
+  final AtomicReference<Long> nsUsage=new AtomicReference<>();
+  Waiter.waitFor(TEST_UTIL.getConfiguration(),30 * 1000 * 1000,new Predicate<Exception>(){
+    @Override public boolean evaluate() throws Exception {
+      SpaceQuotaSnapshot snapshot=QuotaTableUtil.getCurrentSnapshot(conn,tn.getNamespaceAsString());
+      LOG.debug("Namespace snapshot after initial ingest: " + snapshot);
+      if (snapshot == null) {
+        return false;
+      }
+      nsUsage.set(snapshot.getUsage());
+      return snapshot.getLimit() == nsLimit && snapshot.getUsage() > 0;
+    }
+  }
+);
+  SpaceQuotaSnapshot snapshot=QuotaTableUtil.getCurrentSnapshot(conn,tn);
+  assertTrue("QuotaSnapshot for " + tn + " should be non-null and not in violation",snapshot != null && !snapshot.getQuotaStatus().isInViolation());
+  try {
+    helper.writeData(tn,tableSize * 2L);
+  }
+ catch (  RetriesExhaustedWithDetailsException|SpaceLimitingException e) {
+  }
+  Waiter.waitFor(TEST_UTIL.getConfiguration(),30 * 1000,new Predicate<Exception>(){
+    @Override public boolean evaluate() throws Exception {
+      SpaceQuotaSnapshot snapshot=QuotaTableUtil.getCurrentSnapshot(conn,tn);
+      LOG.info("Table snapshot after second ingest: " + snapshot);
+      if (snapshot == null) {
+        return false;
+      }
+      return snapshot.getQuotaStatus().isInViolation();
+    }
+  }
+);
+  Waiter.waitFor(TEST_UTIL.getConfiguration(),30 * 1000,new Predicate<Exception>(){
+    @Override public boolean evaluate() throws Exception {
+      SpaceQuotaSnapshot snapshot=QuotaTableUtil.getCurrentSnapshot(conn,tn.getNamespaceAsString());
+      LOG.debug("Namespace snapshot after second ingest: " + snapshot);
+      if (snapshot == null) {
+        return false;
+      }
+      return snapshot.getUsage() > nsUsage.get() && !snapshot.getQuotaStatus().isInViolation();
+    }
+  }
+);
+}

@@ -1,0 +1,73 @@
+public class HystrixConcurrencyStrategyTest {
+  @Before public void prepareForTest(){
+    HystrixRequestContext.initializeContext();
+  }
+  @After public void cleanup(){
+    shutdownContextIfExists();
+    ConfigurationManager.getConfigInstance().clear();
+  }
+  /** 
+ * If the RequestContext does not get transferred across threads correctly this blows up. No specific assertions are necessary.
+ */
+  @Test public void testRequestContextPropagatesAcrossObserveOnPool(){
+    new SimpleCommand().execute();
+    new SimpleCommand().observe().map(new Func1<String,String>(){
+      @Override public String call(      String s){
+        System.out.println("Map => Commands: " + HystrixRequestLog.getCurrentRequest().getAllExecutedCommands());
+        return s;
+      }
+    }
+).toBlocking().forEach(new Action1<String>(){
+      @Override public void call(      String s){
+        System.out.println("Result [" + s + "] => Commands: "+ HystrixRequestLog.getCurrentRequest().getAllExecutedCommands());
+      }
+    }
+);
+  }
+private static class SimpleCommand extends HystrixCommand<String> {
+    public SimpleCommand(){
+      super(HystrixCommandGroupKey.Factory.asKey("SimpleCommand"));
+    }
+    @Override protected String run() throws Exception {
+      if (HystrixRequestContext.isCurrentThreadInitialized()) {
+        System.out.println("Executing => Commands: " + HystrixRequestLog.getCurrentRequest().getAllExecutedCommands());
+      }
+      return "Hello";
+    }
+  }
+  @Test public void testThreadContextOnTimeout(){
+    final AtomicBoolean isInitialized=new AtomicBoolean();
+    new TimeoutCommand().toObservable().doOnError(new Action1<Throwable>(){
+      @Override public void call(      Throwable throwable){
+        isInitialized.set(HystrixRequestContext.isCurrentThreadInitialized());
+      }
+    }
+).materialize().toBlocking().single();
+    System.out.println("initialized = " + HystrixRequestContext.isCurrentThreadInitialized());
+    System.out.println("initialized inside onError = " + isInitialized.get());
+    assertEquals(true,isInitialized.get());
+  }
+  @Test public void testNoRequestContextOnSimpleConcurencyStrategyWithoutException() throws Exception {
+    shutdownContextIfExists();
+    ConfigurationManager.getConfigInstance().setProperty("hystrix.command.default.requestLog.enabled","false");
+    new SimpleCommand().execute();
+    assertTrue("We are able to run the simple command without a context initialization error.",true);
+  }
+  private void shutdownContextIfExists(){
+    if (HystrixRequestContext.getContextForCurrentThread() != null) {
+      HystrixRequestContext.getContextForCurrentThread().shutdown();
+    }
+  }
+private static class DummyHystrixConcurrencyStrategy extends HystrixConcurrencyStrategy {
+  }
+public static class TimeoutCommand extends HystrixCommand<Void> {
+    static final HystrixCommand.Setter properties=HystrixCommand.Setter.withGroupKey(HystrixCommandGroupKey.Factory.asKey("TimeoutTest")).andCommandPropertiesDefaults(HystrixCommandProperties.Setter().withExecutionTimeoutInMilliseconds(50));
+    public TimeoutCommand(){
+      super(properties);
+    }
+    @Override protected Void run() throws Exception {
+      Thread.sleep(500);
+      return null;
+    }
+  }
+}

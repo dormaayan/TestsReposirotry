@@ -1,0 +1,79 @@
+/** 
+ * Test the OrcRecordUpdater with the OrcRawRecordMerger when there is a base and a delta.
+ * @throws Exception
+ */
+@Test public void testRecordReaderOldBaseAndDelta() throws Exception {
+  final int BUCKET=10;
+  Configuration conf=new Configuration();
+  OrcOutputFormat of=new OrcOutputFormat();
+  FileSystem fs=FileSystem.getLocal(conf);
+  Path root=new Path(tmpDir,"testOldBaseAndDelta").makeQualified(fs);
+  fs.delete(root,true);
+  ObjectInspector inspector;
+synchronized (TestOrcFile.class) {
+    inspector=ObjectInspectorFactory.getReflectionObjectInspector(BigRow.class,ObjectInspectorFactory.ObjectInspectorOptions.JAVA);
+  }
+  MemoryManager mgr=new MemoryManagerImpl(conf){
+    int rowsAddedSinceCheck=0;
+    @Override public synchronized void addedRow(    int rows) throws IOException {
+      rowsAddedSinceCheck+=rows;
+      if (rowsAddedSinceCheck >= 2) {
+        notifyWriters();
+        rowsAddedSinceCheck=0;
+      }
+    }
+  }
+;
+  Writer writer=OrcFile.createWriter(new Path(root,"0000010_0"),OrcFile.writerOptions(conf).inspector(inspector).fileSystem(fs).blockPadding(false).bufferSize(10000).compress(CompressionKind.NONE).stripeSize(1).memory(mgr).batchSize(2).version(OrcFile.Version.V_0_11));
+  String[] values=new String[]{"ignore.1","0.1","ignore.2","ignore.3","2.0","2.1","3.0","ignore.4","ignore.5","ignore.6"};
+  for (int i=0; i < values.length; ++i) {
+    writer.addRow(new BigRow(i,i,values[i],i,i));
+  }
+  writer.close();
+  AcidOutputFormat.Options options=new AcidOutputFormat.Options(conf).writingBase(false).minimumTransactionId(1).maximumTransactionId(1).bucket(BUCKET).inspector(inspector).filesystem(fs).recordIdColumn(5).finalDestination(root);
+  RecordUpdater ru=of.getRecordUpdater(root,options);
+  values=new String[]{"0.0",null,null,"1.1",null,null,null,"ignore.7"};
+  for (int i=0; i < values.length; ++i) {
+    if (values[i] != null) {
+      ru.update(1,new BigRow(i,i,values[i],i,i,i,0,BUCKET));
+    }
+  }
+  ru.delete(100,new BigRow(9,0,BUCKET));
+  ru.close(false);
+  options=options.minimumTransactionId(2).maximumTransactionId(2);
+  ru=of.getRecordUpdater(root,options);
+  values=new String[]{null,null,"1.0",null,null,null,null,"3.1"};
+  for (int i=0; i < values.length; ++i) {
+    if (values[i] != null) {
+      ru.update(2,new BigRow(i,i,values[i],i,i,i,0,BUCKET));
+    }
+  }
+  ru.delete(100,new BigRow(8,0,BUCKET));
+  ru.close(false);
+  InputFormat inf=new OrcInputFormat();
+  JobConf job=new JobConf();
+  job.set(IOConstants.SCHEMA_EVOLUTION_COLUMNS,BigRow.getColumnNamesProperty());
+  job.set(IOConstants.SCHEMA_EVOLUTION_COLUMNS_TYPES,BigRow.getColumnTypesProperty());
+  HiveConf.setBoolVar(job,HiveConf.ConfVars.HIVE_TRANSACTIONAL_TABLE_SCAN,true);
+  job.set("mapred.min.split.size","1");
+  job.set("mapred.max.split.size","2");
+  job.set("mapred.input.dir",root.toString());
+  InputSplit[] splits=inf.getSplits(job,5);
+  assertEquals(5,splits.length);
+  org.apache.hadoop.mapred.RecordReader<NullWritable,OrcStruct> rr;
+  for (int i=0; i < 4; ++i) {
+    System.out.println("starting split " + i);
+    rr=inf.getRecordReader(splits[i],job,Reporter.NULL);
+    NullWritable key=rr.createKey();
+    OrcStruct value=rr.createValue();
+    for (int j=0; j < 2; ++j) {
+      System.out.println("i = " + i + ", j = "+ j);
+      assertEquals(true,rr.next(key,value));
+      System.out.println("record = " + value);
+      assertEquals(i + "." + j,value.getFieldValue(2).toString());
+    }
+    assertEquals(false,rr.next(key,value));
+  }
+  rr=inf.getRecordReader(splits[4],job,Reporter.NULL);
+  assertEquals(false,rr.next(rr.createKey(),rr.createValue()));
+}

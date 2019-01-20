@@ -1,0 +1,58 @@
+@Test public void testAsyncSnapshot() throws Exception {
+  OneShotLatch waiter=new OneShotLatch();
+  BlockerCheckpointStreamFactory streamFactory=new BlockerCheckpointStreamFactory(1024 * 1024);
+  streamFactory.setWaiterLatch(waiter);
+  AbstractKeyedStateBackend<Integer> backend=null;
+  KeyedStateHandle stateHandle=null;
+  try {
+    backend=createKeyedBackend(IntSerializer.INSTANCE);
+    InternalValueState<Integer,VoidNamespace,Integer> valueState=backend.createInternalState(VoidNamespaceSerializer.INSTANCE,new ValueStateDescriptor<>("test",IntSerializer.INSTANCE));
+    valueState.setCurrentNamespace(VoidNamespace.INSTANCE);
+    for (int i=0; i < 10; ++i) {
+      backend.setCurrentKey(i);
+      valueState.update(i);
+    }
+    RunnableFuture<SnapshotResult<KeyedStateHandle>> snapshot=backend.snapshot(0L,0L,streamFactory,CheckpointOptions.forCheckpointWithDefaultLocation());
+    Thread runner=new Thread(snapshot);
+    runner.start();
+    for (int i=0; i < 20; ++i) {
+      backend.setCurrentKey(i);
+      valueState.update(i + 1);
+      if (10 == i) {
+        waiter.await();
+      }
+    }
+    runner.join();
+    SnapshotResult<KeyedStateHandle> snapshotResult=snapshot.get();
+    stateHandle=snapshotResult.getJobManagerOwnedSnapshot();
+    for (int i=0; i < 20; ++i) {
+      backend.setCurrentKey(i);
+      assertEquals(i + 1,(int)valueState.value());
+    }
+  }
+  finally {
+    if (null != backend) {
+      IOUtils.closeQuietly(backend);
+      backend.dispose();
+    }
+  }
+  assertNotNull(stateHandle);
+  backend=null;
+  try {
+    backend=restoreKeyedBackend(IntSerializer.INSTANCE,stateHandle);
+    InternalValueState<Integer,VoidNamespace,Integer> valueState=backend.createInternalState(VoidNamespaceSerializer.INSTANCE,new ValueStateDescriptor<>("test",IntSerializer.INSTANCE));
+    valueState.setCurrentNamespace(VoidNamespace.INSTANCE);
+    for (int i=0; i < 10; ++i) {
+      backend.setCurrentKey(i);
+      assertEquals(i,(int)valueState.value());
+    }
+    backend.setCurrentKey(11);
+    assertNull(valueState.value());
+  }
+  finally {
+    if (null != backend) {
+      IOUtils.closeQuietly(backend);
+      backend.dispose();
+    }
+  }
+}

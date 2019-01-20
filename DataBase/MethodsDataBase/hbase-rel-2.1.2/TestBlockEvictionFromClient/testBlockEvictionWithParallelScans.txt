@@ -1,0 +1,67 @@
+@Test public void testBlockEvictionWithParallelScans() throws Exception {
+  Table table=null;
+  try {
+    latch=new CountDownLatch(1);
+    final TableName tableName=TableName.valueOf(name.getMethodName());
+    table=TEST_UTIL.createTable(tableName,FAMILIES_1,1,1024,CustomInnerRegionObserver.class.getName());
+    RegionLocator locator=TEST_UTIL.getConnection().getRegionLocator(tableName);
+    String regionName=locator.getAllRegionLocations().get(0).getRegionInfo().getEncodedName();
+    HRegion region=TEST_UTIL.getRSForFirstRegionInTable(tableName).getRegion(regionName);
+    HStore store=region.getStores().iterator().next();
+    CacheConfig cacheConf=store.getCacheConfig();
+    cacheConf.setCacheDataOnWrite(true);
+    cacheConf.setEvictOnClose(true);
+    BlockCache cache=cacheConf.getBlockCache();
+    Put put=new Put(ROW);
+    put.addColumn(FAMILY,QUALIFIER,data);
+    table.put(put);
+    put=new Put(ROW1);
+    put.addColumn(FAMILY,QUALIFIER,data);
+    table.put(put);
+    assertTrue(Bytes.equals(table.get(new Get(ROW)).value(),data));
+    region.flush(true);
+    ScanThread[] scanThreads=initiateScan(table,false);
+    Thread.sleep(100);
+    checkForBlockEviction(cache,false,false);
+    for (    ScanThread thread : scanThreads) {
+      thread.join();
+    }
+    Iterator<CachedBlock> iterator=cache.iterator();
+    iterateBlockCache(cache,iterator);
+    assertTrue(Bytes.equals(table.get(new Get(ROW)).value(),data));
+    iterator=cache.iterator();
+    iterateBlockCache(cache,iterator);
+    byte[] QUALIFIER2=Bytes.add(QUALIFIER,QUALIFIER);
+    byte[] data2=Bytes.add(data,data);
+    put=new Put(ROW);
+    put.addColumn(FAMILY,QUALIFIER2,data2);
+    table.put(put);
+    Result r=table.get(new Get(ROW));
+    assertTrue(Bytes.equals(r.getValue(FAMILY,QUALIFIER),data));
+    assertTrue(Bytes.equals(r.getValue(FAMILY,QUALIFIER2),data2));
+    iterator=cache.iterator();
+    iterateBlockCache(cache,iterator);
+    System.out.println("Flushing cache");
+    region.flush(true);
+    iterator=cache.iterator();
+    iterateBlockCache(cache,iterator);
+    System.out.println("Compacting");
+    assertEquals(2,store.getStorefilesCount());
+    store.triggerMajorCompaction();
+    region.compact(true);
+    waitForStoreFileCount(store,1,10000);
+    assertEquals(1,store.getStorefilesCount());
+    iterator=cache.iterator();
+    iterateBlockCache(cache,iterator);
+    r=table.get(new Get(ROW));
+    assertTrue(Bytes.equals(r.getValue(FAMILY,QUALIFIER),data));
+    assertTrue(Bytes.equals(r.getValue(FAMILY,QUALIFIER2),data2));
+    iterator=cache.iterator();
+    iterateBlockCache(cache,iterator);
+  }
+  finally {
+    if (table != null) {
+      table.close();
+    }
+  }
+}

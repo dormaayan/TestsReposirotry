@@ -1,0 +1,51 @@
+/** 
+ * Tests loading and validation of savepoints with correct setup, parallelism mismatch, and a missing task.
+ */
+@Test public void testLoadAndValidateSavepoint() throws Exception {
+  File tmp=tmpFolder.newFolder();
+  int parallelism=128128;
+  long checkpointId=Integer.MAX_VALUE + 123123L;
+  JobVertexID jobVertexID=new JobVertexID();
+  OperatorID operatorID=OperatorID.fromJobVertexID(jobVertexID);
+  OperatorSubtaskState subtaskState=new OperatorSubtaskState(new OperatorStreamStateHandle(Collections.emptyMap(),new ByteStreamStateHandle("testHandler",new byte[0])),null,null,null);
+  OperatorState state=new OperatorState(operatorID,parallelism,parallelism);
+  state.putState(0,subtaskState);
+  Map<OperatorID,OperatorState> taskStates=new HashMap<>();
+  taskStates.put(operatorID,state);
+  JobID jobId=new JobID();
+  final SavepointV2 savepoint=new SavepointV2(checkpointId,taskStates.values(),Collections.emptyList());
+  final StreamStateHandle serializedMetadata;
+  try (ByteArrayOutputStream os=new ByteArrayOutputStream()){
+    Checkpoints.storeCheckpointMetadata(savepoint,os);
+    serializedMetadata=new ByteStreamStateHandle("checkpoint",os.toByteArray());
+  }
+   final CompletedCheckpointStorageLocation storageLocation=new TestCompletedCheckpointStorageLocation(serializedMetadata,"dummy/pointer");
+  ExecutionJobVertex vertex=mock(ExecutionJobVertex.class);
+  when(vertex.getParallelism()).thenReturn(parallelism);
+  when(vertex.getMaxParallelism()).thenReturn(parallelism);
+  when(vertex.getOperatorIDs()).thenReturn(Collections.singletonList(operatorID));
+  Map<JobVertexID,ExecutionJobVertex> tasks=new HashMap<>();
+  tasks.put(jobVertexID,vertex);
+  ClassLoader ucl=Thread.currentThread().getContextClassLoader();
+  CompletedCheckpoint loaded=Checkpoints.loadAndValidateCheckpoint(jobId,tasks,storageLocation,ucl,false);
+  assertEquals(jobId,loaded.getJobId());
+  assertEquals(checkpointId,loaded.getCheckpointID());
+  when(vertex.getMaxParallelism()).thenReturn(222);
+  when(vertex.isMaxParallelismConfigured()).thenReturn(true);
+  try {
+    Checkpoints.loadAndValidateCheckpoint(jobId,tasks,storageLocation,ucl,false);
+    fail("Did not throw expected Exception");
+  }
+ catch (  IllegalStateException expected) {
+    assertTrue(expected.getMessage().contains("Max parallelism mismatch"));
+  }
+  assertNotNull(tasks.remove(jobVertexID));
+  try {
+    Checkpoints.loadAndValidateCheckpoint(jobId,tasks,storageLocation,ucl,false);
+    fail("Did not throw expected Exception");
+  }
+ catch (  IllegalStateException expected) {
+    assertTrue(expected.getMessage().contains("allowNonRestoredState"));
+  }
+  Checkpoints.loadAndValidateCheckpoint(jobId,tasks,storageLocation,ucl,true);
+}

@@ -1,0 +1,66 @@
+public class TestClearDanglingScratchDir {
+  private static MiniDFSCluster m_dfs=null;
+  private static HiveConf conf;
+  private static Path scratchDir;
+  private ByteArrayOutputStream stdout;
+  private ByteArrayOutputStream stderr;
+  private PrintStream origStdoutPs;
+  private PrintStream origStderrPs;
+  @BeforeClass static public void oneTimeSetup() throws Exception {
+    m_dfs=new MiniDFSCluster.Builder(new Configuration()).numDataNodes(1).format(true).build();
+    conf=new HiveConf();
+    conf.set(HiveConf.ConfVars.HIVE_SCRATCH_DIR_LOCK.toString(),"true");
+    conf.set(HiveConf.ConfVars.METASTORE_AUTO_CREATE_ALL.toString(),"true");
+    LoggerFactory.getLogger("SessionState");
+    conf.setVar(HiveConf.ConfVars.METASTOREWAREHOUSE,new Path(System.getProperty("test.tmp.dir"),"warehouse").toString());
+    conf.set(CommonConfigurationKeysPublic.FS_DEFAULT_NAME_KEY,m_dfs.getFileSystem().getUri().toString());
+    scratchDir=new Path(HiveConf.getVar(conf,HiveConf.ConfVars.SCRATCHDIR));
+    m_dfs.getFileSystem().mkdirs(scratchDir);
+    m_dfs.getFileSystem().setPermission(scratchDir,new FsPermission("777"));
+  }
+  @AfterClass static public void shutdown() throws Exception {
+    m_dfs.shutdown();
+  }
+  public void redirectStdOutErr(){
+    stdout=new ByteArrayOutputStream();
+    PrintStream psStdout=new PrintStream(stdout);
+    origStdoutPs=System.out;
+    System.setOut(psStdout);
+    stderr=new ByteArrayOutputStream();
+    PrintStream psStderr=new PrintStream(stderr);
+    origStderrPs=System.err;
+    System.setErr(psStderr);
+  }
+  public void rollbackStdOutErr(){
+    System.setOut(origStdoutPs);
+    System.setErr(origStderrPs);
+  }
+  @Test public void testClearDanglingScratchDir() throws Exception {
+    redirectStdOutErr();
+    ClearDanglingScratchDir.main(new String[]{"-v","-s",m_dfs.getFileSystem().getUri().toString() + scratchDir.toUri().toString()});
+    rollbackStdOutErr();
+    Assert.assertTrue(stderr.toString().contains("Cannot find any scratch directory to clear"));
+    m_dfs.getFileSystem().mkdirs(new Path(new Path(scratchDir,"dummy"),UUID.randomUUID().toString()));
+    redirectStdOutErr();
+    ClearDanglingScratchDir.main(new String[]{"-v","-s",m_dfs.getFileSystem().getUri().toString() + scratchDir.toUri().toString()});
+    rollbackStdOutErr();
+    Assert.assertEquals(StringUtils.countMatches(stderr.toString(),"since it does not contain " + SessionState.LOCK_FILE_NAME),1);
+    Assert.assertTrue(stderr.toString().contains("Cannot find any scratch directory to clear"));
+    SessionState ss=SessionState.start(conf);
+    redirectStdOutErr();
+    ClearDanglingScratchDir.main(new String[]{"-v","-s",m_dfs.getFileSystem().getUri().toString() + scratchDir.toUri().toString()});
+    rollbackStdOutErr();
+    Assert.assertEquals(StringUtils.countMatches(stderr.toString(),"is being used by live process"),1);
+    ss.releaseSessionLockFile();
+    redirectStdOutErr();
+    ClearDanglingScratchDir.main(new String[]{"-r","-v","-s",m_dfs.getFileSystem().getUri().toString() + scratchDir.toUri().toString()});
+    rollbackStdOutErr();
+    Assert.assertFalse(stdout.toString().isEmpty());
+    redirectStdOutErr();
+    ClearDanglingScratchDir.main(new String[]{"-v","-s",m_dfs.getFileSystem().getUri().toString() + scratchDir.toUri().toString()});
+    rollbackStdOutErr();
+    Assert.assertTrue(stderr.toString().contains("Removing 1 scratch directories"));
+    Assert.assertEquals(StringUtils.countMatches(stderr.toString(),"removed"),1);
+    ss.close();
+  }
+}

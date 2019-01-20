@@ -1,0 +1,167 @@
+class GraphDatabaseSettingsTest {
+  @Test void mustHaveNullDefaultPageCacheMemorySizeInBytes(){
+    String bytes=Config.defaults().get(GraphDatabaseSettings.pagecache_memory);
+    assertThat(bytes,is(nullValue()));
+  }
+  @Test void pageCacheSettingMustAcceptArbitraryUserSpecifiedValue(){
+    Setting<String> setting=GraphDatabaseSettings.pagecache_memory;
+    assertThat(Config.defaults(setting,"245760").get(setting),is("245760"));
+    assertThat(Config.defaults(setting,"2244g").get(setting),is("2244g"));
+    assertThat(Config.defaults(setting,"string").get(setting),is("string"));
+  }
+  @Test void noDuplicateSettingsAreAllowed() throws Exception {
+    final HashMap<String,String> fields=new HashMap<>();
+    for (    Field field : GraphDatabaseSettings.class.getDeclaredFields()) {
+      if (field.getType() == Setting.class) {
+        Setting<?> setting=(Setting<?>)field.get(null);
+        assertFalse(fields.containsKey(setting.name()),format("'%s' in %s has already been defined in %s",setting.name(),field.getName(),fields.get(setting.name())));
+        fields.put(setting.name(),field.getName());
+      }
+    }
+  }
+  @Test void groupToScopeSetting(){
+    String hostname="my_other_host";
+    int port=9999;
+    String scoping="bla";
+    Map<String,String> config=stringMap(GraphDatabaseSettings.default_advertised_address.name(),hostname,new BoltConnector(scoping).advertised_address.name(),":" + port);
+    BoltConnector boltConnector=new BoltConnector(scoping);
+    Setting<AdvertisedSocketAddress> advertisedAddress=boltConnector.advertised_address;
+    AdvertisedSocketAddress advertisedSocketAddress=advertisedAddress.apply(config::get);
+    assertEquals(hostname,advertisedSocketAddress.getHostname());
+    assertEquals(port,advertisedSocketAddress.getPort());
+  }
+  @Test void shouldEnableBoltByDefault(){
+    Config config=Config.builder().withServerDefaults().build();
+    BoltConnector boltConnector=config.boltConnectors().get(0);
+    ListenSocketAddress listenSocketAddress=config.get(boltConnector.listen_address);
+    assertEquals(new ListenSocketAddress("127.0.0.1",7687),listenSocketAddress);
+  }
+  @Test void shouldBeAbleToDisableBoltConnectorWithJustOneParameter(){
+    Config config=Config.defaults(new BoltConnector("bolt").enabled,"false");
+    assertThat(config.boltConnectors().size(),is(1));
+    assertThat(config.enabledBoltConnectors(),empty());
+  }
+  @Test void shouldBeAbleToOverrideBoltListenAddressesWithJustOneParameter(){
+    Config config=Config.defaults(stringMap("dbms.connector.bolt.enabled","true","dbms.connector.bolt.listen_address",":8000"));
+    BoltConnector boltConnector=config.boltConnectors().get(0);
+    assertEquals(new ListenSocketAddress("127.0.0.1",8000),config.get(boltConnector.listen_address));
+  }
+  @Test void shouldDeriveBoltListenAddressFromDefaultListenAddress(){
+    Config config=Config.defaults(stringMap("dbms.connector.bolt.enabled","true","dbms.connectors.default_listen_address","0.0.0.0"));
+    BoltConnector boltConnector=config.boltConnectors().get(0);
+    assertEquals(new ListenSocketAddress("0.0.0.0",7687),config.get(boltConnector.listen_address));
+  }
+  @Test void shouldDeriveBoltListenAddressFromDefaultListenAddressAndSpecifiedPort(){
+    Config config=Config.defaults(stringMap("dbms.connectors.default_listen_address","0.0.0.0","dbms.connector.bolt.enabled","true","dbms.connector.bolt.listen_address",":8000"));
+    BoltConnector boltConnector=config.boltConnectors().get(0);
+    assertEquals(new ListenSocketAddress("0.0.0.0",8000),config.get(boltConnector.listen_address));
+  }
+  @Test void shouldStillSupportCustomNameForBoltConnector(){
+    Config config=Config.defaults(stringMap("dbms.connector.random_name_that_will_be_unsupported.type","BOLT","dbms.connector.random_name_that_will_be_unsupported.enabled","true","dbms.connector.random_name_that_will_be_unsupported.listen_address",":8000"));
+    BoltConnector boltConnector=config.boltConnectors().get(0);
+    assertEquals(new ListenSocketAddress("127.0.0.1",8000),config.get(boltConnector.listen_address));
+  }
+  @Test void shouldSupportMultipleBoltConnectorsWithCustomNames(){
+    Config config=Config.defaults(stringMap("dbms.connector.bolt1.type","BOLT","dbms.connector.bolt1.enabled","true","dbms.connector.bolt1.listen_address",":8000","dbms.connector.bolt2.type","BOLT","dbms.connector.bolt2.enabled","true","dbms.connector.bolt2.listen_address",":9000"));
+    List<ListenSocketAddress> addresses=config.boltConnectors().stream().map(c -> config.get(c.listen_address)).collect(Collectors.toList());
+    assertEquals(2,addresses.size());
+    if (addresses.get(0).getPort() == 8000) {
+      assertEquals(new ListenSocketAddress("127.0.0.1",8000),addresses.get(0));
+      assertEquals(new ListenSocketAddress("127.0.0.1",9000),addresses.get(1));
+    }
+ else {
+      assertEquals(new ListenSocketAddress("127.0.0.1",8000),addresses.get(1));
+      assertEquals(new ListenSocketAddress("127.0.0.1",9000),addresses.get(0));
+    }
+  }
+  @Test void shouldSupportMultipleBoltConnectorsWithDefaultAndCustomName(){
+    Config config=Config.defaults(stringMap("dbms.connector.bolt.type","BOLT","dbms.connector.bolt.enabled","true","dbms.connector.bolt.listen_address",":8000","dbms.connector.bolt2.type","BOLT","dbms.connector.bolt2.enabled","true","dbms.connector.bolt2.listen_address",":9000"));
+    BoltConnector boltConnector1=config.boltConnectors().get(0);
+    BoltConnector boltConnector2=config.boltConnectors().get(1);
+    assertEquals(new ListenSocketAddress("127.0.0.1",8000),config.get(boltConnector1.listen_address));
+    assertEquals(new ListenSocketAddress("127.0.0.1",9000),config.get(boltConnector2.listen_address));
+  }
+  @Test void testServerDefaultSettings(){
+    Config config=Config.builder().withServerDefaults().build();
+    List<HttpConnector> connectors=config.httpConnectors();
+    assertEquals(2,connectors.size());
+    if (connectors.get(0).encryptionLevel().equals(TLS)) {
+      assertEquals(new ListenSocketAddress("localhost",7474),config.get(connectors.get(1).listen_address));
+      assertEquals(new ListenSocketAddress("localhost",7473),config.get(connectors.get(0).listen_address));
+    }
+ else {
+      assertEquals(new ListenSocketAddress("127.0.0.1",7474),config.get(connectors.get(0).listen_address));
+      assertEquals(new ListenSocketAddress("127.0.0.1",7473),config.get(connectors.get(1).listen_address));
+    }
+  }
+  @Test void shouldBeAbleToDisableHttpConnectorWithJustOneParameter(){
+    Config disableHttpConfig=Config.defaults(stringMap("dbms.connector.http.enabled","false","dbms.connector.https.enabled","false"));
+    assertTrue(disableHttpConfig.enabledHttpConnectors().isEmpty());
+    assertEquals(2,disableHttpConfig.httpConnectors().size());
+  }
+  @Test void shouldBeAbleToOverrideHttpListenAddressWithJustOneParameter(){
+    Config config=Config.defaults(stringMap("dbms.connector.http.enabled","true","dbms.connector.http.listen_address",":8000"));
+    assertEquals(1,config.enabledHttpConnectors().size());
+    HttpConnector httpConnector=config.enabledHttpConnectors().get(0);
+    assertEquals(new ListenSocketAddress("127.0.0.1",8000),config.get(httpConnector.listen_address));
+  }
+  @Test void hasDefaultBookmarkAwaitTimeout(){
+    Config config=Config.defaults();
+    long bookmarkReadyTimeoutMs=config.get(GraphDatabaseSettings.bookmark_ready_timeout).toMillis();
+    assertEquals(TimeUnit.SECONDS.toMillis(30),bookmarkReadyTimeoutMs);
+  }
+  @Test void shouldBeAbleToOverrideHttpsListenAddressWithJustOneParameter(){
+    Config config=Config.defaults(stringMap("dbms.connector.https.enabled","true","dbms.connector.https.listen_address",":8000"));
+    assertEquals(1,config.enabledHttpConnectors().size());
+    HttpConnector httpConnector=config.enabledHttpConnectors().get(0);
+    assertEquals(new ListenSocketAddress("127.0.0.1",8000),config.get(httpConnector.listen_address));
+  }
+  @Test void throwsForIllegalBookmarkAwaitTimeout(){
+    String[] illegalValues={"0ms","0s","10ms","99ms","999ms","42ms"};
+    for (    String value : illegalValues) {
+      assertThrows(InvalidSettingException.class,() -> {
+        Config config=Config.defaults(stringMap(GraphDatabaseSettings.bookmark_ready_timeout.name(),value));
+        config.get(GraphDatabaseSettings.bookmark_ready_timeout);
+      }
+,"Exception expected for value '" + value + "'");
+    }
+  }
+  @Test void shouldDeriveListenAddressFromDefaultListenAddress(){
+    Config config=Config.fromSettings(stringMap("dbms.connector.https.enabled","true","dbms.connector.http.enabled","true","dbms.connectors.default_listen_address","0.0.0.0")).withServerDefaults().build();
+    assertEquals(2,config.enabledHttpConnectors().size());
+    config.enabledHttpConnectors().forEach(c -> assertEquals("0.0.0.0",config.get(c.listen_address).getHostname()));
+  }
+  @Test void shouldDeriveListenAddressFromDefaultListenAddressAndSpecifiedPorts(){
+    Config config=Config.defaults(stringMap("dbms.connector.https.enabled","true","dbms.connector.http.enabled","true","dbms.connectors.default_listen_address","0.0.0.0","dbms.connector.http.listen_address",":8000","dbms.connector.https.listen_address",":9000"));
+    assertEquals(2,config.enabledHttpConnectors().size());
+    config.enabledHttpConnectors().forEach(c -> {
+      if (c.key().equals("https")) {
+        assertEquals(new ListenSocketAddress("0.0.0.0",9000),config.get(c.listen_address));
+      }
+ else {
+        assertEquals(new ListenSocketAddress("0.0.0.0",8000),config.get(c.listen_address));
+      }
+    }
+);
+  }
+  @Test void shouldStillSupportCustomNameForHttpConnector(){
+    Config config=Config.defaults(stringMap("dbms.connector.random_name_that_will_be_unsupported.type","HTTP","dbms.connector.random_name_that_will_be_unsupported.encryption","NONE","dbms.connector.random_name_that_will_be_unsupported.enabled","true","dbms.connector.random_name_that_will_be_unsupported.listen_address",":8000"));
+    assertEquals(1,config.enabledHttpConnectors().size());
+    assertEquals(new ListenSocketAddress("127.0.0.1",8000),config.get(config.enabledHttpConnectors().get(0).listen_address));
+  }
+  @Test void shouldStillSupportCustomNameForHttpsConnector(){
+    Config config=Config.defaults(stringMap("dbms.connector.random_name_that_will_be_unsupported.type","HTTP","dbms.connector.random_name_that_will_be_unsupported.encryption","TLS","dbms.connector.random_name_that_will_be_unsupported.enabled","true","dbms.connector.random_name_that_will_be_unsupported.listen_address",":9000"));
+    assertEquals(1,config.enabledHttpConnectors().size());
+    assertEquals(new ListenSocketAddress("127.0.0.1",9000),config.get(config.enabledHttpConnectors().get(0).listen_address));
+  }
+  @Test void validateRetentionPolicy(){
+    String[] validSet=new String[]{"true","keep_all","false","keep_none","10 files","10k files","10K size","10m txs","10M entries","10g hours","10G days"};
+    String[] invalidSet=new String[]{"invalid","all","10","10k","10k a"};
+    for (    String valid : validSet) {
+      assertEquals(valid,Config.defaults(keep_logical_logs,valid).get(keep_logical_logs));
+    }
+    for (    String invalid : invalidSet) {
+      assertThrows(InvalidSettingException.class,() -> Config.defaults(keep_logical_logs,invalid),"Value \"" + invalid + "\" should be considered invalid");
+    }
+  }
+}

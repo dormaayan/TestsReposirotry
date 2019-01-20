@@ -1,0 +1,56 @@
+@ExtendWith({DefaultFileSystemExtension.class,TestDirectoryExtension.class}) class NonUniqueDatabaseIndexPopulatorTest {
+  private final DirectoryFactory dirFactory=new DirectoryFactory.InMemoryDirectoryFactory();
+  @Inject private TestDirectory testDir;
+  @Inject private DefaultFileSystemAbstraction fileSystem;
+  private SchemaIndex index;
+  private NonUniqueLuceneIndexPopulator populator;
+  private final SchemaDescriptor labelSchemaDescriptor=SchemaDescriptorFactory.forLabel(0,0);
+  @BeforeEach void setUp(){
+    File folder=testDir.directory("folder");
+    PartitionedIndexStorage indexStorage=new PartitionedIndexStorage(dirFactory,fileSystem,folder);
+    IndexDescriptor descriptor=IndexDescriptorFactory.forSchema(labelSchemaDescriptor);
+    index=LuceneSchemaIndexBuilder.create(descriptor,Config.defaults()).withIndexStorage(indexStorage).build();
+  }
+  @AfterEach void tearDown() throws Exception {
+    if (populator != null) {
+      populator.close(false);
+    }
+    IOUtils.closeAll(index,dirFactory);
+  }
+  @Test void sampleEmptyIndex() throws IOException {
+    populator=newPopulator();
+    IndexSample sample=populator.sampleResult();
+    assertEquals(new IndexSample(),sample);
+  }
+  @Test void sampleIncludedUpdates() throws Exception {
+    populator=newPopulator();
+    List<IndexEntryUpdate<?>> updates=Arrays.asList(add(1,labelSchemaDescriptor,"aaa"),add(2,labelSchemaDescriptor,"bbb"),add(3,labelSchemaDescriptor,"ccc"));
+    updates.forEach(populator::includeSample);
+    IndexSample sample=populator.sampleResult();
+    assertEquals(new IndexSample(3,3,3),sample);
+  }
+  @Test void sampleIncludedUpdatesWithDuplicates() throws Exception {
+    populator=newPopulator();
+    List<IndexEntryUpdate<?>> updates=Arrays.asList(add(1,labelSchemaDescriptor,"foo"),add(2,labelSchemaDescriptor,"bar"),add(3,labelSchemaDescriptor,"foo"));
+    updates.forEach(populator::includeSample);
+    IndexSample sample=populator.sampleResult();
+    assertEquals(new IndexSample(3,2,3),sample);
+  }
+  @Test void addUpdates() throws Exception {
+    populator=newPopulator();
+    List<IndexEntryUpdate<?>> updates=Arrays.asList(add(1,labelSchemaDescriptor,"foo"),add(2,labelSchemaDescriptor,"bar"),add(42,labelSchemaDescriptor,"bar"));
+    populator.add(updates);
+    index.maybeRefreshBlocking();
+    try (IndexReader reader=index.getIndexReader()){
+      int propertyKeyId=labelSchemaDescriptor.getPropertyId();
+      LongIterator allEntities=reader.query(IndexQuery.exists(propertyKeyId));
+      assertArrayEquals(new long[]{1,2,42},PrimitiveLongCollections.asArray(allEntities));
+    }
+   }
+  private NonUniqueLuceneIndexPopulator newPopulator() throws IOException {
+    IndexSamplingConfig samplingConfig=new IndexSamplingConfig(Config.defaults());
+    NonUniqueLuceneIndexPopulator populator=new NonUniqueLuceneIndexPopulator(index,samplingConfig);
+    populator.create();
+    return populator;
+  }
+}

@@ -1,0 +1,162 @@
+public class BatchingTransactionAppenderConcurrencyTest {
+  private static final long MILLISECONDS_TO_WAIT=TimeUnit.SECONDS.toMillis(10);
+  private static ExecutorService executor;
+  @BeforeClass public static void setUpExecutor(){
+    executor=Executors.newCachedThreadPool();
+  }
+  @AfterClass public static void tearDownExecutor(){
+    executor.shutdown();
+    executor=null;
+  }
+  private final LifeRule life=new LifeRule();
+  private final EphemeralFileSystemRule fileSystemRule=new EphemeralFileSystemRule();
+  private final TestDirectory testDirectory=TestDirectory.testDirectory(fileSystemRule);
+  @Rule public final RuleChain ruleChain=RuleChain.outerRule(fileSystemRule).around(testDirectory).around(life);
+  private final LogAppendEvent logAppendEvent=LogAppendEvent.NULL;
+  private final LogFiles logFiles=mock(TransactionLogFiles.class);
+  private final LogFile logFile=mock(LogFile.class);
+  private final LogRotation logRotation=LogRotation.NO_ROTATION;
+  private final TransactionMetadataCache transactionMetadataCache=new TransactionMetadataCache();
+  private final TransactionIdStore transactionIdStore=new SimpleTransactionIdStore();
+  private final SimpleLogVersionRepository logVersionRepository=new SimpleLogVersionRepository();
+  private final IdOrderingQueue explicitIndexTransactionOrdering=IdOrderingQueue.BYPASS;
+  private final DatabaseHealth databaseHealth=mock(DatabaseHealth.class);
+  private final Semaphore forceSemaphore=new Semaphore(0);
+  private final BlockingQueue<ChannelCommand> channelCommandQueue=new LinkedBlockingQueue<>(2);
+  @Before public void setUp(){
+    when(logFiles.getLogFile()).thenReturn(logFile);
+    when(logFile.getWriter()).thenReturn(new CommandQueueChannel());
+  }
+  @Test public void shouldForceLogChannel() throws Throwable {
+    BatchingTransactionAppender appender=life.add(createTransactionAppender());
+    life.start();
+    appender.forceAfterAppend(logAppendEvent);
+    assertThat(channelCommandQueue.take(),is(ChannelCommand.emptyBufferIntoChannelAndClearIt));
+    assertThat(channelCommandQueue.take(),is(ChannelCommand.force));
+    assertTrue(channelCommandQueue.isEmpty());
+  }
+  @Test public void shouldWaitForOngoingForceToCompleteBeforeForcingAgain() throws Throwable {
+    channelCommandQueue.put(ChannelCommand.dummy);
+    final BatchingTransactionAppender appender=life.add(createTransactionAppender());
+    life.start();
+    Runnable runnable=createForceAfterAppendRunnable(appender);
+    Future<?> future=executor.submit(runnable);
+    forceSemaphore.acquire();
+    Thread otherThread=fork(runnable);
+    awaitThreadState(otherThread,MILLISECONDS_TO_WAIT,Thread.State.TIMED_WAITING);
+    assertThat(channelCommandQueue.take(),is(ChannelCommand.dummy));
+    assertThat(channelCommandQueue.take(),is(ChannelCommand.emptyBufferIntoChannelAndClearIt));
+    assertThat(channelCommandQueue.take(),is(ChannelCommand.force));
+    assertThat(channelCommandQueue.take(),is(ChannelCommand.emptyBufferIntoChannelAndClearIt));
+    assertThat(channelCommandQueue.take(),is(ChannelCommand.force));
+    future.get();
+    otherThread.join();
+    assertTrue(channelCommandQueue.isEmpty());
+  }
+  @Test public void shouldBatchUpMultipleWaitingForceRequests() throws Throwable {
+    channelCommandQueue.put(ChannelCommand.dummy);
+    final BatchingTransactionAppender appender=life.add(createTransactionAppender());
+    life.start();
+    Runnable runnable=createForceAfterAppendRunnable(appender);
+    Future<?> future=executor.submit(runnable);
+    forceSemaphore.acquire();
+    Thread[] otherThreads=new Thread[10];
+    for (int i=0; i < otherThreads.length; i++) {
+      otherThreads[i]=fork(runnable);
+    }
+    for (    Thread otherThread : otherThreads) {
+      awaitThreadState(otherThread,MILLISECONDS_TO_WAIT,Thread.State.TIMED_WAITING);
+    }
+    assertThat(channelCommandQueue.take(),is(ChannelCommand.dummy));
+    assertThat(channelCommandQueue.take(),is(ChannelCommand.emptyBufferIntoChannelAndClearIt));
+    assertThat(channelCommandQueue.take(),is(ChannelCommand.force));
+    assertThat(channelCommandQueue.take(),is(ChannelCommand.emptyBufferIntoChannelAndClearIt));
+    assertThat(channelCommandQueue.take(),is(ChannelCommand.force));
+    future.get();
+    for (    Thread otherThread : otherThreads) {
+      otherThread.join();
+    }
+    assertTrue(channelCommandQueue.isEmpty());
+  }
+  @Test public void shouldHaveAllConcurrentAppendersSeePanic() throws Throwable {
+    Adversary adversary=new ClassGuardedAdversary(new CountingAdversary(1,true),failMethod(BatchingTransactionAppender.class,"force"));
+    EphemeralFileSystemAbstraction efs=new EphemeralFileSystemAbstraction();
+    FileSystemAbstraction fs=new AdversarialFileSystemAbstraction(adversary,efs);
+    life.add(new FileSystemLifecycleAdapter(fs));
+    DatabaseHealth databaseHealth=new DatabaseHealth(mock(DatabasePanicEventGenerator.class),NullLog.getInstance());
+    LogFiles logFiles=LogFilesBuilder.builder(testDirectory.databaseLayout(),fs).withLogVersionRepository(logVersionRepository).withTransactionIdStore(transactionIdStore).build();
+    life.add(logFiles);
+    final BatchingTransactionAppender appender=life.add(new BatchingTransactionAppender(logFiles,logRotation,transactionMetadataCache,transactionIdStore,explicitIndexTransactionOrdering,databaseHealth));
+    life.start();
+    int numberOfAppenders=10;
+    final CountDownLatch trap=new CountDownLatch(numberOfAppenders);
+    final LogAppendEvent beforeForceTrappingEvent=new LogAppendEvent.Empty(){
+      @Override public LogForceWaitEvent beginLogForceWait(){
+        trap.countDown();
+        awaitLatch(trap);
+        return super.beginLogForceWait();
+      }
+    }
+;
+    Race race=new Race();
+    for (int i=0; i < numberOfAppenders; i++) {
+      race.addContestant(() -> {
+        try {
+          appender.append(tx(),beforeForceTrappingEvent);
+          fail("No transaction should be considered appended");
+        }
+ catch (        IOException e) {
+        }
+      }
+);
+    }
+    race.go();
+  }
+  protected TransactionToApply tx(){
+    NodeRecord before=new NodeRecord(0);
+    NodeRecord after=new NodeRecord(0);
+    after.setInUse(true);
+    Command.NodeCommand nodeCommand=new Command.NodeCommand(before,after);
+    PhysicalTransactionRepresentation tx=new PhysicalTransactionRepresentation(singletonList(nodeCommand));
+    tx.setHeader(new byte[0],0,0,0,0,0,0);
+    return new TransactionToApply(tx);
+  }
+  private Runnable createForceAfterAppendRunnable(  final BatchingTransactionAppender appender){
+    return () -> {
+      try {
+        appender.forceAfterAppend(logAppendEvent);
+      }
+ catch (      IOException e) {
+        throw new RuntimeException(e);
+      }
+    }
+;
+  }
+  private Predicate<StackTraceElement> failMethod(  final Class<?> klass,  final String methodName){
+    return element -> element.getClassName().equals(klass.getName()) && element.getMethodName().equals(methodName);
+  }
+  private BatchingTransactionAppender createTransactionAppender(){
+    return new BatchingTransactionAppender(logFiles,logRotation,transactionMetadataCache,transactionIdStore,explicitIndexTransactionOrdering,databaseHealth);
+  }
+  private enum ChannelCommand {  emptyBufferIntoChannelAndClearIt,   force,   dummy}
+class CommandQueueChannel extends InMemoryClosableChannel implements Flushable {
+    @Override public Flushable prepareForFlush(){
+      try {
+        channelCommandQueue.put(ChannelCommand.emptyBufferIntoChannelAndClearIt);
+      }
+ catch (      InterruptedException e) {
+        throw new RuntimeException(e);
+      }
+      return this;
+    }
+    @Override public void flush() throws IOException {
+      try {
+        forceSemaphore.release();
+        channelCommandQueue.put(ChannelCommand.force);
+      }
+ catch (      InterruptedException e) {
+        throw new IOException(e);
+      }
+    }
+  }
+}

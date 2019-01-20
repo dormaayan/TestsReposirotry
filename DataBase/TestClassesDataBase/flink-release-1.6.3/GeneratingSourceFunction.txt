@@ -1,0 +1,56 @@
+/** 
+ * Generates some Long values and as an implementation for the  {@link CheckpointListener}interface it stores all the checkpoint ids it has seen in a static list.
+ */
+private static class GeneratingSourceFunction extends RichSourceFunction<Long> implements ParallelSourceFunction<Long>, CheckpointListener, ListCheckpointed<Integer> {
+  static final List<Long>[] COMPLETED_CHECKPOINTS=createCheckpointLists(PARALLELISM);
+  static AtomicLong numPostFailureNotifications=new AtomicLong();
+  private final long numElements;
+  private final int notificationsToWaitFor;
+  private int index;
+  private int step;
+  private volatile boolean notificationAlready;
+  private volatile boolean isRunning=true;
+  GeneratingSourceFunction(  long numElements,  int notificationsToWaitFor){
+    this.numElements=numElements;
+    this.notificationsToWaitFor=notificationsToWaitFor;
+  }
+  @Override public void open(  Configuration parameters) throws IOException {
+    step=getRuntimeContext().getNumberOfParallelSubtasks();
+    if (index == 0) {
+      index=getRuntimeContext().getIndexOfThisSubtask();
+    }
+  }
+  @Override public void run(  SourceContext<Long> ctx) throws Exception {
+    final Object lockingObject=ctx.getCheckpointLock();
+    while (isRunning && index < numElements) {
+      long result=index % 10;
+synchronized (lockingObject) {
+        index+=step;
+        ctx.collect(result);
+      }
+    }
+    while (isRunning && numPostFailureNotifications.get() < notificationsToWaitFor) {
+      Thread.sleep(50);
+    }
+  }
+  @Override public void cancel(){
+    isRunning=false;
+  }
+  @Override public List<Integer> snapshotState(  long checkpointId,  long timestamp) throws Exception {
+    return Collections.singletonList(this.index);
+  }
+  @Override public void restoreState(  List<Integer> state) throws Exception {
+    if (state.isEmpty() || state.size() > 1) {
+      throw new RuntimeException("Test failed due to unexpected recovered state size " + state.size());
+    }
+    this.index=state.get(0);
+  }
+  @Override public void notifyCheckpointComplete(  long checkpointId){
+    int partition=getRuntimeContext().getIndexOfThisSubtask();
+    COMPLETED_CHECKPOINTS[partition].add(checkpointId);
+    if (OnceFailingReducer.hasFailed && !notificationAlready) {
+      notificationAlready=true;
+      GeneratingSourceFunction.numPostFailureNotifications.incrementAndGet();
+    }
+  }
+}

@@ -1,0 +1,60 @@
+@Test public void testSnapshotWhenSnapshotHFileCleanerRunning() throws Exception {
+  loadDataAndFlush();
+  SnapshotHFileCleaner cleaner=new SnapshotHFileCleaner();
+  cleaner.init(ImmutableMap.of(HMaster.MASTER,TEST_UTIL.getHBaseCluster().getMaster()));
+  cleaner.setConf(CONF);
+  FileSystem fs=FSUtils.getCurrentFileSystem(CONF);
+  List<Path> fileNames=listHFileNames(fs,FSUtils.getTableDir(FSUtils.getRootDir(CONF),TABLE_NAME));
+  List<FileStatus> files=new ArrayList<>();
+  for (  Path fileName : fileNames) {
+    files.add(fs.getFileStatus(fileName));
+  }
+  TEST_UTIL.getAdmin().snapshot("snapshotName_prev",TABLE_NAME);
+  Assert.assertEquals(Lists.newArrayList(cleaner.getDeletableFiles(files)).size(),0);
+  TEST_UTIL.getAdmin().deleteSnapshot("snapshotName_prev");
+  cleaner.getFileCacheForTesting().triggerCacheRefreshForTesting();
+  Assert.assertEquals(Lists.newArrayList(cleaner.getDeletableFiles(files)).size(),100);
+  Runnable snapshotRunnable=() -> {
+    try {
+      for (int k=0; k < 5; k++) {
+        TEST_UTIL.getAdmin().snapshot("snapshotName_" + k,TABLE_NAME);
+      }
+    }
+ catch (    Exception e) {
+      LOG.error("Snapshot failed: ",e);
+    }
+  }
+;
+  final AtomicBoolean success=new AtomicBoolean(true);
+  Runnable cleanerRunnable=() -> {
+    try {
+      while (!isAnySnapshots(fs)) {
+        LOG.info("Not found any snapshot, sleep 100ms");
+        Thread.sleep(100);
+      }
+      for (int k=0; k < 5; k++) {
+        cleaner.getFileCacheForTesting().triggerCacheRefreshForTesting();
+        Iterable<FileStatus> toDeleteFiles=cleaner.getDeletableFiles(files);
+        List<FileStatus> deletableFiles=Lists.newArrayList(toDeleteFiles);
+        LOG.info("Size of deletableFiles is: " + deletableFiles.size());
+        for (int i=0; i < deletableFiles.size(); i++) {
+          LOG.debug("toDeleteFiles[{}] is: {}",i,deletableFiles.get(i));
+        }
+        if (deletableFiles.size() > 0) {
+          success.set(false);
+        }
+      }
+    }
+ catch (    Exception e) {
+      LOG.error("Chore cleaning failed: ",e);
+    }
+  }
+;
+  Thread t1=new Thread(snapshotRunnable);
+  t1.start();
+  Thread t2=new Thread(cleanerRunnable);
+  t2.start();
+  t1.join();
+  t2.join();
+  Assert.assertTrue(success.get());
+}

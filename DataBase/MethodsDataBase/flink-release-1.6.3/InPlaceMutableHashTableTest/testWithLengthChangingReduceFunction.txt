@@ -1,0 +1,64 @@
+@Test public void testWithLengthChangingReduceFunction() throws Exception {
+  Random rnd=new Random(RANDOM_SEED);
+  final int numKeys=10000;
+  final int numVals=10;
+  final int numRecords=numKeys * numVals;
+  StringPairSerializer serializer=new StringPairSerializer();
+  StringPairComparator comparator=new StringPairComparator();
+  ReduceFunction<StringPair> reducer=new ConcatReducer();
+  List<StringPair> expectedOutput=new ArrayList<>();
+  InPlaceMutableHashTableWithJavaHashMap<StringPair,String> reference=new InPlaceMutableHashTableWithJavaHashMap<>(serializer,comparator,reducer,new CopyingListCollector<>(expectedOutput,serializer));
+  final int numMemPages=numRecords * 10 / PAGE_SIZE;
+  List<StringPair> actualOutput=new ArrayList<>();
+  InPlaceMutableHashTable<StringPair> table=new InPlaceMutableHashTable<>(serializer,comparator,getMemory(numMemPages,PAGE_SIZE));
+  InPlaceMutableHashTable<StringPair>.ReduceFacade reduceFacade=table.new ReduceFacade(reducer,new CopyingListCollector<>(actualOutput,serializer),true);
+  for (int j=0; j < 3; j++) {
+    table.open();
+    reduceFacade.emit();
+    reference.updateTableEntryWithReduce(serializer.copy(new StringPair("foo","bar")),"foo");
+    reference.updateTableEntryWithReduce(serializer.copy(new StringPair("foo","baz")),"foo");
+    reference.updateTableEntryWithReduce(serializer.copy(new StringPair("alma","xyz")),"alma");
+    reduceFacade.updateTableEntryWithReduce(serializer.copy(new StringPair("foo","bar")));
+    reduceFacade.updateTableEntryWithReduce(serializer.copy(new StringPair("foo","baz")));
+    reduceFacade.updateTableEntryWithReduce(serializer.copy(new StringPair("alma","xyz")));
+    for (int i=0; i < 5; i++) {
+      reduceFacade.updateTableEntryWithReduce(serializer.copy(new StringPair("korte","abc")));
+      reference.updateTableEntryWithReduce(serializer.copy(new StringPair("korte","abc")),"korte");
+    }
+    reference.emitAndReset();
+    reduceFacade.emitAndReset();
+    UniformStringPairGenerator gen=new UniformStringPairGenerator(numKeys,numVals,true);
+    List<StringPair> input=new ArrayList<>();
+    StringPair cur=new StringPair();
+    while (gen.next(cur) != null) {
+      input.add(serializer.copy(cur));
+    }
+    Collections.shuffle(input,rnd);
+    final int numIntermingledEmits=5;
+    for (    StringPair record : input) {
+      reference.updateTableEntryWithReduce(serializer.copy(record),record.getKey());
+      reduceFacade.updateTableEntryWithReduce(serializer.copy(record));
+      if (rnd.nextDouble() < 1.0 / ((double)numRecords / numIntermingledEmits)) {
+        reference.emitAndReset();
+        reduceFacade.emitAndReset();
+      }
+    }
+    reference.emitAndReset();
+    reduceFacade.emit();
+    table.close();
+    assertEquals(expectedOutput.size(),actualOutput.size());
+    String[] expectedValues=new String[expectedOutput.size()];
+    for (int i=0; i < expectedOutput.size(); i++) {
+      expectedValues[i]=expectedOutput.get(i).getValue();
+    }
+    String[] actualValues=new String[actualOutput.size()];
+    for (int i=0; i < actualOutput.size(); i++) {
+      actualValues[i]=actualOutput.get(i).getValue();
+    }
+    Arrays.sort(expectedValues,Ordering.<String>natural());
+    Arrays.sort(actualValues,Ordering.<String>natural());
+    assertArrayEquals(expectedValues,actualValues);
+    expectedOutput.clear();
+    actualOutput.clear();
+  }
+}

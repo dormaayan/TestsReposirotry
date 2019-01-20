@@ -1,0 +1,45 @@
+public class ConfiguringPageCacheFactoryTest {
+  @Rule public final EphemeralFileSystemRule fsRule=new EphemeralFileSystemRule();
+  private JobScheduler jobScheduler;
+  @Before public void setUp(){
+    jobScheduler=new ThreadPoolJobScheduler();
+    PageSwapperFactoryForTesting.createdCounter.set(0);
+    PageSwapperFactoryForTesting.configuredCounter.set(0);
+  }
+  @After public void tearDown() throws Exception {
+    jobScheduler.close();
+  }
+  @Test public void shouldFitAsManyPagesAsItCan(){
+    long pageCount=60;
+    long memory=MuninnPageCache.memoryRequiredForPages(pageCount);
+    Config config=Config.defaults(pagecache_memory,Long.toString(memory));
+    ConfiguringPageCacheFactory factory=new ConfiguringPageCacheFactory(fsRule.get(),config,PageCacheTracer.NULL,PageCursorTracerSupplier.NULL,NullLog.getInstance(),EmptyVersionContextSupplier.EMPTY,jobScheduler);
+    try (PageCache cache=factory.getOrCreatePageCache()){
+      assertThat(cache.pageSize(),equalTo(PageCache.PAGE_SIZE));
+      assertThat(cache.maxCachedPages(),equalTo(pageCount));
+    }
+   }
+  @Test public void shouldWarnWhenCreatedWithConfiguredPageCache(){
+    Config config=Config.defaults(stringMap(GraphDatabaseSettings.mapped_memory_page_size.name(),"4096",pagecache_swapper.name(),TEST_PAGESWAPPER_NAME));
+    AssertableLogProvider logProvider=new AssertableLogProvider();
+    Log log=logProvider.getLog(PageCache.class);
+    ConfiguringPageCacheFactory pageCacheFactory=new ConfiguringPageCacheFactory(fsRule.get(),config,PageCacheTracer.NULL,PageCursorTracerSupplier.NULL,log,EmptyVersionContextSupplier.EMPTY,jobScheduler);
+    try (PageCache ignore=pageCacheFactory.getOrCreatePageCache()){
+      logProvider.assertContainsLogCallContaining("The setting unsupported.dbms.memory.pagecache.pagesize does not have any effect. It is " + "deprecated and will be removed in a future version.");
+    }
+   }
+  @Test public void mustUseAndLogConfiguredPageSwapper(){
+    Config config=Config.defaults(stringMap(pagecache_memory.name(),"8m",pagecache_swapper.name(),TEST_PAGESWAPPER_NAME));
+    AssertableLogProvider logProvider=new AssertableLogProvider();
+    Log log=logProvider.getLog(PageCache.class);
+    ConfiguringPageCacheFactory cacheFactory=new ConfiguringPageCacheFactory(fsRule.get(),config,PageCacheTracer.NULL,PageCursorTracerSupplier.NULL,log,EmptyVersionContextSupplier.EMPTY,jobScheduler);
+    cacheFactory.getOrCreatePageCache().close();
+    assertThat(PageSwapperFactoryForTesting.countCreatedPageSwapperFactories(),is(1));
+    assertThat(PageSwapperFactoryForTesting.countConfiguredPageSwapperFactories(),is(1));
+    logProvider.assertContainsMessageContaining(TEST_PAGESWAPPER_NAME);
+  }
+  @Test(expected=IllegalArgumentException.class) public void mustThrowIfConfiguredPageSwapperCannotBeFound(){
+    Config config=Config.defaults(stringMap(pagecache_memory.name(),"8m",pagecache_swapper.name(),"non-existing"));
+    new ConfiguringPageCacheFactory(fsRule.get(),config,PageCacheTracer.NULL,PageCursorTracerSupplier.NULL,NullLog.getInstance(),EmptyVersionContextSupplier.EMPTY,jobScheduler).getOrCreatePageCache().close();
+  }
+}

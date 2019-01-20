@@ -1,0 +1,111 @@
+/** 
+ * Failure / recovery test for truncate. In this failure the DNs fail to recover the blocks and the NN triggers lease recovery. File stays in RecoveryInProgress until DataNodes report recovery.
+ */
+@Test public void testTruncateFailure() throws IOException {
+  int startingFileSize=2 * BLOCK_SIZE + BLOCK_SIZE / 2;
+  int toTruncate=1;
+  byte[] contents=AppendTestUtil.initBuffer(startingFileSize);
+  final Path dir=new Path("/dir");
+  final Path p=new Path(dir,"testTruncateFailure");
+{
+    FSDataOutputStream out=fs.create(p,false,BLOCK_SIZE,REPLICATION,BLOCK_SIZE);
+    out.write(contents,0,startingFileSize);
+    try {
+      fs.truncate(p,0);
+      fail("Truncate must fail on open file.");
+    }
+ catch (    IOException expected) {
+      GenericTestUtils.assertExceptionContains("Failed to TRUNCATE_FILE",expected);
+    }
+ finally {
+      out.close();
+    }
+  }
+{
+    FSDataOutputStream out=fs.append(p);
+    try {
+      fs.truncate(p,0);
+      fail("Truncate must fail for append.");
+    }
+ catch (    IOException expected) {
+      GenericTestUtils.assertExceptionContains("Failed to TRUNCATE_FILE",expected);
+    }
+ finally {
+      out.close();
+    }
+  }
+  try {
+    fs.truncate(p,-1);
+    fail("Truncate must fail for a negative new length.");
+  }
+ catch (  HadoopIllegalArgumentException expected) {
+    GenericTestUtils.assertExceptionContains("Cannot truncate to a negative file size",expected);
+  }
+  try {
+    fs.truncate(p,startingFileSize + 1);
+    fail("Truncate must fail for a larger new length.");
+  }
+ catch (  Exception expected) {
+    GenericTestUtils.assertExceptionContains("Cannot truncate to a larger file size",expected);
+  }
+  try {
+    fs.truncate(dir,0);
+    fail("Truncate must fail for a directory.");
+  }
+ catch (  Exception expected) {
+    GenericTestUtils.assertExceptionContains("Path is not a file",expected);
+  }
+  try {
+    fs.truncate(new Path(dir,"non-existing"),0);
+    fail("Truncate must fail for a non-existing file.");
+  }
+ catch (  Exception expected) {
+    GenericTestUtils.assertExceptionContains("File does not exist",expected);
+  }
+  fs.setPermission(p,FsPermission.createImmutable((short)0664));
+{
+    final UserGroupInformation fooUgi=UserGroupInformation.createUserForTesting("foo",new String[]{"foo"});
+    try {
+      final FileSystem foofs=DFSTestUtil.getFileSystemAs(fooUgi,conf);
+      foofs.truncate(p,0);
+      fail("Truncate must fail for no WRITE permission.");
+    }
+ catch (    Exception expected) {
+      GenericTestUtils.assertExceptionContains("Permission denied",expected);
+    }
+  }
+  cluster.shutdownDataNodes();
+  NameNodeAdapter.getLeaseManager(cluster.getNamesystem()).setLeasePeriod(LOW_SOFTLIMIT,LOW_HARDLIMIT);
+  int newLength=startingFileSize - toTruncate;
+  boolean isReady=fs.truncate(p,newLength);
+  assertThat("truncate should have triggered block recovery.",isReady,is(false));
+{
+    try {
+      fs.truncate(p,0);
+      fail("Truncate must fail since a trancate is already in pregress.");
+    }
+ catch (    IOException expected) {
+      GenericTestUtils.assertExceptionContains("Failed to TRUNCATE_FILE",expected);
+    }
+  }
+  boolean recoveryTriggered=false;
+  for (int i=0; i < RECOVERY_ATTEMPTS; i++) {
+    String leaseHolder=NameNodeAdapter.getLeaseHolderForPath(cluster.getNameNode(),p.toUri().getPath());
+    if (leaseHolder.startsWith(HdfsServerConstants.NAMENODE_LEASE_HOLDER)) {
+      recoveryTriggered=true;
+      break;
+    }
+    try {
+      Thread.sleep(SLEEP);
+    }
+ catch (    InterruptedException ignored) {
+    }
+  }
+  assertThat("lease recovery should have occurred in ~" + SLEEP * RECOVERY_ATTEMPTS + " ms.",recoveryTriggered,is(true));
+  cluster.startDataNodes(conf,DATANODE_NUM,true,StartupOption.REGULAR,null);
+  cluster.waitActive();
+  checkBlockRecovery(p);
+  NameNodeAdapter.getLeaseManager(cluster.getNamesystem()).setLeasePeriod(HdfsConstants.LEASE_SOFTLIMIT_PERIOD,HdfsConstants.LEASE_HARDLIMIT_PERIOD);
+  checkFullFile(p,newLength,contents);
+  fs.delete(p,false);
+}

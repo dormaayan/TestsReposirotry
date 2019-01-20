@@ -1,0 +1,42 @@
+/** 
+ * Tests that a standby  {@link Dispatcher} can recover all submitted jobs.
+ */
+@Test public void testStandbyDispatcherJobRecovery() throws Exception {
+  try (CuratorFramework curatorFramework=ZooKeeperUtils.startCuratorFramework(configuration)){
+    HighAvailabilityServices haServices=null;
+    Dispatcher dispatcher1=null;
+    Dispatcher dispatcher2=null;
+    try {
+      haServices=new ZooKeeperHaServices(curatorFramework,rpcService.getExecutor(),configuration,new VoidBlobStore());
+      final CompletableFuture<JobGraph> jobGraphFuture1=new CompletableFuture<>();
+      dispatcher1=createDispatcher(haServices,new TestingJobManagerRunnerFactory(jobGraphFuture1,new CompletableFuture<>(),CompletableFuture.completedFuture(null)));
+      final CompletableFuture<JobGraph> jobGraphFuture2=new CompletableFuture<>();
+      dispatcher2=createDispatcher(haServices,new TestingJobManagerRunnerFactory(jobGraphFuture2,new CompletableFuture<>(),CompletableFuture.completedFuture(null)));
+      dispatcher1.start();
+      dispatcher2.start();
+      final LeaderConnectionInfo leaderConnectionInfo=LeaderRetrievalUtils.retrieveLeaderConnectionInfo(haServices.getDispatcherLeaderRetriever(),TIMEOUT);
+      final DispatcherGateway dispatcherGateway=rpcService.connect(leaderConnectionInfo.getAddress(),DispatcherId.fromUuid(leaderConnectionInfo.getLeaderSessionID()),DispatcherGateway.class).get();
+      final JobGraph nonEmptyJobGraph=DispatcherHATest.createNonEmptyJobGraph();
+      dispatcherGateway.submitJob(nonEmptyJobGraph,TIMEOUT).get();
+      if (dispatcher1.getAddress().equals(leaderConnectionInfo.getAddress())) {
+        dispatcher1.shutDown();
+        assertThat(jobGraphFuture2.get().getJobID(),is(equalTo(nonEmptyJobGraph.getJobID())));
+      }
+ else {
+        dispatcher2.shutDown();
+        assertThat(jobGraphFuture1.get().getJobID(),is(equalTo(nonEmptyJobGraph.getJobID())));
+      }
+    }
+  finally {
+      if (dispatcher1 != null) {
+        RpcUtils.terminateRpcEndpoint(dispatcher1,TIMEOUT);
+      }
+      if (dispatcher2 != null) {
+        RpcUtils.terminateRpcEndpoint(dispatcher2,TIMEOUT);
+      }
+      if (haServices != null) {
+        haServices.close();
+      }
+    }
+  }
+ }

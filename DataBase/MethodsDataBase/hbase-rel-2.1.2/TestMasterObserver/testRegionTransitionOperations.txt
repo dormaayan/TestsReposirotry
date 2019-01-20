@@ -1,0 +1,64 @@
+@Test public void testRegionTransitionOperations() throws Exception {
+  final TableName tableName=TableName.valueOf(name.getMethodName());
+  MiniHBaseCluster cluster=UTIL.getHBaseCluster();
+  HMaster master=cluster.getMaster();
+  MasterCoprocessorHost host=master.getMasterCoprocessorHost();
+  CPMasterObserver cp=host.findCoprocessor(CPMasterObserver.class);
+  cp.resetStates();
+  Table table=UTIL.createMultiRegionTable(tableName,TEST_FAMILY);
+  try (RegionLocator r=UTIL.getConnection().getRegionLocator(tableName)){
+    UTIL.waitUntilAllRegionsAssigned(tableName);
+    List<HRegionLocation> regions=r.getAllRegionLocations();
+    HRegionLocation firstGoodPair=null;
+    for (    HRegionLocation e : regions) {
+      if (e.getServerName() != null) {
+        firstGoodPair=e;
+        break;
+      }
+    }
+    assertNotNull("Found a non-null entry",firstGoodPair);
+    LOG.info("Found " + firstGoodPair.toString());
+    Collection<ServerName> servers=master.getClusterMetrics().getLiveServerMetrics().keySet();
+    String destName=null;
+    String serverNameForFirstRegion=firstGoodPair.getServerName().toString();
+    LOG.info("serverNameForFirstRegion=" + serverNameForFirstRegion);
+    ServerName masterServerName=master.getServerName();
+    boolean found=false;
+    for (    ServerName info : servers) {
+      LOG.info("ServerName=" + info);
+      if (!serverNameForFirstRegion.equals(info.getServerName()) && !masterServerName.equals(info)) {
+        destName=info.toString();
+        found=true;
+        break;
+      }
+    }
+    assertTrue("Found server",found);
+    LOG.info("Found " + destName);
+    master.getMasterRpcServices().moveRegion(null,RequestConverter.buildMoveRegionRequest(firstGoodPair.getRegionInfo().getEncodedNameAsBytes(),ServerName.valueOf(destName)));
+    assertTrue("Coprocessor should have been called on region move",cp.wasMoveCalled());
+    master.balanceSwitch(true);
+    assertTrue("Coprocessor should have been called on balance switch",cp.wasBalanceSwitchCalled());
+    master.balanceSwitch(false);
+    UTIL.waitUntilNoRegionsInTransition();
+    HRegionServer rs=cluster.getRegionServer(0);
+    byte[] destRS=Bytes.toBytes(cluster.getRegionServer(1).getServerName().toString());
+    UTIL.waitUntilNoRegionsInTransition();
+    List<RegionInfo> openRegions=ProtobufUtil.getOnlineRegions(rs.getRSRpcServices());
+    int moveCnt=openRegions.size() / 2;
+    for (int i=0; i < moveCnt; i++) {
+      RegionInfo info=openRegions.get(i);
+      if (!info.isMetaRegion()) {
+        master.getMasterRpcServices().moveRegion(null,RequestConverter.buildMoveRegionRequest(openRegions.get(i).getEncodedNameAsBytes(),ServerName.valueOf(Bytes.toString(destRS))));
+      }
+    }
+    UTIL.waitUntilNoRegionsInTransition();
+    master.balanceSwitch(true);
+    boolean balanceRun=master.balance();
+    assertTrue("Coprocessor should be called on region rebalancing",cp.wasBalanceCalled());
+  }
+  finally {
+    Admin admin=UTIL.getAdmin();
+    admin.disableTable(tableName);
+    deleteTable(admin,tableName);
+  }
+}

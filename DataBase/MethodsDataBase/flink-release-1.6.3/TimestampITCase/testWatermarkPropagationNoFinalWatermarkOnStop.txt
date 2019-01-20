@@ -1,0 +1,62 @@
+@Test public void testWatermarkPropagationNoFinalWatermarkOnStop() throws Exception {
+  final ClusterClient<?> clusterClient=CLUSTER.getClusterClient();
+  while (!getRunningJobs(clusterClient).isEmpty()) {
+    Thread.sleep(100);
+  }
+  final int numWatermarks=10;
+  long initialTime=0L;
+  StreamExecutionEnvironment env=StreamExecutionEnvironment.getExecutionEnvironment();
+  env.setStreamTimeCharacteristic(TimeCharacteristic.EventTime);
+  env.setParallelism(PARALLELISM);
+  env.getConfig().disableSysoutLogging();
+  DataStream<Integer> source1=env.addSource(new MyTimestampSourceInfinite(initialTime,numWatermarks));
+  DataStream<Integer> source2=env.addSource(new MyTimestampSourceInfinite(initialTime,numWatermarks / 2));
+  source1.union(source2).map(new IdentityMap()).connect(source2).map(new IdentityCoMap()).transform("Custom Operator",BasicTypeInfo.INT_TYPE_INFO,new CustomOperator(true)).addSink(new DiscardingSink<Integer>());
+  Thread t=new Thread("stopper"){
+    @Override public void run(){
+      try {
+        List<JobID> running=getRunningJobs(clusterClient);
+        while (running.isEmpty()) {
+          Thread.sleep(10);
+          running=getRunningJobs(clusterClient);
+        }
+        JobID id=running.get(0);
+        do {
+          try {
+            clusterClient.stop(id);
+          }
+ catch (          Exception e) {
+            if (e.getCause() instanceof IllegalStateException) {
+            }
+ else {
+              throw e;
+            }
+          }
+          Thread.sleep(10);
+        }
+ while (!getRunningJobs(clusterClient).isEmpty());
+      }
+ catch (      Throwable t) {
+        t.printStackTrace();
+      }
+    }
+  }
+;
+  t.start();
+  env.execute();
+  for (  List<Watermark> subtaskWatermarks : CustomOperator.finalWatermarks) {
+    for (int j=0; j < subtaskWatermarks.size(); j++) {
+      if (subtaskWatermarks.get(j).getTimestamp() != initialTime + j) {
+        System.err.println("All Watermarks: ");
+        for (int k=0; k <= numWatermarks / 2; k++) {
+          System.err.println(subtaskWatermarks.get(k));
+        }
+        fail("Wrong watermark.");
+      }
+    }
+    if (subtaskWatermarks.size() > 0) {
+      assertNotEquals(Watermark.MAX_WATERMARK,subtaskWatermarks.get(subtaskWatermarks.size() - 1));
+    }
+  }
+  t.join();
+}

@@ -1,0 +1,104 @@
+public class CheckPointerIntegrationTest {
+  @Rule public EphemeralFileSystemRule fsRule=new EphemeralFileSystemRule();
+  @Rule public final TestDirectory testDirectory=TestDirectory.testDirectory();
+  private GraphDatabaseBuilder builder;
+  private FileSystemAbstraction fs;
+  @Before public void setup(){
+    fs=fsRule.get();
+    File storeDir=testDirectory.databaseDir();
+    builder=new TestGraphDatabaseFactory().setFileSystem(new UncloseableDelegatingFileSystemAbstraction(fs)).newImpermanentDatabaseBuilder(storeDir);
+  }
+  @Test public void databaseShutdownDuringConstantCheckPointing() throws InterruptedException {
+    GraphDatabaseService db=builder.setConfig(GraphDatabaseSettings.check_point_interval_time,0 + "ms").setConfig(GraphDatabaseSettings.check_point_interval_tx,"1").setConfig(GraphDatabaseSettings.logical_log_rotation_threshold,"1g").newGraphDatabase();
+    try (Transaction tx=db.beginTx()){
+      db.createNode();
+      tx.success();
+    }
+     Thread.sleep(10);
+    db.shutdown();
+  }
+  @Test public void shouldCheckPointBasedOnTime() throws Throwable {
+    long millis=200;
+    GraphDatabaseService db=builder.setConfig(GraphDatabaseSettings.check_point_interval_time,millis + "ms").setConfig(GraphDatabaseSettings.check_point_interval_tx,"10000").setConfig(GraphDatabaseSettings.logical_log_rotation_threshold,"1g").newGraphDatabase();
+    try (Transaction tx=db.beginTx()){
+      db.createNode();
+      tx.success();
+    }
+     long endTime=currentTimeMillis() + SECONDS.toMillis(30);
+    while (!checkPointInTxLog(db)) {
+      Thread.sleep(millis);
+      assertTrue("Took too long to produce a checkpoint",currentTimeMillis() < endTime);
+    }
+    db.shutdown();
+    List<CheckPoint> checkPoints=new CheckPointCollector(testDirectory.databaseDir(),fs).find(0);
+    assertTrue("Expected at least two (at least one for time interval and one for shutdown), was " + checkPoints.toString(),checkPoints.size() >= 2);
+  }
+  private static boolean checkPointInTxLog(  GraphDatabaseService db) throws IOException {
+    LogFiles logFiles=((GraphDatabaseAPI)db).getDependencyResolver().resolveDependency(LogFiles.class);
+    LogFile logFile=logFiles.getLogFile();
+    try (ReadableLogChannel reader=logFile.getReader(new LogPosition(0,LOG_HEADER_SIZE))){
+      LogEntryReader<ReadableClosablePositionAwareChannel> logEntryReader=new VersionAwareLogEntryReader<>();
+      LogEntry entry;
+      while ((entry=logEntryReader.readLogEntry(reader)) != null) {
+        if (entry instanceof CheckPoint) {
+          return true;
+        }
+      }
+      return false;
+    }
+   }
+  @Test public void shouldCheckPointBasedOnTxCount() throws Throwable {
+    GraphDatabaseService db=builder.setConfig(GraphDatabaseSettings.check_point_interval_time,"300m").setConfig(GraphDatabaseSettings.check_point_interval_tx,"1").setConfig(GraphDatabaseSettings.logical_log_rotation_threshold,"1g").newGraphDatabase();
+    try (Transaction tx=db.beginTx()){
+      db.createNode();
+      tx.success();
+    }
+     triggerCheckPointAttempt(db);
+    assertTrue(checkPointInTxLog(db));
+    db.shutdown();
+    List<CheckPoint> checkPoints=new CheckPointCollector(testDirectory.databaseDir(),fs).find(0);
+    assertEquals(2,checkPoints.size());
+  }
+  @Test public void shouldNotCheckPointWhenThereAreNoCommits() throws Throwable {
+    GraphDatabaseService db=builder.setConfig(GraphDatabaseSettings.check_point_interval_time,"1s").setConfig(GraphDatabaseSettings.check_point_interval_tx,"10000").setConfig(GraphDatabaseSettings.logical_log_rotation_threshold,"1g").newGraphDatabase();
+    triggerCheckPointAttempt(db);
+    assertFalse(checkPointInTxLog(db));
+    db.shutdown();
+    List<CheckPoint> checkPoints=new CheckPointCollector(testDirectory.databaseDir(),fs).find(0);
+    assertEquals(1,checkPoints.size());
+  }
+  @Test public void shouldBeAbleToStartAndShutdownMultipleTimesTheDBWithoutCommittingTransactions() throws Throwable {
+    GraphDatabaseBuilder graphDatabaseBuilder=builder.setConfig(GraphDatabaseSettings.check_point_interval_time,"300m").setConfig(GraphDatabaseSettings.check_point_interval_tx,"10000").setConfig(GraphDatabaseSettings.logical_log_rotation_threshold,"1g");
+    graphDatabaseBuilder.newGraphDatabase().shutdown();
+    graphDatabaseBuilder.newGraphDatabase().shutdown();
+    List<CheckPoint> checkPoints=new CheckPointCollector(testDirectory.databaseDir(),fs).find(0);
+    assertEquals(2,checkPoints.size());
+  }
+  private static void triggerCheckPointAttempt(  GraphDatabaseService db) throws Exception {
+    ((GraphDatabaseAPI)db).getDependencyResolver().resolveDependency(CheckPointer.class).checkPointIfNeeded(new SimpleTriggerInfo("Test"));
+  }
+private static class CheckPointCollector {
+    private final LogFiles logFiles;
+    private final LogEntryReader<ReadableClosablePositionAwareChannel> logEntryReader;
+    CheckPointCollector(    File directory,    FileSystemAbstraction fileSystem) throws IOException {
+      this.logEntryReader=new VersionAwareLogEntryReader<>();
+      this.logFiles=LogFilesBuilder.logFilesBasedOnlyBuilder(directory,fileSystem).withLogEntryReader(logEntryReader).build();
+    }
+    public List<CheckPoint> find(    long version) throws IOException {
+      List<CheckPoint> checkPoints=new ArrayList<>();
+      for (; version >= INITIAL_LOG_VERSION && logFiles.versionExists(version); version--) {
+        LogVersionedStoreChannel channel=logFiles.openForVersion(version);
+        ReadableClosablePositionAwareChannel recoveredDataChannel=new ReadAheadLogChannel(channel);
+        try (LogEntryCursor cursor=new LogEntryCursor(logEntryReader,recoveredDataChannel)){
+          while (cursor.next()) {
+            LogEntry entry=cursor.get();
+            if (entry instanceof CheckPoint) {
+              checkPoints.add(entry.as());
+            }
+          }
+        }
+       }
+      return checkPoints;
+    }
+  }
+}

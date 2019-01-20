@@ -1,0 +1,54 @@
+/** 
+ * Additional  {@link ExecutionGraph} restart tests {@link ExecutionGraphRestartTest} whichrequire the usage of a  {@link SlotProvider}.
+ */
+@RunWith(Parameterized.class) public class ExecutionGraphCoLocationRestartTest extends SchedulerTestBase {
+  private static final int NUM_TASKS=31;
+  public ExecutionGraphCoLocationRestartTest(  SchedulerType schedulerType){
+    super(schedulerType);
+  }
+  @Test public void testConstraintsAfterRestart() throws Exception {
+    final long timeout=5000L;
+    testingSlotProvider.addTaskManager(NUM_TASKS);
+    JobVertex groupVertex=ExecutionGraphTestUtils.createNoOpVertex(NUM_TASKS);
+    JobVertex groupVertex2=ExecutionGraphTestUtils.createNoOpVertex(NUM_TASKS);
+    SlotSharingGroup sharingGroup=new SlotSharingGroup();
+    groupVertex.setSlotSharingGroup(sharingGroup);
+    groupVertex2.setSlotSharingGroup(sharingGroup);
+    groupVertex.setStrictlyCoLocatedWith(groupVertex2);
+    final ExecutionGraph eg=ExecutionGraphTestUtils.createSimpleTestGraph(new JobID(),testingSlotProvider,new OneTimeDirectRestartStrategy(),groupVertex,groupVertex2);
+    if (schedulerType == SchedulerType.SLOT_POOL) {
+      eg.setQueuedSchedulingAllowed(true);
+    }
+    assertEquals(JobStatus.CREATED,eg.getState());
+    eg.scheduleForExecution();
+    Predicate<Execution> isDeploying=ExecutionGraphTestUtils.isInExecutionState(ExecutionState.DEPLOYING);
+    ExecutionGraphTestUtils.waitForAllExecutionsPredicate(eg,isDeploying,timeout);
+    assertEquals(JobStatus.RUNNING,eg.getState());
+    validateConstraints(eg);
+    ExecutionGraphTestUtils.failExecutionGraph(eg,new FlinkException("Test exception"));
+    ExecutionGraphTestUtils.waitUntilJobStatus(eg,JobStatus.RUNNING,timeout);
+    ExecutionGraphTestUtils.waitForAllExecutionsPredicate(eg,isDeploying,timeout);
+    validateConstraints(eg);
+    ExecutionGraphTestUtils.finishAllVertices(eg);
+    assertThat(eg.getState(),is(FINISHED));
+  }
+  private void validateConstraints(  ExecutionGraph eg){
+    ExecutionJobVertex[] tasks=eg.getAllVertices().values().toArray(new ExecutionJobVertex[2]);
+    for (int i=0; i < NUM_TASKS; i++) {
+      CoLocationConstraint constr1=tasks[0].getTaskVertices()[i].getLocationConstraint();
+      CoLocationConstraint constr2=tasks[1].getTaskVertices()[i].getLocationConstraint();
+      assertThat(constr1.isAssigned(),is(true));
+      assertThat(constr1.getLocation(),equalTo(constr2.getLocation()));
+    }
+  }
+private static final class OneTimeDirectRestartStrategy implements RestartStrategy {
+    private boolean hasRestarted=false;
+    @Override public boolean canRestart(){
+      return !hasRestarted;
+    }
+    @Override public void restart(    RestartCallback restarter,    ScheduledExecutor executor){
+      hasRestarted=true;
+      restarter.triggerFullRecovery();
+    }
+  }
+}

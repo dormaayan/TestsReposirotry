@@ -1,0 +1,45 @@
+@Ignore @Test public void testAllFavoredNodesDead() throws Exception {
+  TableName tableName=TableName.valueOf("testAllFavoredNodesDead");
+  HTableDescriptor desc=new HTableDescriptor(tableName);
+  desc.addFamily(new HColumnDescriptor(HConstants.CATALOG_FAMILY));
+  admin.createTable(desc,Bytes.toBytes("aaa"),Bytes.toBytes("zzz"),REGION_NUM);
+  TEST_UTIL.waitTableAvailable(tableName);
+  final RegionInfo region=admin.getTableRegions(tableName).get(0);
+  LOG.info("Region that's supposed to be in transition: " + region);
+  FavoredNodesManager fnm=master.getFavoredNodesManager();
+  List<ServerName> currentFN=fnm.getFavoredNodes(region);
+  assertNotNull(currentFN);
+  stopServersAndWaitUntilProcessed(currentFN);
+  final RegionStates regionStates=master.getAssignmentManager().getRegionStates();
+  TEST_UTIL.waitFor(10000,new Waiter.Predicate<Exception>(){
+    @Override public boolean evaluate() throws Exception {
+      return regionStates.getRegionState(region).isFailedOpen();
+    }
+  }
+);
+  assertTrue("Region: " + region + " should be RIT",regionStates.getRegionState(region).isFailedOpen());
+  List<ServerName> serversForNewFN=Lists.newArrayList();
+  for (  ServerName sn : admin.getClusterMetrics(EnumSet.of(Option.LIVE_SERVERS)).getLiveServerMetrics().keySet()) {
+    serversForNewFN.add(ServerName.valueOf(sn.getHostname(),sn.getPort(),NON_STARTCODE));
+  }
+  FavoredNodeAssignmentHelper helper=new FavoredNodeAssignmentHelper(serversForNewFN,conf);
+  helper.initialize();
+  for (  RegionStateNode regionState : regionStates.getRegionsInTransition()) {
+    RegionInfo regionInfo=regionState.getRegionInfo();
+    List<ServerName> newFavoredNodes=helper.generateFavoredNodes(regionInfo);
+    assertNotNull(newFavoredNodes);
+    assertEquals(FavoredNodeAssignmentHelper.FAVORED_NODES_NUM,newFavoredNodes.size());
+    LOG.info("Region: " + regionInfo.getEncodedName() + " FN: "+ newFavoredNodes);
+    Map<RegionInfo,List<ServerName>> regionFNMap=Maps.newHashMap();
+    regionFNMap.put(regionInfo,newFavoredNodes);
+    fnm.updateFavoredNodes(regionFNMap);
+    LOG.info("Assigning region: " + regionInfo.getEncodedName());
+    admin.assign(regionInfo.getEncodedNameAsBytes());
+  }
+  TEST_UTIL.waitUntilNoRegionsInTransition(60000);
+  assertEquals("Not all regions are online",REGION_NUM,admin.getTableRegions(tableName).size());
+  admin.setBalancerRunning(true,true);
+  assertTrue("Balancer did not run",admin.balancer());
+  TEST_UTIL.waitUntilNoRegionsInTransition(60000);
+  checkFavoredNodeAssignments(tableName,fnm,regionStates);
+}

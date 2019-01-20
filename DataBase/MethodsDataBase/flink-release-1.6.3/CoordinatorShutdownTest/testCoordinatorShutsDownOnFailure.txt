@@ -1,0 +1,39 @@
+@Test public void testCoordinatorShutsDownOnFailure(){
+  LocalFlinkMiniCluster cluster=null;
+  try {
+    Configuration config=new Configuration();
+    config.setInteger(ConfigConstants.LOCAL_NUMBER_TASK_MANAGER,1);
+    config.setInteger(TaskManagerOptions.NUM_TASK_SLOTS,1);
+    cluster=new LocalFlinkMiniCluster(config,true);
+    cluster.start();
+    JobVertex vertex=new JobVertex("Test Vertex");
+    vertex.setInvokableClass(FailingBlockingInvokable.class);
+    List<JobVertexID> vertexIdList=Collections.singletonList(vertex.getID());
+    final ExecutionConfig executionConfig=new ExecutionConfig();
+    executionConfig.setRestartStrategy(RestartStrategies.noRestart());
+    JobGraph testGraph=new JobGraph("test job",vertex);
+    testGraph.setSnapshotSettings(new JobCheckpointingSettings(vertexIdList,vertexIdList,vertexIdList,new CheckpointCoordinatorConfiguration(5000,60000,0L,Integer.MAX_VALUE,CheckpointRetentionPolicy.NEVER_RETAIN_AFTER_TERMINATION,true),null));
+    testGraph.setExecutionConfig(executionConfig);
+    ActorGateway jmGateway=cluster.getLeaderGateway(TestingUtils.TESTING_DURATION());
+    FiniteDuration timeout=new FiniteDuration(60,TimeUnit.SECONDS);
+    JobManagerMessages.SubmitJob submitMessage=new JobManagerMessages.SubmitJob(testGraph,ListeningBehaviour.EXECUTION_RESULT);
+    Future<Object> submitFuture=jmGateway.ask(submitMessage,timeout);
+    Await.result(submitFuture,timeout);
+    Future<Object> jobRequestFuture=jmGateway.ask(new JobManagerMessages.RequestJob(testGraph.getJobID()),timeout);
+    ExecutionGraph graph=(ExecutionGraph)((JobManagerMessages.JobFound)Await.result(jobRequestFuture,timeout)).executionGraph();
+    assertNotNull(graph);
+    FailingBlockingInvokable.unblock();
+    graph.waitUntilTerminal();
+    CheckpointCoordinator coord=graph.getCheckpointCoordinator();
+    assertTrue(coord == null || coord.isShutdown());
+  }
+ catch (  Exception e) {
+    e.printStackTrace();
+    fail(e.getMessage());
+  }
+ finally {
+    if (cluster != null) {
+      cluster.stop();
+    }
+  }
+}

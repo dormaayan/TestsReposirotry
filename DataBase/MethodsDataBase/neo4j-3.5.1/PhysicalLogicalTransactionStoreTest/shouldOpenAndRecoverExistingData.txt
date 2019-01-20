@@ -1,0 +1,55 @@
+@Test public void shouldOpenAndRecoverExistingData() throws Exception {
+  TransactionIdStore transactionIdStore=new SimpleTransactionIdStore();
+  TransactionMetadataCache positionCache=new TransactionMetadataCache();
+  final byte[] additionalHeader=new byte[]{1,2,5};
+  final int masterId=2;
+  int authorId=1;
+  final long timeStarted=12345;
+  long latestCommittedTxWhenStarted=4545;
+  long timeCommitted=timeStarted + 10;
+  LifeSupport life=new LifeSupport();
+  final LogFiles logFiles=LogFilesBuilder.builder(dir.databaseLayout(),fileSystemRule.get()).withTransactionIdStore(transactionIdStore).withLogVersionRepository(mock(LogVersionRepository.class)).build();
+  life.start();
+  life.add(logFiles);
+  try {
+    addATransactionAndRewind(life,logFiles,positionCache,transactionIdStore,additionalHeader,masterId,authorId,timeStarted,latestCommittedTxWhenStarted,timeCommitted);
+  }
+  finally {
+    life.shutdown();
+  }
+  life=new LifeSupport();
+  life.add(logFiles);
+  final AtomicBoolean recoveryRequired=new AtomicBoolean();
+  FakeRecoveryVisitor visitor=new FakeRecoveryVisitor(additionalHeader,masterId,authorId,timeStarted,timeCommitted,latestCommittedTxWhenStarted);
+  LogicalTransactionStore txStore=new PhysicalLogicalTransactionStore(logFiles,positionCache,new VersionAwareLogEntryReader<>(),monitors,true);
+  life.add(new BatchingTransactionAppender(logFiles,NO_ROTATION,positionCache,transactionIdStore,BYPASS,DATABASE_HEALTH));
+  CorruptedLogsTruncator logPruner=new CorruptedLogsTruncator(databaseDirectory,logFiles,fileSystemRule.get());
+  life.add(new Recovery(new RecoveryService(){
+    @Override public void startRecovery(){
+      recoveryRequired.set(true);
+    }
+    @Override public RecoveryApplier getRecoveryApplier(    TransactionApplicationMode mode){
+      return mode == TransactionApplicationMode.REVERSE_RECOVERY ? mock(RecoveryApplier.class) : visitor;
+    }
+    @Override public RecoveryStartInformation getRecoveryStartInformation(){
+      return new RecoveryStartInformation(LogPosition.start(0),1);
+    }
+    @Override public TransactionCursor getTransactions(    LogPosition position) throws IOException {
+      return txStore.getTransactions(position);
+    }
+    @Override public TransactionCursor getTransactionsInReverseOrder(    LogPosition position) throws IOException {
+      return txStore.getTransactionsInReverseOrder(position);
+    }
+    @Override public void transactionsRecovered(    CommittedTransactionRepresentation lastRecoveredTransaction,    LogPosition positionAfterLastRecoveredTransaction){
+    }
+  }
+,logPruner,mock(RecoveryMonitor.class),SilentProgressReporter.INSTANCE,false));
+  try {
+    life.start();
+  }
+  finally {
+    life.shutdown();
+  }
+  assertEquals(1,visitor.getVisitedTransactions());
+  assertTrue(recoveryRequired.get());
+}

@@ -1,0 +1,62 @@
+/** 
+ * Runs a simple topology producing random (key, 1) pairs at the sources (where number of keys is in fixed in range 0...numKeys). The records are keyed and a reducing queryable state instance is created, which sums up the records. <p>After submitting the job in detached mode, the QueryableStateCLient is used to query the counts of each key in rounds until all keys have non-zero counts.
+ */
+@Test @SuppressWarnings("unchecked") public void testQueryableState() throws Exception {
+  final Deadline deadline=Deadline.now().plus(TEST_TIMEOUT);
+  final int numKeys=256;
+  StreamExecutionEnvironment env=StreamExecutionEnvironment.getExecutionEnvironment();
+  env.setStateBackend(stateBackend);
+  env.setParallelism(maxParallelism);
+  env.setRestartStrategy(RestartStrategies.fixedDelayRestart(Integer.MAX_VALUE,1000L));
+  DataStream<Tuple2<Integer,Long>> source=env.addSource(new TestKeyRangeSource(numKeys));
+  ReducingStateDescriptor<Tuple2<Integer,Long>> reducingState=new ReducingStateDescriptor<>("any-name",new SumReduce(),source.getType());
+  final String queryName="hakuna-matata";
+  source.keyBy(new KeySelector<Tuple2<Integer,Long>,Integer>(){
+    private static final long serialVersionUID=7143749578983540352L;
+    @Override public Integer getKey(    Tuple2<Integer,Long> value){
+      return value.f0;
+    }
+  }
+).asQueryableState(queryName,reducingState);
+  try (AutoCancellableJob autoCancellableJob=new AutoCancellableJob(deadline,clusterClient,env)){
+    final JobID jobId=autoCancellableJob.getJobId();
+    final JobGraph jobGraph=autoCancellableJob.getJobGraph();
+    clusterClient.setDetached(true);
+    clusterClient.submitJob(jobGraph,AbstractQueryableStateTestBase.class.getClassLoader());
+    final AtomicLongArray counts=new AtomicLongArray(numKeys);
+    final List<CompletableFuture<ReducingState<Tuple2<Integer,Long>>>> futures=new ArrayList<>(numKeys);
+    boolean allNonZero=false;
+    while (!allNonZero && deadline.hasTimeLeft()) {
+      allNonZero=true;
+      futures.clear();
+      for (int i=0; i < numKeys; i++) {
+        final int key=i;
+        if (counts.get(key) > 0L) {
+          continue;
+        }
+ else {
+          allNonZero=false;
+        }
+        CompletableFuture<ReducingState<Tuple2<Integer,Long>>> result=getKvState(deadline,client,jobId,queryName,key,BasicTypeInfo.INT_TYPE_INFO,reducingState,false,executor);
+        result.thenAccept(response -> {
+          try {
+            Tuple2<Integer,Long> res=response.get();
+            counts.set(key,res.f1);
+            assertEquals("Key mismatch",key,res.f0.intValue());
+          }
+ catch (          Exception e) {
+            Assert.fail(e.getMessage());
+          }
+        }
+);
+        futures.add(result);
+      }
+      CompletableFuture.allOf(futures.toArray(new CompletableFuture<?>[futures.size()])).get(deadline.timeLeft().toMillis(),TimeUnit.MILLISECONDS);
+    }
+    assertTrue("Not all keys are non-zero",allNonZero);
+    for (int i=0; i < numKeys; i++) {
+      long count=counts.get(i);
+      assertTrue("Count at position " + i + " is "+ count,count > 0);
+    }
+  }
+ }

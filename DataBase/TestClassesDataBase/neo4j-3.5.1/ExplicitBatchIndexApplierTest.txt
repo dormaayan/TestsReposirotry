@@ -1,0 +1,87 @@
+public class ExplicitBatchIndexApplierTest {
+  private final LifeRule life=new LifeRule(true);
+  private final EphemeralFileSystemRule fs=new EphemeralFileSystemRule();
+  private final TestDirectory testDirectory=TestDirectory.testDirectory(fs);
+  @Rule public final RuleChain ruleChain=RuleChain.outerRule(fs).around(testDirectory).around(life);
+  @Test public void shouldOnlyCreateOneApplierPerProvider() throws Exception {
+    MutableObjectIntMap<String> names=ObjectIntHashMap.newWithKeysValues("first",0,"second",1);
+    MutableObjectIntMap<String> keys=ObjectIntHashMap.newWithKeysValues("key",0);
+    String applierName="test-applier";
+    Commitment commitment=mock(Commitment.class);
+    when(commitment.hasExplicitIndexChanges()).thenReturn(true);
+    IndexConfigStore config=newIndexConfigStore(names,applierName);
+    ExplicitIndexApplierLookup applierLookup=mock(ExplicitIndexApplierLookup.class);
+    TransactionApplier transactionApplier=mock(TransactionApplier.class);
+    when(applierLookup.newApplier(anyString(),anyBoolean())).thenReturn(transactionApplier);
+    try (ExplicitBatchIndexApplier applier=new ExplicitBatchIndexApplier(config,applierLookup,BYPASS,INTERNAL)){
+      TransactionToApply tx=new TransactionToApply(null,2);
+      tx.commitment(commitment,2);
+      try (TransactionApplier txApplier=applier.startTx(tx)){
+        IndexDefineCommand definitions=definitions(names,keys);
+        txApplier.visitIndexDefineCommand(definitions);
+        txApplier.visitIndexAddNodeCommand(addNodeToIndex(definitions,"first"));
+        txApplier.visitIndexAddNodeCommand(addNodeToIndex(definitions,"second"));
+        txApplier.visitIndexAddRelationshipCommand(addRelationshipToIndex(definitions,"second"));
+      }
+     }
+     verify(applierLookup,times(1)).newApplier(eq(applierName),anyBoolean());
+  }
+  @Test public void shouldOrderTransactionsMakingExplicitIndexChanges() throws Throwable {
+    MutableObjectIntMap<String> names=ObjectIntHashMap.newWithKeysValues("first",0,"second",1);
+    MutableObjectIntMap<String> keys=ObjectIntHashMap.newWithKeysValues("key",0);
+    String applierName="test-applier";
+    ExplicitIndexApplierLookup applierLookup=mock(ExplicitIndexApplierLookup.class);
+    TransactionApplier transactionApplier=mock(TransactionApplier.class);
+    when(applierLookup.newApplier(anyString(),anyBoolean())).thenReturn(transactionApplier);
+    IndexConfigStore config=newIndexConfigStore(names,applierName);
+    SynchronizedArrayIdOrderingQueue queue=new SynchronizedArrayIdOrderingQueue();
+    final AtomicLong lastAppliedTxId=new AtomicLong(-1);
+    Race race=new Race();
+    for (long i=0; i < 100; i++) {
+      final long txId=i;
+      race.addContestant(() -> {
+        try (ExplicitBatchIndexApplier applier=new ExplicitBatchIndexApplier(config,applierLookup,queue,INTERNAL)){
+          TransactionToApply txToApply=new TransactionToApply(new PhysicalTransactionRepresentation(new ArrayList<>()));
+          FakeCommitment commitment=new FakeCommitment(txId,mock(TransactionIdStore.class));
+          commitment.setHasExplicitIndexChanges(true);
+          txToApply.commitment(commitment,txId);
+          TransactionApplier txApplier=applier.startTx(txToApply);
+          Thread.sleep(ThreadLocalRandom.current().nextInt(5));
+          assertTrue(lastAppliedTxId.compareAndSet(txId - 1,txId));
+          txApplier.close();
+        }
+ catch (        Exception e) {
+          throw new RuntimeException(e);
+        }
+      }
+);
+      queue.offer(txId);
+    }
+    race.go();
+  }
+  private static AddRelationshipCommand addRelationshipToIndex(  IndexDefineCommand definitions,  String indexName){
+    AddRelationshipCommand command=new AddRelationshipCommand();
+    command.init(definitions.getOrAssignIndexNameId(indexName),0L,(byte)0,null,1,2);
+    return command;
+  }
+  private static AddNodeCommand addNodeToIndex(  IndexDefineCommand definitions,  String indexName){
+    AddNodeCommand command=new AddNodeCommand();
+    command.init(definitions.getOrAssignIndexNameId(indexName),0L,(byte)0,null);
+    return command;
+  }
+  private static IndexDefineCommand definitions(  MutableObjectIntMap<String> names,  MutableObjectIntMap<String> keys){
+    IndexDefineCommand definitions=new IndexDefineCommand();
+    definitions.init(names,keys);
+    return definitions;
+  }
+  private IndexConfigStore newIndexConfigStore(  MutableObjectIntMap<String> names,  String providerName){
+    EphemeralFileSystemAbstraction fileSystem=fs.get();
+    IndexConfigStore store=life.add(new IndexConfigStore(testDirectory.databaseLayout(),fileSystem));
+    names.forEachKey(name -> {
+      store.set(Node.class,name,stringMap(IndexManager.PROVIDER,providerName));
+      store.set(Relationship.class,name,stringMap(IndexManager.PROVIDER,providerName));
+    }
+);
+    return store;
+  }
+}

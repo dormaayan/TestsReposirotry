@@ -1,0 +1,100 @@
+/** 
+ * Tests for  {@link org.apache.flink.runtime.jobmaster.JobMaster#triggerSavepoint(String,boolean,Time)}.
+ * @see org.apache.flink.runtime.jobmaster.JobMaster
+ */
+public class JobMasterTriggerSavepointIT extends AbstractTestBase {
+  private static CountDownLatch invokeLatch;
+  private static volatile CountDownLatch triggerCheckpointLatch;
+  @Rule public TemporaryFolder temporaryFolder=new TemporaryFolder();
+  private Path savepointDirectory;
+  private MiniClusterClient clusterClient;
+  private JobGraph jobGraph;
+  @Before public void setUp() throws Exception {
+    invokeLatch=new CountDownLatch(1);
+    triggerCheckpointLatch=new CountDownLatch(1);
+    savepointDirectory=temporaryFolder.newFolder().toPath();
+    Assume.assumeTrue("ClusterClient is not an instance of MiniClusterClient",miniClusterResource.getClusterClient() instanceof MiniClusterClient);
+    clusterClient=(MiniClusterClient)miniClusterResource.getClusterClient();
+    clusterClient.setDetached(true);
+    jobGraph=new JobGraph();
+    final JobVertex vertex=new JobVertex("testVertex");
+    vertex.setInvokableClass(NoOpBlockingInvokable.class);
+    jobGraph.addVertex(vertex);
+    jobGraph.setSnapshotSettings(new JobCheckpointingSettings(Collections.singletonList(vertex.getID()),Collections.singletonList(vertex.getID()),Collections.singletonList(vertex.getID()),new CheckpointCoordinatorConfiguration(10,60_000,10,1,CheckpointRetentionPolicy.NEVER_RETAIN_AFTER_TERMINATION,true),null));
+    clusterClient.submitJob(jobGraph,ClassLoader.getSystemClassLoader());
+    invokeLatch.await(60,TimeUnit.SECONDS);
+    waitForJob();
+  }
+  @Test public void testStopJobAfterSavepoint() throws Exception {
+    final String savepointLocation=cancelWithSavepoint();
+    final JobStatus jobStatus=clusterClient.getJobStatus(jobGraph.getJobID()).get(60,TimeUnit.SECONDS);
+    assertThat(jobStatus,isOneOf(JobStatus.CANCELED,JobStatus.CANCELLING));
+    final List<Path> savepoints;
+    try (Stream<Path> savepointFiles=Files.list(savepointDirectory)){
+      savepoints=savepointFiles.map(Path::getFileName).collect(Collectors.toList());
+    }
+     assertThat(savepoints,hasItem(Paths.get(savepointLocation).getFileName()));
+  }
+  @Test public void testDoNotCancelJobIfSavepointFails() throws Exception {
+    try {
+      Files.setPosixFilePermissions(savepointDirectory,Collections.emptySet());
+    }
+ catch (    IOException e) {
+      Assume.assumeNoException(e);
+    }
+    try {
+      cancelWithSavepoint();
+    }
+ catch (    Exception e) {
+      assertThat(ExceptionUtils.findThrowable(e,CheckpointTriggerException.class).isPresent(),equalTo(true));
+    }
+    final JobStatus jobStatus=clusterClient.getJobStatus(jobGraph.getJobID()).get(60,TimeUnit.SECONDS);
+    assertThat(jobStatus,equalTo(JobStatus.RUNNING));
+    triggerCheckpointLatch=new CountDownLatch(1);
+    assertThat(triggerCheckpointLatch.await(60,TimeUnit.SECONDS),equalTo(true));
+  }
+  private void waitForJob() throws Exception {
+    for (int i=0; i < 60; i++) {
+      try {
+        final JobStatus jobStatus=clusterClient.getJobStatus(jobGraph.getJobID()).get(60,TimeUnit.SECONDS);
+        assertThat(jobStatus.isGloballyTerminalState(),equalTo(false));
+        if (jobStatus == JobStatus.RUNNING) {
+          return;
+        }
+      }
+ catch (      ExecutionException ignored) {
+      }
+      Thread.sleep(1000);
+    }
+    throw new AssertionError("Job did not become running within timeout.");
+  }
+  /** 
+ * Invokable which calls  {@link CountDownLatch#countDown()} on{@link JobMasterTriggerSavepointIT#invokeLatch}, and then blocks afterwards.
+ */
+public static class NoOpBlockingInvokable extends AbstractInvokable {
+    public NoOpBlockingInvokable(    final Environment environment){
+      super(environment);
+    }
+    @Override public void invoke(){
+      invokeLatch.countDown();
+      try {
+        Thread.sleep(Long.MAX_VALUE);
+      }
+ catch (      InterruptedException e) {
+        Thread.currentThread().interrupt();
+      }
+    }
+    @Override public boolean triggerCheckpoint(    final CheckpointMetaData checkpointMetaData,    final CheckpointOptions checkpointOptions) throws Exception {
+      final TaskStateSnapshot checkpointStateHandles=new TaskStateSnapshot();
+      checkpointStateHandles.putSubtaskStateByOperatorID(OperatorID.fromJobVertexID(getEnvironment().getJobVertexId()),new OperatorSubtaskState());
+      getEnvironment().acknowledgeCheckpoint(checkpointMetaData.getCheckpointId(),new CheckpointMetrics(),checkpointStateHandles);
+      triggerCheckpointLatch.countDown();
+      return true;
+    }
+    @Override public void notifyCheckpointComplete(    final long checkpointId) throws Exception {
+    }
+  }
+  private String cancelWithSavepoint() throws Exception {
+    return clusterClient.cancelWithSavepoint(jobGraph.getJobID(),savepointDirectory.toAbsolutePath().toString());
+  }
+}

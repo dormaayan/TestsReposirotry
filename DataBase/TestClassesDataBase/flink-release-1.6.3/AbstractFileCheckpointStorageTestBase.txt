@@ -1,0 +1,179 @@
+/** 
+ * Test base for file-system-based checkoint storage, such as the {@link org.apache.flink.runtime.state.memory.MemoryBackendCheckpointStorage} and the{@link FsCheckpointStorage}.
+ */
+public abstract class AbstractFileCheckpointStorageTestBase {
+  @Rule public final TemporaryFolder tmp=new TemporaryFolder();
+  protected abstract CheckpointStorage createCheckpointStorage(  Path checkpointDir) throws Exception ;
+  protected abstract CheckpointStorage createCheckpointStorageWithSavepointDir(  Path checkpointDir,  Path savepointDir) throws Exception ;
+  @Test public void testPointerPathResolution() throws Exception {
+    final FileSystem fs=FileSystem.getLocalFileSystem();
+    final Path metadataFile=new Path(Path.fromLocalFile(tmp.newFolder()),AbstractFsCheckpointStorage.METADATA_FILE_NAME);
+    final String basePointer=metadataFile.getParent().toString();
+    final String pointer1=metadataFile.toString();
+    final String pointer2=metadataFile.getParent().toString();
+    final String pointer3=metadataFile.getParent().toString() + '/';
+    final CheckpointStorage storage=createCheckpointStorage(randomTempPath());
+    final byte[] data=new byte[23686];
+    new Random().nextBytes(data);
+    try (FSDataOutputStream out=fs.create(metadataFile,WriteMode.NO_OVERWRITE)){
+      out.write(data);
+    }
+     CompletedCheckpointStorageLocation completed1=storage.resolveCheckpoint(pointer1);
+    CompletedCheckpointStorageLocation completed2=storage.resolveCheckpoint(pointer2);
+    CompletedCheckpointStorageLocation completed3=storage.resolveCheckpoint(pointer3);
+    assertEquals(basePointer,completed1.getExternalPointer());
+    assertEquals(basePointer,completed2.getExternalPointer());
+    assertEquals(basePointer,completed3.getExternalPointer());
+    StreamStateHandle handle1=completed1.getMetadataHandle();
+    StreamStateHandle handle2=completed2.getMetadataHandle();
+    StreamStateHandle handle3=completed3.getMetadataHandle();
+    assertNotNull(handle1);
+    assertNotNull(handle2);
+    assertNotNull(handle3);
+    validateContents(handle1,data);
+    validateContents(handle2,data);
+    validateContents(handle3,data);
+  }
+  @Test public void testFailingPointerPathResolution() throws Exception {
+    final CheckpointStorage storage=createCheckpointStorage(randomTempPath());
+    try {
+      storage.resolveCheckpoint(null);
+      fail("expected exception");
+    }
+ catch (    NullPointerException ignored) {
+    }
+    try {
+      storage.resolveCheckpoint("");
+      fail("expected exception");
+    }
+ catch (    IllegalArgumentException ignored) {
+    }
+    try {
+      storage.resolveCheckpoint("this-is_not/a#filepath.at.all");
+      fail("expected exception");
+    }
+ catch (    IOException ignored) {
+    }
+    try {
+      storage.resolveCheckpoint(tmp.newFile().toURI().toString() + "_not_existing");
+      fail("expected exception");
+    }
+ catch (    IOException ignored) {
+    }
+  }
+  /** 
+ * Validates that multiple checkpoints from different jobs with the same checkpoint ID do not interfere with each other.
+ */
+  @Test public void testPersistMultipleMetadataOnlyCheckpoints() throws Exception {
+    final FileSystem fs=FileSystem.getLocalFileSystem();
+    final Path checkpointDir=new Path(tmp.newFolder().toURI());
+    final long checkpointId=177;
+    final CheckpointStorage storage1=createCheckpointStorage(checkpointDir);
+    final CheckpointStorage storage2=createCheckpointStorage(checkpointDir);
+    final CheckpointStorageLocation loc1=storage1.initializeLocationForCheckpoint(checkpointId);
+    final CheckpointStorageLocation loc2=storage2.initializeLocationForCheckpoint(checkpointId);
+    final byte[] data1={77,66,55,99,88};
+    final byte[] data2={1,3,2,5,4};
+    final CompletedCheckpointStorageLocation completedLocation1;
+    try (CheckpointMetadataOutputStream out=loc1.createMetadataOutputStream()){
+      out.write(data1);
+      completedLocation1=out.closeAndFinalizeCheckpoint();
+    }
+     final String result1=completedLocation1.getExternalPointer();
+    final CompletedCheckpointStorageLocation completedLocation2;
+    try (CheckpointMetadataOutputStream out=loc2.createMetadataOutputStream()){
+      out.write(data2);
+      completedLocation2=out.closeAndFinalizeCheckpoint();
+    }
+     final String result2=completedLocation2.getExternalPointer();
+    FileStatus[] files=fs.listStatus(checkpointDir);
+    assertEquals(2,files.length);
+    FileStatus[] job1Files=fs.listStatus(files[0].getPath());
+    FileStatus[] job2Files=fs.listStatus(files[1].getPath());
+    assertTrue(job1Files.length >= 1);
+    assertTrue(job2Files.length >= 1);
+    assertTrue(fs.exists(new Path(result1,AbstractFsCheckpointStorage.METADATA_FILE_NAME)));
+    assertTrue(fs.exists(new Path(result2,AbstractFsCheckpointStorage.METADATA_FILE_NAME)));
+    validateContents(storage1.resolveCheckpoint(result1).getMetadataHandle(),data1);
+    validateContents(storage1.resolveCheckpoint(result2).getMetadataHandle(),data2);
+    validateContents(storage2.resolveCheckpoint(result1).getMetadataHandle(),data1);
+    validateContents(storage2.resolveCheckpoint(result2).getMetadataHandle(),data2);
+  }
+  @Test public void writeToAlreadyExistingCheckpointFails() throws Exception {
+    final byte[] data={8,8,4,5,2,6,3};
+    final long checkpointId=177;
+    final CheckpointStorage storage=createCheckpointStorage(randomTempPath());
+    final CheckpointStorageLocation loc=storage.initializeLocationForCheckpoint(checkpointId);
+    try (CheckpointMetadataOutputStream out=loc.createMetadataOutputStream()){
+      out.write(data);
+      out.closeAndFinalizeCheckpoint();
+    }
+     try {
+      loc.createMetadataOutputStream();
+      fail("this should fail with an exception");
+    }
+ catch (    IOException ignored) {
+    }
+  }
+  @Test public void testSavepointPathConfiguredAndTarget() throws Exception {
+    final Path savepointDir=randomTempPath();
+    final Path customDir=randomTempPath();
+    testSavepoint(savepointDir,customDir,customDir);
+  }
+  @Test public void testSavepointPathConfiguredNoTarget() throws Exception {
+    final Path savepointDir=randomTempPath();
+    testSavepoint(savepointDir,null,savepointDir);
+  }
+  @Test public void testNoSavepointPathConfiguredAndTarget() throws Exception {
+    final Path customDir=Path.fromLocalFile(tmp.newFolder());
+    testSavepoint(null,customDir,customDir);
+  }
+  @Test public void testNoSavepointPathConfiguredNoTarget() throws Exception {
+    final CheckpointStorage storage=createCheckpointStorage(randomTempPath());
+    try {
+      storage.initializeLocationForSavepoint(1337,null);
+      fail("this should fail with an exception");
+    }
+ catch (    IllegalArgumentException ignored) {
+    }
+  }
+  private void testSavepoint(  @Nullable Path savepointDir,  @Nullable Path customDir,  Path expectedParent) throws Exception {
+    final CheckpointStorage storage=savepointDir == null ? createCheckpointStorage(randomTempPath()) : createCheckpointStorageWithSavepointDir(randomTempPath(),savepointDir);
+    final String customLocation=customDir == null ? null : customDir.toString();
+    final CheckpointStorageLocation savepointLocation=storage.initializeLocationForSavepoint(52452L,customLocation);
+    final byte[] data={77,66,55,99,88};
+    final CompletedCheckpointStorageLocation completed;
+    try (CheckpointMetadataOutputStream out=savepointLocation.createMetadataOutputStream()){
+      out.write(data);
+      completed=out.closeAndFinalizeCheckpoint();
+    }
+     final Path normalizedWithSlash=Path.fromLocalFile(new File(new Path(completed.getExternalPointer()).getParent().getPath()));
+    assertEquals(expectedParent,normalizedWithSlash);
+    validateContents(completed.getMetadataHandle(),data);
+    FileStateHandle fileStateHandle=(FileStateHandle)completed.getMetadataHandle();
+    Path usedSavepointDir=new Path(new File(fileStateHandle.getFilePath().getParent().getParent().getPath()).toURI());
+    assertEquals(expectedParent,usedSavepointDir);
+  }
+  public Path randomTempPath() throws IOException {
+    return Path.fromLocalFile(tmp.newFolder());
+  }
+  private static void validateContents(  StreamStateHandle handle,  byte[] expected) throws IOException {
+    try (FSDataInputStream in=handle.openInputStream()){
+      validateContents(in,expected);
+    }
+   }
+  private static void validateContents(  InputStream in,  byte[] expected) throws IOException {
+    final byte[] buffer=new byte[expected.length];
+    int pos=0;
+    int remaining=expected.length;
+    while (remaining > 0) {
+      int read=in.read(buffer,pos,remaining);
+      if (read == -1) {
+        throw new EOFException();
+      }
+      pos+=read;
+      remaining-=read;
+    }
+    assertArrayEquals(expected,buffer);
+  }
+}

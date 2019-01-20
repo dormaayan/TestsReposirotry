@@ -1,0 +1,133 @@
+/** 
+ * Test for testing protocol buffer based RPC mechanism. This test depends on test.proto definition of types in src/test/proto and protobuf service definition from src/test/test_rpc_service.proto
+ */
+public class TestProtoBufRpc extends TestRpcBase {
+  private static RPC.Server server;
+  private final static int SLEEP_DURATION=1000;
+@ProtocolInfo(protocolName="testProto2",protocolVersion=1) public interface TestRpcService2 extends TestProtobufRpc2Proto.BlockingInterface {
+  }
+public static class PBServer2Impl implements TestRpcService2 {
+    @Override public EmptyResponseProto ping2(    RpcController unused,    EmptyRequestProto request) throws ServiceException {
+      return EmptyResponseProto.newBuilder().build();
+    }
+    @Override public EchoResponseProto echo2(    RpcController unused,    EchoRequestProto request) throws ServiceException {
+      return EchoResponseProto.newBuilder().setMessage(request.getMessage()).build();
+    }
+    @Override public TestProtos.SleepResponseProto sleep(    RpcController controller,    TestProtos.SleepRequestProto request) throws ServiceException {
+      try {
+        Thread.sleep(request.getMilliSeconds());
+      }
+ catch (      InterruptedException ex) {
+      }
+      return TestProtos.SleepResponseProto.newBuilder().build();
+    }
+  }
+  @Before public void setUp() throws IOException {
+    conf=new Configuration();
+    conf.setInt(CommonConfigurationKeys.IPC_MAXIMUM_DATA_LENGTH,1024);
+    conf.setBoolean(CommonConfigurationKeys.IPC_SERVER_LOG_SLOW_RPC,true);
+    RPC.setProtocolEngine(conf,TestRpcService.class,ProtobufRpcEngine.class);
+    RPC.setProtocolEngine(conf,TestRpcService2.class,ProtobufRpcEngine.class);
+    PBServerImpl serverImpl=new PBServerImpl();
+    BlockingService service=TestProtobufRpcProto.newReflectiveBlockingService(serverImpl);
+    server=new RPC.Builder(conf).setProtocol(TestRpcService.class).setInstance(service).setBindAddress(ADDRESS).setPort(PORT).build();
+    addr=NetUtils.getConnectAddress(server);
+    PBServer2Impl server2Impl=new PBServer2Impl();
+    BlockingService service2=TestProtobufRpc2Proto.newReflectiveBlockingService(server2Impl);
+    server.addProtocol(RPC.RpcKind.RPC_PROTOCOL_BUFFER,TestRpcService2.class,service2);
+    server.start();
+  }
+  @After public void tearDown() throws Exception {
+    server.stop();
+  }
+  private TestRpcService2 getClient2() throws IOException {
+    return RPC.getProxy(TestRpcService2.class,0,addr,conf);
+  }
+  @Test(timeout=5000) public void testProtoBufRpc() throws Exception {
+    TestRpcService client=getClient(addr,conf);
+    testProtoBufRpc(client);
+  }
+  public static void testProtoBufRpc(  TestRpcService client) throws Exception {
+    client.ping(null,newEmptyRequest());
+    EchoRequestProto echoRequest=EchoRequestProto.newBuilder().setMessage("hello").build();
+    EchoResponseProto echoResponse=client.echo(null,echoRequest);
+    Assert.assertEquals(echoResponse.getMessage(),"hello");
+    try {
+      client.error(null,newEmptyRequest());
+      Assert.fail("Expected exception is not thrown");
+    }
+ catch (    ServiceException e) {
+      RemoteException re=(RemoteException)e.getCause();
+      RpcServerException rse=(RpcServerException)re.unwrapRemoteException(RpcServerException.class);
+      Assert.assertNotNull(rse);
+      Assert.assertTrue(re.getErrorCode().equals(RpcErrorCodeProto.ERROR_RPC_SERVER));
+    }
+  }
+  @Test(timeout=5000) public void testProtoBufRpc2() throws Exception {
+    TestRpcService2 client=getClient2();
+    client.ping2(null,newEmptyRequest());
+    EchoResponseProto echoResponse=client.echo2(null,newEchoRequest("hello"));
+    Assert.assertEquals(echoResponse.getMessage(),"hello");
+    MetricsRecordBuilder rpcMetrics=getMetrics(server.getRpcMetrics().name());
+    assertCounterGt("RpcQueueTimeNumOps",0L,rpcMetrics);
+    assertCounterGt("RpcProcessingTimeNumOps",0L,rpcMetrics);
+    MetricsRecordBuilder rpcDetailedMetrics=getMetrics(server.getRpcDetailedMetrics().name());
+    assertCounterGt("Echo2NumOps",0L,rpcDetailedMetrics);
+  }
+  @Test(timeout=5000) public void testProtoBufRandomException() throws Exception {
+    TestRpcService client=getClient(addr,conf);
+    try {
+      client.error2(null,newEmptyRequest());
+    }
+ catch (    ServiceException se) {
+      Assert.assertTrue(se.getCause() instanceof RemoteException);
+      RemoteException re=(RemoteException)se.getCause();
+      Assert.assertTrue(re.getClassName().equals(URISyntaxException.class.getName()));
+      Assert.assertTrue(re.getMessage().contains("testException"));
+      Assert.assertTrue(re.getErrorCode().equals(RpcErrorCodeProto.ERROR_APPLICATION));
+    }
+  }
+  @Test(timeout=6000) public void testExtraLongRpc() throws Exception {
+    TestRpcService2 client=getClient2();
+    final String shortString=StringUtils.repeat("X",4);
+    EchoResponseProto echoResponse=client.echo2(null,newEchoRequest(shortString));
+    Assert.assertEquals(shortString,echoResponse.getMessage());
+    final String longString=StringUtils.repeat("X",4096);
+    try {
+      client.echo2(null,newEchoRequest(longString));
+      Assert.fail("expected extra-long RPC to fail");
+    }
+ catch (    ServiceException se) {
+    }
+  }
+  @Test(timeout=12000) public void testLogSlowRPC() throws IOException, ServiceException {
+    TestRpcService2 client=getClient2();
+    for (int x=0; x < 10000; x++) {
+      try {
+        client.ping2(null,newEmptyRequest());
+      }
+ catch (      Exception ex) {
+        throw ex;
+      }
+    }
+    RpcMetrics rpcMetrics=server.getRpcMetrics();
+    assertTrue(rpcMetrics.getProcessingSampleCount() > 999L);
+    long before=rpcMetrics.getRpcSlowCalls();
+    client.sleep(null,newSleepRequest(SLEEP_DURATION * 3));
+    long after=rpcMetrics.getRpcSlowCalls();
+    Assert.assertEquals(before + 1L,after);
+  }
+  @Test(timeout=12000) public void testEnsureNoLogIfDisabled() throws IOException, ServiceException {
+    server.setLogSlowRPC(false);
+    TestRpcService2 client=getClient2();
+    for (int x=0; x < 10000; x++) {
+      client.ping2(null,newEmptyRequest());
+    }
+    RpcMetrics rpcMetrics=server.getRpcMetrics();
+    assertTrue(rpcMetrics.getProcessingSampleCount() > 999L);
+    long before=rpcMetrics.getRpcSlowCalls();
+    client.sleep(null,newSleepRequest(SLEEP_DURATION));
+    long after=rpcMetrics.getRpcSlowCalls();
+    assertEquals(before,after);
+  }
+}

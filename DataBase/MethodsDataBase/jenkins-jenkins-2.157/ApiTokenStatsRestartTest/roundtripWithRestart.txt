@@ -1,0 +1,70 @@
+@Test @Issue("SECURITY-1072") public void roundtripWithRestart() throws Exception {
+  AtomicReference<String> tokenValue=new AtomicReference<>();
+  AtomicReference<String> tokenUuid=new AtomicReference<>();
+  String TOKEN_NAME="New Token Name";
+  int NUM_CALL_WITH_TOKEN=5;
+  rr.addStep(new Statement(){
+    @Override public void evaluate() throws Throwable {
+      JenkinsRule j=rr.j;
+      j.jenkins.setCrumbIssuer(null);
+      j.jenkins.setSecurityRealm(j.createDummySecurityRealm());
+      User u=User.getById("foo",true);
+      ApiTokenProperty t=u.getProperty(ApiTokenProperty.class);
+      assertNotNull(t.getTokenStore());
+      assertNotNull(t.getTokenStats());
+      WebClient wc=j.createWebClient().withBasicCredentials(u.getId());
+      wc.getOptions().setThrowExceptionOnFailingStatusCode(false);
+      WebRequest request=new WebRequest(new URL(j.getURL() + "user/" + u.getId()+ "/descriptorByName/"+ ApiTokenProperty.class.getName()+ "/generateNewToken"),HttpMethod.POST);
+      request.setRequestParameters(Arrays.asList(new NameValuePair("newTokenName",TOKEN_NAME)));
+      Page page=wc.getPage(request);
+      assertEquals(200,page.getWebResponse().getStatusCode());
+      String responseContent=page.getWebResponse().getContentAsString();
+      JSONObject jsonObject=JSONObject.fromObject(responseContent);
+      JSONObject jsonData=jsonObject.getJSONObject("data");
+      String tokenName=jsonData.getString("tokenName");
+      tokenValue.set(jsonData.getString("tokenValue"));
+      tokenUuid.set(jsonData.getString("tokenUuid"));
+      assertEquals(TOKEN_NAME,tokenName);
+      WebClient restWc=j.createWebClient().withBasicCredentials(u.getId(),tokenValue.get());
+      checkUserIsConnected(restWc,u.getId());
+      HtmlPage config=wc.goTo(u.getUrl() + "/configure");
+      assertEquals(200,config.getWebResponse().getStatusCode());
+      assertThat(config.getWebResponse().getContentAsString(),containsString(tokenUuid.get()));
+      assertThat(config.getWebResponse().getContentAsString(),containsString(tokenName));
+      for (int i=1; i < NUM_CALL_WITH_TOKEN; i++) {
+        restWc.goToXml("whoAmI/api/xml");
+      }
+      HtmlPage configWithStats=wc.goTo(u.getUrl() + "/configure");
+      assertEquals(200,configWithStats.getWebResponse().getStatusCode());
+      HtmlSpan useCounterSpan=configWithStats.getDocumentElement().getOneHtmlElementByAttribute("span","class","token-use-counter");
+      assertThat(useCounterSpan.getTextContent(),containsString("" + NUM_CALL_WITH_TOKEN));
+      File apiTokenStatsFile=new File(u.getUserFolder(),"apiTokenStats.xml");
+      assertTrue("apiTokenStats.xml file should exist",apiTokenStatsFile.exists());
+    }
+  }
+);
+  rr.addStep(new Statement(){
+    @Override public void evaluate() throws Throwable {
+      JenkinsRule j=rr.j;
+      j.jenkins.setCrumbIssuer(null);
+      User u=User.getById("foo",false);
+      assertNotNull(u);
+      WebClient wc=j.createWebClient().login(u.getId());
+      checkUserIsConnected(wc,u.getId());
+      HtmlPage config=wc.goTo(u.getUrl() + "/configure");
+      assertEquals(200,config.getWebResponse().getStatusCode());
+      assertThat(config.getWebResponse().getContentAsString(),containsString(tokenUuid.get()));
+      assertThat(config.getWebResponse().getContentAsString(),containsString(TOKEN_NAME));
+      HtmlSpan useCounterSpan=config.getDocumentElement().getOneHtmlElementByAttribute("span","class","token-use-counter");
+      assertThat(useCounterSpan.getTextContent(),containsString("" + NUM_CALL_WITH_TOKEN));
+      revokeToken(wc,u.getId(),tokenUuid.get());
+      WebClient restWc=j.createWebClient().withBasicCredentials(u.getId(),tokenValue.get());
+      checkUserIsNotConnected(restWc);
+      HtmlPage configWithoutToken=wc.goTo(u.getUrl() + "/configure");
+      assertEquals(200,configWithoutToken.getWebResponse().getStatusCode());
+      assertThat(configWithoutToken.getWebResponse().getContentAsString(),not(containsString(tokenUuid.get())));
+      assertThat(configWithoutToken.getWebResponse().getContentAsString(),not(containsString(TOKEN_NAME)));
+    }
+  }
+);
+}

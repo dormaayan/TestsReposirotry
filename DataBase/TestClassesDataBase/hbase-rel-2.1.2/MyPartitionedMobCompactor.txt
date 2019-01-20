@@ -1,0 +1,68 @@
+static class MyPartitionedMobCompactor extends PartitionedMobCompactor {
+  int delPartitionSize=0;
+  int PartitionsIncludeDelFiles=0;
+  CacheConfig cacheConfig=null;
+  MyPartitionedMobCompactor(  Configuration conf,  FileSystem fs,  TableName tableName,  ColumnFamilyDescriptor column,  ExecutorService pool,  final int delPartitionSize,  final CacheConfig cacheConf,  final int PartitionsIncludeDelFiles) throws IOException {
+    super(conf,fs,tableName,column,pool);
+    this.delPartitionSize=delPartitionSize;
+    this.cacheConfig=cacheConf;
+    this.PartitionsIncludeDelFiles=PartitionsIncludeDelFiles;
+  }
+  @Override public List<Path> compact(  List<FileStatus> files,  boolean isForceAllFiles) throws IOException {
+    if (files == null || files.isEmpty()) {
+      return null;
+    }
+    PartitionedMobCompactionRequest request=select(files,isForceAllFiles);
+    assertTrue(request.getDelPartitions().size() == delPartitionSize);
+    if (request.getDelPartitions().size() > 0) {
+      for (      CompactionPartition p : request.getCompactionPartitions()) {
+        assertTrue(p.getStartKey() != null);
+        assertTrue(p.getEndKey() != null);
+      }
+    }
+    try {
+      for (      CompactionDelPartition delPartition : request.getDelPartitions()) {
+        for (        Path newDelPath : delPartition.listDelFiles()) {
+          HStoreFile sf=new HStoreFile(fs,newDelPath,conf,this.cacheConfig,BloomType.NONE,true);
+          sf.initReader();
+          delPartition.addStoreFile(sf);
+        }
+      }
+      CompactionDelPartition prevDelP=null;
+      for (      CompactionDelPartition delP : request.getDelPartitions()) {
+        assertTrue(Bytes.compareTo(delP.getId().getStartKey(),delP.getId().getEndKey()) <= 0);
+        if (prevDelP != null) {
+          assertTrue(Bytes.compareTo(prevDelP.getId().getEndKey(),delP.getId().getStartKey()) < 0);
+        }
+      }
+      int affectedPartitions=0;
+      for (      CompactionPartition partition : request.getCompactionPartitions()) {
+        List<HStoreFile> delFiles=getListOfDelFilesForPartition(partition,request.getDelPartitions());
+        if (!request.getDelPartitions().isEmpty()) {
+          if (!((Bytes.compareTo(request.getDelPartitions().get(0).getId().getStartKey(),partition.getEndKey()) > 0) || (Bytes.compareTo(request.getDelPartitions().get(request.getDelPartitions().size() - 1).getId().getEndKey(),partition.getStartKey()) < 0))) {
+            if (delFiles.size() > 0) {
+              assertTrue(delFiles.size() == 1);
+              affectedPartitions+=delFiles.size();
+              assertTrue(Bytes.compareTo(partition.getStartKey(),CellUtil.cloneRow(delFiles.get(0).getLastKey().get())) <= 0);
+              assertTrue(Bytes.compareTo(partition.getEndKey(),CellUtil.cloneRow(delFiles.get(delFiles.size() - 1).getFirstKey().get())) >= 0);
+            }
+          }
+        }
+      }
+      assertTrue(affectedPartitions == PartitionsIncludeDelFiles);
+    }
+  finally {
+      for (      CompactionDelPartition delPartition : request.getDelPartitions()) {
+        for (        HStoreFile storeFile : delPartition.getStoreFiles()) {
+          try {
+            storeFile.closeStoreFile(true);
+          }
+ catch (          IOException e) {
+            LOG.warn("Failed to close the reader on store file " + storeFile.getPath(),e);
+          }
+        }
+      }
+    }
+    return null;
+  }
+}

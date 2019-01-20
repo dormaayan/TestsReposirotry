@@ -1,0 +1,73 @@
+public class JobManagerLeaderElectionTest extends TestLogger {
+  @Rule public TemporaryFolder tempFolder=new TemporaryFolder();
+  private static ActorSystem actorSystem;
+  private static TestingServer testingServer;
+  private static Timeout timeout=new Timeout(TestingUtils.TESTING_DURATION());
+  private static FiniteDuration duration=new FiniteDuration(5,TimeUnit.MINUTES);
+  @BeforeClass public static void setup() throws Exception {
+    actorSystem=ActorSystem.create("TestingActorSystem");
+    testingServer=new TestingServer();
+  }
+  @AfterClass public static void teardown() throws Exception {
+    if (actorSystem != null) {
+      JavaTestKit.shutdownActorSystem(actorSystem);
+    }
+    if (testingServer != null) {
+      testingServer.stop();
+    }
+  }
+  /** 
+ * Tests that a single JobManager is elected as the leader by ZooKeeper.
+ */
+  @Test public void testLeaderElection() throws Exception {
+    final Configuration configuration=ZooKeeperTestUtils.createZooKeeperHAConfig(testingServer.getConnectString(),tempFolder.getRoot().getPath());
+    ActorRef jm=null;
+    try {
+      Props jmProps=createJobManagerProps(configuration);
+      jm=actorSystem.actorOf(jmProps);
+      Future<Object> leaderFuture=Patterns.ask(jm,TestingJobManagerMessages.getNotifyWhenLeader(),timeout);
+      Await.ready(leaderFuture,duration);
+    }
+  finally {
+      TestingUtils.stopActor(jm);
+    }
+  }
+  /** 
+ * Tests that a second JobManager is elected as the leader once the previous leader dies.
+ */
+  @Test public void testLeaderReelection() throws Exception {
+    final Configuration configuration=ZooKeeperTestUtils.createZooKeeperHAConfig(testingServer.getConnectString(),tempFolder.getRoot().getPath());
+    ActorRef jm;
+    ActorRef jm2=null;
+    try {
+      Props jmProps=createJobManagerProps(configuration);
+      jm=actorSystem.actorOf(jmProps);
+      Future<Object> leaderFuture=Patterns.ask(jm,TestingJobManagerMessages.getNotifyWhenLeader(),timeout);
+      Await.ready(leaderFuture,duration);
+      Props jmProps2=createJobManagerProps(configuration);
+      jm2=actorSystem.actorOf(jmProps2);
+      jm.tell(PoisonPill.getInstance(),ActorRef.noSender());
+      Future<Object> leader2Future=Patterns.ask(jm2,TestingJobManagerMessages.getNotifyWhenLeader(),timeout);
+      Await.ready(leader2Future,duration);
+    }
+  finally {
+      TestingUtils.stopActor(jm2);
+    }
+  }
+  private Props createJobManagerProps(  Configuration configuration) throws Exception {
+    LeaderElectionService leaderElectionService;
+    if (HighAvailabilityMode.fromConfig(configuration) == HighAvailabilityMode.NONE) {
+      leaderElectionService=new StandaloneLeaderElectionService();
+    }
+ else {
+      CuratorFramework client=ZooKeeperUtils.startCuratorFramework(configuration);
+      leaderElectionService=ZooKeeperUtils.createLeaderElectionService(client,configuration);
+    }
+    SubmittedJobGraphStore submittedJobGraphStore=new StandaloneSubmittedJobGraphStore();
+    CheckpointRecoveryFactory checkpointRecoveryFactory=new StandaloneCheckpointRecoveryFactory();
+    configuration.setLong(BlobServerOptions.CLEANUP_INTERVAL,1L);
+    BlobServer blobServer=new BlobServer(configuration,new VoidBlobStore());
+    blobServer.start();
+    return Props.create(TestingJobManager.class,configuration,TestingUtils.defaultExecutor(),TestingUtils.defaultExecutor(),new InstanceManager(),new Scheduler(TestingUtils.defaultExecutionContext()),blobServer,new BlobLibraryCacheManager(blobServer,FlinkUserCodeClassLoaders.ResolveOrder.CHILD_FIRST,new String[0]),ActorRef.noSender(),new NoRestartStrategy.NoRestartStrategyFactory(),AkkaUtils.getDefaultTimeoutAsFiniteDuration(),leaderElectionService,submittedJobGraphStore,checkpointRecoveryFactory,AkkaUtils.getDefaultTimeoutAsFiniteDuration(),UnregisteredMetricGroups.createUnregisteredJobManagerMetricGroup(),Option.<String>empty());
+  }
+}

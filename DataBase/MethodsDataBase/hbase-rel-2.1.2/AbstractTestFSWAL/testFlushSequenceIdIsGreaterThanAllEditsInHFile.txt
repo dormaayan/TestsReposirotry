@@ -1,0 +1,64 @@
+/** 
+ * Test flush for sure has a sequence id that is beyond the last edit appended. We do this by slowing appends in the background ring buffer thread while in foreground we call flush. The addition of the sync over HRegion in flush should fix an issue where flush was returning before all of its appends had made it out to the WAL (HBASE-11109).
+ * @throws IOException
+ * @see <a href="https://issues.apache.org/jira/browse/HBASE-11109">HBASE-11109</a>
+ */
+@Test public void testFlushSequenceIdIsGreaterThanAllEditsInHFile() throws IOException {
+  String testName=currentTest.getMethodName();
+  final TableName tableName=TableName.valueOf(testName);
+  final RegionInfo hri=RegionInfoBuilder.newBuilder(tableName).build();
+  final byte[] rowName=tableName.getName();
+  final TableDescriptor htd=TableDescriptorBuilder.newBuilder(tableName).setColumnFamily(ColumnFamilyDescriptorBuilder.of("f")).build();
+  HRegion r=HBaseTestingUtility.createRegionAndWAL(hri,TEST_UTIL.getDefaultRootDirPath(),TEST_UTIL.getConfiguration(),htd);
+  HBaseTestingUtility.closeRegionAndWAL(r);
+  final int countPerFamily=10;
+  final AtomicBoolean goslow=new AtomicBoolean(false);
+  NavigableMap<byte[],Integer> scopes=new TreeMap<>(Bytes.BYTES_COMPARATOR);
+  for (  byte[] fam : htd.getColumnFamilyNames()) {
+    scopes.put(fam,0);
+  }
+  AbstractFSWAL<?> wal=newSlowWAL(FS,CommonFSUtils.getWALRootDir(CONF),DIR.toString(),testName,CONF,null,true,null,null,new Runnable(){
+    @Override public void run(){
+      if (goslow.get()) {
+        Threads.sleep(100);
+        LOG.debug("Sleeping before appending 100ms");
+      }
+    }
+  }
+);
+  HRegion region=HRegion.openHRegion(TEST_UTIL.getConfiguration(),TEST_UTIL.getTestFileSystem(),TEST_UTIL.getDefaultRootDirPath(),hri,htd,wal);
+  EnvironmentEdge ee=EnvironmentEdgeManager.getDelegate();
+  try {
+    List<Put> puts=null;
+    for (    byte[] fam : htd.getColumnFamilyNames()) {
+      puts=TestWALReplay.addRegionEdits(rowName,fam,countPerFamily,ee,region,"x");
+    }
+    final Get g=new Get(rowName);
+    Result result=region.get(g);
+    assertEquals(countPerFamily * htd.getColumnFamilyNames().size(),result.size());
+    WALEdit edits=new WALEdit();
+    for (    Put p : puts) {
+      CellScanner cs=p.cellScanner();
+      while (cs.advance()) {
+        edits.add(cs.current());
+      }
+    }
+    List<UUID> clusterIds=new ArrayList<>(1);
+    clusterIds.add(TEST_UTIL.getRandomUUID());
+    goslow.set(true);
+    for (int i=0; i < countPerFamily; i++) {
+      final RegionInfo info=region.getRegionInfo();
+      final WALKeyImpl logkey=new WALKeyImpl(info.getEncodedNameAsBytes(),tableName,System.currentTimeMillis(),clusterIds,-1,-1,region.getMVCC(),scopes);
+      wal.append(info,logkey,edits,true);
+      region.getMVCC().completeAndWait(logkey.getWriteEntry());
+    }
+    region.flush(true);
+    long currentSequenceId=region.getReadPoint(null);
+    goslow.set(false);
+    assertTrue(currentSequenceId >= region.getReadPoint(null));
+  }
+  finally {
+    region.close(true);
+    wal.close();
+  }
+}

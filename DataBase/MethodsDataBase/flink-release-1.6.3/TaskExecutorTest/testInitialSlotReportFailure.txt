@@ -1,0 +1,40 @@
+/** 
+ * Tests that the  {@link TaskExecutor} tries to reconnect if the initial slot reportfails.
+ */
+@Test public void testInitialSlotReportFailure() throws Exception {
+  final TaskSlotTable taskSlotTable=new TaskSlotTable(Collections.singleton(ResourceProfile.UNKNOWN),timerService);
+  final TaskManagerLocation taskManagerLocation=new LocalTaskManagerLocation();
+  final TaskManagerServices taskManagerServices=new TaskManagerServicesBuilder().setTaskSlotTable(taskSlotTable).setTaskManagerLocation(taskManagerLocation).build();
+  final TaskExecutor taskExecutor=createTaskExecutor(taskManagerServices);
+  taskExecutor.start();
+  try {
+    final TestingResourceManagerGateway testingResourceManagerGateway=new TestingResourceManagerGateway();
+    final BlockingQueue<CompletableFuture<Acknowledge>> responseQueue=new ArrayBlockingQueue<>(2);
+    testingResourceManagerGateway.setSendSlotReportFunction(resourceIDInstanceIDSlotReportTuple3 -> {
+      try {
+        return responseQueue.take();
+      }
+ catch (      InterruptedException e) {
+        return FutureUtils.completedExceptionally(e);
+      }
+    }
+);
+    final CompletableFuture<RegistrationResponse> registrationResponse=CompletableFuture.completedFuture(new TaskExecutorRegistrationSuccess(new InstanceID(),testingResourceManagerGateway.getOwnResourceId(),1000L,new ClusterInformation("foobar",1234)));
+    final CountDownLatch numberRegistrations=new CountDownLatch(2);
+    testingResourceManagerGateway.setRegisterTaskExecutorFunction(new Function<Tuple4<String,ResourceID,Integer,HardwareDescription>,CompletableFuture<RegistrationResponse>>(){
+      @Override public CompletableFuture<RegistrationResponse> apply(      Tuple4<String,ResourceID,Integer,HardwareDescription> stringResourceIDIntegerHardwareDescriptionTuple4){
+        numberRegistrations.countDown();
+        return registrationResponse;
+      }
+    }
+);
+    responseQueue.offer(FutureUtils.completedExceptionally(new FlinkException("Test exception")));
+    responseQueue.offer(CompletableFuture.completedFuture(Acknowledge.get()));
+    rpc.registerGateway(testingResourceManagerGateway.getAddress(),testingResourceManagerGateway);
+    resourceManagerLeaderRetriever.notifyListener(testingResourceManagerGateway.getAddress(),testingResourceManagerGateway.getFencingToken().toUUID());
+    numberRegistrations.await();
+  }
+  finally {
+    RpcUtils.terminateRpcEndpoint(taskExecutor,timeout);
+  }
+}

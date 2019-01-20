@@ -1,0 +1,64 @@
+@Test public void oneMasterOneSlaveAndFlippedAgainScenarioContolledByPolicy() throws Exception {
+  final String path="oneMasterOneSlaveScenarioContolledByPolicy";
+  final String firstDestination="first" + System.currentTimeMillis();
+  final String secondDestination="second" + System.currentTimeMillis();
+  final CountDownLatch waitForSecondRouteCompletedLatch=new CountDownLatch(1);
+  final int activeNodeDesired=1;
+  MultiMasterZookeeperPolicyEnforcedContext first=createEnforcedContext(firstDestination,activeNodeDesired,path);
+  DefaultCamelContext controlledContext=(DefaultCamelContext)first.controlledContext;
+  CuratorMultiMasterLeaderRoutePolicy routePolicy=(CuratorMultiMasterLeaderRoutePolicy)controlledContext.getRouteDefinition(firstDestination).getRoutePolicies().get(0);
+  assertWeHaveMasters(routePolicy);
+  LOG.info("Starting first CamelContext");
+  final MultiMasterZookeeperPolicyEnforcedContext[] arr=new MultiMasterZookeeperPolicyEnforcedContext[1];
+  new Thread(){
+    @Override public void run(){
+      MultiMasterZookeeperPolicyEnforcedContext slave=null;
+      try {
+        LOG.info("Starting second CamelContext in a separate thread");
+        slave=createEnforcedContext(secondDestination,activeNodeDesired,path);
+        arr[0]=slave;
+        slave.sendMessageToEnforcedRoute("message for second",0);
+        waitForSecondRouteCompletedLatch.countDown();
+      }
+ catch (      Exception e) {
+        LOG.error("Error in the thread controlling the second context",e);
+        fail("Error in the thread controlling the second context: " + e.getMessage());
+      }
+    }
+  }
+.start();
+  first.sendMessageToEnforcedRoute("message for first",1);
+  waitForSecondRouteCompletedLatch.await(2,TimeUnit.MINUTES);
+  MultiMasterZookeeperPolicyEnforcedContext second=arr[0];
+  LOG.info("Explicitly shutting down the first camel context.");
+  first.shutdown();
+  DefaultCamelContext secondCamelContext=(DefaultCamelContext)second.controlledContext;
+  assertWeHaveMasters((CuratorMultiMasterLeaderRoutePolicy)secondCamelContext.getRouteDefinition(secondDestination).getRoutePolicies().get(0));
+  CountDownLatch restartFirstLatch=new CountDownLatch(1);
+  LOG.info("Start back first context");
+  new Thread(){
+    @Override public void run(){
+      try {
+        first.startup();
+        restartFirstLatch.countDown();
+      }
+ catch (      Exception e) {
+        e.printStackTrace();
+      }
+    }
+  }
+.start();
+  restartFirstLatch.await();
+  second.sendMessageToEnforcedRoute("message for second",1);
+  first.mock.reset();
+  first.sendMessageToEnforcedRoute("message for first",0);
+  second.shutdown();
+  controlledContext=(DefaultCamelContext)first.controlledContext;
+  routePolicy=(CuratorMultiMasterLeaderRoutePolicy)controlledContext.getRouteDefinition(firstDestination).getRoutePolicies().get(0);
+  log.info("Asserting route is up. context: [{}]",controlledContext.getName());
+  assertWeHaveMasters(routePolicy);
+  first.controlledContext.setTracing(true);
+  first.mock=controlledContext.getEndpoint("mock:controlled",MockEndpoint.class);
+  first.sendMessageToEnforcedRoute("message for first",1);
+  first.shutdown();
+}

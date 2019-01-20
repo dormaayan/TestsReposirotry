@@ -1,0 +1,39 @@
+@Test public void shouldReadYourOwnWrites() throws Exception {
+  try (Transaction tx=env.graph().beginTx()){
+    Node node=env.graph().createNode(Label.label("A"));
+    node.setProperty("prop","one");
+    tx.success();
+  }
+   BinaryLatch latch=new BinaryLatch();
+  long dbVersion=env.lastClosedTxId();
+  Thread thread=new Thread(() -> {
+    try (BoltStateMachine machine=env.newMachine(BOLT_CHANNEL)){
+      machine.process(new InitMessage(USER_AGENT,emptyMap()),nullResponseHandler());
+      latch.await();
+      machine.process(new RunMessage("MATCH (n:A) SET n.prop = 'two'",EMPTY_MAP),nullResponseHandler());
+      machine.process(PullAllMessage.INSTANCE,nullResponseHandler());
+    }
+ catch (    BoltConnectionFatality connectionFatality) {
+      throw new RuntimeException(connectionFatality);
+    }
+  }
+);
+  thread.start();
+  long dbVersionAfterWrite=dbVersion + 1;
+  try (BoltStateMachine machine=env.newMachine(BOLT_CHANNEL)){
+    BoltResponseRecorder recorder=new BoltResponseRecorder();
+    machine.process(new InitMessage(USER_AGENT,emptyMap()),nullResponseHandler());
+    latch.release();
+    final String bookmark="neo4j:bookmark:v1:tx" + dbVersionAfterWrite;
+    machine.process(new RunMessage("BEGIN",ValueUtils.asMapValue(singletonMap("bookmark",bookmark))),nullResponseHandler());
+    machine.process(PullAllMessage.INSTANCE,recorder);
+    machine.process(new RunMessage("MATCH (n:A) RETURN n.prop",EMPTY_MAP),nullResponseHandler());
+    machine.process(PullAllMessage.INSTANCE,recorder);
+    machine.process(new RunMessage("COMMIT",EMPTY_MAP),nullResponseHandler());
+    machine.process(PullAllMessage.INSTANCE,recorder);
+    assertThat(recorder.nextResponse(),succeeded());
+    assertThat(recorder.nextResponse(),succeededWithRecord("two"));
+    assertThat(recorder.nextResponse(),succeededWithMetadata("bookmark",BOOKMARK_PATTERN));
+  }
+   thread.join();
+}

@@ -1,0 +1,61 @@
+@Test public void testSplitWithRegionReplicas() throws Exception {
+  final TableName tableName=TableName.valueOf(name.getMethodName());
+  HTableDescriptor htd=TESTING_UTIL.createTableDescriptor(name.getMethodName());
+  htd.setRegionReplication(2);
+  htd.addCoprocessor(SlowMeCopro.class.getName());
+  Table t=TESTING_UTIL.createTable(htd,new byte[][]{Bytes.toBytes("cf")},null);
+  List<HRegion> oldRegions;
+  do {
+    oldRegions=cluster.getRegions(tableName);
+    Thread.sleep(10);
+  }
+ while (oldRegions.size() != 2);
+  for (  HRegion h : oldRegions)   LOG.debug("OLDREGION " + h.getRegionInfo());
+  try {
+    int regionServerIndex=cluster.getServerWith(oldRegions.get(0).getRegionInfo().getRegionName());
+    HRegionServer regionServer=cluster.getRegionServer(regionServerIndex);
+    insertData(tableName,admin,t);
+    admin.setBalancerRunning(false,true);
+    cluster.getMaster().setCatalogJanitorEnabled(false);
+    boolean tableExists=MetaTableAccessor.tableExists(regionServer.getConnection(),tableName);
+    assertEquals("The specified table should be present.",true,tableExists);
+    final HRegion region=findSplittableRegion(oldRegions);
+    regionServerIndex=cluster.getServerWith(region.getRegionInfo().getRegionName());
+    regionServer=cluster.getRegionServer(regionServerIndex);
+    assertTrue("not able to find a splittable region",region != null);
+    try {
+      requestSplitRegion(regionServer,region,Bytes.toBytes("row2"));
+    }
+ catch (    IOException e) {
+      e.printStackTrace();
+      fail("Split execution should have succeeded with no exceptions thrown " + e);
+    }
+    List<HRegion> newRegions;
+    do {
+      newRegions=cluster.getRegions(tableName);
+      for (      HRegion h : newRegions)       LOG.debug("NEWREGION " + h.getRegionInfo());
+      Thread.sleep(1000);
+    }
+ while ((newRegions.contains(oldRegions.get(0)) || newRegions.contains(oldRegions.get(1))) || newRegions.size() != 4);
+    tableExists=MetaTableAccessor.tableExists(regionServer.getConnection(),tableName);
+    assertEquals("The specified table should be present.",true,tableExists);
+    byte[] b1="row1".getBytes();
+    Get g=new Get(b1);
+    g.setConsistency(Consistency.STRONG);
+    Result r=t.get(g);
+    Assert.assertFalse(r.isStale());
+    LOG.info("exists stale after flush done");
+    SlowMeCopro.getPrimaryCdl().set(new CountDownLatch(1));
+    g=new Get(b1);
+    g.setConsistency(Consistency.TIMELINE);
+    r=t.get(g);
+    Assert.assertTrue(r.isStale());
+    SlowMeCopro.getPrimaryCdl().get().countDown();
+  }
+  finally {
+    SlowMeCopro.getPrimaryCdl().get().countDown();
+    admin.setBalancerRunning(true,false);
+    cluster.getMaster().setCatalogJanitorEnabled(true);
+    t.close();
+  }
+}

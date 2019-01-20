@@ -1,0 +1,247 @@
+/** 
+ * Tests for the WebRuntimeMonitor.
+ */
+public class WebRuntimeMonitorITCase extends TestLogger {
+  @Rule public TemporaryFolder temporaryFolder=new TemporaryFolder();
+  private static final FiniteDuration TEST_TIMEOUT=new FiniteDuration(2L,TimeUnit.MINUTES);
+  private static final Time TIMEOUT=Time.milliseconds(TEST_TIMEOUT.toMillis());
+  private final String mainResourcesPath=getClass().getResource("/web").getPath();
+  /** 
+ * Tests operation of the monitor in standalone operation.
+ */
+  @Test public void testStandaloneWebRuntimeMonitor() throws Exception {
+    final Deadline deadline=TEST_TIMEOUT.fromNow();
+    TestingCluster flink=null;
+    final Configuration configuration=new Configuration();
+    configuration.setBoolean(LOCAL_START_WEBSERVER,true);
+    configuration.setInteger(WebOptions.PORT,0);
+    try {
+      flink=new TestingCluster(configuration);
+      flink.start(true);
+      WebMonitor webMonitor=flink.webMonitor().get();
+      try (HttpTestClient client=new HttpTestClient("localhost",webMonitor.getServerPort())){
+        String expected=new Scanner(new File(mainResourcesPath + "/index.html")).useDelimiter("\\A").next();
+        client.sendGetRequest("index.html",deadline.timeLeft());
+        HttpTestClient.SimpleHttpResponse response=client.getNextResponse(deadline.timeLeft());
+        assertEquals(HttpResponseStatus.OK,response.getStatus());
+        assertEquals(response.getType(),MimeTypes.getMimeTypeForExtension("html"));
+        assertEquals(expected,response.getContent());
+        client.sendGetRequest("/overview",deadline.timeLeft());
+        response=client.getNextResponse(deadline.timeLeft());
+        assertEquals(HttpResponseStatus.OK,response.getStatus());
+        assertEquals("application/json; charset=UTF-8",response.getType());
+        assertTrue(response.getContent().contains("\"taskmanagers\":1"));
+      }
+     }
+  finally {
+      if (flink != null) {
+        flink.stop();
+      }
+    }
+  }
+  /** 
+ * Tests that the monitor associated with the following job manager redirects to the leader.
+ */
+  @Test public void testRedirectToLeader() throws Exception {
+    final Deadline deadline=TEST_TIMEOUT.fromNow();
+    ActorSystem[] jobManagerSystem=new ActorSystem[2];
+    WebRuntimeMonitor[] webMonitor=new WebRuntimeMonitor[2];
+    AkkaJobManagerRetriever[] jobManagerRetrievers=new AkkaJobManagerRetriever[2];
+    HighAvailabilityServices highAvailabilityServices=null;
+    try (TestingServer zooKeeper=new TestingServer()){
+      final Configuration config=ZooKeeperTestUtils.createZooKeeperHAConfig(zooKeeper.getConnectString(),temporaryFolder.getRoot().getPath());
+      File logDir=temporaryFolder.newFolder();
+      Path logFile=Files.createFile(new File(logDir,"jobmanager.log").toPath());
+      Files.createFile(new File(logDir,"jobmanager.out").toPath());
+      config.setInteger(WebOptions.PORT,0);
+      config.setString(WebOptions.LOG_PATH,logFile.toString());
+      highAvailabilityServices=HighAvailabilityServicesUtils.createAvailableOrEmbeddedServices(config,TestingUtils.defaultExecutor());
+      for (int i=0; i < jobManagerSystem.length; i++) {
+        jobManagerSystem[i]=AkkaUtils.createActorSystem(new Configuration(),new Some<>(new Tuple2<String,Object>("localhost",0)));
+      }
+      for (int i=0; i < webMonitor.length; i++) {
+        jobManagerRetrievers[i]=new AkkaJobManagerRetriever(jobManagerSystem[i],TIMEOUT,0,Time.milliseconds(50L));
+        webMonitor[i]=new WebRuntimeMonitor(config,highAvailabilityServices.getJobManagerLeaderRetriever(HighAvailabilityServices.DEFAULT_JOB_ID),jobManagerRetrievers[i],new AkkaQueryServiceRetriever(jobManagerSystem[i],TIMEOUT),TIMEOUT,TestingUtils.defaultScheduledExecutor());
+      }
+      ActorRef[] jobManager=new ActorRef[2];
+      String[] jobManagerAddress=new String[2];
+      for (int i=0; i < jobManager.length; i++) {
+        Configuration jmConfig=config.clone();
+        jmConfig.setInteger(WebOptions.PORT,webMonitor[i].getServerPort());
+        jobManager[i]=JobManager.startJobManagerActors(jmConfig,jobManagerSystem[i],TestingUtils.defaultExecutor(),TestingUtils.defaultExecutor(),highAvailabilityServices,NoOpMetricRegistry.INSTANCE,Option.apply(webMonitor[i].getRestAddress()),JobManager.class,MemoryArchivist.class)._1();
+        jobManagerAddress[i]=AkkaUtils.getAkkaURL(jobManagerSystem[i],jobManager[i]);
+        webMonitor[i].start();
+      }
+      LeaderRetrievalService lrs=highAvailabilityServices.getJobManagerLeaderRetriever(HighAvailabilityServices.DEFAULT_JOB_ID);
+      TestingListener leaderListener=new TestingListener();
+      lrs.start(leaderListener);
+      leaderListener.waitForNewLeader(deadline.timeLeft().toMillis());
+      String leaderAddress=leaderListener.getAddress();
+      int leaderIndex=leaderAddress.equals(jobManagerAddress[0]) ? 0 : 1;
+      int followerIndex=(leaderIndex + 1) % 2;
+      ActorSystem leadingSystem=jobManagerSystem[leaderIndex];
+      WebMonitor leadingWebMonitor=webMonitor[leaderIndex];
+      WebMonitor followerWebMonitor=webMonitor[followerIndex];
+      AkkaJobManagerRetriever leadingRetriever=jobManagerRetrievers[leaderIndex];
+      AkkaJobManagerRetriever followerRetriever=jobManagerRetrievers[followerIndex];
+      waitForLeaderNotification(jobManager[leaderIndex].path().toString(),leadingRetriever,deadline);
+      waitForLeaderNotification(AkkaUtils.getAkkaURL(leadingSystem,jobManager[leaderIndex]),followerRetriever,deadline);
+      try (HttpTestClient leaderClient=new HttpTestClient("localhost",leadingWebMonitor.getServerPort());HttpTestClient followingClient=new HttpTestClient("localhost",followerWebMonitor.getServerPort())){
+        String expected=new Scanner(new File(mainResourcesPath + "/index.html")).useDelimiter("\\A").next();
+        leaderClient.sendGetRequest("index.html",deadline.timeLeft());
+        HttpTestClient.SimpleHttpResponse response=leaderClient.getNextResponse(deadline.timeLeft());
+        assertEquals(HttpResponseStatus.OK,response.getStatus());
+        assertEquals(response.getType(),MimeTypes.getMimeTypeForExtension("html"));
+        assertEquals(expected,response.getContent());
+        followingClient.sendGetRequest("index.html",deadline.timeLeft());
+        response=followingClient.getNextResponse(deadline.timeLeft());
+        assertEquals(HttpResponseStatus.TEMPORARY_REDIRECT,response.getStatus());
+        assertTrue(response.getLocation().contains(String.valueOf(leadingWebMonitor.getServerPort())));
+        leadingSystem.shutdown();
+        waitForLeaderNotification(jobManager[followerIndex].path().toString(),followerRetriever,deadline);
+        followingClient.sendGetRequest("index.html",deadline.timeLeft());
+        response=followingClient.getNextResponse(deadline.timeLeft());
+        assertEquals(HttpResponseStatus.OK,response.getStatus());
+        assertEquals(response.getType(),MimeTypes.getMimeTypeForExtension("html"));
+        assertEquals(expected,response.getContent());
+        followingClient.sendGetRequest("/overview",deadline.timeLeft());
+        response=followingClient.getNextResponse(deadline.timeLeft());
+        assertEquals(HttpResponseStatus.OK,response.getStatus());
+        assertEquals("application/json; charset=UTF-8",response.getType());
+        assertTrue(response.getContent().contains("\"taskmanagers\":1") || response.getContent().contains("\"taskmanagers\":0"));
+      }
+  finally {
+        lrs.stop();
+      }
+    }
+  finally {
+      for (      ActorSystem system : jobManagerSystem) {
+        if (system != null) {
+          system.shutdown();
+        }
+      }
+      for (      WebMonitor monitor : webMonitor) {
+        monitor.stop();
+      }
+      if (highAvailabilityServices != null) {
+        highAvailabilityServices.closeAndCleanupAllData();
+      }
+    }
+  }
+  @Test public void testLeaderNotAvailable() throws Exception {
+    final Deadline deadline=TEST_TIMEOUT.fromNow();
+    ActorSystem actorSystem=null;
+    WebRuntimeMonitor webRuntimeMonitor=null;
+    try (TestingServer zooKeeper=new TestingServer()){
+      File logDir=temporaryFolder.newFolder();
+      Path logFile=Files.createFile(new File(logDir,"jobmanager.log").toPath());
+      Files.createFile(new File(logDir,"jobmanager.out").toPath());
+      final Configuration config=new Configuration();
+      config.setInteger(WebOptions.PORT,0);
+      config.setString(WebOptions.LOG_PATH,logFile.toString());
+      config.setString(HighAvailabilityOptions.HA_MODE,"ZOOKEEPER");
+      config.setString(HighAvailabilityOptions.HA_ZOOKEEPER_QUORUM,zooKeeper.getConnectString());
+      actorSystem=AkkaUtils.createDefaultActorSystem();
+      webRuntimeMonitor=new WebRuntimeMonitor(config,mock(LeaderRetrievalService.class),new AkkaJobManagerRetriever(actorSystem,TIMEOUT,0,Time.milliseconds(50L)),new AkkaQueryServiceRetriever(actorSystem,TIMEOUT),TIMEOUT,TestingUtils.defaultScheduledExecutor());
+      webRuntimeMonitor.start();
+      try (HttpTestClient client=new HttpTestClient("localhost",webRuntimeMonitor.getServerPort())){
+        client.sendGetRequest("index.html",deadline.timeLeft());
+        HttpTestClient.SimpleHttpResponse response=client.getNextResponse();
+        assertEquals(HttpResponseStatus.SERVICE_UNAVAILABLE,response.getStatus());
+        assertEquals("application/json; charset=UTF-8",response.getType());
+        assertTrue(response.getContent().contains("refresh"));
+      }
+     }
+  finally {
+      if (actorSystem != null) {
+        actorSystem.shutdown();
+      }
+      if (webRuntimeMonitor != null) {
+        webRuntimeMonitor.stop();
+      }
+    }
+  }
+  /** 
+ * Files are copied from the flink-dist jar to a temporary directory and then served from there. Only allow to access files in this temporary directory.
+ */
+  @Test public void testNoEscape() throws Exception {
+    final Deadline deadline=TEST_TIMEOUT.fromNow();
+    TestingCluster flink=null;
+    final Configuration configuration=new Configuration();
+    configuration.setBoolean(LOCAL_START_WEBSERVER,true);
+    configuration.setInteger(WebOptions.PORT,0);
+    try {
+      flink=new TestingCluster(configuration);
+      flink.start(true);
+      WebRuntimeMonitor webMonitor=(WebRuntimeMonitor)flink.webMonitor().get();
+      try (HttpTestClient client=new HttpTestClient("localhost",webMonitor.getServerPort())){
+        String expectedIndex=new Scanner(new File(mainResourcesPath + "/index.html")).useDelimiter("\\A").next();
+        client.sendGetRequest("index.html",deadline.timeLeft());
+        HttpTestClient.SimpleHttpResponse response=client.getNextResponse(deadline.timeLeft());
+        assertEquals(HttpResponseStatus.OK,response.getStatus());
+        assertEquals(response.getType(),MimeTypes.getMimeTypeForExtension("html"));
+        assertEquals(expectedIndex,response.getContent());
+        File illegalFile=new File(webMonitor.getBaseDir(new Configuration()),"test-file-" + UUID.randomUUID());
+        illegalFile.deleteOnExit();
+        assertTrue("Failed to create test file",illegalFile.createNewFile());
+        client.sendGetRequest("../" + illegalFile.getName(),deadline.timeLeft());
+        response=client.getNextResponse(deadline.timeLeft());
+        assertEquals("Unexpected status code " + response.getStatus() + " for file outside of web root.",HttpResponseStatus.NOT_FOUND,response.getStatus());
+        client.sendGetRequest("not-existing-resource",deadline.timeLeft());
+        response=client.getNextResponse(deadline.timeLeft());
+        assertEquals("Unexpected status code " + response.getStatus() + " for file outside of web root.",HttpResponseStatus.NOT_FOUND,response.getStatus());
+      }
+     }
+  finally {
+      if (flink != null) {
+        flink.stop();
+      }
+    }
+  }
+  /** 
+ * Files are copied from the flink-dist jar to a temporary directory and then served from there. Only allow to copy files from <code>flink-dist.jar:/web</code>
+ */
+  @Test public void testNoCopyFromJar() throws Exception {
+    final Deadline deadline=TEST_TIMEOUT.fromNow();
+    TestingCluster flink=null;
+    final Configuration configuration=new Configuration();
+    configuration.setBoolean(LOCAL_START_WEBSERVER,true);
+    configuration.setInteger(WebOptions.PORT,0);
+    try {
+      flink=new TestingCluster(configuration);
+      flink.start(true);
+      WebRuntimeMonitor webMonitor=((WebRuntimeMonitor)flink.webMonitor().get());
+      try (HttpTestClient client=new HttpTestClient("localhost",webMonitor.getServerPort())){
+        String expectedIndex=new Scanner(new File(mainResourcesPath + "/index.html")).useDelimiter("\\A").next();
+        client.sendGetRequest("index.html",deadline.timeLeft());
+        HttpTestClient.SimpleHttpResponse response=client.getNextResponse(deadline.timeLeft());
+        assertEquals(HttpResponseStatus.OK,response.getStatus());
+        assertEquals(response.getType(),MimeTypes.getMimeTypeForExtension("html"));
+        assertEquals(expectedIndex,response.getContent());
+        client.sendGetRequest("../log4j-test.properties",deadline.timeLeft());
+        response=client.getNextResponse(deadline.timeLeft());
+        assertEquals("Returned status code " + response.getStatus() + " for file outside of web root.",HttpResponseStatus.NOT_FOUND,response.getStatus());
+        assertFalse("Did not respond with the file, but still copied it from the JAR.",new File(webMonitor.getBaseDir(new Configuration()),"log4j-test.properties").exists());
+        client.sendGetRequest("not-existing-resource",deadline.timeLeft());
+        response=client.getNextResponse(deadline.timeLeft());
+        assertEquals("Unexpected status code " + response.getStatus() + " for file outside of web root.",HttpResponseStatus.NOT_FOUND,response.getStatus());
+      }
+     }
+  finally {
+      if (flink != null) {
+        flink.stop();
+      }
+    }
+  }
+  private void waitForLeaderNotification(  String expectedJobManagerURL,  GatewayRetriever<JobManagerGateway> retriever,  Deadline deadline) throws Exception {
+    while (deadline.hasTimeLeft()) {
+      Optional<JobManagerGateway> optJobManagerGateway=retriever.getNow();
+      if (optJobManagerGateway.isPresent() && Objects.equals(expectedJobManagerURL,optJobManagerGateway.get().getAddress())) {
+        return;
+      }
+ else {
+        Thread.sleep(100);
+      }
+    }
+  }
+}

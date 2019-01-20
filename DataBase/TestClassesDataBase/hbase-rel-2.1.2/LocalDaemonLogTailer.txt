@@ -1,0 +1,98 @@
+private final class LocalDaemonLogTailer implements Runnable {
+  private final Set<String> tailedFiles=new HashSet<>();
+  private final List<String> dirList=new ArrayList<>();
+  private final Object printLock=new Object();
+  private final FilenameFilter LOG_FILES=new FilenameFilter(){
+    @Override public boolean accept(    File dir,    String name){
+      return name.endsWith(".out") || name.endsWith(".log");
+    }
+  }
+;
+  @Override public void run(){
+    try {
+      runInternal();
+    }
+ catch (    IOException ex) {
+      LOG.error(ex.toString(),ex);
+    }
+  }
+  private void runInternal() throws IOException {
+    Thread.currentThread().setName(getClass().getSimpleName());
+    while (true) {
+      scanDirs();
+      try {
+        Thread.sleep(500);
+      }
+ catch (      InterruptedException e) {
+        LOG.error("Log tailer thread interrupted",e);
+        break;
+      }
+    }
+  }
+  private void scanDirs() throws FileNotFoundException {
+    dirList.clear();
+    dirList.addAll(logTailDirs);
+    for (    String d : dirList) {
+      for (      File f : new File(d).listFiles(LOG_FILES)) {
+        String filePath=f.getAbsolutePath();
+        if (!tailedFiles.contains(filePath)) {
+          tailedFiles.add(filePath);
+          startTailingFile(filePath);
+        }
+      }
+    }
+  }
+  private void startTailingFile(  final String filePath) throws FileNotFoundException {
+    final PrintStream dest=filePath.endsWith(".log") ? System.err : System.out;
+    final ServerType serverType;
+    final int serverPort;
+    Matcher m=LOG_PATH_FORMAT_RE.matcher(filePath);
+    if (m.matches()) {
+      serverType=ServerType.valueOf(m.group(1));
+      serverPort=Integer.valueOf(m.group(2));
+    }
+ else {
+      LOG.error("Unrecognized log path format: " + filePath);
+      return;
+    }
+    final String logMsgPrefix="[" + serverType + (serverPort != 0 ? ":" + serverPort : "")+ "] ";
+    LOG.debug("Tailing " + filePath);
+    Thread t=new Thread(new Runnable(){
+      @Override public void run(){
+        try {
+          FileInputStream fis=new FileInputStream(filePath);
+          BufferedReader br=new BufferedReader(new InputStreamReader(fis));
+          String line;
+          while (true) {
+            try {
+              Thread.sleep(200);
+            }
+ catch (            InterruptedException e) {
+              LOG.error("Tailer for " + filePath + " interrupted");
+              break;
+            }
+            while ((line=br.readLine()) != null) {
+              line=logMsgPrefix + processLine(line);
+synchronized (printLock) {
+                if (line.endsWith("\n")) {
+                  dest.print(line);
+                }
+ else {
+                  dest.println(line);
+                }
+                dest.flush();
+              }
+            }
+          }
+        }
+ catch (        IOException ex) {
+          LOG.error("Failed tailing " + filePath,ex);
+        }
+      }
+    }
+);
+    t.setDaemon(true);
+    t.setName("Tailer for " + filePath);
+    t.start();
+  }
+}

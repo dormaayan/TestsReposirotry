@@ -1,0 +1,318 @@
+/** 
+ * Tests the scenarios where replicas are enabled for the meta table
+ */
+@Category(LargeTests.class) public class TestMetaWithReplicas {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestMetaWithReplicas.class);
+  private static final Logger LOG=LoggerFactory.getLogger(TestMetaWithReplicas.class);
+  private final HBaseTestingUtility TEST_UTIL=new HBaseTestingUtility();
+  private static final int REGIONSERVERS_COUNT=3;
+  @Rule public TestName name=new TestName();
+  @Before public void setup() throws Exception {
+    TEST_UTIL.getConfiguration().setInt("zookeeper.session.timeout",30000);
+    TEST_UTIL.getConfiguration().setInt(HConstants.META_REPLICAS_NUM,3);
+    TEST_UTIL.getConfiguration().setInt(StorefileRefresherChore.REGIONSERVER_STOREFILE_REFRESH_PERIOD,1000);
+    TEST_UTIL.startMiniCluster(REGIONSERVERS_COUNT);
+    AssignmentManager am=TEST_UTIL.getMiniHBaseCluster().getMaster().getAssignmentManager();
+    Set<ServerName> sns=new HashSet<ServerName>();
+    ServerName hbaseMetaServerName=TEST_UTIL.getMiniHBaseCluster().getMaster().getMetaTableLocator().getMetaRegionLocation(TEST_UTIL.getZooKeeperWatcher());
+    LOG.info("HBASE:META DEPLOY: on " + hbaseMetaServerName);
+    sns.add(hbaseMetaServerName);
+    for (int replicaId=1; replicaId < 3; replicaId++) {
+      RegionInfo h=RegionReplicaUtil.getRegionInfoForReplica(RegionInfoBuilder.FIRST_META_REGIONINFO,replicaId);
+      AssignmentTestingUtil.waitForAssignment(am,h);
+      ServerName sn=am.getRegionStates().getRegionServerOfRegion(h);
+      assertNotNull(sn);
+      LOG.info("HBASE:META DEPLOY: " + h.getRegionNameAsString() + " on "+ sn);
+      sns.add(sn);
+    }
+    if (sns.size() == 1) {
+      int count=TEST_UTIL.getMiniHBaseCluster().getLiveRegionServerThreads().size();
+      assertTrue("count=" + count,count == REGIONSERVERS_COUNT);
+      LOG.warn("All hbase:meta replicas are on the one server; moving hbase:meta: " + sns);
+      int metaServerIndex=TEST_UTIL.getHBaseCluster().getServerWithMeta();
+      int newServerIndex=metaServerIndex;
+      while (newServerIndex == metaServerIndex) {
+        newServerIndex=(newServerIndex + 1) % REGIONSERVERS_COUNT;
+      }
+      assertNotEquals(metaServerIndex,newServerIndex);
+      ServerName destinationServerName=TEST_UTIL.getHBaseCluster().getRegionServer(newServerIndex).getServerName();
+      ServerName metaServerName=TEST_UTIL.getHBaseCluster().getRegionServer(metaServerIndex).getServerName();
+      assertNotEquals(destinationServerName,metaServerName);
+      TEST_UTIL.getAdmin().move(RegionInfoBuilder.FIRST_META_REGIONINFO.getEncodedNameAsBytes(),Bytes.toBytes(destinationServerName.toString()));
+    }
+    LoadBalancerTracker l=new LoadBalancerTracker(TEST_UTIL.getZooKeeperWatcher(),new Abortable(){
+      AtomicBoolean aborted=new AtomicBoolean(false);
+      @Override public boolean isAborted(){
+        return aborted.get();
+      }
+      @Override public void abort(      String why,      Throwable e){
+        aborted.set(true);
+      }
+    }
+);
+    l.setBalancerOn(false);
+    LOG.debug("All meta replicas assigned");
+  }
+  @After public void tearDown() throws Exception {
+    TEST_UTIL.shutdownMiniCluster();
+  }
+  @Test public void testMetaHTDReplicaCount() throws Exception {
+    assertTrue(TEST_UTIL.getAdmin().getTableDescriptor(TableName.META_TABLE_NAME).getRegionReplication() == 3);
+  }
+  @Test public void testZookeeperNodesForReplicas() throws Exception {
+    ZKWatcher zkw=TEST_UTIL.getZooKeeperWatcher();
+    Configuration conf=TEST_UTIL.getConfiguration();
+    String baseZNode=conf.get(HConstants.ZOOKEEPER_ZNODE_PARENT,HConstants.DEFAULT_ZOOKEEPER_ZNODE_PARENT);
+    String primaryMetaZnode=ZNodePaths.joinZNode(baseZNode,conf.get("zookeeper.znode.metaserver","meta-region-server"));
+    byte[] data=ZKUtil.getData(zkw,primaryMetaZnode);
+    ProtobufUtil.toServerName(data);
+    for (int i=1; i < 3; i++) {
+      String secZnode=ZNodePaths.joinZNode(baseZNode,conf.get("zookeeper.znode.metaserver","meta-region-server") + "-" + i);
+      String str=zkw.getZNodePaths().getZNodeForReplica(i);
+      assertTrue(str.equals(secZnode));
+      data=ZKUtil.getData(zkw,secZnode);
+      ProtobufUtil.toServerName(data);
+    }
+  }
+  @Test public void testShutdownHandling() throws Exception {
+    shutdownMetaAndDoValidations(TEST_UTIL);
+  }
+  public static void shutdownMetaAndDoValidations(  HBaseTestingUtility util) throws Exception {
+    ZKWatcher zkw=util.getZooKeeperWatcher();
+    Configuration conf=util.getConfiguration();
+    conf.setBoolean(HConstants.USE_META_REPLICAS,true);
+    String baseZNode=conf.get(HConstants.ZOOKEEPER_ZNODE_PARENT,HConstants.DEFAULT_ZOOKEEPER_ZNODE_PARENT);
+    String primaryMetaZnode=ZNodePaths.joinZNode(baseZNode,conf.get("zookeeper.znode.metaserver","meta-region-server"));
+    byte[] data=ZKUtil.getData(zkw,primaryMetaZnode);
+    ServerName primary=ProtobufUtil.toServerName(data);
+    LOG.info("Primary=" + primary.toString());
+    TableName TABLE=TableName.valueOf("testShutdownHandling");
+    byte[][] FAMILIES=new byte[][]{Bytes.toBytes("foo")};
+    if (util.getAdmin().tableExists(TABLE)) {
+      util.getAdmin().disableTable(TABLE);
+      util.getAdmin().deleteTable(TABLE);
+    }
+    ServerName master=null;
+    try (Connection c=ConnectionFactory.createConnection(util.getConfiguration())){
+      try (Table htable=util.createTable(TABLE,FAMILIES)){
+        util.getAdmin().flush(TableName.META_TABLE_NAME);
+        Thread.sleep(conf.getInt(StorefileRefresherChore.REGIONSERVER_STOREFILE_REFRESH_PERIOD,30000) * 6);
+        List<RegionInfo> regions=MetaTableAccessor.getTableRegions(c,TABLE);
+        HRegionLocation hrl=MetaTableAccessor.getRegionLocation(c,regions.get(0));
+        if (hrl.getServerName().equals(primary)) {
+          util.getAdmin().move(hrl.getRegionInfo().getEncodedNameAsBytes(),null);
+          do {
+            Thread.sleep(10);
+            hrl=MetaTableAccessor.getRegionLocation(c,regions.get(0));
+          }
+ while (primary.equals(hrl.getServerName()));
+          util.getAdmin().flush(TableName.META_TABLE_NAME);
+          Thread.sleep(conf.getInt(StorefileRefresherChore.REGIONSERVER_STOREFILE_REFRESH_PERIOD,30000) * 3);
+        }
+        master=util.getHBaseClusterInterface().getClusterMetrics().getMasterName();
+        LOG.info("Stopping master=" + master.toString());
+        util.getHBaseClusterInterface().stopMaster(master);
+        util.getHBaseClusterInterface().waitForMasterToStop(master,60000);
+        LOG.info("Master " + master + " stopped!");
+        if (!master.equals(primary)) {
+          util.getHBaseClusterInterface().killRegionServer(primary);
+          util.getHBaseClusterInterface().waitForRegionServerToStop(primary,60000);
+        }
+        ((ClusterConnection)c).clearRegionCache();
+      }
+       LOG.info("Running GETs");
+      Get get=null;
+      Result r=null;
+      byte[] row="test".getBytes();
+      try (Table htable=c.getTable(TABLE)){
+        Put put=new Put(row);
+        put.addColumn("foo".getBytes(),row,row);
+        BufferedMutator m=c.getBufferedMutator(TABLE);
+        m.mutate(put);
+        m.flush();
+        get=new Get(row);
+        r=htable.get(get);
+        assertTrue(Arrays.equals(r.getRow(),row));
+        LOG.info("Starting Master");
+        util.getHBaseClusterInterface().startMaster(master.getHostname(),0);
+        util.getHBaseClusterInterface().startRegionServer(primary.getHostname(),0);
+        util.getHBaseClusterInterface().waitForActiveAndReadyMaster();
+        LOG.info("Master active!");
+        ((ClusterConnection)c).clearRegionCache();
+      }
+       conf.setBoolean(HConstants.USE_META_REPLICAS,false);
+      LOG.info("Running GETs no replicas");
+      try (Table htable=c.getTable(TABLE)){
+        r=htable.get(get);
+        assertTrue(Arrays.equals(r.getRow(),row));
+      }
+     }
+   }
+  @Test public void testMetaLookupThreadPoolCreated() throws Exception {
+    final TableName tableName=TableName.valueOf(name.getMethodName());
+    byte[][] FAMILIES=new byte[][]{Bytes.toBytes("foo")};
+    if (TEST_UTIL.getAdmin().tableExists(tableName)) {
+      TEST_UTIL.getAdmin().disableTable(tableName);
+      TEST_UTIL.getAdmin().deleteTable(tableName);
+    }
+    try (Table htable=TEST_UTIL.createTable(tableName,FAMILIES)){
+      byte[] row="test".getBytes();
+      ConnectionImplementation c=((ConnectionImplementation)TEST_UTIL.getConnection());
+      c.relocateRegion(tableName,row);
+      ExecutorService ex=c.getCurrentMetaLookupPool();
+      assert (ex != null);
+    }
+   }
+  @Ignore @Test public void testChangingReplicaCount() throws Exception {
+    stopMasterAndValidateReplicaCount(3,2);
+    stopMasterAndValidateReplicaCount(2,3);
+  }
+  private void stopMasterAndValidateReplicaCount(  final int originalReplicaCount,  final int newReplicaCount) throws Exception {
+    ServerName sn=TEST_UTIL.getHBaseClusterInterface().getClusterMetrics().getMasterName();
+    TEST_UTIL.getHBaseClusterInterface().stopMaster(sn);
+    TEST_UTIL.getHBaseClusterInterface().waitForMasterToStop(sn,60000);
+    List<String> metaZnodes=TEST_UTIL.getZooKeeperWatcher().getMetaReplicaNodes();
+    assert (metaZnodes.size() == originalReplicaCount);
+    TEST_UTIL.getHBaseClusterInterface().getConf().setInt(HConstants.META_REPLICAS_NUM,newReplicaCount);
+    if (TEST_UTIL.getHBaseCluster().countServedRegions() < newReplicaCount) {
+      TEST_UTIL.getHBaseCluster().startRegionServer();
+    }
+    TEST_UTIL.getHBaseClusterInterface().startMaster(sn.getHostname(),0);
+    TEST_UTIL.getHBaseClusterInterface().waitForActiveAndReadyMaster();
+    TEST_UTIL.waitFor(10000,predicateMetaHasReplicas(newReplicaCount));
+    TEST_UTIL.getConfiguration().setInt(HConstants.META_REPLICAS_NUM,newReplicaCount);
+    HBaseFsck hbck=HbckTestingUtil.doFsck(TEST_UTIL.getConfiguration(),false);
+    HbckTestingUtil.assertNoErrors(hbck);
+  }
+  private Waiter.ExplainingPredicate<Exception> predicateMetaHasReplicas(  final int newReplicaCount){
+    return new Waiter.ExplainingPredicate<Exception>(){
+      @Override public String explainFailure() throws Exception {
+        return checkMetaLocationAndExplain(newReplicaCount);
+      }
+      @Override public boolean evaluate() throws Exception {
+        return checkMetaLocationAndExplain(newReplicaCount) == null;
+      }
+    }
+;
+  }
+  @Nullable private String checkMetaLocationAndExplain(  int originalReplicaCount) throws KeeperException, IOException {
+    List<String> metaZnodes=TEST_UTIL.getZooKeeperWatcher().getMetaReplicaNodes();
+    if (metaZnodes.size() == originalReplicaCount) {
+      RegionLocations rl=((ClusterConnection)TEST_UTIL.getConnection()).locateRegion(TableName.META_TABLE_NAME,HConstants.EMPTY_START_ROW,false,false);
+      for (      HRegionLocation location : rl.getRegionLocations()) {
+        if (location == null) {
+          return "Null location found in " + rl.toString();
+        }
+        if (location.getRegionInfo() == null) {
+          return "Null regionInfo for location " + location;
+        }
+        if (location.getHostname() == null) {
+          return "Null hostName for location " + location;
+        }
+      }
+      return null;
+    }
+    return "Replica count is not as expected " + originalReplicaCount + " <> "+ metaZnodes.size()+ "("+ metaZnodes.toString()+ ")";
+  }
+  @Ignore @Test public void testHBaseFsckWithMetaReplicas() throws Exception {
+    HBaseFsck hbck=HbckTestingUtil.doFsck(TEST_UTIL.getConfiguration(),false);
+    HbckTestingUtil.assertNoErrors(hbck);
+  }
+  @Ignore @Test public void testHBaseFsckWithFewerMetaReplicas() throws Exception {
+    ClusterConnection c=(ClusterConnection)ConnectionFactory.createConnection(TEST_UTIL.getConfiguration());
+    RegionLocations rl=c.locateRegion(TableName.META_TABLE_NAME,HConstants.EMPTY_START_ROW,false,false);
+    HBaseFsckRepair.closeRegionSilentlyAndWait(c,rl.getRegionLocation(1).getServerName(),rl.getRegionLocation(1).getRegionInfo());
+    HBaseFsck hbck=doFsck(TEST_UTIL.getConfiguration(),false);
+    assertErrors(hbck,new ERROR_CODE[]{ERROR_CODE.UNKNOWN,ERROR_CODE.NO_META_REGION});
+    hbck=doFsck(TEST_UTIL.getConfiguration(),true);
+    hbck=doFsck(TEST_UTIL.getConfiguration(),false);
+    assertErrors(hbck,new ERROR_CODE[]{});
+  }
+  @Ignore @Test public void testHBaseFsckWithFewerMetaReplicaZnodes() throws Exception {
+    ClusterConnection c=(ClusterConnection)ConnectionFactory.createConnection(TEST_UTIL.getConfiguration());
+    RegionLocations rl=c.locateRegion(TableName.META_TABLE_NAME,HConstants.EMPTY_START_ROW,false,false);
+    HBaseFsckRepair.closeRegionSilentlyAndWait(c,rl.getRegionLocation(2).getServerName(),rl.getRegionLocation(2).getRegionInfo());
+    ZKWatcher zkw=TEST_UTIL.getZooKeeperWatcher();
+    ZKUtil.deleteNode(zkw,zkw.getZNodePaths().getZNodeForReplica(2));
+    HBaseFsck hbck=doFsck(TEST_UTIL.getConfiguration(),false);
+    assertErrors(hbck,new ERROR_CODE[]{ERROR_CODE.UNKNOWN,ERROR_CODE.NO_META_REGION});
+    hbck=doFsck(TEST_UTIL.getConfiguration(),true);
+    hbck=doFsck(TEST_UTIL.getConfiguration(),false);
+    assertErrors(hbck,new ERROR_CODE[]{});
+  }
+  @Test public void testAccessingUnknownTables() throws Exception {
+    Configuration conf=new Configuration(TEST_UTIL.getConfiguration());
+    conf.setBoolean(HConstants.USE_META_REPLICAS,true);
+    Table table=TEST_UTIL.getConnection().getTable(TableName.valueOf(name.getMethodName()));
+    Get get=new Get(Bytes.toBytes("foo"));
+    try {
+      table.get(get);
+    }
+ catch (    TableNotFoundException t) {
+      return;
+    }
+    fail("Expected TableNotFoundException");
+  }
+  @Test public void testMetaAddressChange() throws Exception {
+    Configuration conf=TEST_UTIL.getConfiguration();
+    ZKWatcher zkw=TEST_UTIL.getZooKeeperWatcher();
+    String baseZNode=conf.get(HConstants.ZOOKEEPER_ZNODE_PARENT,HConstants.DEFAULT_ZOOKEEPER_ZNODE_PARENT);
+    String primaryMetaZnode=ZNodePaths.joinZNode(baseZNode,conf.get("zookeeper.znode.metaserver","meta-region-server"));
+    byte[] data=ZKUtil.getData(zkw,primaryMetaZnode);
+    ServerName currentServer=ProtobufUtil.toServerName(data);
+    Collection<ServerName> liveServers=TEST_UTIL.getAdmin().getClusterMetrics(EnumSet.of(Option.LIVE_SERVERS)).getLiveServerMetrics().keySet();
+    ServerName moveToServer=null;
+    for (    ServerName s : liveServers) {
+      if (!currentServer.equals(s)) {
+        moveToServer=s;
+      }
+    }
+    assert (moveToServer != null);
+    final TableName tableName=TableName.valueOf(name.getMethodName());
+    TEST_UTIL.createTable(tableName,"f");
+    assertTrue(TEST_UTIL.getAdmin().tableExists(tableName));
+    TEST_UTIL.getAdmin().move(RegionInfoBuilder.FIRST_META_REGIONINFO.getEncodedNameAsBytes(),Bytes.toBytes(moveToServer.getServerName()));
+    int i=0;
+    assert !moveToServer.equals(currentServer);
+    LOG.info("CurrentServer=" + currentServer + ", moveToServer="+ moveToServer);
+    final int max=10000;
+    do {
+      Thread.sleep(10);
+      data=ZKUtil.getData(zkw,primaryMetaZnode);
+      currentServer=ProtobufUtil.toServerName(data);
+      i++;
+    }
+ while (!moveToServer.equals(currentServer) && i < max);
+    assert (i != max);
+    TEST_UTIL.getAdmin().disableTable(tableName);
+    assertTrue(TEST_UTIL.getAdmin().isTableDisabled(tableName));
+  }
+  @Test public void testShutdownOfReplicaHolder() throws Exception {
+    try (ClusterConnection conn=(ClusterConnection)ConnectionFactory.createConnection(TEST_UTIL.getConfiguration())){
+      RegionLocations rl=conn.locateRegion(TableName.META_TABLE_NAME,Bytes.toBytes(""),false,true);
+      HRegionLocation hrl=rl.getRegionLocation(1);
+      ServerName oldServer=hrl.getServerName();
+      TEST_UTIL.getHBaseClusterInterface().killRegionServer(oldServer);
+      int i=0;
+      do {
+        LOG.debug("Waiting for the replica " + hrl.getRegionInfo() + " to come up");
+        Thread.sleep(10000);
+        rl=conn.locateRegion(TableName.META_TABLE_NAME,Bytes.toBytes(""),false,true);
+        hrl=rl.getRegionLocation(1);
+        i++;
+      }
+ while ((hrl == null || hrl.getServerName().equals(oldServer)) && i < 3);
+      assertTrue(i != 3);
+    }
+   }
+  @Ignore @Test public void testHBaseFsckWithExcessMetaReplicas() throws Exception {
+    RegionInfo h=RegionReplicaUtil.getRegionInfoForReplica(RegionInfoBuilder.FIRST_META_REGIONINFO,3);
+    TEST_UTIL.assignRegion(h);
+    HBaseFsckRepair.waitUntilAssigned(TEST_UTIL.getAdmin(),h);
+    HBaseFsck hbck=doFsck(TEST_UTIL.getConfiguration(),false);
+    assertErrors(hbck,new ERROR_CODE[]{ERROR_CODE.UNKNOWN,ERROR_CODE.SHOULD_NOT_BE_DEPLOYED});
+    hbck=doFsck(TEST_UTIL.getConfiguration(),true);
+    hbck=doFsck(TEST_UTIL.getConfiguration(),false);
+    assertErrors(hbck,new ERROR_CODE[]{});
+  }
+}

@@ -1,0 +1,39 @@
+/** 
+ * Tests that we can retrieve the correct  {@link TaskManagerInfo} from the {@link ResourceManager}.
+ */
+@Test public void testRequestTaskManagerInfo() throws Exception {
+  final Configuration configuration=new Configuration();
+  final ResourceManagerConfiguration resourceManagerConfiguration=ResourceManagerConfiguration.fromConfiguration(configuration);
+  final TestingHighAvailabilityServices highAvailabilityServices=new TestingHighAvailabilityServices();
+  final SlotManager slotManager=new SlotManager(rpcService.getScheduledExecutor(),TestingUtils.infiniteTime(),TestingUtils.infiniteTime(),TestingUtils.infiniteTime());
+  final JobLeaderIdService jobLeaderIdService=new JobLeaderIdService(highAvailabilityServices,rpcService.getScheduledExecutor(),TestingUtils.infiniteTime());
+  final TestingFatalErrorHandler testingFatalErrorHandler=new TestingFatalErrorHandler();
+  final TestingLeaderElectionService resourceManagerLeaderElectionService=new TestingLeaderElectionService();
+  highAvailabilityServices.setResourceManagerLeaderElectionService(resourceManagerLeaderElectionService);
+  final TestingResourceManager resourceManager=new TestingResourceManager(rpcService,ResourceManager.RESOURCE_MANAGER_NAME,ResourceID.generate(),resourceManagerConfiguration,highAvailabilityServices,new HeartbeatServices(1000L,10000L),slotManager,NoOpMetricRegistry.INSTANCE,jobLeaderIdService,testingFatalErrorHandler,UnregisteredMetricGroups.createUnregisteredJobManagerMetricGroup());
+  resourceManager.start();
+  try {
+    final ResourceID taskManagerId=ResourceID.generate();
+    final ResourceManagerGateway resourceManagerGateway=resourceManager.getSelfGateway(ResourceManagerGateway.class);
+    final TaskExecutorGateway taskExecutorGateway=new TestingTaskExecutorGatewayBuilder().createTestingTaskExecutorGateway();
+    resourceManagerLeaderElectionService.isLeader(UUID.randomUUID()).get();
+    rpcService.registerGateway(taskExecutorGateway.getAddress(),taskExecutorGateway);
+    final HardwareDescription hardwareDescription=new HardwareDescription(42,1337L,1337L,0L);
+    final int dataPort=1234;
+    CompletableFuture<RegistrationResponse> registrationResponseFuture=resourceManagerGateway.registerTaskExecutor(taskExecutorGateway.getAddress(),taskManagerId,dataPort,hardwareDescription,TestingUtils.TIMEOUT());
+    Assert.assertTrue(registrationResponseFuture.get() instanceof RegistrationResponse.Success);
+    CompletableFuture<TaskManagerInfo> taskManagerInfoFuture=resourceManagerGateway.requestTaskManagerInfo(taskManagerId,TestingUtils.TIMEOUT());
+    TaskManagerInfo taskManagerInfo=taskManagerInfoFuture.get();
+    Assert.assertEquals(taskManagerId,taskManagerInfo.getResourceId());
+    Assert.assertEquals(hardwareDescription,taskManagerInfo.getHardwareDescription());
+    Assert.assertEquals(taskExecutorGateway.getAddress(),taskManagerInfo.getAddress());
+    Assert.assertEquals(dataPort,taskManagerInfo.getDataPort());
+    Assert.assertEquals(0,taskManagerInfo.getNumberSlots());
+    Assert.assertEquals(0,taskManagerInfo.getNumberAvailableSlots());
+    testingFatalErrorHandler.rethrowError();
+  }
+  finally {
+    RpcUtils.terminateRpcEndpoint(resourceManager,TestingUtils.TIMEOUT());
+    highAvailabilityServices.close();
+  }
+}

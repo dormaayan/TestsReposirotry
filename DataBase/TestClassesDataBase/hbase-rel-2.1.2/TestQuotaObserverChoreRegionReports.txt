@@ -1,0 +1,132 @@
+/** 
+ * A test case to verify that region reports are expired when they are not sent.
+ */
+@Category(LargeTests.class) public class TestQuotaObserverChoreRegionReports {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestQuotaObserverChoreRegionReports.class);
+  private static final Logger LOG=LoggerFactory.getLogger(TestQuotaObserverChoreRegionReports.class);
+  private static final HBaseTestingUtility TEST_UTIL=new HBaseTestingUtility();
+  @Rule public TestName testName=new TestName();
+  @Before public void setUp() throws Exception {
+    Configuration conf=TEST_UTIL.getConfiguration();
+    SpaceQuotaHelperForTests.updateConfigForQuotas(conf);
+    conf.setInt(QuotaObserverChore.REGION_REPORT_RETENTION_DURATION_KEY,1000);
+  }
+  @After public void tearDown() throws Exception {
+    TEST_UTIL.shutdownMiniCluster();
+  }
+  @Test public void testReportExpiration() throws Exception {
+    Configuration conf=TEST_UTIL.getConfiguration();
+    conf.setInt(FileSystemUtilizationChore.FS_UTILIZATION_CHORE_PERIOD_KEY,25000);
+    conf.setInt(QuotaObserverChore.REGION_REPORT_RETENTION_DURATION_KEY,5000);
+    TEST_UTIL.startMiniCluster(1);
+    final String FAM1="f1";
+    final HMaster master=TEST_UTIL.getMiniHBaseCluster().getMaster();
+    while (master.getMasterQuotaManager() == null) {
+      LOG.debug("MasterQuotaManager is null, waiting...");
+      Thread.sleep(500);
+    }
+    final MasterQuotaManager quotaManager=master.getMasterQuotaManager();
+    final TableName tn=TableName.valueOf("reportExpiration");
+    HTableDescriptor tableDesc=new HTableDescriptor(tn);
+    tableDesc.addFamily(new HColumnDescriptor(FAM1));
+    TEST_UTIL.getAdmin().createTable(tableDesc);
+    assertEquals(0,getRegionReportsForTable(quotaManager.snapshotRegionSizes(),tn));
+    final long sizeLimit=100L * SpaceQuotaHelperForTests.ONE_MEGABYTE;
+    final SpaceViolationPolicy violationPolicy=SpaceViolationPolicy.NO_INSERTS;
+    QuotaSettings settings=QuotaSettingsFactory.limitTableSpace(tn,sizeLimit,violationPolicy);
+    TEST_UTIL.getAdmin().setQuota(settings);
+    Waiter.waitFor(TEST_UTIL.getConfiguration(),45000,1000,new Waiter.Predicate<Exception>(){
+      @Override public boolean evaluate() throws Exception {
+        int numReports=getRegionReportsForTable(quotaManager.snapshotRegionSizes(),tn);
+        LOG.debug("Saw " + numReports + " reports for "+ tn+ " while waiting for 1");
+        return numReports == 1;
+      }
+    }
+);
+    Waiter.waitFor(TEST_UTIL.getConfiguration(),15000,1000,new Waiter.Predicate<Exception>(){
+      @Override public boolean evaluate() throws Exception {
+        int numReports=getRegionReportsForTable(quotaManager.snapshotRegionSizes(),tn);
+        LOG.debug("Saw " + numReports + " reports for "+ tn+ " while waiting for none");
+        return numReports == 0;
+      }
+    }
+);
+  }
+  @Test public void testMissingReportsRemovesQuota() throws Exception {
+    Configuration conf=TEST_UTIL.getConfiguration();
+    conf.setInt(QuotaObserverChore.REGION_REPORT_RETENTION_DURATION_KEY,5000);
+    TEST_UTIL.startMiniCluster(1);
+    final String FAM1="f1";
+    final TableName tn=TableName.valueOf("quotaAcceptanceWithoutReports");
+    HTableDescriptor tableDesc=new HTableDescriptor(tn);
+    tableDesc.addFamily(new HColumnDescriptor(FAM1));
+    TEST_UTIL.getAdmin().createTable(tableDesc);
+    final long sizeLimit=1L * SpaceQuotaHelperForTests.ONE_KILOBYTE;
+    final SpaceViolationPolicy violationPolicy=SpaceViolationPolicy.NO_INSERTS;
+    QuotaSettings settings=QuotaSettingsFactory.limitTableSpace(tn,sizeLimit,violationPolicy);
+    final Admin admin=TEST_UTIL.getAdmin();
+    admin.setQuota(settings);
+    final Connection conn=TEST_UTIL.getConnection();
+    Put p=new Put(Bytes.toBytes("row1"));
+    byte[] bytes=new byte[10];
+    Arrays.fill(bytes,(byte)2);
+    for (int i=0; i < 200; i++) {
+      p.addColumn(Bytes.toBytes(FAM1),Bytes.toBytes("qual" + i),bytes);
+    }
+    conn.getTable(tn).put(p);
+    admin.flush(tn);
+    Waiter.waitFor(TEST_UTIL.getConfiguration(),30000,1000,new Waiter.Predicate<Exception>(){
+      @Override public boolean evaluate() throws Exception {
+        SpaceQuotaSnapshot snapshot=getSnapshotForTable(conn,tn);
+        if (snapshot == null) {
+          return false;
+        }
+        return snapshot.getQuotaStatus().isInViolation();
+      }
+    }
+);
+    List<RegionInfo> regions=admin.getRegions(tn);
+    assertEquals(1,regions.size());
+    RegionInfo hri=regions.get(0);
+    admin.unassign(hri.getRegionName(),true);
+    Waiter.waitFor(TEST_UTIL.getConfiguration(),30000,1000,new Waiter.Predicate<Exception>(){
+      @Override public boolean evaluate() throws Exception {
+        SpaceQuotaSnapshot snapshot=getSnapshotForTable(conn,tn);
+        if (snapshot == null) {
+          return false;
+        }
+        return !snapshot.getQuotaStatus().isInViolation();
+      }
+    }
+);
+    final HMaster master=TEST_UTIL.getMiniHBaseCluster().getMaster();
+    QuotaSnapshotStore<TableName> tableStore=master.getQuotaObserverChore().getTableSnapshotStore();
+    SpaceQuotaSnapshot snapshot=tableStore.getCurrentState(tn);
+    assertFalse("Quota should not be in violation",snapshot.getQuotaStatus().isInViolation());
+  }
+  private SpaceQuotaSnapshot getSnapshotForTable(  Connection conn,  TableName tn) throws IOException {
+    try (Table quotaTable=conn.getTable(QuotaUtil.QUOTA_TABLE_NAME);ResultScanner scanner=quotaTable.getScanner(QuotaTableUtil.makeQuotaSnapshotScan())){
+      Map<TableName,SpaceQuotaSnapshot> activeViolations=new HashMap<>();
+      for (      Result result : scanner) {
+        try {
+          QuotaTableUtil.extractQuotaSnapshot(result,activeViolations);
+        }
+ catch (        IllegalArgumentException e) {
+          final String msg="Failed to parse result for row " + Bytes.toString(result.getRow());
+          LOG.error(msg,e);
+          throw new IOException(msg,e);
+        }
+      }
+      return activeViolations.get(tn);
+    }
+   }
+  private int getRegionReportsForTable(  Map<RegionInfo,Long> reports,  TableName tn){
+    int numReports=0;
+    for (    Entry<RegionInfo,Long> entry : reports.entrySet()) {
+      if (tn.equals(entry.getKey().getTable())) {
+        numReports++;
+      }
+    }
+    return numReports;
+  }
+}

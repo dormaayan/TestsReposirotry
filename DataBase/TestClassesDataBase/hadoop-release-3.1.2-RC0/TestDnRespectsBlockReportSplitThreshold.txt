@@ -1,0 +1,86 @@
+/** 
+ * Tests that the DataNode respects {@link DFSConfigKeys#DFS_BLOCKREPORT_SPLIT_THRESHOLD_KEY}
+ */
+public class TestDnRespectsBlockReportSplitThreshold {
+  public static final Log LOG=LogFactory.getLog(TestStorageReport.class);
+  private static final int BLOCK_SIZE=1024;
+  private static final short REPL_FACTOR=1;
+  private static final long seed=0xFEEDFACE;
+  private static final int BLOCKS_IN_FILE=5;
+  private static Configuration conf;
+  private MiniDFSCluster cluster;
+  private DistributedFileSystem fs;
+  static String bpid;
+  public void startUpCluster(  long splitThreshold) throws IOException {
+    conf=new HdfsConfiguration();
+    conf.setLong(DFS_BLOCKREPORT_SPLIT_THRESHOLD_KEY,splitThreshold);
+    cluster=new MiniDFSCluster.Builder(conf).numDataNodes(REPL_FACTOR).build();
+    fs=cluster.getFileSystem();
+    bpid=cluster.getNamesystem().getBlockPoolId();
+  }
+  @After public void shutDownCluster() throws IOException {
+    if (cluster != null) {
+      fs.close();
+      cluster.shutdown();
+      cluster=null;
+    }
+  }
+  private void createFile(  String filenamePrefix,  int blockCount) throws IOException {
+    Path path=new Path("/" + filenamePrefix + ".dat");
+    DFSTestUtil.createFile(fs,path,BLOCK_SIZE,blockCount * BLOCK_SIZE,BLOCK_SIZE,REPL_FACTOR,seed);
+  }
+  private void verifyCapturedArguments(  ArgumentCaptor<StorageBlockReport[]> captor,  int expectedReportsPerCall,  int expectedTotalBlockCount){
+    List<StorageBlockReport[]> listOfReports=captor.getAllValues();
+    int numBlocksReported=0;
+    for (    StorageBlockReport[] reports : listOfReports) {
+      assertThat(reports.length,is(expectedReportsPerCall));
+      for (      StorageBlockReport report : reports) {
+        BlockListAsLongs blockList=report.getBlocks();
+        numBlocksReported+=blockList.getNumberOfBlocks();
+      }
+    }
+    assert (numBlocksReported >= expectedTotalBlockCount);
+  }
+  /** 
+ * Test that if splitThreshold is zero, then we always get a separate call per storage.
+ */
+  @Test(timeout=300000) public void testAlwaysSplit() throws IOException, InterruptedException {
+    startUpCluster(0);
+    NameNode nn=cluster.getNameNode();
+    DataNode dn=cluster.getDataNodes().get(0);
+    createFile(GenericTestUtils.getMethodName(),BLOCKS_IN_FILE);
+    DatanodeProtocolClientSideTranslatorPB nnSpy=InternalDataNodeTestUtils.spyOnBposToNN(dn,nn);
+    DataNodeTestUtils.triggerBlockReport(dn);
+    ArgumentCaptor<StorageBlockReport[]> captor=ArgumentCaptor.forClass(StorageBlockReport[].class);
+    Mockito.verify(nnSpy,times(cluster.getStoragesPerDatanode())).blockReport(any(DatanodeRegistration.class),anyString(),captor.capture(),Mockito.<BlockReportContext>anyObject());
+    verifyCapturedArguments(captor,1,BLOCKS_IN_FILE);
+  }
+  /** 
+ * Tests the behavior when the count of blocks is exactly one less than the threshold.
+ */
+  @Test(timeout=300000) public void testCornerCaseUnderThreshold() throws IOException, InterruptedException {
+    startUpCluster(BLOCKS_IN_FILE + 1);
+    NameNode nn=cluster.getNameNode();
+    DataNode dn=cluster.getDataNodes().get(0);
+    createFile(GenericTestUtils.getMethodName(),BLOCKS_IN_FILE);
+    DatanodeProtocolClientSideTranslatorPB nnSpy=InternalDataNodeTestUtils.spyOnBposToNN(dn,nn);
+    DataNodeTestUtils.triggerBlockReport(dn);
+    ArgumentCaptor<StorageBlockReport[]> captor=ArgumentCaptor.forClass(StorageBlockReport[].class);
+    Mockito.verify(nnSpy,times(1)).blockReport(any(DatanodeRegistration.class),anyString(),captor.capture(),Mockito.<BlockReportContext>anyObject());
+    verifyCapturedArguments(captor,cluster.getStoragesPerDatanode(),BLOCKS_IN_FILE);
+  }
+  /** 
+ * Tests the behavior when the count of blocks is exactly equal to the threshold.
+ */
+  @Test(timeout=300000) public void testCornerCaseAtThreshold() throws IOException, InterruptedException {
+    startUpCluster(BLOCKS_IN_FILE);
+    NameNode nn=cluster.getNameNode();
+    DataNode dn=cluster.getDataNodes().get(0);
+    createFile(GenericTestUtils.getMethodName(),BLOCKS_IN_FILE);
+    DatanodeProtocolClientSideTranslatorPB nnSpy=InternalDataNodeTestUtils.spyOnBposToNN(dn,nn);
+    DataNodeTestUtils.triggerBlockReport(dn);
+    ArgumentCaptor<StorageBlockReport[]> captor=ArgumentCaptor.forClass(StorageBlockReport[].class);
+    Mockito.verify(nnSpy,times(cluster.getStoragesPerDatanode())).blockReport(any(DatanodeRegistration.class),anyString(),captor.capture(),Mockito.<BlockReportContext>anyObject());
+    verifyCapturedArguments(captor,1,BLOCKS_IN_FILE);
+  }
+}

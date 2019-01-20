@@ -1,0 +1,62 @@
+@Test public void testRetry() throws Exception {
+  final ServerSocket[] serverSocket=new ServerSocket[1];
+  final ExecutorService[] executor=new ExecutorService[1];
+  try {
+    serverSocket[0]=new ServerSocket(0);
+    executor[0]=Executors.newCachedThreadPool();
+    int port=serverSocket[0].getLocalPort();
+    Callable<Void> serverTask=new Callable<Void>(){
+      @Override public Void call() throws Exception {
+        Socket socket=serverSocket[0].accept();
+        BufferedReader reader=new BufferedReader(new InputStreamReader(socket.getInputStream()));
+        String value=reader.readLine();
+        assertEquals("0",value);
+        socket.close();
+        return null;
+      }
+    }
+;
+    Future<Void> serverFuture=executor[0].submit(serverTask);
+    final SocketClientSink<String> sink=new SocketClientSink<>(host,serverSocket[0].getLocalPort(),simpleSchema,-1,true);
+    sink.open(new Configuration());
+    sink.invoke("0\n",SinkContextUtil.forTimestamp(0));
+    serverFuture.get();
+    serverSocket[0].close();
+    assertTrue(serverSocket[0].isClosed());
+    assertEquals(0,sink.getCurrentNumberOfRetries());
+    final CountDownLatch retryLatch=new CountDownLatch(1);
+    final CountDownLatch again=new CountDownLatch(1);
+    Callable<Void> sinkTask=new Callable<Void>(){
+      @Override public Void call() throws Exception {
+        while (retryLatch.getCount() != 0) {
+          sink.invoke("1\n");
+        }
+        return null;
+      }
+    }
+;
+    Future<Void> sinkFuture=executor[0].submit(sinkTask);
+    while (sink.getCurrentNumberOfRetries() == 0) {
+      Thread.sleep(100);
+    }
+    retryLatch.countDown();
+    try {
+      serverSocket[0]=new ServerSocket(port);
+    }
+ catch (    BindException be) {
+      throw new AssumptionViolatedException("Could not bind server to previous port.",be);
+    }
+    Socket socket=serverSocket[0].accept();
+    BufferedReader reader=new BufferedReader(new InputStreamReader(socket.getInputStream()));
+    String value=reader.readLine();
+    assertEquals("1",value);
+  }
+  finally {
+    if (serverSocket[0] != null) {
+      serverSocket[0].close();
+    }
+    if (executor[0] != null) {
+      executor[0].shutdown();
+    }
+  }
+}

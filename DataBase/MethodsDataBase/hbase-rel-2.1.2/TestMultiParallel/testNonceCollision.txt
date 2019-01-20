@@ -1,0 +1,86 @@
+@Test public void testNonceCollision() throws Exception {
+  LOG.info("test=testNonceCollision");
+  final Connection connection=ConnectionFactory.createConnection(UTIL.getConfiguration());
+  Table table=connection.getTable(TEST_TABLE);
+  Put put=new Put(ONE_ROW);
+  put.addColumn(BYTES_FAMILY,QUALIFIER,Bytes.toBytes(0L));
+  NonceGenerator cnm=new NonceGenerator(){
+    private final PerClientRandomNonceGenerator delegate=PerClientRandomNonceGenerator.get();
+    private long lastNonce=-1;
+    @Override public synchronized long newNonce(){
+      long nonce=0;
+      if (lastNonce == -1) {
+        lastNonce=nonce=delegate.newNonce();
+      }
+ else {
+        nonce=lastNonce;
+        lastNonce=-1L;
+      }
+      return nonce;
+    }
+    @Override public long getNonceGroup(){
+      return delegate.getNonceGroup();
+    }
+  }
+;
+  NonceGenerator oldCnm=ConnectionUtils.injectNonceGeneratorForTesting((ClusterConnection)connection,cnm);
+  try {
+    Increment inc=new Increment(ONE_ROW);
+    inc.addColumn(BYTES_FAMILY,QUALIFIER,1L);
+    table.increment(inc);
+    inc=new Increment(ONE_ROW);
+    inc.addColumn(BYTES_FAMILY,QUALIFIER,1L);
+    Result result=table.increment(inc);
+    validateResult(result,QUALIFIER,Bytes.toBytes(1L));
+    Get get=new Get(ONE_ROW);
+    get.addColumn(BYTES_FAMILY,QUALIFIER);
+    result=table.get(get);
+    validateResult(result,QUALIFIER,Bytes.toBytes(1L));
+    int numRequests=40;
+    final CountDownLatch startedLatch=new CountDownLatch(numRequests);
+    final CountDownLatch startLatch=new CountDownLatch(1);
+    final CountDownLatch doneLatch=new CountDownLatch(numRequests);
+    for (int i=0; i < numRequests; ++i) {
+      Runnable r=new Runnable(){
+        @Override public void run(){
+          Table table=null;
+          try {
+            table=connection.getTable(TEST_TABLE);
+          }
+ catch (          IOException e) {
+            fail("Not expected");
+          }
+          Increment inc=new Increment(ONE_ROW);
+          inc.addColumn(BYTES_FAMILY,QUALIFIER,1L);
+          startedLatch.countDown();
+          try {
+            startLatch.await();
+          }
+ catch (          InterruptedException e) {
+            fail("Not expected");
+          }
+          try {
+            table.increment(inc);
+          }
+ catch (          IOException ioEx) {
+            fail("Not expected");
+          }
+          doneLatch.countDown();
+        }
+      }
+;
+      Threads.setDaemonThreadRunning(new Thread(r));
+    }
+    startedLatch.await();
+    startLatch.countDown();
+    doneLatch.await();
+    get=new Get(ONE_ROW);
+    get.addColumn(BYTES_FAMILY,QUALIFIER);
+    result=table.get(get);
+    validateResult(result,QUALIFIER,Bytes.toBytes((numRequests / 2) + 1L));
+    table.close();
+  }
+  finally {
+    ConnectionImplementation.injectNonceGeneratorForTesting((ClusterConnection)connection,oldCnm);
+  }
+}

@@ -1,0 +1,87 @@
+@Test public void ensureOffsetsGetCommitted() throws Exception {
+  final KafkaTopicPartition testPartition1=new KafkaTopicPartition("test",42);
+  final KafkaTopicPartition testPartition2=new KafkaTopicPartition("another",99);
+  final Map<KafkaTopicPartition,Long> testCommitData1=new HashMap<>();
+  testCommitData1.put(testPartition1,11L);
+  testCommitData1.put(testPartition2,18L);
+  final Map<KafkaTopicPartition,Long> testCommitData2=new HashMap<>();
+  testCommitData2.put(testPartition1,19L);
+  testCommitData2.put(testPartition2,28L);
+  final BlockingQueue<Map<TopicPartition,OffsetAndMetadata>> commitStore=new LinkedBlockingQueue<>();
+  final MultiShotLatch blockerLatch=new MultiShotLatch();
+  KafkaConsumer<?,?> mockConsumer=mock(KafkaConsumer.class);
+  when(mockConsumer.poll(anyLong())).thenAnswer(new Answer<ConsumerRecords<?,?>>(){
+    @Override public ConsumerRecords<?,?> answer(    InvocationOnMock invocation) throws InterruptedException {
+      blockerLatch.await();
+      return ConsumerRecords.empty();
+    }
+  }
+);
+  doAnswer(new Answer<Void>(){
+    @Override public Void answer(    InvocationOnMock invocation){
+      blockerLatch.trigger();
+      return null;
+    }
+  }
+).when(mockConsumer).wakeup();
+  doAnswer(new Answer<Void>(){
+    @Override public Void answer(    InvocationOnMock invocation){
+      @SuppressWarnings("unchecked") Map<TopicPartition,OffsetAndMetadata> offsets=(Map<TopicPartition,OffsetAndMetadata>)invocation.getArguments()[0];
+      OffsetCommitCallback callback=(OffsetCommitCallback)invocation.getArguments()[1];
+      commitStore.add(offsets);
+      callback.onComplete(offsets,null);
+      return null;
+    }
+  }
+).when(mockConsumer).commitAsync(Mockito.<Map<TopicPartition,OffsetAndMetadata>>any(),any(OffsetCommitCallback.class));
+  whenNew(KafkaConsumer.class).withAnyArguments().thenReturn(mockConsumer);
+  @SuppressWarnings("unchecked") SourceContext<String> sourceContext=mock(SourceContext.class);
+  Map<KafkaTopicPartition,Long> partitionsWithInitialOffsets=Collections.singletonMap(new KafkaTopicPartition("test",42),KafkaTopicPartitionStateSentinel.GROUP_OFFSET);
+  KeyedDeserializationSchema<String> schema=new KeyedDeserializationSchemaWrapper<>(new SimpleStringSchema());
+  final Kafka09Fetcher<String> fetcher=new Kafka09Fetcher<>(sourceContext,partitionsWithInitialOffsets,null,null,new TestProcessingTimeService(),10,this.getClass().getClassLoader(),"task_name",schema,new Properties(),0L,new UnregisteredMetricsGroup(),new UnregisteredMetricsGroup(),false);
+  final AtomicReference<Throwable> error=new AtomicReference<>();
+  final Thread fetcherRunner=new Thread("fetcher runner"){
+    @Override public void run(){
+      try {
+        fetcher.runFetchLoop();
+      }
+ catch (      Throwable t) {
+        error.set(t);
+      }
+    }
+  }
+;
+  fetcherRunner.start();
+  fetcher.commitInternalOffsetsToKafka(testCommitData1,mock(KafkaCommitCallback.class));
+  Map<TopicPartition,OffsetAndMetadata> result1=commitStore.take();
+  for (  Entry<TopicPartition,OffsetAndMetadata> entry : result1.entrySet()) {
+    TopicPartition partition=entry.getKey();
+    if (partition.topic().equals("test")) {
+      assertEquals(42,partition.partition());
+      assertEquals(12L,entry.getValue().offset());
+    }
+ else     if (partition.topic().equals("another")) {
+      assertEquals(99,partition.partition());
+      assertEquals(17L,entry.getValue().offset());
+    }
+  }
+  fetcher.commitInternalOffsetsToKafka(testCommitData2,mock(KafkaCommitCallback.class));
+  Map<TopicPartition,OffsetAndMetadata> result2=commitStore.take();
+  for (  Entry<TopicPartition,OffsetAndMetadata> entry : result2.entrySet()) {
+    TopicPartition partition=entry.getKey();
+    if (partition.topic().equals("test")) {
+      assertEquals(42,partition.partition());
+      assertEquals(20L,entry.getValue().offset());
+    }
+ else     if (partition.topic().equals("another")) {
+      assertEquals(99,partition.partition());
+      assertEquals(27L,entry.getValue().offset());
+    }
+  }
+  fetcher.cancel();
+  fetcherRunner.join();
+  final Throwable caughtError=error.get();
+  if (caughtError != null && !(caughtError instanceof Handover.ClosedException)) {
+    throw new Exception("Exception in the fetcher",caughtError);
+  }
+}

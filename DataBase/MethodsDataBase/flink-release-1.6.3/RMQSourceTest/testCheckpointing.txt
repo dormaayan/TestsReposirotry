@@ -1,0 +1,42 @@
+@Test public void testCheckpointing() throws Exception {
+  source.autoAck=false;
+  StreamSource<String,RMQSource<String>> src=new StreamSource<>(source);
+  AbstractStreamOperatorTestHarness<String> testHarness=new AbstractStreamOperatorTestHarness<>(src,1,1,0);
+  testHarness.open();
+  sourceThread.start();
+  Thread.sleep(5);
+  final Random random=new Random(System.currentTimeMillis());
+  int numSnapshots=50;
+  long previousSnapshotId;
+  long lastSnapshotId=0;
+  long totalNumberOfAcks=0;
+  for (int i=0; i < numSnapshots; i++) {
+    long snapshotId=random.nextLong();
+    OperatorSubtaskState data;
+synchronized (DummySourceContext.lock) {
+      data=testHarness.snapshot(snapshotId,System.currentTimeMillis());
+      previousSnapshotId=lastSnapshotId;
+      lastSnapshotId=messageId;
+    }
+    Thread.sleep(5);
+    final long numIds=lastSnapshotId - previousSnapshotId;
+    RMQTestSource sourceCopy=new RMQTestSource();
+    StreamSource<String,RMQTestSource> srcCopy=new StreamSource<>(sourceCopy);
+    AbstractStreamOperatorTestHarness<String> testHarnessCopy=new AbstractStreamOperatorTestHarness<>(srcCopy,1,1,0);
+    testHarnessCopy.setup();
+    testHarnessCopy.initializeState(data);
+    testHarnessCopy.open();
+    ArrayDeque<Tuple2<Long,Set<String>>> deque=sourceCopy.getRestoredState();
+    Set<String> messageIds=deque.getLast().f1;
+    assertEquals(numIds,messageIds.size());
+    if (messageIds.size() > 0) {
+      assertTrue(messageIds.contains(Long.toString(lastSnapshotId)));
+    }
+synchronized (DummySourceContext.lock) {
+      source.notifyCheckpointComplete(snapshotId);
+    }
+    totalNumberOfAcks+=numIds;
+  }
+  Mockito.verify(source.channel,Mockito.times((int)totalNumberOfAcks)).basicAck(Mockito.anyLong(),Mockito.eq(false));
+  Mockito.verify(source.channel,Mockito.times(numSnapshots)).txCommit();
+}

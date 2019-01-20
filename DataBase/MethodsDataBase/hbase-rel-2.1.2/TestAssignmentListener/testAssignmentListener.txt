@@ -1,0 +1,67 @@
+@Test public void testAssignmentListener() throws IOException, InterruptedException {
+  AssignmentManager am=TEST_UTIL.getHBaseCluster().getMaster().getAssignmentManager();
+  Admin admin=TEST_UTIL.getAdmin();
+  DummyAssignmentListener listener=new DummyAssignmentListener();
+  am.registerListener(listener);
+  try {
+    final TableName tableName=TableName.valueOf(name.getMethodName());
+    final byte[] FAMILY=Bytes.toBytes("cf");
+    LOG.info("Create Table");
+    TEST_UTIL.createTable(tableName,FAMILY);
+    listener.awaitModifications(1);
+    assertEquals(1,listener.getLoadCount());
+    assertEquals(0,listener.getCloseCount());
+    Table table=TEST_UTIL.getConnection().getTable(tableName);
+    try {
+      for (int i=0; i < 10; ++i) {
+        byte[] key=Bytes.toBytes("row-" + i);
+        Put put=new Put(key);
+        put.addColumn(FAMILY,null,key);
+        table.put(put);
+      }
+    }
+  finally {
+      table.close();
+    }
+    LOG.info("Split Table");
+    listener.reset();
+    admin.split(tableName,Bytes.toBytes("row-3"));
+    listener.awaitModifications(3);
+    assertEquals(2,listener.getLoadCount());
+    assertEquals(1,listener.getCloseCount());
+    MiniHBaseCluster miniCluster=TEST_UTIL.getMiniHBaseCluster();
+    int mergeable=0;
+    while (mergeable < 2) {
+      Thread.sleep(100);
+      admin.majorCompact(tableName);
+      mergeable=0;
+      for (      JVMClusterUtil.RegionServerThread regionThread : miniCluster.getRegionServerThreads()) {
+        for (        Region region : regionThread.getRegionServer().getRegions(tableName)) {
+          mergeable+=((HRegion)region).isMergeable() ? 1 : 0;
+        }
+      }
+    }
+    LOG.info("Merge Regions");
+    listener.reset();
+    List<RegionInfo> regions=admin.getRegions(tableName);
+    assertEquals(2,regions.size());
+    boolean sameServer=areAllRegionsLocatedOnSameServer(tableName);
+    final int expectedModifications=sameServer ? 3 : 5;
+    final int expectedLoadCount=sameServer ? 1 : 2;
+    final int expectedCloseCount=sameServer ? 2 : 3;
+    admin.mergeRegionsAsync(regions.get(0).getEncodedNameAsBytes(),regions.get(1).getEncodedNameAsBytes(),true);
+    listener.awaitModifications(expectedModifications);
+    assertEquals(1,admin.getRegions(tableName).size());
+    assertEquals(expectedLoadCount,listener.getLoadCount());
+    assertEquals(expectedCloseCount,listener.getCloseCount());
+    LOG.info("Drop Table");
+    listener.reset();
+    TEST_UTIL.deleteTable(tableName);
+    listener.awaitModifications(1);
+    assertEquals(0,listener.getLoadCount());
+    assertEquals(1,listener.getCloseCount());
+  }
+  finally {
+    am.unregisterListener(listener);
+  }
+}

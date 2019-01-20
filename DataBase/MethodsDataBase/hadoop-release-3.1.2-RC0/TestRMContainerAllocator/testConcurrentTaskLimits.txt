@@ -1,0 +1,86 @@
+@Test public void testConcurrentTaskLimits() throws Exception {
+  final int MAP_COUNT=5;
+  final int REDUCE_COUNT=2;
+  final int MAP_LIMIT=3;
+  final int REDUCE_LIMIT=1;
+  LOG.info("Running testConcurrentTaskLimits");
+  Configuration conf=new Configuration();
+  conf.setInt(MRJobConfig.JOB_RUNNING_MAP_LIMIT,MAP_LIMIT);
+  conf.setInt(MRJobConfig.JOB_RUNNING_REDUCE_LIMIT,REDUCE_LIMIT);
+  conf.setFloat(MRJobConfig.COMPLETED_MAPS_FOR_REDUCE_SLOWSTART,0.0f);
+  ApplicationId appId=ApplicationId.newInstance(1,1);
+  ApplicationAttemptId appAttemptId=ApplicationAttemptId.newInstance(appId,1);
+  JobId jobId=MRBuilderUtils.newJobId(appAttemptId.getApplicationId(),0);
+  Job mockJob=mock(Job.class);
+  when(mockJob.getReport()).thenReturn(MRBuilderUtils.newJobReport(jobId,"job","user",JobState.RUNNING,0,0,0,0,0,0,0,"jobfile",null,false,""));
+  when(mockJob.getTotalMaps()).thenReturn(MAP_COUNT);
+  when(mockJob.getTotalReduces()).thenReturn(REDUCE_COUNT);
+  final MockScheduler mockScheduler=new MockScheduler(appAttemptId);
+  MyContainerAllocator allocator=new MyContainerAllocator(null,conf,appAttemptId,mockJob,SystemClock.getInstance()){
+    @Override protected void register(){
+    }
+    @Override protected ApplicationMasterProtocol createSchedulerProxy(){
+      return mockScheduler;
+    }
+  }
+;
+  ContainerRequestEvent[] reqMapEvents=new ContainerRequestEvent[MAP_COUNT];
+  for (int i=0; i < reqMapEvents.length; ++i) {
+    reqMapEvents[i]=ContainerRequestCreator.createRequest(jobId,i,Resource.newInstance(1024,1),new String[]{"h" + i});
+  }
+  allocator.sendRequests(Arrays.asList(reqMapEvents));
+  ContainerRequestEvent[] reqReduceEvents=new ContainerRequestEvent[REDUCE_COUNT];
+  for (int i=0; i < reqReduceEvents.length; ++i) {
+    reqReduceEvents[i]=createRequest(jobId,i,Resource.newInstance(1024,1),new String[]{},false,true);
+  }
+  allocator.sendRequests(Arrays.asList(reqReduceEvents));
+  allocator.schedule();
+  Assert.assertEquals(reqMapEvents.length + 2,mockScheduler.lastAsk.size());
+  Assert.assertEquals(MAP_LIMIT,mockScheduler.lastAnyAskMap);
+  ContainerId cid0=mockScheduler.assignContainer("h0",false);
+  allocator.schedule();
+  allocator.schedule();
+  Assert.assertEquals(2,mockScheduler.lastAnyAskMap);
+  mockScheduler.completeContainer(cid0);
+  allocator.schedule();
+  allocator.schedule();
+  Assert.assertEquals(3,mockScheduler.lastAnyAskMap);
+  ContainerId cid1=mockScheduler.assignContainer("h1",false);
+  ContainerId cid2=mockScheduler.assignContainer("h2",false);
+  ContainerId cid3=mockScheduler.assignContainer("h3",false);
+  allocator.schedule();
+  allocator.schedule();
+  Assert.assertEquals(0,mockScheduler.lastAnyAskMap);
+  mockScheduler.completeContainer(cid2);
+  mockScheduler.completeContainer(cid3);
+  allocator.schedule();
+  allocator.schedule();
+  Assert.assertEquals(1,mockScheduler.lastAnyAskMap);
+  mockScheduler.completeContainer(cid1);
+  ContainerId cid4=mockScheduler.assignContainer("h4",false);
+  allocator.schedule();
+  allocator.schedule();
+  Assert.assertEquals(0,mockScheduler.lastAnyAskMap);
+  mockScheduler.completeContainer(cid4);
+  allocator.schedule();
+  allocator.schedule();
+  Assert.assertEquals(0,mockScheduler.lastAnyAskMap);
+  Assert.assertEquals(REDUCE_LIMIT,mockScheduler.lastAnyAskReduce);
+  cid0=mockScheduler.assignContainer("h0",true);
+  allocator.schedule();
+  allocator.schedule();
+  Assert.assertEquals(0,mockScheduler.lastAnyAskReduce);
+  mockScheduler.completeContainer(cid0);
+  allocator.schedule();
+  allocator.schedule();
+  Assert.assertEquals(1,mockScheduler.lastAnyAskReduce);
+  cid0=mockScheduler.assignContainer("h0",true);
+  allocator.schedule();
+  allocator.schedule();
+  Assert.assertEquals(0,mockScheduler.lastAnyAskReduce);
+  mockScheduler.completeContainer(cid0);
+  allocator.schedule();
+  allocator.schedule();
+  Assert.assertEquals(0,mockScheduler.lastAnyAskReduce);
+  allocator.close();
+}

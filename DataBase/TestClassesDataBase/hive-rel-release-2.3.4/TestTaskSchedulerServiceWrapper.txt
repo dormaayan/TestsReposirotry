@@ -1,0 +1,162 @@
+private static class TestTaskSchedulerServiceWrapper {
+  static final Resource resource=Resource.newInstance(1024,1);
+  Configuration conf;
+  TaskSchedulerContext mockAppCallback=mock(TaskSchedulerContext.class);
+  ServiceInstanceSet mockServiceInstanceSet=mock(ServiceInstanceSet.class);
+  ControlledClock clock=new ControlledClock(new MonotonicClock());
+  ApplicationAttemptId appAttemptId=ApplicationAttemptId.newInstance(ApplicationId.newInstance(1000,1),1);
+  LlapTaskSchedulerServiceForTest ts;
+  TestTaskSchedulerServiceWrapper() throws IOException, InterruptedException {
+    this(2000l);
+  }
+  TestTaskSchedulerServiceWrapper(  long disableTimeoutMillis) throws IOException, InterruptedException {
+    this(disableTimeoutMillis,new String[]{HOST1,HOST2,HOST3},4,ConfVars.LLAP_DAEMON_TASK_SCHEDULER_WAIT_QUEUE_SIZE.defaultIntVal);
+  }
+  TestTaskSchedulerServiceWrapper(  long disableTimeoutMillis,  String[] hosts,  int numExecutors,  int waitQueueSize) throws IOException, InterruptedException {
+    this(disableTimeoutMillis,hosts,numExecutors,waitQueueSize,0l);
+  }
+  TestTaskSchedulerServiceWrapper(  long nodeDisableTimeoutMillis,  String[] hosts,  int numExecutors,  int waitQueueSize,  long localityDelayMs) throws IOException, InterruptedException {
+    this(nodeDisableTimeoutMillis,hosts,numExecutors,waitQueueSize,localityDelayMs,false);
+  }
+  TestTaskSchedulerServiceWrapper(  long nodeDisableTimeoutMillis,  String[] hosts,  int numExecutors,  int waitQueueSize,  long localityDelayMs,  boolean controlledDelayedTaskQueue) throws IOException, InterruptedException {
+    this(nodeDisableTimeoutMillis,hosts,numExecutors,waitQueueSize,localityDelayMs,controlledDelayedTaskQueue,hosts,false);
+  }
+  TestTaskSchedulerServiceWrapper(  long nodeDisableTimeoutMillis,  String[] hosts,  int numExecutors,  int waitQueueSize,  long localityDelayMs,  boolean controlledDelayedTaskQueue,  String[] liveHosts,  boolean useMockRegistry) throws IOException, InterruptedException {
+    conf=new Configuration();
+    conf.setStrings(ConfVars.LLAP_DAEMON_SERVICE_HOSTS.varname,hosts);
+    conf.setInt(ConfVars.LLAP_DAEMON_NUM_EXECUTORS.varname,numExecutors);
+    conf.setInt(ConfVars.LLAP_DAEMON_TASK_SCHEDULER_WAIT_QUEUE_SIZE.varname,waitQueueSize);
+    conf.set(ConfVars.LLAP_TASK_SCHEDULER_NODE_REENABLE_MIN_TIMEOUT_MS.varname,nodeDisableTimeoutMillis + "ms");
+    conf.setBoolean(LlapFixedRegistryImpl.FIXED_REGISTRY_RESOLVE_HOST_NAMES,false);
+    conf.setLong(ConfVars.LLAP_TASK_SCHEDULER_LOCALITY_DELAY.varname,localityDelayMs);
+    doReturn(appAttemptId).when(mockAppCallback).getApplicationAttemptId();
+    doReturn(11111l).when(mockAppCallback).getCustomClusterIdentifier();
+    UserPayload userPayload=TezUtils.createUserPayloadFromConf(conf);
+    doReturn(userPayload).when(mockAppCallback).getInitialUserPayload();
+    if (useMockRegistry) {
+      List<ServiceInstance> liveInstances=new ArrayList<>();
+      for (      String host : liveHosts) {
+        if (host == null) {
+          ServiceInstance mockInactive=mock(InactiveServiceInstance.class);
+          doReturn(host).when(mockInactive).getHost();
+          doReturn("inactive-host-" + host).when(mockInactive).getWorkerIdentity();
+          doReturn(ImmutableSet.builder().add(mockInactive).build()).when(mockServiceInstanceSet).getByHost(host);
+          liveInstances.add(mockInactive);
+        }
+ else {
+          ServiceInstance mockActive=mock(ServiceInstance.class);
+          doReturn(host).when(mockActive).getHost();
+          doReturn("host-" + host).when(mockActive).getWorkerIdentity();
+          doReturn(ImmutableSet.builder().add(mockActive).build()).when(mockServiceInstanceSet).getByHost(host);
+          liveInstances.add(mockActive);
+        }
+      }
+      doReturn(liveInstances).when(mockServiceInstanceSet).getAllInstancesOrdered(true);
+      List<ServiceInstance> allInstances=new ArrayList<>();
+      for (      String host : hosts) {
+        ServiceInstance mockActive=mock(ServiceInstance.class);
+        doReturn(host).when(mockActive).getHost();
+        doReturn(Resource.newInstance(100,1)).when(mockActive).getResource();
+        doReturn("host-" + host).when(mockActive).getWorkerIdentity();
+        allInstances.add(mockActive);
+      }
+      doReturn(allInstances).when(mockServiceInstanceSet).getAll();
+    }
+    if (controlledDelayedTaskQueue) {
+      ts=new LlapTaskSchedulerServiceForTestControlled(mockAppCallback,clock);
+    }
+ else {
+      ts=new LlapTaskSchedulerServiceForTest(mockAppCallback,clock);
+    }
+    controlScheduler(true);
+    ts.initialize();
+    ts.start();
+    if (useMockRegistry) {
+      ts.setServiceInstanceSet(mockServiceInstanceSet);
+    }
+    signalSchedulerRun();
+    controlScheduler(false);
+    awaitSchedulerRun();
+  }
+  ControlledClock getClock(){
+    return clock;
+  }
+  void controlScheduler(  boolean val){
+    ts.forTestsetControlScheduling(val);
+  }
+  void signalSchedulerRun() throws InterruptedException {
+    ts.forTestSignalSchedulingRun();
+  }
+  void awaitSchedulerRun() throws InterruptedException {
+    ts.forTestAwaitSchedulingRun(-1);
+  }
+  /** 
+ * @param timeoutMs
+ * @return false if the time elapsed
+ * @throws InterruptedException
+ */
+  boolean awaitSchedulerRun(  long timeoutMs) throws InterruptedException {
+    return ts.forTestAwaitSchedulingRun(timeoutMs);
+  }
+  void resetAppCallback(){
+    reset(mockAppCallback);
+  }
+  void shutdown(){
+    ts.shutdown();
+  }
+  void allocateTask(  Object task,  String[] hosts,  Priority priority,  Object clientCookie){
+    ts.allocateTask(task,resource,hosts,null,priority,null,clientCookie);
+  }
+  void deallocateTask(  Object task,  boolean succeeded,  TaskAttemptEndReason endReason){
+    ts.deallocateTask(task,succeeded,endReason,null);
+  }
+  void rejectExecution(  Object task){
+    ts.deallocateTask(task,false,TaskAttemptEndReason.EXECUTOR_BUSY,null);
+  }
+  Object allocateTask(  String[] hosts,  Priority priority){
+    Object task=new Object();
+    Object clientCookie=new Object();
+    allocateTask(task,hosts,priority,clientCookie);
+    return task;
+  }
+  public void awaitTotalTaskAllocations(  int numTasks) throws InterruptedException {
+    while (true) {
+      signalSchedulerRun();
+      awaitSchedulerRun();
+      if (ts.dagStats.numTotalAllocations == numTasks) {
+        break;
+      }
+    }
+  }
+  public void awaitLocalTaskAllocations(  int numTasks) throws InterruptedException {
+    while (true) {
+      signalSchedulerRun();
+      awaitSchedulerRun();
+      if (ts.dagStats.numLocalAllocations == numTasks) {
+        break;
+      }
+    }
+  }
+  public void awaitChangeInTotalAllocations(  int previousAllocations) throws InterruptedException {
+    while (true) {
+      signalSchedulerRun();
+      awaitSchedulerRun();
+      if (ts.dagStats.numTotalAllocations > previousAllocations) {
+        break;
+      }
+      Thread.sleep(200l);
+    }
+  }
+  public void ensureNoChangeInTotalAllocations(  int previousAllocations,  long timeout) throws InterruptedException {
+    long startTime=Time.monotonicNow();
+    long timeLeft=timeout;
+    while (timeLeft > 0) {
+      signalSchedulerRun();
+      awaitSchedulerRun(Math.min(200,timeLeft));
+      if (ts.dagStats.numTotalAllocations != previousAllocations) {
+        throw new IllegalStateException("NumTotalAllocations expected to stay at " + previousAllocations + ". Actual="+ ts.dagStats.numTotalAllocations);
+      }
+      timeLeft=(startTime + timeout) - Time.monotonicNow();
+    }
+  }
+}

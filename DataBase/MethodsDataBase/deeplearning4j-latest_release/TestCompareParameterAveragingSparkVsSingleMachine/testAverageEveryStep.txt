@@ -1,0 +1,43 @@
+@Test public void testAverageEveryStep(){
+  int miniBatchSizePerWorker=10;
+  int nWorkers=4;
+  for (  boolean saveUpdater : new boolean[]{true,false}) {
+    JavaSparkContext sc=getContext(nWorkers);
+    try {
+      int[] seeds={1,2,3};
+      MultiLayerNetwork net=new MultiLayerNetwork(getConf(12345,new Sgd(0.5)));
+      net.init();
+      INDArray initialParams=net.params().dup();
+      for (int i=0; i < seeds.length; i++) {
+        DataSet ds=getOneDataSet(miniBatchSizePerWorker * nWorkers,seeds[i]);
+        if (!saveUpdater)         net.setUpdater(null);
+        net.fit(ds);
+      }
+      INDArray finalParams=net.params().dup();
+      ParameterAveragingTrainingMaster tm=new ParameterAveragingTrainingMaster.Builder(1).averagingFrequency(1).batchSizePerWorker(miniBatchSizePerWorker).saveUpdater(saveUpdater).workerPrefetchNumBatches(0).rddTrainingApproach(RDDTrainingApproach.Export).build();
+      SparkDl4jMultiLayer sparkNet=new SparkDl4jMultiLayer(sc,getConf(12345,new Sgd(0.5)),tm);
+      sparkNet.setCollectTrainingStats(true);
+      INDArray initialSparkParams=sparkNet.getNetwork().params().dup();
+      for (int i=0; i < seeds.length; i++) {
+        List<DataSet> list=getOneDataSetAsIndividalExamples(miniBatchSizePerWorker * nWorkers,seeds[i]);
+        JavaRDD<DataSet> rdd=sc.parallelize(list);
+        sparkNet.fit(rdd);
+      }
+      System.out.println(sparkNet.getSparkTrainingStats().statsAsString());
+      INDArray finalSparkParams=sparkNet.getNetwork().params().dup();
+      System.out.println("Initial (Local) params:       " + Arrays.toString(initialParams.data().asFloat()));
+      System.out.println("Initial (Spark) params:       " + Arrays.toString(initialSparkParams.data().asFloat()));
+      System.out.println("Final (Local) params: " + Arrays.toString(finalParams.data().asFloat()));
+      System.out.println("Final (Spark) params: " + Arrays.toString(finalSparkParams.data().asFloat()));
+      assertEquals(initialParams,initialSparkParams);
+      assertNotEquals(initialParams,finalParams);
+      assertEquals(finalParams,finalSparkParams);
+      double sparkScore=sparkNet.getScore();
+      assertTrue(sparkScore > 0.0);
+      assertEquals(net.score(),sparkScore,1e-3);
+    }
+  finally {
+      sc.stop();
+    }
+  }
+}

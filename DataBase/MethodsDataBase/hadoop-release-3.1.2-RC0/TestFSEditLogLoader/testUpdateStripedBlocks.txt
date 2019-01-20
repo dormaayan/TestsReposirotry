@@ -1,0 +1,61 @@
+@Test public void testUpdateStripedBlocks() throws IOException {
+  Configuration conf=new HdfsConfiguration();
+  MiniDFSCluster cluster=null;
+  try {
+    cluster=new MiniDFSCluster.Builder(conf).numDataNodes(9).build();
+    cluster.waitActive();
+    DistributedFileSystem fs=cluster.getFileSystem();
+    FSNamesystem fns=cluster.getNamesystem();
+    fs.enableErasureCodingPolicy(testECPolicy.getName());
+    String testDir="/ec";
+    String testFile="testfile_002";
+    String testFilePath=testDir + "/" + testFile;
+    String clientName="testUser2";
+    String clientMachine="testMachine2";
+    long blkId=1;
+    long blkNumBytes=1024;
+    long timestamp=1426222918;
+    short blockNum=(short)testECPolicy.getNumDataUnits();
+    short parityNum=(short)testECPolicy.getNumParityUnits();
+    fs.mkdir(new Path(testDir),new FsPermission("755"));
+    fs.getClient().getNamenode().setErasureCodingPolicy(testDir,testECPolicy.getName());
+    Path p=new Path(testFilePath);
+    DFSTestUtil.createFile(fs,p,0,(short)1,1);
+    BlockInfoStriped stripedBlk=new BlockInfoStriped(new Block(blkId,blkNumBytes,timestamp),testECPolicy);
+    INodeFile file=(INodeFile)fns.getFSDirectory().getINode(testFilePath);
+    file.toUnderConstruction(clientName,clientMachine);
+    file.addBlock(stripedBlk);
+    fns.getEditLog().logAddBlock(testFilePath,file);
+    TestINodeFile.toCompleteFile(file);
+    fns.enterSafeMode(false);
+    fns.saveNamespace(0,0);
+    fns.leaveSafeMode(false);
+    long newBlkNumBytes=1024 * 8;
+    long newTimestamp=1426222918 + 3600;
+    file.toUnderConstruction(clientName,clientMachine);
+    file.getLastBlock().setNumBytes(newBlkNumBytes);
+    file.getLastBlock().setGenerationStamp(newTimestamp);
+    fns.getEditLog().logUpdateBlocks(testFilePath,file,true);
+    TestINodeFile.toCompleteFile(file);
+    cluster.restartNameNodes();
+    cluster.waitActive();
+    fns=cluster.getNamesystem();
+    INodeFile inodeLoaded=(INodeFile)fns.getFSDirectory().getINode(testFilePath);
+    assertTrue(inodeLoaded.isStriped());
+    BlockInfo[] blks=inodeLoaded.getBlocks();
+    assertEquals(1,blks.length);
+    assertTrue(blks[0].isStriped());
+    assertEquals(blkId,blks[0].getBlockId());
+    assertEquals(newBlkNumBytes,blks[0].getNumBytes());
+    assertEquals(newTimestamp,blks[0].getGenerationStamp());
+    assertEquals(blockNum,((BlockInfoStriped)blks[0]).getDataBlockNum());
+    assertEquals(parityNum,((BlockInfoStriped)blks[0]).getParityBlockNum());
+    cluster.shutdown();
+    cluster=null;
+  }
+  finally {
+    if (cluster != null) {
+      cluster.shutdown();
+    }
+  }
+}

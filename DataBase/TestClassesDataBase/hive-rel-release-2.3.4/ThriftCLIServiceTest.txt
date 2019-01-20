@@ -1,0 +1,170 @@
+/** 
+ * ThriftCLIServiceTest. This is the abstract class that tests ThriftCLIService. Subclass this to test more specific behaviour.
+ */
+public abstract class ThriftCLIServiceTest {
+  protected static int port;
+  protected static String host="localhost";
+  protected static HiveServer2 hiveServer2;
+  protected static ThriftCLIServiceClient client;
+  protected static HiveConf hiveConf;
+  protected static String USERNAME="anonymous";
+  protected static String PASSWORD="anonymous";
+  /** 
+ * @throws java.lang.Exception
+ */
+  @BeforeClass public static void setUpBeforeClass() throws Exception {
+    port=MetaStoreUtils.findFreePort();
+    hiveServer2=new HiveServer2();
+    hiveConf=new HiveConf();
+  }
+  /** 
+ * @throws java.lang.Exception
+ */
+  @AfterClass public static void tearDownAfterClass() throws Exception {
+    stopHiveServer2();
+  }
+  static void startHiveServer2WithConf(  HiveConf hiveConf) throws Exception {
+    hiveServer2.init(hiveConf);
+    try {
+      hiveServer2.start();
+    }
+ catch (    Throwable t) {
+      t.printStackTrace();
+      fail();
+    }
+    Thread.sleep(2000);
+    System.out.println("HiveServer2 started on port " + port);
+  }
+  protected static void stopHiveServer2() throws Exception {
+    if (hiveServer2 != null) {
+      hiveServer2.stop();
+    }
+  }
+  static ThriftCLIServiceClient getServiceClientInternal(){
+    for (    Service service : hiveServer2.getServices()) {
+      if (service instanceof ThriftBinaryCLIService) {
+        return new ThriftCLIServiceClient((ThriftBinaryCLIService)service);
+      }
+      if (service instanceof ThriftHttpCLIService) {
+        return new ThriftCLIServiceClient((ThriftHttpCLIService)service);
+      }
+    }
+    throw new IllegalStateException("HiveServer2 not running Thrift service");
+  }
+  /** 
+ * @throws java.lang.Exception
+ */
+  @Before public void setUp() throws Exception {
+  }
+  /** 
+ * @throws java.lang.Exception
+ */
+  @After public void tearDown() throws Exception {
+  }
+  @Test public void testOpenSession() throws Exception {
+    SessionHandle sessHandle=client.openSession(USERNAME,PASSWORD,new HashMap<String,String>());
+    assertNotNull("Session handle should not be null",sessHandle);
+    client.closeSession(sessHandle);
+  }
+  @Test public void testGetFunctions() throws Exception {
+    SessionHandle sessHandle=client.openSession(USERNAME,PASSWORD,new HashMap<String,String>());
+    assertNotNull("Session handle should not be null",sessHandle);
+    String catalogName=null;
+    String schemaName=null;
+    String functionName="*";
+    OperationHandle opHandle=client.getFunctions(sessHandle,catalogName,schemaName,functionName);
+    assertNotNull("Operation handle should not be null",opHandle);
+    client.closeSession(sessHandle);
+  }
+  /** 
+ * Test synchronous query execution
+ * @throws Exception
+ */
+  @Test public void testExecuteStatement() throws Exception {
+    Map<String,String> opConf=new HashMap<String,String>();
+    SessionHandle sessHandle=client.openSession(USERNAME,PASSWORD,opConf);
+    assertNotNull("Session handle should not be null",sessHandle);
+    String queryString="SET hive.lock.manager=" + "org.apache.hadoop.hive.ql.lockmgr.EmbeddedLockManager";
+    client.executeStatement(sessHandle,queryString,opConf);
+    queryString="DROP TABLE IF EXISTS TEST_EXEC_THRIFT";
+    client.executeStatement(sessHandle,queryString,opConf);
+    queryString="CREATE TABLE TEST_EXEC_THRIFT(ID STRING)";
+    client.executeStatement(sessHandle,queryString,opConf);
+    queryString="SELECT ID+1 FROM TEST_EXEC_THRIFT";
+    OperationHandle opHandle=client.executeStatement(sessHandle,queryString,opConf);
+    assertNotNull(opHandle);
+    OperationStatus opStatus=client.getOperationStatus(opHandle,false);
+    assertNotNull(opStatus);
+    OperationState state=opStatus.getState();
+    assertEquals("Query should be finished",OperationState.FINISHED,state);
+    queryString="DROP TABLE TEST_EXEC_THRIFT";
+    client.executeStatement(sessHandle,queryString,opConf);
+    client.closeSession(sessHandle);
+  }
+  /** 
+ * Test asynchronous query execution and error reporting to the client
+ * @throws Exception
+ */
+  @Test public void testExecuteStatementAsync() throws Exception {
+    Map<String,String> opConf=new HashMap<String,String>();
+    SessionHandle sessHandle=client.openSession(USERNAME,PASSWORD,opConf);
+    assertNotNull("Session handle should not be null",sessHandle);
+    OperationHandle opHandle;
+    OperationStatus opStatus;
+    OperationState state=null;
+    String queryString="SET hive.lock.manager=" + "org.apache.hadoop.hive.ql.lockmgr.EmbeddedLockManager";
+    client.executeStatement(sessHandle,queryString,opConf);
+    queryString="DROP TABLE IF EXISTS TEST_EXEC_ASYNC_THRIFT";
+    client.executeStatement(sessHandle,queryString,opConf);
+    queryString="CREATE TABLE TEST_EXEC_ASYNC_THRIFT(ID STRING)";
+    client.executeStatement(sessHandle,queryString,opConf);
+    queryString="SELECT ID+1 FROM TEST_EXEC_ASYNC_THRIFT";
+    System.out.println("Will attempt to execute: " + queryString);
+    opHandle=client.executeStatementAsync(sessHandle,queryString,opConf);
+    assertNotNull(opHandle);
+    boolean isQueryRunning=true;
+    long pollTimeout=System.currentTimeMillis() + 100000;
+    while (isQueryRunning) {
+      if (System.currentTimeMillis() > pollTimeout) {
+        System.out.println("Polling timed out");
+        break;
+      }
+      opStatus=client.getOperationStatus(opHandle,false);
+      assertNotNull(opStatus);
+      state=opStatus.getState();
+      System.out.println("Current state: " + state);
+      if (state == OperationState.CANCELED || state == OperationState.CLOSED || state == OperationState.FINISHED || state == OperationState.ERROR) {
+        isQueryRunning=false;
+      }
+      Thread.sleep(1000);
+    }
+    assertEquals("Query should be finished",OperationState.FINISHED,state);
+    queryString="CREATE TABLE NON_EXISTING_TAB (ID STRING) location 'hdfs://localhost:10000/a/b/c'";
+    System.out.println("Will attempt to execute: " + queryString);
+    opHandle=client.executeStatementAsync(sessHandle,queryString,opConf);
+    assertNotNull(opHandle);
+    opStatus=client.getOperationStatus(opHandle,false);
+    assertNotNull(opStatus);
+    isQueryRunning=true;
+    pollTimeout=System.currentTimeMillis() + 100000;
+    while (isQueryRunning) {
+      if (System.currentTimeMillis() > pollTimeout) {
+        System.out.println("Polling timed out");
+        break;
+      }
+      state=opStatus.getState();
+      System.out.println("Current state: " + state);
+      if (state == OperationState.CANCELED || state == OperationState.CLOSED || state == OperationState.FINISHED || state == OperationState.ERROR) {
+        isQueryRunning=false;
+      }
+      Thread.sleep(1000);
+      opStatus=client.getOperationStatus(opHandle,false);
+    }
+    assertEquals("Operation should be in error state",OperationState.ERROR,state);
+    assertEquals(opStatus.getOperationException().getSQLState(),"08S01");
+    assertEquals(opStatus.getOperationException().getErrorCode(),1);
+    queryString="DROP TABLE TEST_EXEC_ASYNC_THRIFT";
+    client.executeStatement(sessHandle,queryString,opConf);
+    client.closeSession(sessHandle);
+  }
+}

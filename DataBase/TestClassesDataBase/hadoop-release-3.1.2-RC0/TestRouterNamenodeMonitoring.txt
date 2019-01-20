@@ -1,0 +1,65 @@
+/** 
+ * Test namenodes monitor behavior in the Router.
+ */
+public class TestRouterNamenodeMonitoring {
+  private static StateStoreDFSCluster cluster;
+  private static RouterContext routerContext;
+  private static MembershipNamenodeResolver resolver;
+  private String ns0;
+  private String ns1;
+  private long initializedTime;
+  @Before public void setUp() throws Exception {
+    cluster=new StateStoreDFSCluster(true,2);
+    Configuration routerConf=new RouterConfigBuilder().stateStore().admin().rpc().enableLocalHeartbeat(true).heartbeat().build();
+    StringBuilder sb=new StringBuilder();
+    ns0=cluster.getNameservices().get(0);
+    NamenodeContext context=cluster.getNamenodes(ns0).get(1);
+    routerConf.set(DFS_NAMESERVICE_ID,ns0);
+    routerConf.set(DFS_HA_NAMENODE_ID_KEY,context.getNamenodeId());
+    sb=new StringBuilder();
+    ns1=cluster.getNameservices().get(1);
+    for (    NamenodeContext ctx : cluster.getNamenodes(ns1)) {
+      String suffix=ctx.getConfSuffix();
+      if (sb.length() != 0) {
+        sb.append(",");
+      }
+      sb.append(suffix);
+    }
+    routerConf.set(DFS_ROUTER_MONITOR_NAMENODE,sb.toString());
+    cluster.addRouterOverrides(routerConf);
+    cluster.startCluster();
+    cluster.startRouters();
+    cluster.waitClusterUp();
+    routerContext=cluster.getRandomRouter();
+    resolver=(MembershipNamenodeResolver)routerContext.getRouter().getNamenodeResolver();
+    initializedTime=Time.now();
+  }
+  @After public void tearDown(){
+    if (cluster != null) {
+      cluster.stopRouter(routerContext);
+      cluster.shutdown();
+      cluster=null;
+    }
+  }
+  @Test public void testNamenodeMonitoring() throws Exception {
+    for (    String ns : cluster.getNameservices()) {
+      cluster.switchToActive(ns,"nn0");
+      cluster.switchToStandby(ns,"nn1");
+    }
+    Collection<NamenodeHeartbeatService> heartbeatServices=routerContext.getRouter().getNamenodeHearbeatServices();
+    for (    NamenodeHeartbeatService service : heartbeatServices) {
+      service.periodicInvoke();
+    }
+    resolver.loadCache(true);
+    List<? extends FederationNamenodeContext> namespaceInfo0=resolver.getNamenodesForNameserviceId(ns0);
+    List<? extends FederationNamenodeContext> namespaceInfo1=resolver.getNamenodesForNameserviceId(ns1);
+    assertEquals("nn0",namespaceInfo0.get(1).getNamenodeId());
+    assertTrue(namespaceInfo0.get(1).getDateModified() < initializedTime);
+    assertEquals("nn1",namespaceInfo0.get(0).getNamenodeId());
+    assertTrue(namespaceInfo0.get(0).getDateModified() > initializedTime);
+    assertEquals("nn0",namespaceInfo1.get(0).getNamenodeId());
+    assertTrue(namespaceInfo1.get(0).getDateModified() > initializedTime);
+    assertEquals("nn1",namespaceInfo1.get(1).getNamenodeId());
+    assertTrue(namespaceInfo1.get(1).getDateModified() > initializedTime);
+  }
+}

@@ -1,0 +1,94 @@
+/** 
+ * This class contains unit tests for the  {@link BlobCacheService}.
+ */
+public class BlobCacheSuccessTest extends TestLogger {
+  @Rule public TemporaryFolder temporaryFolder=new TemporaryFolder();
+  /** 
+ * BlobCache with no HA, job-unrelated BLOBs. BLOBs need to be downloaded form a working BlobServer.
+ */
+  @Test public void testBlobNoJobCache() throws IOException {
+    Configuration config=new Configuration();
+    config.setString(BlobServerOptions.STORAGE_DIRECTORY,temporaryFolder.newFolder().getAbsolutePath());
+    uploadFileGetTest(config,null,false,false,TRANSIENT_BLOB);
+  }
+  /** 
+ * BlobCache with no HA, job-related BLOBS. BLOBs need to be downloaded form a working BlobServer.
+ */
+  @Test public void testBlobForJobCache() throws IOException {
+    Configuration config=new Configuration();
+    config.setString(BlobServerOptions.STORAGE_DIRECTORY,temporaryFolder.newFolder().getAbsolutePath());
+    uploadFileGetTest(config,new JobID(),false,false,TRANSIENT_BLOB);
+  }
+  /** 
+ * BlobCache is configured in HA mode and the cache can download files from the file system directly and does not need to download BLOBs from the BlobServer which remains active after the BLOB upload. Using job-related BLOBs.
+ */
+  @Test public void testBlobForJobCacheHa() throws IOException {
+    Configuration config=new Configuration();
+    config.setString(BlobServerOptions.STORAGE_DIRECTORY,temporaryFolder.newFolder().getAbsolutePath());
+    config.setString(HighAvailabilityOptions.HA_MODE,"ZOOKEEPER");
+    config.setString(HighAvailabilityOptions.HA_STORAGE_PATH,temporaryFolder.newFolder().getPath());
+    uploadFileGetTest(config,new JobID(),true,true,PERMANENT_BLOB);
+  }
+  /** 
+ * BlobCache is configured in HA mode and the cache can download files from the file system directly and does not need to download BLOBs from the BlobServer which is shut down after the BLOB upload. Using job-related BLOBs.
+ */
+  @Test public void testBlobForJobCacheHa2() throws IOException {
+    Configuration config=new Configuration();
+    config.setString(BlobServerOptions.STORAGE_DIRECTORY,temporaryFolder.newFolder().getAbsolutePath());
+    config.setString(HighAvailabilityOptions.HA_MODE,"ZOOKEEPER");
+    config.setString(HighAvailabilityOptions.HA_STORAGE_PATH,temporaryFolder.newFolder().getPath());
+    uploadFileGetTest(config,new JobID(),false,true,PERMANENT_BLOB);
+  }
+  /** 
+ * BlobCache is configured in HA mode but the cache itself cannot access the file system and thus needs to download BLOBs from the BlobServer. Using job-related BLOBs.
+ */
+  @Test public void testBlobForJobCacheHaFallback() throws IOException {
+    Configuration config=new Configuration();
+    config.setString(BlobServerOptions.STORAGE_DIRECTORY,temporaryFolder.newFolder().getAbsolutePath());
+    config.setString(HighAvailabilityOptions.HA_MODE,"ZOOKEEPER");
+    config.setString(HighAvailabilityOptions.HA_STORAGE_PATH,temporaryFolder.newFolder().getPath());
+    uploadFileGetTest(config,new JobID(),false,false,PERMANENT_BLOB);
+  }
+  /** 
+ * Uploads two different BLOBs to the  {@link BlobServer} via a {@link BlobClient} and verifieswe can access the files from a  {@link BlobCacheService}.
+ * @param config configuration to use for the server and cache (the final cache's configuration will actually get some modifications)
+ * @param shutdownServerAfterUpload whether the server should be shut down after uploading the BLOBs (only useful with HA mode) - this implies that the cache has access to the shared <tt>HA_STORAGE_PATH</tt>
+ * @param cacheHasAccessToFs whether the cache should have access to a shared <tt>HA_STORAGE_PATH</tt> (only useful with HA mode)
+ * @param blobType whether the BLOB should become permanent or transient
+ */
+  private void uploadFileGetTest(  final Configuration config,  @Nullable JobID jobId,  boolean shutdownServerAfterUpload,  boolean cacheHasAccessToFs,  BlobKey.BlobType blobType) throws IOException {
+    final Configuration cacheConfig=new Configuration(config);
+    cacheConfig.setString(BlobServerOptions.STORAGE_DIRECTORY,temporaryFolder.newFolder().getAbsolutePath());
+    if (!cacheHasAccessToFs) {
+      cacheConfig.setString(BlobServerOptions.STORAGE_DIRECTORY,temporaryFolder.newFolder().getAbsolutePath());
+      cacheConfig.setString(HighAvailabilityOptions.HA_STORAGE_PATH,temporaryFolder.newFolder().getPath() + "/does-not-exist");
+    }
+    final byte[] data=new byte[128];
+    byte[] data2=Arrays.copyOf(data,data.length);
+    data2[0]^=1;
+    BlobStoreService blobStoreService=null;
+    try {
+      blobStoreService=BlobUtils.createBlobStoreFromConfig(cacheConfig);
+      try (BlobServer server=new BlobServer(config,blobStoreService);BlobCacheService cache=new BlobCacheService(cacheConfig,blobStoreService,new InetSocketAddress("localhost",server.getPort()))){
+        server.start();
+        BlobKey key1=put(server,jobId,data,blobType);
+        BlobKey key2=put(server,jobId,data2,blobType);
+        if (shutdownServerAfterUpload) {
+          server.close();
+        }
+        verifyContents(cache,jobId,key1,data);
+        verifyContents(cache,jobId,key2,data2);
+        if (shutdownServerAfterUpload) {
+          server.close();
+          verifyContents(cache,jobId,key1,data);
+          verifyContents(cache,jobId,key2,data2);
+        }
+      }
+     }
+  finally {
+      if (blobStoreService != null) {
+        blobStoreService.closeAndCleanupAllData();
+      }
+    }
+  }
+}

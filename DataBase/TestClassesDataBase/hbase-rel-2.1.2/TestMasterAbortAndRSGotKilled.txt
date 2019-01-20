@@ -1,0 +1,53 @@
+@Category({MasterTests.class,MediumTests.class}) public class TestMasterAbortAndRSGotKilled {
+  private static Logger LOG=LoggerFactory.getLogger(TestMasterAbortAndRSGotKilled.class.getName());
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestMasterAbortAndRSGotKilled.class);
+  private static final HBaseTestingUtility UTIL=new HBaseTestingUtility();
+  private static TableName TABLE_NAME=TableName.valueOf("test");
+  private static CountDownLatch countDownLatch=new CountDownLatch(1);
+  private static byte[] CF=Bytes.toBytes("cf");
+  @BeforeClass public static void setUp() throws Exception {
+    UTIL.getConfiguration().setStrings(CoprocessorHost.REGION_COPROCESSOR_CONF_KEY,DelayCloseCP.class.getName());
+    UTIL.startMiniCluster(3);
+    UTIL.getAdmin().balancerSwitch(false,true);
+    UTIL.createTable(TABLE_NAME,CF);
+    UTIL.waitTableAvailable(TABLE_NAME);
+  }
+  @AfterClass public static void tearDown() throws Exception {
+    UTIL.shutdownMiniCluster();
+  }
+  @Test public void test() throws Exception {
+    JVMClusterUtil.RegionServerThread rsThread=null;
+    for (    JVMClusterUtil.RegionServerThread t : UTIL.getMiniHBaseCluster().getRegionServerThreads()) {
+      if (!t.getRegionServer().getRegions(TABLE_NAME).isEmpty()) {
+        rsThread=t;
+        break;
+      }
+    }
+    HRegionServer rs=rsThread.getRegionServer();
+    RegionInfo hri=rs.getRegions(TABLE_NAME).get(0).getRegionInfo();
+    MoveRegionProcedure moveRegionProcedure=new MoveRegionProcedure(UTIL.getMiniHBaseCluster().getMaster().getMasterProcedureExecutor().getEnvironment(),new RegionPlan(hri,rs.getServerName(),rs.getServerName()),true);
+    long procID=UTIL.getMiniHBaseCluster().getMaster().getMasterProcedureExecutor().submitProcedure(moveRegionProcedure);
+    countDownLatch.await();
+    UTIL.getMiniHBaseCluster().stopMaster(0);
+    UTIL.getMiniHBaseCluster().startMaster();
+    UTIL.waitFor(30000,() -> UTIL.getMiniHBaseCluster().getMaster() != null && UTIL.getMiniHBaseCluster().getMaster().isInitialized());
+    Assert.assertTrue("Should be 3 RS after master restart",UTIL.getMiniHBaseCluster().getLiveRegionServerThreads().size() == 3);
+  }
+public static class DelayCloseCP implements RegionCoprocessor, RegionObserver {
+    @Override public void preClose(    ObserverContext<RegionCoprocessorEnvironment> c,    boolean abortRequested) throws IOException {
+      try {
+        if (!c.getEnvironment().getRegion().getRegionInfo().getTable().isSystemTable()) {
+          LOG.error("begin to sleep");
+          countDownLatch.countDown();
+          Thread.sleep(10000);
+          LOG.error("finish sleep");
+        }
+      }
+ catch (      Throwable t) {
+      }
+    }
+    @Override public Optional<RegionObserver> getRegionObserver(){
+      return Optional.of(this);
+    }
+  }
+}

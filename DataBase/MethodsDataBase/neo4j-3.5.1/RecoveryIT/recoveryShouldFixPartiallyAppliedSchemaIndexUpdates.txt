@@ -1,0 +1,46 @@
+@Test(timeout=60_000) public void recoveryShouldFixPartiallyAppliedSchemaIndexUpdates(){
+  Label label=Label.label("Foo");
+  String property="Bar";
+  ClassGuardedAdversary adversary=new ClassGuardedAdversary(new CountingAdversary(1,true),Command.RelationshipCommand.class);
+  adversary.disable();
+  File databaseDir=directory.databaseDir();
+  GraphDatabaseService db=AdversarialPageCacheGraphDatabaseFactory.create(fileSystemRule.get(),adversary).newEmbeddedDatabaseBuilder(databaseDir).newGraphDatabase();
+  try {
+    try (Transaction tx=db.beginTx()){
+      db.schema().constraintFor(label).assertPropertyIsUnique(property).create();
+      tx.success();
+    }
+     long relationshipId=createRelationship(db);
+    TransactionFailureException txFailure=null;
+    try (Transaction tx=db.beginTx()){
+      Node node=db.createNode(label);
+      node.setProperty(property,"B");
+      db.getRelationshipById(relationshipId).delete();
+      tx.success();
+      adversary.enable();
+    }
+ catch (    TransactionFailureException e) {
+      txFailure=e;
+    }
+    assertNotNull(txFailure);
+    adversary.disable();
+    healthOf(db).healed();
+    try (Transaction tx=db.beginTx()){
+      assertNotNull(findNode(db,label,property,"B"));
+      assertNotNull(db.getRelationshipById(relationshipId));
+      tx.success();
+    }
+     healthOf(db).panic(txFailure.getCause());
+    File databaseDirectory=((GraphDatabaseAPI)db).databaseLayout().databaseDirectory();
+    db.shutdown();
+    db=startDatabase(databaseDirectory);
+    try (Transaction tx=db.beginTx()){
+      assertNotNull(findNode(db,label,property,"B"));
+      assertRelationshipNotExist(db,relationshipId);
+      tx.success();
+    }
+   }
+  finally {
+    db.shutdown();
+  }
+}

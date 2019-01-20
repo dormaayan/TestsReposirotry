@@ -1,0 +1,588 @@
+@Category({MasterTests.class,SmallTests.class}) public class TestWALProcedureStore {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestWALProcedureStore.class);
+  private static final Logger LOG=LoggerFactory.getLogger(TestWALProcedureStore.class);
+  private static final int PROCEDURE_STORE_SLOTS=1;
+  private WALProcedureStore procStore;
+  private HBaseCommonTestingUtility htu;
+  private FileSystem fs;
+  private Path testDir;
+  private Path logDir;
+  private void setupConfig(  final Configuration conf){
+    conf.setBoolean(WALProcedureStore.EXEC_WAL_CLEANUP_ON_LOAD_CONF_KEY,true);
+  }
+  @Before public void setUp() throws IOException {
+    htu=new HBaseCommonTestingUtility();
+    testDir=htu.getDataTestDir();
+    fs=testDir.getFileSystem(htu.getConfiguration());
+    assertTrue(testDir.depth() > 1);
+    setupConfig(htu.getConfiguration());
+    logDir=new Path(testDir,"proc-logs");
+    procStore=ProcedureTestingUtility.createWalStore(htu.getConfiguration(),logDir);
+    procStore.start(PROCEDURE_STORE_SLOTS);
+    procStore.recoverLease();
+    procStore.load(new LoadCounter());
+  }
+  @After public void tearDown() throws IOException {
+    procStore.stop(false);
+    fs.delete(logDir,true);
+  }
+  private void storeRestart(  ProcedureStore.ProcedureLoader loader) throws Exception {
+    ProcedureTestingUtility.storeRestart(procStore,loader);
+  }
+  @Test public void testEmptyRoll() throws Exception {
+    for (int i=0; i < 10; ++i) {
+      procStore.periodicRollForTesting();
+    }
+    assertEquals(1,procStore.getActiveLogs().size());
+    FileStatus[] status=fs.listStatus(logDir);
+    assertEquals(1,status.length);
+  }
+  @Test public void testRestartWithoutData() throws Exception {
+    for (int i=0; i < 10; ++i) {
+      final LoadCounter loader=new LoadCounter();
+      storeRestart(loader);
+    }
+    LOG.info("ACTIVE WALs " + procStore.getActiveLogs());
+    assertEquals(1,procStore.getActiveLogs().size());
+    FileStatus[] status=fs.listStatus(logDir);
+    assertEquals(1,status.length);
+  }
+  /** 
+ * Tests that tracker for all old logs are loaded back after procedure store is restarted.
+ */
+  @Test public void trackersLoadedForAllOldLogs() throws Exception {
+    for (int i=0; i <= 20; ++i) {
+      procStore.insert(new TestProcedure(i),null);
+      if (i > 0 && (i % 5) == 0) {
+        LoadCounter loader=new LoadCounter();
+        storeRestart(loader);
+      }
+    }
+    assertEquals(5,procStore.getActiveLogs().size());
+    for (int i=0; i < procStore.getActiveLogs().size() - 1; ++i) {
+      ProcedureStoreTracker tracker=procStore.getActiveLogs().get(i).getTracker();
+      assertTrue(tracker != null && !tracker.isEmpty());
+    }
+  }
+  @Test public void testWalCleanerSequentialClean() throws Exception {
+    final Procedure<?>[] procs=new Procedure[5];
+    ArrayList<ProcedureWALFile> logs=null;
+    for (int i=0; i < procs.length; i++) {
+      procs[i]=new TestSequentialProcedure();
+      procStore.insert(procs[i],null);
+      procStore.rollWriterForTesting();
+      logs=procStore.getActiveLogs();
+      assertEquals(logs.size(),i + 2);
+    }
+    final int[] deleteOrder=new int[]{0,1,2,3,4};
+    for (int i=0; i < deleteOrder.length; i++) {
+      procStore.delete(procs[deleteOrder[i]].getProcId());
+      procStore.removeInactiveLogsForTesting();
+      assertFalse(logs.get(deleteOrder[i]).toString(),procStore.getActiveLogs().contains(logs.get(deleteOrder[i])));
+      assertEquals(procStore.getActiveLogs().size(),procs.length - i);
+    }
+  }
+  @Test public void testWalCleanerNoHoles() throws Exception {
+    final Procedure<?>[] procs=new Procedure[5];
+    ArrayList<ProcedureWALFile> logs=null;
+    for (int i=0; i < procs.length; i++) {
+      procs[i]=new TestSequentialProcedure();
+      procStore.insert(procs[i],null);
+      procStore.rollWriterForTesting();
+      logs=procStore.getActiveLogs();
+      assertEquals(i + 2,logs.size());
+    }
+    for (int i=1; i < procs.length; i++) {
+      procStore.delete(procs[i].getProcId());
+    }
+    assertEquals(procs.length + 1,procStore.getActiveLogs().size());
+    procStore.delete(procs[0].getProcId());
+    assertEquals(1,procStore.getActiveLogs().size());
+  }
+  @Test public void testWalCleanerUpdates() throws Exception {
+    TestSequentialProcedure p1=new TestSequentialProcedure();
+    TestSequentialProcedure p2=new TestSequentialProcedure();
+    procStore.insert(p1,null);
+    procStore.insert(p2,null);
+    procStore.rollWriterForTesting();
+    ProcedureWALFile firstLog=procStore.getActiveLogs().get(0);
+    procStore.update(p1);
+    procStore.rollWriterForTesting();
+    procStore.update(p2);
+    procStore.rollWriterForTesting();
+    procStore.removeInactiveLogsForTesting();
+    assertFalse(procStore.getActiveLogs().contains(firstLog));
+  }
+  @Test public void testWalCleanerUpdatesDontLeaveHoles() throws Exception {
+    TestSequentialProcedure p1=new TestSequentialProcedure();
+    TestSequentialProcedure p2=new TestSequentialProcedure();
+    procStore.insert(p1,null);
+    procStore.insert(p2,null);
+    procStore.rollWriterForTesting();
+    ProcedureWALFile log1=procStore.getActiveLogs().get(0);
+    procStore.update(p2);
+    procStore.rollWriterForTesting();
+    ProcedureWALFile log2=procStore.getActiveLogs().get(1);
+    procStore.update(p2);
+    procStore.rollWriterForTesting();
+    procStore.removeInactiveLogsForTesting();
+    assertEquals(4,procStore.getActiveLogs().size());
+    procStore.update(p1);
+    procStore.rollWriterForTesting();
+    procStore.removeInactiveLogsForTesting();
+    assertEquals(3,procStore.getActiveLogs().size());
+    assertFalse(procStore.getActiveLogs().contains(log1));
+    assertFalse(procStore.getActiveLogs().contains(log2));
+  }
+  @Test public void testWalCleanerWithEmptyRolls() throws Exception {
+    final Procedure<?>[] procs=new Procedure[3];
+    for (int i=0; i < procs.length; ++i) {
+      procs[i]=new TestSequentialProcedure();
+      procStore.insert(procs[i],null);
+    }
+    assertEquals(1,procStore.getActiveLogs().size());
+    procStore.rollWriterForTesting();
+    assertEquals(2,procStore.getActiveLogs().size());
+    procStore.rollWriterForTesting();
+    assertEquals(3,procStore.getActiveLogs().size());
+    for (int i=0; i < procs.length; ++i) {
+      procStore.update(procs[i]);
+      procStore.rollWriterForTesting();
+      procStore.rollWriterForTesting();
+      if (i < (procs.length - 1)) {
+        assertEquals(3 + ((i + 1) * 2),procStore.getActiveLogs().size());
+      }
+    }
+    assertEquals(7,procStore.getActiveLogs().size());
+    for (int i=0; i < procs.length; ++i) {
+      procStore.delete(procs[i].getProcId());
+      assertEquals(7 - ((i + 1) * 2),procStore.getActiveLogs().size());
+    }
+    assertEquals(1,procStore.getActiveLogs().size());
+  }
+  @Test public void testEmptyLogLoad() throws Exception {
+    LoadCounter loader=new LoadCounter();
+    storeRestart(loader);
+    assertEquals(0,loader.getMaxProcId());
+    assertEquals(0,loader.getLoadedCount());
+    assertEquals(0,loader.getCorruptedCount());
+  }
+  @Test public void testLoad() throws Exception {
+    Set<Long> procIds=new HashSet<>();
+    Procedure<?> proc1=new TestSequentialProcedure();
+    procIds.add(proc1.getProcId());
+    procStore.insert(proc1,null);
+    Procedure<?> proc2=new TestSequentialProcedure();
+    Procedure<?>[] child2=new Procedure[2];
+    child2[0]=new TestSequentialProcedure();
+    child2[1]=new TestSequentialProcedure();
+    procIds.add(proc2.getProcId());
+    procIds.add(child2[0].getProcId());
+    procIds.add(child2[1].getProcId());
+    procStore.insert(proc2,child2);
+    verifyProcIdsOnRestart(procIds);
+    procStore.update(proc1);
+    procStore.update(child2[1]);
+    procStore.delete(child2[1].getProcId());
+    procIds.remove(child2[1].getProcId());
+    verifyProcIdsOnRestart(procIds);
+    procStore.stop(false);
+    FileStatus[] logs=fs.listStatus(logDir);
+    assertEquals(3,logs.length);
+    for (int i=0; i < logs.length; ++i) {
+      corruptLog(logs[i],4);
+    }
+    verifyProcIdsOnRestart(procIds);
+  }
+  @Test public void testNoTrailerDoubleRestart() throws Exception {
+    Procedure<?> proc0=new TestSequentialProcedure();
+    procStore.insert(proc0,null);
+    Procedure<?> proc1=new TestSequentialProcedure();
+    procStore.insert(proc1,null);
+    Procedure<?> proc2=new TestSequentialProcedure();
+    procStore.insert(proc2,null);
+    procStore.rollWriterForTesting();
+    procStore.delete(proc1.getProcId());
+    procStore.rollWriterForTesting();
+    procStore.update(proc2);
+    procStore.rollWriterForTesting();
+    procStore.delete(proc2.getProcId());
+    procStore.stop(false);
+    FileStatus[] logs=fs.listStatus(logDir);
+    assertEquals(4,logs.length);
+    for (int i=0; i < logs.length; ++i) {
+      corruptLog(logs[i],4);
+    }
+    htu.getConfiguration().setBoolean(WALProcedureStore.EXEC_WAL_CLEANUP_ON_LOAD_CONF_KEY,false);
+    LoadCounter loader=new LoadCounter();
+    storeRestart(loader);
+    assertEquals(1,loader.getLoadedCount());
+    assertEquals(0,loader.getCorruptedCount());
+    assertEquals(5,fs.listStatus(logDir).length);
+    loader=new LoadCounter();
+    storeRestart(loader);
+    assertEquals(1,loader.getLoadedCount());
+    assertEquals(0,loader.getCorruptedCount());
+    procStore.delete(proc0.getProcId());
+    procStore.periodicRollForTesting();
+    assertEquals(1,fs.listStatus(logDir).length);
+    storeRestart(loader);
+  }
+  @Test public void testProcIdHoles() throws Exception {
+    for (int i=0; i < 100; i+=2) {
+      procStore.insert(new TestProcedure(i),null);
+      if (i > 0 && (i % 10) == 0) {
+        LoadCounter loader=new LoadCounter();
+        storeRestart(loader);
+        assertEquals(0,loader.getCorruptedCount());
+        assertEquals((i / 2) + 1,loader.getLoadedCount());
+      }
+    }
+    assertEquals(10,procStore.getActiveLogs().size());
+    for (int i=0; i < 100; i+=2) {
+      procStore.delete(i);
+    }
+    assertEquals(1,procStore.getActiveLogs().size());
+    LoadCounter loader=new LoadCounter();
+    storeRestart(loader);
+    assertEquals(0,loader.getLoadedCount());
+    assertEquals(0,loader.getCorruptedCount());
+  }
+  @Test public void testCorruptedTrailer() throws Exception {
+    for (int i=0; i < 100; ++i) {
+      procStore.insert(new TestSequentialProcedure(),null);
+    }
+    procStore.stop(false);
+    FileStatus[] logs=fs.listStatus(logDir);
+    assertEquals(1,logs.length);
+    corruptLog(logs[0],4);
+    LoadCounter loader=new LoadCounter();
+    storeRestart(loader);
+    assertEquals(100,loader.getLoadedCount());
+    assertEquals(0,loader.getCorruptedCount());
+  }
+  private static void assertUpdated(  final ProcedureStoreTracker tracker,  final Procedure<?>[] procs,  final int[] updatedProcs,  final int[] nonUpdatedProcs){
+    for (    int index : updatedProcs) {
+      long procId=procs[index].getProcId();
+      assertTrue("Procedure id : " + procId,tracker.isModified(procId));
+    }
+    for (    int index : nonUpdatedProcs) {
+      long procId=procs[index].getProcId();
+      assertFalse("Procedure id : " + procId,tracker.isModified(procId));
+    }
+  }
+  private static void assertDeleted(  final ProcedureStoreTracker tracker,  final Procedure<?>[] procs,  final int[] deletedProcs,  final int[] nonDeletedProcs){
+    for (    int index : deletedProcs) {
+      long procId=procs[index].getProcId();
+      assertEquals("Procedure id : " + procId,ProcedureStoreTracker.DeleteState.YES,tracker.isDeleted(procId));
+    }
+    for (    int index : nonDeletedProcs) {
+      long procId=procs[index].getProcId();
+      assertEquals("Procedure id : " + procId,ProcedureStoreTracker.DeleteState.NO,tracker.isDeleted(procId));
+    }
+  }
+  @Test public void testCorruptedTrailersRebuild() throws Exception {
+    final Procedure<?>[] procs=new Procedure[6];
+    for (int i=0; i < procs.length; ++i) {
+      procs[i]=new TestSequentialProcedure();
+    }
+    procStore.insert(procs[0],null);
+    procStore.insert(procs[1],null);
+    procStore.insert(procs[2],null);
+    procStore.insert(procs[3],null);
+    procStore.delete(procs[0].getProcId());
+    procStore.rollWriterForTesting();
+    procStore.delete(procs[2].getProcId());
+    procStore.update(procs[3]);
+    procStore.insert(procs[4],null);
+    procStore.rollWriterForTesting();
+    procStore.delete(procs[4].getProcId());
+    procStore.insert(procs[5],null);
+    procStore.stop(false);
+    final FileStatus[] logs=fs.listStatus(logDir);
+    assertEquals(3,logs.length);
+    for (int i=0; i < logs.length; ++i) {
+      corruptLog(logs[i],4);
+    }
+    htu.getConfiguration().setBoolean(WALProcedureStore.EXEC_WAL_CLEANUP_ON_LOAD_CONF_KEY,false);
+    final LoadCounter loader=new LoadCounter();
+    storeRestart(loader);
+    assertEquals(3,loader.getLoadedCount());
+    assertEquals(0,loader.getCorruptedCount());
+    final ArrayList<ProcedureWALFile> walFiles=procStore.getActiveLogs();
+    LOG.info("WALs " + walFiles);
+    assertEquals(4,walFiles.size());
+    LOG.info("Checking wal " + walFiles.get(0));
+    assertUpdated(walFiles.get(0).getTracker(),procs,new int[]{0,1,2,3},new int[]{4,5});
+    LOG.info("Checking wal " + walFiles.get(1));
+    assertUpdated(walFiles.get(1).getTracker(),procs,new int[]{2,3,4},new int[]{0,1,5});
+    LOG.info("Checking wal " + walFiles.get(2));
+    assertUpdated(walFiles.get(2).getTracker(),procs,new int[]{4,5},new int[]{0,1,2,3});
+    LOG.info("Checking global tracker ");
+    assertDeleted(procStore.getStoreTracker(),procs,new int[]{0,2,4},new int[]{1,3,5});
+  }
+  @Test public void testCorruptedEntries() throws Exception {
+    for (int i=0; i < 100; ++i) {
+      procStore.insert(new TestSequentialProcedure(),null);
+    }
+    procStore.stop(false);
+    FileStatus[] logs=fs.listStatus(logDir);
+    assertEquals(1,logs.length);
+    corruptLog(logs[0],1823);
+    LoadCounter loader=new LoadCounter();
+    storeRestart(loader);
+    assertTrue(procStore.getCorruptedLogs() != null);
+    assertEquals(1,procStore.getCorruptedLogs().size());
+    assertEquals(87,loader.getLoadedCount());
+    assertEquals(0,loader.getCorruptedCount());
+  }
+  @Test public void testCorruptedProcedures() throws Exception {
+    TestProcedure[] rootProcs=new TestProcedure[10];
+    for (int i=1; i <= rootProcs.length; i++) {
+      rootProcs[i - 1]=new TestProcedure(i,0);
+      procStore.insert(rootProcs[i - 1],null);
+      rootProcs[i - 1].addStackId(0);
+      procStore.update(rootProcs[i - 1]);
+    }
+    procStore.rollWriterForTesting();
+    for (int i=1; i <= rootProcs.length; i++) {
+      TestProcedure b=new TestProcedure(rootProcs.length + i,i);
+      rootProcs[i - 1].addStackId(1);
+      procStore.insert(rootProcs[i - 1],new Procedure[]{b});
+    }
+    procStore.rollWriterForTesting();
+    for (int i=1; i <= rootProcs.length; i++) {
+      procStore.update(new TestProcedure(rootProcs.length + i,i));
+    }
+    procStore.stop(false);
+    FileStatus[] logs=fs.listStatus(logDir);
+    assertEquals(Arrays.toString(logs),2,logs.length);
+    Arrays.sort(logs,new Comparator<FileStatus>(){
+      @Override public int compare(      FileStatus o1,      FileStatus o2){
+        return o1.getPath().getName().compareTo(o2.getPath().getName());
+      }
+    }
+);
+    LoadCounter loader=new LoadCounter();
+    storeRestart(loader);
+    assertEquals(rootProcs.length * 2,loader.getLoadedCount());
+    assertEquals(0,loader.getCorruptedCount());
+    fs.delete(logs[0].getPath(),false);
+    loader.reset();
+    storeRestart(loader);
+    assertEquals(0,loader.getLoadedCount());
+    assertEquals(rootProcs.length,loader.getCorruptedCount());
+    for (    Procedure<?> proc : loader.getCorrupted()) {
+      assertTrue(proc.toString(),proc.getParentProcId() <= rootProcs.length);
+      assertTrue(proc.toString(),proc.getProcId() > rootProcs.length && proc.getProcId() <= (rootProcs.length * 2));
+    }
+  }
+  @Test public void testRollAndRemove() throws IOException {
+    Procedure<?> proc1=new TestSequentialProcedure();
+    procStore.insert(proc1,null);
+    Procedure<?> proc2=new TestSequentialProcedure();
+    procStore.insert(proc2,null);
+    procStore.rollWriterForTesting();
+    assertEquals(2,procStore.getActiveLogs().size());
+    procStore.update(proc1);
+    procStore.update(proc2);
+    assertEquals(1,procStore.getActiveLogs().size());
+    procStore.rollWriterForTesting();
+    assertEquals(2,procStore.getActiveLogs().size());
+    procStore.delete(proc1.getProcId());
+    procStore.delete(proc2.getProcId());
+    assertEquals(1,procStore.getActiveLogs().size());
+  }
+  @Test public void testFileNotFoundDuringLeaseRecovery() throws IOException {
+    final TestProcedure[] procs=new TestProcedure[3];
+    for (int i=0; i < procs.length; ++i) {
+      procs[i]=new TestProcedure(i + 1,0);
+      procStore.insert(procs[i],null);
+    }
+    procStore.rollWriterForTesting();
+    for (int i=0; i < procs.length; ++i) {
+      procStore.update(procs[i]);
+      procStore.rollWriterForTesting();
+    }
+    procStore.stop(false);
+    FileStatus[] status=fs.listStatus(logDir);
+    assertEquals(procs.length + 1,status.length);
+    procStore=new WALProcedureStore(htu.getConfiguration(),logDir,null,new WALProcedureStore.LeaseRecovery(){
+      private int count=0;
+      @Override public void recoverFileLease(      FileSystem fs,      Path path) throws IOException {
+        if (++count <= 2) {
+          fs.delete(path,false);
+          LOG.debug("Simulate FileNotFound at count=" + count + " for "+ path);
+          throw new FileNotFoundException("test file not found " + path);
+        }
+        LOG.debug("Simulate recoverFileLease() at count=" + count + " for "+ path);
+      }
+    }
+);
+    final LoadCounter loader=new LoadCounter();
+    procStore.start(PROCEDURE_STORE_SLOTS);
+    procStore.recoverLease();
+    procStore.load(loader);
+    assertEquals(procs.length,loader.getMaxProcId());
+    assertEquals(1,loader.getRunnableCount());
+    assertEquals(0,loader.getCompletedCount());
+    assertEquals(0,loader.getCorruptedCount());
+  }
+  @Test public void testLogFileAleadExists() throws IOException {
+    final boolean[] tested={false};
+    WALProcedureStore mStore=Mockito.spy(procStore);
+    Answer<Boolean> ans=new Answer<Boolean>(){
+      @Override public Boolean answer(      InvocationOnMock invocationOnMock) throws Throwable {
+        long logId=((Long)invocationOnMock.getArgument(0)).longValue();
+switch ((int)logId) {
+case 2:
+          Path logFilePath=mStore.getLogFilePath(logId);
+        mStore.getFileSystem().create(logFilePath);
+      break;
+case 3:
+    tested[0]=true;
+default :
+  break;
+}
+return (Boolean)invocationOnMock.callRealMethod();
+}
+}
+;
+Mockito.doAnswer(ans).when(mStore).rollWriter(2);
+Mockito.doAnswer(ans).when(mStore).rollWriter(3);
+mStore.recoverLease();
+assertTrue(tested[0]);
+}
+@Test public void testLoadChildren() throws Exception {
+TestProcedure a=new TestProcedure(1,0);
+TestProcedure b=new TestProcedure(2,1);
+TestProcedure c=new TestProcedure(3,1);
+procStore.insert(a,null);
+a.addStackId(0);
+procStore.update(a);
+a.addStackId(1);
+procStore.insert(a,new Procedure[]{b,c});
+b.addStackId(2);
+procStore.update(b);
+c.addStackId(3);
+procStore.update(c);
+b.addStackId(4);
+procStore.update(b);
+a.addStackId(5);
+a.setSuccessState();
+procStore.delete(a,new long[]{b.getProcId(),c.getProcId()});
+restartAndAssert(3,0,1,0);
+}
+@Test public void testBatchDelete() throws Exception {
+for (int i=1; i < 10; ++i) {
+procStore.insert(new TestProcedure(i),null);
+}
+long[] toDelete=new long[]{1,2,3,4};
+procStore.delete(toDelete,2,0);
+LoadCounter loader=restartAndAssert(9,9,0,0);
+for (int i=1; i < 10; ++i) {
+assertEquals(true,loader.isRunnable(i));
+}
+toDelete=new long[]{2,4,6,8};
+procStore.delete(toDelete,0,toDelete.length);
+loader=restartAndAssert(9,5,0,0);
+for (int i=1; i < 10; ++i) {
+assertEquals(i % 2 != 0,loader.isRunnable(i));
+}
+toDelete=new long[]{5,7,1,3,9};
+procStore.delete(toDelete,2,2);
+loader=restartAndAssert(9,3,0,0);
+for (int i=1; i < 10; ++i) {
+assertEquals(i > 3 && i % 2 != 0,loader.isRunnable(i));
+}
+toDelete=new long[]{5};
+procStore.delete(toDelete,0,1);
+loader=restartAndAssert(9,2,0,0);
+for (int i=1; i < 10; ++i) {
+assertEquals(i > 5 && i % 2 != 0,loader.isRunnable(i));
+}
+toDelete=new long[]{0,7,9};
+procStore.delete(toDelete,1,2);
+loader=restartAndAssert(0,0,0,0);
+for (int i=1; i < 10; ++i) {
+assertEquals(false,loader.isRunnable(i));
+}
+}
+@Test public void testBatchInsert() throws Exception {
+final int count=10;
+final TestProcedure[] procs=new TestProcedure[count];
+for (int i=0; i < procs.length; ++i) {
+procs[i]=new TestProcedure(i + 1);
+}
+procStore.insert(procs);
+restartAndAssert(count,count,0,0);
+for (int i=0; i < procs.length; ++i) {
+final long procId=procs[i].getProcId();
+procStore.delete(procId);
+restartAndAssert(procId != count ? count : 0,count - (i + 1),0,0);
+}
+procStore.removeInactiveLogsForTesting();
+assertEquals("WALs=" + procStore.getActiveLogs(),1,procStore.getActiveLogs().size());
+}
+@Test public void testWALDirAndWALArchiveDir() throws IOException {
+Configuration conf=htu.getConfiguration();
+procStore=createWALProcedureStore(conf);
+assertEquals(procStore.getFileSystem(),procStore.getWalArchiveDir().getFileSystem(conf));
+}
+private WALProcedureStore createWALProcedureStore(Configuration conf) throws IOException {
+return new WALProcedureStore(conf,new WALProcedureStore.LeaseRecovery(){
+@Override public void recoverFileLease(FileSystem fs,Path path) throws IOException {
+}
+}
+);
+}
+private LoadCounter restartAndAssert(long maxProcId,long runnableCount,int completedCount,int corruptedCount) throws Exception {
+return ProcedureTestingUtility.storeRestartAndAssert(procStore,maxProcId,runnableCount,completedCount,corruptedCount);
+}
+private void corruptLog(final FileStatus logFile,final long dropBytes) throws IOException {
+assertTrue(logFile.getLen() > dropBytes);
+LOG.debug("corrupt log " + logFile.getPath() + " size="+ logFile.getLen()+ " drop="+ dropBytes);
+Path tmpPath=new Path(testDir,"corrupted.log");
+InputStream in=fs.open(logFile.getPath());
+OutputStream out=fs.create(tmpPath);
+IOUtils.copyBytes(in,out,logFile.getLen() - dropBytes,true);
+if (!fs.rename(tmpPath,logFile.getPath())) {
+throw new IOException("Unable to rename");
+}
+}
+private void verifyProcIdsOnRestart(final Set<Long> procIds) throws Exception {
+LOG.debug("expected: " + procIds);
+LoadCounter loader=new LoadCounter();
+storeRestart(loader);
+assertEquals(procIds.size(),loader.getLoadedCount());
+assertEquals(0,loader.getCorruptedCount());
+}
+public static class TestSequentialProcedure extends SequentialProcedure<Void> {
+private static long seqid=0;
+public TestSequentialProcedure(){
+setProcId(++seqid);
+}
+@Override protected Procedure<Void>[] execute(Void env){
+return null;
+}
+@Override protected void rollback(Void env){
+}
+@Override protected boolean abort(Void env){
+return false;
+}
+@Override protected void serializeStateData(ProcedureStateSerializer serializer) throws IOException {
+long procId=getProcId();
+if (procId % 2 == 0) {
+Int64Value.Builder builder=Int64Value.newBuilder().setValue(procId);
+serializer.serialize(builder.build());
+}
+}
+@Override protected void deserializeStateData(ProcedureStateSerializer serializer) throws IOException {
+long procId=getProcId();
+if (procId % 2 == 0) {
+Int64Value value=serializer.deserialize(Int64Value.class);
+assertEquals(procId,value.getValue());
+}
+}
+}
+}

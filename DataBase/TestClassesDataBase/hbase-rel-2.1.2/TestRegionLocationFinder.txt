@@ -1,0 +1,96 @@
+@Category({MasterTests.class,MediumTests.class}) public class TestRegionLocationFinder {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestRegionLocationFinder.class);
+  private final static HBaseTestingUtility TEST_UTIL=new HBaseTestingUtility();
+  private static MiniHBaseCluster cluster;
+  private final static TableName tableName=TableName.valueOf("table");
+  private final static byte[] FAMILY=Bytes.toBytes("cf");
+  private static Table table;
+  private final static int ServerNum=5;
+  private static RegionLocationFinder finder=new RegionLocationFinder();
+  @BeforeClass public static void setUpBeforeClass() throws Exception {
+    cluster=TEST_UTIL.startMiniCluster(1,ServerNum);
+    table=TEST_UTIL.createTable(tableName,FAMILY,HBaseTestingUtility.KEYS_FOR_HBA_CREATE_TABLE);
+    TEST_UTIL.waitTableAvailable(tableName,1000);
+    TEST_UTIL.loadTable(table,FAMILY);
+    for (int i=0; i < ServerNum; i++) {
+      HRegionServer server=cluster.getRegionServer(i);
+      for (      HRegion region : server.getRegions(tableName)) {
+        region.flush(true);
+      }
+    }
+    finder.setConf(TEST_UTIL.getConfiguration());
+    finder.setServices(cluster.getMaster());
+    finder.setClusterMetrics(cluster.getMaster().getClusterMetrics());
+  }
+  @AfterClass public static void tearDownAfterClass() throws Exception {
+    table.close();
+    TEST_UTIL.deleteTable(tableName);
+    TEST_UTIL.shutdownMiniCluster();
+  }
+  @Test public void testInternalGetTopBlockLocation() throws Exception {
+    for (int i=0; i < ServerNum; i++) {
+      HRegionServer server=cluster.getRegionServer(i);
+      for (      HRegion region : server.getRegions(tableName)) {
+        HDFSBlocksDistribution blocksDistribution1=region.getHDFSBlocksDistribution();
+        HDFSBlocksDistribution blocksDistribution2=finder.getBlockDistribution(region.getRegionInfo());
+        assertEquals(blocksDistribution1.getUniqueBlocksTotalWeight(),blocksDistribution2.getUniqueBlocksTotalWeight());
+        if (blocksDistribution1.getUniqueBlocksTotalWeight() != 0) {
+          assertEquals(blocksDistribution1.getTopHosts().get(0),blocksDistribution2.getTopHosts().get(0));
+        }
+      }
+    }
+  }
+  @Test public void testMapHostNameToServerName() throws Exception {
+    List<String> topHosts=new ArrayList<>();
+    for (int i=0; i < ServerNum; i++) {
+      HRegionServer server=cluster.getRegionServer(i);
+      String serverHost=server.getServerName().getHostname();
+      if (!topHosts.contains(serverHost)) {
+        topHosts.add(serverHost);
+      }
+    }
+    List<ServerName> servers=finder.mapHostNameToServerName(topHosts);
+    assertEquals(1,topHosts.size());
+    for (int i=0; i < ServerNum; i++) {
+      ServerName server=cluster.getRegionServer(i).getServerName();
+      assertTrue(servers.contains(server));
+    }
+  }
+  @Test public void testGetTopBlockLocations() throws Exception {
+    for (int i=0; i < ServerNum; i++) {
+      HRegionServer server=cluster.getRegionServer(i);
+      for (      HRegion region : server.getRegions(tableName)) {
+        List<ServerName> servers=finder.getTopBlockLocations(region.getRegionInfo());
+        if (region.getHDFSBlocksDistribution().getUniqueBlocksTotalWeight() == 0) {
+          continue;
+        }
+        List<String> topHosts=region.getHDFSBlocksDistribution().getTopHosts();
+        if (!topHosts.contains(server.getServerName().getHostname())) {
+          continue;
+        }
+        for (int j=0; j < ServerNum; j++) {
+          ServerName serverName=cluster.getRegionServer(j).getServerName();
+          assertTrue(servers.contains(serverName));
+        }
+      }
+    }
+  }
+  @Test public void testRefreshAndWait() throws Exception {
+    finder.getCache().invalidateAll();
+    for (int i=0; i < ServerNum; i++) {
+      HRegionServer server=cluster.getRegionServer(i);
+      List<HRegion> regions=server.getRegions(tableName);
+      if (regions.size() <= 0) {
+        continue;
+      }
+      List<RegionInfo> regionInfos=new ArrayList<>(regions.size());
+      for (      HRegion region : regions) {
+        regionInfos.add(region.getRegionInfo());
+      }
+      finder.refreshAndWait(regionInfos);
+      for (      RegionInfo regionInfo : regionInfos) {
+        assertNotNull(finder.getCache().getIfPresent(regionInfo));
+      }
+    }
+  }
+}

@@ -1,0 +1,54 @@
+@Test(timeout=60000) public void testReCacheAfterUncache() throws Exception {
+  final int TOTAL_BLOCKS_PER_CACHE=Ints.checkedCast(CACHE_CAPACITY / BLOCK_SIZE);
+  BlockReaderTestUtil.enableHdfsCachingTracing();
+  Assert.assertEquals(0,CACHE_CAPACITY % BLOCK_SIZE);
+  final Path SMALL_FILE=new Path("/smallFile");
+  DFSTestUtil.createFile(fs,SMALL_FILE,BLOCK_SIZE,(short)1,0xcafe);
+  final Path BIG_FILE=new Path("/bigFile");
+  DFSTestUtil.createFile(fs,BIG_FILE,TOTAL_BLOCKS_PER_CACHE * BLOCK_SIZE,(short)1,0xbeef);
+  final DistributedFileSystem dfs=cluster.getFileSystem();
+  dfs.addCachePool(new CachePoolInfo("pool"));
+  final long bigCacheDirectiveId=dfs.addCacheDirective(new CacheDirectiveInfo.Builder().setPool("pool").setPath(BIG_FILE).setReplication((short)1).build());
+  GenericTestUtils.waitFor(new Supplier<Boolean>(){
+    @Override public Boolean get(){
+      MetricsRecordBuilder dnMetrics=getMetrics(dn.getMetrics().name());
+      long blocksCached=MetricsAsserts.getLongCounter("BlocksCached",dnMetrics);
+      if (blocksCached != TOTAL_BLOCKS_PER_CACHE) {
+        LOG.info("waiting for " + TOTAL_BLOCKS_PER_CACHE + " to "+ "be cached.   Right now only "+ blocksCached+ " blocks are cached.");
+        return false;
+      }
+      LOG.info(TOTAL_BLOCKS_PER_CACHE + " blocks are now cached.");
+      return true;
+    }
+  }
+,1000,30000);
+  final long shortCacheDirectiveId=dfs.addCacheDirective(new CacheDirectiveInfo.Builder().setPool("pool").setPath(SMALL_FILE).setReplication((short)1).build());
+  Thread.sleep(10000);
+  MetricsRecordBuilder dnMetrics=getMetrics(dn.getMetrics().name());
+  Assert.assertEquals(TOTAL_BLOCKS_PER_CACHE,MetricsAsserts.getLongCounter("BlocksCached",dnMetrics));
+  dfs.removeCacheDirective(bigCacheDirectiveId);
+  GenericTestUtils.waitFor(new Supplier<Boolean>(){
+    @Override public Boolean get(){
+      RemoteIterator<CacheDirectiveEntry> iter;
+      try {
+        iter=dfs.listCacheDirectives(new CacheDirectiveInfo.Builder().build());
+        CacheDirectiveEntry entry;
+        do {
+          entry=iter.next();
+        }
+ while (entry.getInfo().getId() != shortCacheDirectiveId);
+        if (entry.getStats().getFilesCached() != 1) {
+          LOG.info("waiting for directive " + shortCacheDirectiveId + " to be cached.  stats = "+ entry.getStats());
+          return false;
+        }
+        LOG.info("directive " + shortCacheDirectiveId + " has been cached.");
+      }
+ catch (      IOException e) {
+        Assert.fail("unexpected exception" + e.toString());
+      }
+      return true;
+    }
+  }
+,1000,30000);
+  dfs.removeCacheDirective(shortCacheDirectiveId);
+}

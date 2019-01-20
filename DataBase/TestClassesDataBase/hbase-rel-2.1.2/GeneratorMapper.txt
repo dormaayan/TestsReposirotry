@@ -1,0 +1,219 @@
+/** 
+ * Some ASCII art time: <p> [ . . . ] represents one batch of random longs of length WIDTH <pre> _________________________ |                  ______ | |                 |      || .-+-----------------+-----.|| | |                 |     ||| first   = [ . . . . . . . . . . . ]   ||| ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^     ||| | | | | | | | | | | |     ||| prev    = [ . . . . . . . . . . . ]   ||| ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^     ||| | | | | | | | | | | |     ||| current = [ . . . . . . . . . . . ]   ||| ||| ...                                   ||| ||| last    = [ . . . . . . . . . . . ]   ||| ^ ^ ^ ^ ^ ^ ^ ^ ^ ^ ^_____||| |                 |________|| |___________________________| </pre>
+ */
+static class GeneratorMapper extends Mapper<BytesWritable,NullWritable,NullWritable,NullWritable> {
+  byte[][] first=null;
+  byte[][] prev=null;
+  byte[][] current=null;
+  byte[] id;
+  long count=0;
+  int i;
+  BufferedMutator mutator;
+  Connection connection;
+  long numNodes;
+  long wrap;
+  int width;
+  boolean multipleUnevenColumnFamilies;
+  byte[] tinyValue=new byte[]{'t'};
+  byte[] bigValue=null;
+  Configuration conf;
+  volatile boolean walkersStop;
+  int numWalkers;
+  volatile List<Long> flushedLoops=new ArrayList<>();
+  List<Thread> walkers=new ArrayList<>();
+  @Override protected void setup(  Context context) throws IOException, InterruptedException {
+    id=Bytes.toBytes("Job: " + context.getJobID() + " Task: "+ context.getTaskAttemptID());
+    this.connection=ConnectionFactory.createConnection(context.getConfiguration());
+    instantiateHTable();
+    this.width=context.getConfiguration().getInt(GENERATOR_WIDTH_KEY,WIDTH_DEFAULT);
+    current=new byte[this.width][];
+    int wrapMultiplier=context.getConfiguration().getInt(GENERATOR_WRAP_KEY,WRAP_DEFAULT);
+    this.wrap=(long)wrapMultiplier * width;
+    this.numNodes=context.getConfiguration().getLong(GENERATOR_NUM_ROWS_PER_MAP_KEY,(long)WIDTH_DEFAULT * WRAP_DEFAULT);
+    if (this.numNodes < this.wrap) {
+      this.wrap=this.numNodes;
+    }
+    this.multipleUnevenColumnFamilies=isMultiUnevenColumnFamilies(context.getConfiguration());
+    this.numWalkers=context.getConfiguration().getInt(CONCURRENT_WALKER_KEY,CONCURRENT_WALKER_DEFAULT);
+    this.walkersStop=false;
+    this.conf=context.getConfiguration();
+  }
+  protected void instantiateHTable() throws IOException {
+    mutator=connection.getBufferedMutator(new BufferedMutatorParams(getTableName(connection.getConfiguration())).writeBufferSize(4 * 1024 * 1024));
+  }
+  @Override protected void cleanup(  Context context) throws IOException, InterruptedException {
+    joinWalkers();
+    mutator.close();
+    connection.close();
+  }
+  @Override protected void map(  BytesWritable key,  NullWritable value,  Context output) throws IOException {
+    current[i]=new byte[key.getLength()];
+    System.arraycopy(key.getBytes(),0,current[i],0,key.getLength());
+    if (++i == current.length) {
+      LOG.info("Persisting current.length=" + current.length + ", count="+ count+ ", id="+ Bytes.toStringBinary(id)+ ", current="+ Bytes.toStringBinary(current[0])+ ", i="+ i);
+      persist(output,count,prev,current,id);
+      i=0;
+      if (first == null) {
+        first=current;
+      }
+      prev=current;
+      current=new byte[this.width][];
+      count+=current.length;
+      output.setStatus("Count " + count);
+      if (count % wrap == 0) {
+        circularLeftShift(first);
+        persist(output,-1,prev,first,null);
+        if (numWalkers > 0) {
+          addFlushed(key.getBytes());
+          if (walkers.isEmpty()) {
+            startWalkers(numWalkers,conf,output);
+          }
+        }
+        first=null;
+        prev=null;
+      }
+    }
+  }
+  private static <T>void circularLeftShift(  T[] first){
+    T ez=first[0];
+    System.arraycopy(first,1,first,0,first.length - 1);
+    first[first.length - 1]=ez;
+  }
+  private void addFlushed(  byte[] rowKey){
+synchronized (flushedLoops) {
+      flushedLoops.add(Bytes.toLong(rowKey));
+      flushedLoops.notifyAll();
+    }
+  }
+  protected void persist(  Context output,  long count,  byte[][] prev,  byte[][] current,  byte[] id) throws IOException {
+    for (int i=0; i < current.length; i++) {
+      if (i % 100 == 0) {
+        output.progress();
+      }
+      Put put=new Put(current[i]);
+      put.addColumn(FAMILY_NAME,COLUMN_PREV,prev == null ? NO_KEY : prev[i]);
+      if (count >= 0) {
+        put.addColumn(FAMILY_NAME,COLUMN_COUNT,Bytes.toBytes(count + i));
+      }
+      if (id != null) {
+        put.addColumn(FAMILY_NAME,COLUMN_CLIENT,id);
+      }
+      if (this.multipleUnevenColumnFamilies) {
+        put.addColumn(TINY_FAMILY_NAME,TINY_FAMILY_NAME,this.tinyValue);
+        if (this.bigValue == null) {
+          this.bigValue=new byte[current[i].length * 10];
+          ThreadLocalRandom.current().nextBytes(this.bigValue);
+        }
+        put.addColumn(BIG_FAMILY_NAME,BIG_FAMILY_NAME,this.bigValue);
+      }
+      mutator.mutate(put);
+    }
+    mutator.flush();
+  }
+  private void startWalkers(  int numWalkers,  Configuration conf,  Context context){
+    LOG.info("Starting " + numWalkers + " concurrent walkers");
+    for (int i=0; i < numWalkers; i++) {
+      Thread walker=new Thread(new ContinuousConcurrentWalker(conf,context));
+      walker.start();
+      walkers.add(walker);
+    }
+  }
+  private void joinWalkers(){
+    walkersStop=true;
+synchronized (flushedLoops) {
+      flushedLoops.notifyAll();
+    }
+    for (    Thread walker : walkers) {
+      try {
+        walker.join();
+      }
+ catch (      InterruptedException e) {
+      }
+    }
+  }
+  /** 
+ * Randomly selects and walks a random flushed loop concurrently with the Generator Mapper by spawning ConcurrentWalker's with specified StartNodes. These ConcurrentWalker's are configured to only log erroneous nodes.
+ */
+public class ContinuousConcurrentWalker implements Runnable {
+    ConcurrentWalker walker;
+    Configuration conf;
+    Context context;
+    Random rand;
+    public ContinuousConcurrentWalker(    Configuration conf,    Context context){
+      this.conf=conf;
+      this.context=context;
+      rand=new Random();
+    }
+    @Override public void run(){
+      while (!walkersStop) {
+        try {
+          long node=selectLoop();
+          try {
+            walkLoop(node);
+          }
+ catch (          IOException e) {
+            context.getCounter(Counts.IOEXCEPTION).increment(1l);
+            return;
+          }
+        }
+ catch (        InterruptedException e) {
+          return;
+        }
+      }
+    }
+    private void walkLoop(    long node) throws IOException {
+      walker=new ConcurrentWalker(context);
+      walker.setConf(conf);
+      walker.run(node,wrap);
+    }
+    private long selectLoop() throws InterruptedException {
+synchronized (flushedLoops) {
+        while (flushedLoops.isEmpty() && !walkersStop) {
+          flushedLoops.wait();
+        }
+        if (walkersStop) {
+          throw new InterruptedException();
+        }
+        return flushedLoops.get(rand.nextInt(flushedLoops.size()));
+      }
+    }
+  }
+public static class ConcurrentWalker extends WalkerBase {
+    Context context;
+    public ConcurrentWalker(    Context context){
+      this.context=context;
+    }
+    public void run(    long startKeyIn,    long maxQueriesIn) throws IOException {
+      long maxQueries=maxQueriesIn > 0 ? maxQueriesIn : Long.MAX_VALUE;
+      byte[] startKey=Bytes.toBytes(startKeyIn);
+      Connection connection=ConnectionFactory.createConnection(getConf());
+      Table table=connection.getTable(getTableName(getConf()));
+      long numQueries=0;
+      CINode node=findStartNode(table,startKey);
+      if (node == null) {
+        LOG.error("Start node not found: " + Bytes.toStringBinary(startKey));
+        throw new IOException("Start node not found: " + startKeyIn);
+      }
+      while (numQueries < maxQueries) {
+        numQueries++;
+        byte[] prev=node.prev;
+        long t1=System.currentTimeMillis();
+        node=getNode(prev,table,node);
+        long t2=System.currentTimeMillis();
+        if (node == null) {
+          LOG.error("ConcurrentWalker found UNDEFINED NODE: " + Bytes.toStringBinary(prev));
+          context.getCounter(Counts.UNDEFINED).increment(1l);
+        }
+ else         if (node.prev.length == NO_KEY.length) {
+          LOG.error("ConcurrentWalker found TERMINATING NODE: " + Bytes.toStringBinary(node.key));
+          context.getCounter(Counts.TERMINATING).increment(1l);
+        }
+ else {
+          context.getCounter(Counts.SUCCESS).increment(1l);
+        }
+      }
+      table.close();
+      connection.close();
+    }
+  }
+}

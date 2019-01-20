@@ -1,0 +1,298 @@
+public class FreeIdKeeperTest {
+  @Rule public final EphemeralFileSystemRule fs=new EphemeralFileSystemRule();
+  @Test public void newlyConstructedInstanceShouldReportProperDefaultValues() throws Exception {
+    FreeIdKeeper keeper=getFreeIdKeeperAggressive();
+    assertEquals(NO_RESULT,keeper.getId());
+    assertEquals(0,keeper.getCount());
+  }
+  @Test public void freeingAnIdShouldReturnThatIdAndUpdateTheCountWhenAggressiveModeIsSet() throws Exception {
+    FreeIdKeeper keeper=getFreeIdKeeperAggressive();
+    keeper.freeId(13);
+    assertEquals(1,keeper.getCount());
+    long result=keeper.getId();
+    assertEquals(13,result);
+    assertEquals(0,keeper.getCount());
+  }
+  @Test public void shouldReturnMinusOneWhenRunningOutOfIds() throws Exception {
+    FreeIdKeeper keeper=getFreeIdKeeperAggressive();
+    keeper.freeId(13);
+    assertEquals(13,keeper.getId());
+    assertEquals(NO_RESULT,keeper.getId());
+    assertEquals(NO_RESULT,keeper.getId());
+  }
+  @Test public void shouldOnlyOverflowWhenThresholdIsReached() throws Exception {
+    StoreChannel channel=spy(fs.get().open(new File("id.file"),OpenMode.READ_WRITE));
+    int batchSize=10;
+    FreeIdKeeper keeper=getFreeIdKeeperAggressive(channel,batchSize);
+    reset(channel);
+    for (int i=0; i < batchSize - 1; i++) {
+      keeper.freeId(i);
+    }
+    verifyZeroInteractions(channel);
+    keeper.freeId(10);
+    verify(channel).writeAll(any(ByteBuffer.class));
+  }
+  @Test public void shouldReadBackPersistedIdsWhenAggressiveModeIsSet() throws Exception {
+    StoreChannel channel=getStoreChannel();
+    int batchSize=10;
+    FreeIdKeeper keeper=getFreeIdKeeperAggressive(channel,batchSize);
+    for (int i=0; i < batchSize; i++) {
+      keeper.freeId(i);
+    }
+    for (int i=0; i < batchSize; i++) {
+      assertEquals(i,keeper.getId());
+    }
+  }
+  @Test public void shouldReadBackManyPersistedIdBatchesWhenAggressiveModeIsSet() throws Exception {
+    StoreChannel channel=getStoreChannel();
+    int batchSize=10;
+    FreeIdKeeper keeper=getFreeIdKeeperAggressive(channel,batchSize);
+    Set<Long> freeIds=new HashSet<>();
+    for (long i=0; i < batchSize * 2; i++) {
+      keeper.freeId(i);
+      freeIds.add(i);
+    }
+    assertEquals(freeIds.size(),keeper.getCount());
+    for (int i=batchSize * 2 - 1; i >= 0; i--) {
+      assertTrue(freeIds.remove(keeper.getId()));
+    }
+  }
+  @Test public void shouldFirstReturnNonPersistedIdsAndThenPersistedOnesWhenAggressiveMode() throws Exception {
+    StoreChannel channel=getStoreChannel();
+    int batchSize=10;
+    FreeIdKeeper keeper=getFreeIdKeeperAggressive(channel,batchSize);
+    for (int i=0; i < batchSize; i++) {
+      keeper.freeId(i);
+    }
+    int extraIds=3;
+    for (int i=batchSize; i < batchSize + extraIds; i++) {
+      keeper.freeId(i);
+    }
+    for (int i=batchSize; i < batchSize + extraIds; i++) {
+      assertEquals(i,keeper.getId());
+    }
+    for (int i=0; i < batchSize; i++) {
+      assertEquals(i,keeper.getId());
+    }
+  }
+  @Test public void persistedIdsShouldStillBeCounted() throws Exception {
+    StoreChannel channel=getStoreChannel();
+    int batchSize=10;
+    FreeIdKeeper keeper=new FreeIdKeeper(channel,batchSize,true);
+    for (int i=0; i < batchSize; i++) {
+      keeper.freeId(i);
+    }
+    int extraIds=3;
+    for (int i=batchSize; i < batchSize + extraIds; i++) {
+      keeper.freeId(i);
+    }
+    assertEquals(batchSize + extraIds,keeper.getCount());
+  }
+  @Test public void shouldStoreAndRestoreIds() throws Exception {
+    StoreChannel channel=getStoreChannel();
+    int batchSize=10;
+    FreeIdKeeper keeper=getFreeIdKeeperAggressive(channel,batchSize);
+    Set<Long> freeIds=new HashSet<>();
+    for (long i=0; i < batchSize; i++) {
+      keeper.freeId(i);
+      freeIds.add(i);
+    }
+    int extraIds=3;
+    for (long i=batchSize; i < batchSize + extraIds; i++) {
+      keeper.freeId(i);
+      freeIds.add(i);
+    }
+    keeper.close();
+    channel.close();
+    channel=fs.get().open(new File("id.file"),OpenMode.READ_WRITE);
+    keeper=getFreeIdKeeperAggressive(channel,batchSize);
+    assertEquals(batchSize + extraIds,keeper.getCount());
+    assertEquals(freeIds.size(),keeper.getCount());
+    for (int i=batchSize + extraIds - 1; i >= 0; i--) {
+      long id=keeper.getId();
+      assertTrue(freeIds.contains(id));
+    }
+  }
+  @Test public void shouldNotReturnNewlyReleasedIdsIfAggressiveIsFalse() throws Exception {
+    FreeIdKeeper keeper=getFreeIdKeeper();
+    keeper.freeId(1);
+    long nextFree=keeper.getId();
+    assertEquals(NO_RESULT,nextFree);
+  }
+  @Test public void shouldNotReturnIdsPersistedDuringThisRunIfAggressiveIsFalse() throws Exception {
+    StoreChannel channel=spy(fs.get().open(new File("id.file"),OpenMode.READ_WRITE));
+    int batchSize=10;
+    FreeIdKeeper keeper=getFreeIdKeeper(channel,batchSize);
+    for (int i=0; i < batchSize; i++) {
+      keeper.freeId(i);
+    }
+    verify(channel,times(1)).write(any(ByteBuffer.class));
+    assertEquals(NO_RESULT,keeper.getId());
+  }
+  @Test public void shouldReturnIdsRestoredAndIgnoreNewlyReleasedIfAggressiveModeIsFalse() throws Exception {
+    StoreChannel channel=getStoreChannel();
+    int batchSize=10;
+    FreeIdKeeper keeper=getFreeIdKeeper(channel,batchSize);
+    Set<Long> freeIds=new HashSet<>();
+    for (long i=0; i < batchSize; i++) {
+      keeper.freeId(i);
+      freeIds.add(i);
+    }
+    keeper.close();
+    channel.close();
+    channel=fs.get().open(new File("id.file"),OpenMode.READ_WRITE);
+    keeper=getFreeIdKeeper(channel,batchSize);
+    for (int i=0; i < batchSize; i++) {
+      keeper.freeId(i);
+    }
+    for (int i=0; i < batchSize; i++) {
+      assertTrue(freeIds.remove(keeper.getId()));
+    }
+    assertEquals(NO_RESULT,keeper.getId());
+  }
+  @Test public void shouldReturnNoResultIfIdsAreRestoredAndExhaustedAndThereAreFreeIdsFromThisRunWithAggressiveFalse() throws Exception {
+    StoreChannel channel=getStoreChannel();
+    int batchSize=10;
+    FreeIdKeeper keeper=getFreeIdKeeper(channel,batchSize);
+    Set<Long> freeIds=new HashSet<>();
+    for (long i=0; i < batchSize; i++) {
+      keeper.freeId(i);
+      freeIds.add(i);
+    }
+    keeper.close();
+    channel.close();
+    channel=fs.get().open(new File("id.file"),OpenMode.READ_WRITE);
+    keeper=getFreeIdKeeper(channel,batchSize);
+    for (int i=0; i < batchSize; i++) {
+      assertTrue(freeIds.remove(keeper.getId()));
+    }
+    for (int i=0; i < batchSize; i++) {
+      keeper.freeId(i);
+    }
+    assertEquals(NO_RESULT,keeper.getId());
+  }
+  @Test public void shouldNotReturnReusedIdsAfterRestart() throws Exception {
+    StoreChannel channel=getStoreChannel();
+    int batchSize=10;
+    FreeIdKeeper keeper=getFreeIdKeeperAggressive(channel,batchSize);
+    long idGen=0;
+    for (long i=0; i < batchSize * 4; i++) {
+      keeper.freeId(idGen++);
+    }
+    List<Long> reusedIds=new ArrayList<>();
+    for (int i=0; i < batchSize * 2; i++) {
+      long id=keeper.getId();
+      reusedIds.add(id);
+    }
+    keeper.close();
+    channel.close();
+    channel=getStoreChannel();
+    keeper=getFreeIdKeeper(channel,batchSize);
+    List<Long> remainingIds=new ArrayList<>();
+    long id;
+    while ((id=keeper.getId()) != IdContainer.NO_RESULT) {
+      remainingIds.add(id);
+    }
+    assertEquals(2 * batchSize,remainingIds.size());
+    for (    Long remainingId : remainingIds) {
+      assertFalse(reusedIds.contains(remainingId));
+    }
+  }
+  @Test public void shouldTruncateFileInAggressiveMode() throws Exception {
+    StoreChannel channel=getStoreChannel();
+    int batchSize=10;
+    FreeIdKeeper keeper=getFreeIdKeeperAggressive(channel,batchSize);
+    for (long i=0; i < batchSize * 4; i++) {
+      keeper.freeId(i);
+    }
+    assertEquals(channel.size(),4 * batchSize * Long.BYTES);
+    for (int i=0; i < batchSize * 2; i++) {
+      keeper.getId();
+    }
+    assertEquals(channel.size(),2 * batchSize * Long.BYTES);
+  }
+  @Test public void shouldCompactFileOnCloseInRegularMode() throws Exception {
+    StoreChannel channel=getStoreChannel();
+    int batchSize=10;
+    FreeIdKeeper keeper=getFreeIdKeeper(channel,batchSize);
+    for (long i=0; i < batchSize * 4; i++) {
+      keeper.freeId(i);
+    }
+    keeper.close();
+    assertEquals(channel.size(),4 * batchSize * Long.BYTES);
+    channel.close();
+    channel=getStoreChannel();
+    keeper=getFreeIdKeeper(channel,batchSize);
+    for (long i=0; i < batchSize * 4; i++) {
+      keeper.freeId(i);
+    }
+    for (int i=0; i < batchSize * 2; i++) {
+      keeper.getId();
+    }
+    keeper.close();
+    assertEquals(channel.size(),6 * batchSize * Long.BYTES);
+  }
+  @Test public void allocateEmptyBatchWhenNoIdsAreAvailable() throws IOException {
+    FreeIdKeeper freeIdKeeper=getFreeIdKeeperAggressive();
+    long[] ids=freeIdKeeper.getIds(1024);
+    assertSame(PrimitiveLongCollections.EMPTY_LONG_ARRAY,ids);
+    assertEquals(0,freeIdKeeper.getCount());
+  }
+  @Test public void allocateBatchWhenHaveMoreIdsInMemory() throws IOException {
+    FreeIdKeeper freeIdKeeper=getFreeIdKeeperAggressive();
+    for (long id=1L; id < 7L; id++) {
+      freeIdKeeper.freeId(id);
+    }
+    long[] ids=freeIdKeeper.getIds(5);
+    assertArrayEquals(new long[]{1L,2L,3L,4L,5L},ids);
+    assertEquals(1,freeIdKeeper.getCount());
+  }
+  @Test public void allocateBatchWhenHaveLessIdsInMemory() throws IOException {
+    FreeIdKeeper freeIdKeeper=getFreeIdKeeperAggressive();
+    for (long id=1L; id < 4L; id++) {
+      freeIdKeeper.freeId(id);
+    }
+    long[] ids=freeIdKeeper.getIds(5);
+    assertArrayEquals(new long[]{1L,2L,3L},ids);
+    assertEquals(0,freeIdKeeper.getCount());
+  }
+  @Test public void allocateBatchWhenHaveLessIdsInMemoryButHaveOnDiskMore() throws IOException {
+    FreeIdKeeper freeIdKeeper=getFreeIdKeeperAggressive(4);
+    for (long id=1L; id < 11L; id++) {
+      freeIdKeeper.freeId(id);
+    }
+    long[] ids=freeIdKeeper.getIds(7);
+    assertArrayEquals(new long[]{9L,10L,5L,6L,7L,8L,1L},ids);
+    assertEquals(3,freeIdKeeper.getCount());
+  }
+  @Test public void allocateBatchWhenHaveLessIdsInMemoryAndOnDisk() throws IOException {
+    FreeIdKeeper freeIdKeeper=getFreeIdKeeperAggressive(4);
+    for (long id=1L; id < 10L; id++) {
+      freeIdKeeper.freeId(id);
+    }
+    long[] ids=freeIdKeeper.getIds(15);
+    assertArrayEquals(new long[]{9L,5L,6L,7L,8L,1L,2L,3L,4L},ids);
+    assertEquals(0,freeIdKeeper.getCount());
+  }
+  private FreeIdKeeper getFreeIdKeeperAggressive() throws IOException {
+    return getFreeIdKeeperAggressive(getStoreChannel(),10);
+  }
+  private FreeIdKeeper getFreeIdKeeperAggressive(  int batchSize) throws IOException {
+    return getFreeIdKeeperAggressive(getStoreChannel(),batchSize);
+  }
+  private FreeIdKeeper getFreeIdKeeperAggressive(  StoreChannel channel,  int batchSize) throws IOException {
+    return getFreeIdKeeper(channel,batchSize,true);
+  }
+  private FreeIdKeeper getFreeIdKeeper(  StoreChannel channel,  int batchSize) throws IOException {
+    return getFreeIdKeeper(channel,batchSize,false);
+  }
+  private FreeIdKeeper getFreeIdKeeper() throws IOException {
+    return getFreeIdKeeper(getStoreChannel(),10);
+  }
+  private FreeIdKeeper getFreeIdKeeper(  StoreChannel channel,  int batchSize,  boolean aggressiveMode) throws IOException {
+    return new FreeIdKeeper(channel,batchSize,aggressiveMode);
+  }
+  private StoreChannel getStoreChannel() throws IOException {
+    return fs.get().open(new File("id.file"),OpenMode.READ_WRITE);
+  }
+}

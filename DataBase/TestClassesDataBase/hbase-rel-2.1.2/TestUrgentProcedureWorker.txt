@@ -1,0 +1,86 @@
+@Category({MasterTests.class,SmallTests.class}) public class TestUrgentProcedureWorker {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestUrgentProcedureWorker.class);
+  private static final Logger LOG=LoggerFactory.getLogger(TestUrgentProcedureWorker.class);
+  private static final int PROCEDURE_EXECUTOR_SLOTS=1;
+  private static final CountDownLatch metaFinished=new CountDownLatch(1);
+  private static final HBaseTestingUtility UTIL=new HBaseTestingUtility();
+  private static final TableName TABLE_NAME=TableName.valueOf("TestUrgentProcedureWorker");
+  private static WALProcedureStore procStore;
+  private static ProcedureExecutor<TestEnv> procExec;
+private static final class TestEnv {
+    private final MasterProcedureScheduler scheduler;
+    public TestEnv(    MasterProcedureScheduler scheduler){
+      this.scheduler=scheduler;
+    }
+    public MasterProcedureScheduler getScheduler(){
+      return scheduler;
+    }
+  }
+public static class WaitingMetaProcedure extends ProcedureTestingUtility.NoopProcedure<TestEnv> implements TableProcedureInterface {
+    @Override protected Procedure<TestEnv>[] execute(    TestEnv env) throws ProcedureYieldException, ProcedureSuspendedException, InterruptedException {
+      metaFinished.await();
+      return null;
+    }
+    @Override protected Procedure.LockState acquireLock(    TestEnv env){
+      if (env.getScheduler().waitTableExclusiveLock(this,getTableName())) {
+        return LockState.LOCK_EVENT_WAIT;
+      }
+      return LockState.LOCK_ACQUIRED;
+    }
+    @Override protected void releaseLock(    TestEnv env){
+      env.getScheduler().wakeTableExclusiveLock(this,getTableName());
+    }
+    @Override protected boolean holdLock(    TestEnv env){
+      return true;
+    }
+    @Override public TableName getTableName(){
+      return TABLE_NAME;
+    }
+    @Override public TableOperationType getTableOperationType(){
+      return TableOperationType.EDIT;
+    }
+  }
+public static class MetaProcedure extends ProcedureTestingUtility.NoopProcedure<TestEnv> implements TableProcedureInterface {
+    @Override protected Procedure<TestEnv>[] execute(    TestEnv env) throws ProcedureYieldException, ProcedureSuspendedException, InterruptedException {
+      metaFinished.countDown();
+      return null;
+    }
+    @Override protected Procedure.LockState acquireLock(    TestEnv env){
+      if (env.getScheduler().waitTableExclusiveLock(this,getTableName())) {
+        return LockState.LOCK_EVENT_WAIT;
+      }
+      return LockState.LOCK_ACQUIRED;
+    }
+    @Override protected void releaseLock(    TestEnv env){
+      env.getScheduler().wakeTableExclusiveLock(this,getTableName());
+    }
+    @Override protected boolean holdLock(    TestEnv env){
+      return true;
+    }
+    @Override public TableName getTableName(){
+      return TableName.META_TABLE_NAME;
+    }
+    @Override public TableOperationType getTableOperationType(){
+      return TableOperationType.EDIT;
+    }
+  }
+  @AfterClass public static void tearDownAfterClass() throws IOException {
+    UTIL.cleanupTestDir();
+  }
+  @BeforeClass public static void setUp() throws IOException {
+    UTIL.getConfiguration().setInt("hbase.procedure.worker.stuck.threshold.msec",6000000);
+    procStore=ProcedureTestingUtility.createWalStore(UTIL.getConfiguration(),UTIL.getDataTestDir("TestUrgentProcedureWorker"));
+    procStore.start(1);
+    MasterProcedureScheduler scheduler=new MasterProcedureScheduler(pid -> null);
+    procExec=new ProcedureExecutor<>(UTIL.getConfiguration(),new TestEnv(scheduler),procStore,scheduler);
+    procExec.init(1,1,false);
+    procExec.startWorkers();
+  }
+  @Test public void test() throws Exception {
+    WaitingMetaProcedure waitingMetaProcedure=new WaitingMetaProcedure();
+    long waitProc=procExec.submitProcedure(waitingMetaProcedure);
+    MetaProcedure metaProcedure=new MetaProcedure();
+    long metaProc=procExec.submitProcedure(metaProcedure);
+    UTIL.waitFor(5000,() -> procExec.isFinished(waitProc));
+  }
+}

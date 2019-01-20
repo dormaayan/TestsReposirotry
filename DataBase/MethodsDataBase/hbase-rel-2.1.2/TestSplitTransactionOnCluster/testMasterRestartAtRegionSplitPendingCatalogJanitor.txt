@@ -1,0 +1,50 @@
+/** 
+ * Verifies HBASE-5806.  Here the case is that splitting is completed but before the CJ could remove the parent region the master is killed and restarted.
+ * @throws IOException
+ * @throws InterruptedException
+ * @throws NodeExistsException
+ * @throws KeeperException
+ */
+@Test public void testMasterRestartAtRegionSplitPendingCatalogJanitor() throws IOException, InterruptedException, NodeExistsException, KeeperException, ServiceException {
+  final TableName tableName=TableName.valueOf(name.getMethodName());
+  Table t=createTableAndWait(tableName,HConstants.CATALOG_FAMILY);
+  List<HRegion> regions=cluster.getRegions(tableName);
+  RegionInfo hri=getAndCheckSingleTableRegion(regions);
+  int tableRegionIndex=ensureTableRegionNotOnSameServerAsMeta(admin,hri);
+  this.admin.setBalancerRunning(false,true);
+  cluster.getMaster().setCatalogJanitorEnabled(false);
+  try {
+    TESTING_UTIL.loadTable(t,HConstants.CATALOG_FAMILY,false);
+    HRegionServer server=cluster.getRegionServer(tableRegionIndex);
+    printOutRegions(server,"Initial regions: ");
+    this.admin.splitRegion(hri.getRegionName());
+    List<HRegion> daughters=checkAndGetDaughters(tableName);
+    HMaster master=abortAndWaitForMaster();
+    for (    HRegion daughter : daughters) {
+      daughter.compact(true);
+      RetryCounter retrier=new RetryCounter(30,1,TimeUnit.SECONDS);
+      while (CompactionState.NONE != admin.getCompactionStateForRegion(daughter.getRegionInfo().getRegionName()) && retrier.shouldRetry()) {
+        retrier.sleepUntilNextRetry();
+      }
+      daughter.getStores().get(0).closeAndArchiveCompactedFiles();
+      assertFalse(daughter.hasReferences());
+    }
+    for (    RegionServerThread rst : cluster.getRegionServerThreads()) {
+      boolean oldSetting=rst.getRegionServer().compactedFileDischarger.setUseExecutor(false);
+      rst.getRegionServer().compactedFileDischarger.run();
+      rst.getRegionServer().compactedFileDischarger.setUseExecutor(oldSetting);
+    }
+    cluster.getMaster().setCatalogJanitorEnabled(true);
+    LOG.info("Starting run of CatalogJanitor");
+    cluster.getMaster().getCatalogJanitor().run();
+    ProcedureTestingUtility.waitAllProcedures(cluster.getMaster().getMasterProcedureExecutor());
+    RegionStates regionStates=master.getAssignmentManager().getRegionStates();
+    ServerName regionServerOfRegion=regionStates.getRegionServerOfRegion(hri);
+    assertEquals(null,regionServerOfRegion);
+  }
+  finally {
+    TESTING_UTIL.getAdmin().setBalancerRunning(true,false);
+    cluster.getMaster().setCatalogJanitorEnabled(true);
+    t.close();
+  }
+}

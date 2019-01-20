@@ -1,0 +1,97 @@
+@Category({MediumTests.class,ClientTests.class}) public class TestClientOperationInterrupt {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestClientOperationInterrupt.class);
+  private static final Logger LOG=LoggerFactory.getLogger(TestClientOperationInterrupt.class);
+  private static HBaseTestingUtility util;
+  private static final TableName tableName=TableName.valueOf("test");
+  private static final byte[] dummy=Bytes.toBytes("dummy");
+  private static final byte[] row1=Bytes.toBytes("r1");
+  private static final byte[] test=Bytes.toBytes("test");
+  private static Configuration conf;
+public static class TestCoprocessor implements RegionCoprocessor, RegionObserver {
+    @Override public Optional<RegionObserver> getRegionObserver(){
+      return Optional.of(this);
+    }
+    @Override public void preGetOp(    final ObserverContext<RegionCoprocessorEnvironment> e,    final Get get,    final List<Cell> results) throws IOException {
+      Threads.sleep(2500);
+    }
+  }
+  @BeforeClass public static void setUpBeforeClass() throws Exception {
+    conf=HBaseConfiguration.create();
+    conf.setStrings(CoprocessorHost.USER_REGION_COPROCESSOR_CONF_KEY,TestCoprocessor.class.getName());
+    util=new HBaseTestingUtility(conf);
+    util.startMiniCluster();
+    Admin admin=util.getAdmin();
+    if (admin.tableExists(tableName)) {
+      if (admin.isTableEnabled(tableName)) {
+        admin.disableTable(tableName);
+      }
+      admin.deleteTable(tableName);
+    }
+    Table ht=util.createTable(tableName,new byte[][]{dummy,test});
+    Put p=new Put(row1);
+    p.addColumn(dummy,dummy,dummy);
+    ht.put(p);
+  }
+  @Test public void testInterrupt50Percent() throws IOException, InterruptedException {
+    final AtomicInteger noEx=new AtomicInteger(0);
+    final AtomicInteger badEx=new AtomicInteger(0);
+    final AtomicInteger noInt=new AtomicInteger(0);
+    final AtomicInteger done=new AtomicInteger(0);
+    List<Thread> threads=new ArrayList<>();
+    final int nbThread=100;
+    for (int i=0; i < nbThread; i++) {
+      Thread t=new Thread(){
+        @Override public void run(){
+          try {
+            Table ht=util.getConnection().getTable(tableName);
+            Result r=ht.get(new Get(row1));
+            noEx.incrementAndGet();
+          }
+ catch (          IOException e) {
+            LOG.info("exception",e);
+            if (!(e instanceof InterruptedIOException) || (e instanceof SocketTimeoutException)) {
+              badEx.incrementAndGet();
+            }
+ else {
+              if (Thread.currentThread().isInterrupted()) {
+                noInt.incrementAndGet();
+                LOG.info("The thread should NOT be with the 'interrupt' status.");
+              }
+            }
+          }
+ finally {
+            done.incrementAndGet();
+          }
+        }
+      }
+;
+      t.setName("TestClientOperationInterrupt #" + i);
+      threads.add(t);
+      t.start();
+    }
+    for (int i=0; i < nbThread / 2; i++) {
+      threads.get(i).interrupt();
+    }
+    boolean stillAlive=true;
+    while (stillAlive) {
+      stillAlive=false;
+      for (      Thread t : threads) {
+        if (t.isAlive()) {
+          stillAlive=true;
+        }
+      }
+      Threads.sleep(10);
+    }
+    Assert.assertFalse(Thread.currentThread().isInterrupted());
+    Assert.assertTrue(" noEx: " + noEx.get() + ", badEx="+ badEx.get()+ ", noInt="+ noInt.get(),noEx.get() == nbThread / 2 && badEx.get() == 0);
+    while (done.get() != nbThread) {
+      Thread.sleep(1);
+    }
+    Table ht=util.getConnection().getTable(tableName);
+    Result r=ht.get(new Get(row1));
+    Assert.assertFalse(r.isEmpty());
+  }
+  @AfterClass public static void tearDownAfterClass() throws Exception {
+    util.shutdownMiniCluster();
+  }
+}

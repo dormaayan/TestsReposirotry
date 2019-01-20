@@ -1,0 +1,63 @@
+/** 
+ * If a table has regions that have no store files in a region, they should split successfully into two regions with no store files.
+ */
+@Test public void testSplitRegionWithNoStoreFiles() throws Exception {
+  final TableName tableName=TableName.valueOf(name.getMethodName());
+  createTableAndWait(tableName,HConstants.CATALOG_FAMILY);
+  List<HRegion> regions=cluster.getRegions(tableName);
+  RegionInfo hri=getAndCheckSingleTableRegion(regions);
+  ensureTableRegionNotOnSameServerAsMeta(admin,hri);
+  int regionServerIndex=cluster.getServerWith(regions.get(0).getRegionInfo().getRegionName());
+  HRegionServer regionServer=cluster.getRegionServer(regionServerIndex);
+  this.admin.setBalancerRunning(false,true);
+  cluster.getMaster().setCatalogJanitorEnabled(false);
+  try {
+    printOutRegions(regionServer,"Initial regions: ");
+    Configuration conf=cluster.getConfiguration();
+    HBaseFsck.debugLsr(conf,new Path("/"));
+    Path rootDir=FSUtils.getRootDir(conf);
+    FileSystem fs=TESTING_UTIL.getDFSCluster().getFileSystem();
+    Map<String,Path> storefiles=FSUtils.getTableStoreFilePathMap(null,fs,rootDir,tableName);
+    assertEquals("Expected nothing but found " + storefiles.toString(),0,storefiles.size());
+    regions=cluster.getRegions(tableName);
+    final HRegion region=findSplittableRegion(regions);
+    assertTrue("not able to find a splittable region",region != null);
+    try {
+      requestSplitRegion(regionServer,region,Bytes.toBytes("row2"));
+    }
+ catch (    IOException e) {
+      fail("Split execution should have succeeded with no exceptions thrown");
+    }
+    List<HRegion> daughters=cluster.getRegions(tableName);
+    assertEquals(2,daughters.size());
+    HBaseFsck.debugLsr(conf,new Path("/"));
+    Map<String,Path> storefilesAfter=FSUtils.getTableStoreFilePathMap(null,fs,rootDir,tableName);
+    assertEquals("Expected nothing but found " + storefilesAfter.toString(),0,storefilesAfter.size());
+    hri=region.getRegionInfo();
+    AssignmentManager am=cluster.getMaster().getAssignmentManager();
+    RegionStates regionStates=am.getRegionStates();
+    long start=EnvironmentEdgeManager.currentTime();
+    while (!regionStates.isRegionInState(hri,State.SPLIT)) {
+      LOG.debug("Waiting for SPLIT state on: " + hri);
+      assertFalse("Timed out in waiting split parent to be in state SPLIT",EnvironmentEdgeManager.currentTime() - start > 60000);
+      Thread.sleep(500);
+    }
+    assertTrue(regionStates.isRegionInState(daughters.get(0).getRegionInfo(),State.OPEN));
+    assertTrue(regionStates.isRegionInState(daughters.get(1).getRegionInfo(),State.OPEN));
+    am.assign(hri);
+    assertFalse("Split region can't be assigned",regionStates.isRegionInTransition(hri));
+    assertTrue(regionStates.isRegionInState(hri,State.SPLIT));
+    try {
+      am.unassign(hri);
+      fail("Should have thrown exception");
+    }
+ catch (    UnexpectedStateException e) {
+    }
+    assertFalse("Split region can't be unassigned",regionStates.isRegionInTransition(hri));
+    assertTrue(regionStates.isRegionInState(hri,State.SPLIT));
+  }
+  finally {
+    admin.setBalancerRunning(true,false);
+    cluster.getMaster().setCatalogJanitorEnabled(true);
+  }
+}

@@ -1,0 +1,30 @@
+@Test public void testCleanupTimeOverflow() throws Exception {
+  final int windowSize=1000;
+  final long lateness=2000;
+  ReducingStateDescriptor<Tuple2<String,Integer>> stateDesc=new ReducingStateDescriptor<>("window-contents",new SumReducer(),STRING_INT_TUPLE.createSerializer(new ExecutionConfig()));
+  TumblingEventTimeWindows windowAssigner=TumblingEventTimeWindows.of(Time.milliseconds(windowSize));
+  final WindowOperator<String,Tuple2<String,Integer>,Tuple2<String,Integer>,Tuple2<String,Integer>,TimeWindow> operator=new WindowOperator<>(windowAssigner,new TimeWindow.Serializer(),new TupleKeySelector(),BasicTypeInfo.STRING_TYPE_INFO.createSerializer(new ExecutionConfig()),stateDesc,new InternalSingleValueWindowFunction<>(new PassThroughWindowFunction<String,TimeWindow,Tuple2<String,Integer>>()),EventTimeTrigger.create(),lateness,null);
+  OneInputStreamOperatorTestHarness<Tuple2<String,Integer>,Tuple2<String,Integer>> testHarness=createTestHarness(operator);
+  testHarness.open();
+  ConcurrentLinkedQueue<Object> expected=new ConcurrentLinkedQueue<>();
+  long timestamp=Long.MAX_VALUE - 1750;
+  Collection<TimeWindow> windows=windowAssigner.assignWindows(new Tuple2<>("key2",1),timestamp,new WindowAssigner.WindowAssignerContext(){
+    @Override public long getCurrentProcessingTime(){
+      return operator.windowAssignerContext.getCurrentProcessingTime();
+    }
+  }
+);
+  TimeWindow window=Iterables.getOnlyElement(windows);
+  testHarness.processElement(new StreamRecord<>(new Tuple2<>("key2",1),timestamp));
+  Assert.assertTrue(window.maxTimestamp() + lateness < window.maxTimestamp());
+  Assert.assertTrue(window.maxTimestamp() + lateness < Long.MAX_VALUE - 1500);
+  testHarness.processWatermark(new Watermark(Long.MAX_VALUE - 1500));
+  Assert.assertTrue(Long.MAX_VALUE - 1500 < window.maxTimestamp());
+  Assert.assertTrue(window.maxTimestamp() < Long.MAX_VALUE);
+  testHarness.processWatermark(new Watermark(window.maxTimestamp()));
+  expected.add(new Watermark(Long.MAX_VALUE - 1500));
+  expected.add(new StreamRecord<>(new Tuple2<>("key2",1),window.maxTimestamp()));
+  expected.add(new Watermark(window.maxTimestamp()));
+  TestHarnessUtil.assertOutputEqualsSorted("Output was not correct.",expected,testHarness.getOutput(),new Tuple2ResultSortComparator());
+  testHarness.close();
+}

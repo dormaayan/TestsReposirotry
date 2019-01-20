@@ -1,0 +1,65 @@
+/** 
+ * Test archiving/cleaning across multiple tables, where some are retained, and others aren't
+ * @throws Exception on failure
+ */
+@Test public void testMultipleTables() throws Exception {
+  createArchiveDirectory();
+  String otherTable="otherTable";
+  FileSystem fs=UTIL.getTestFileSystem();
+  Path archiveDir=getArchiveDir();
+  Path tableDir=getTableDir(STRING_TABLE_NAME);
+  Path otherTableDir=getTableDir(otherTable);
+  toCleanup.add(archiveDir);
+  toCleanup.add(tableDir);
+  toCleanup.add(otherTableDir);
+  Configuration conf=UTIL.getConfiguration();
+  Stoppable stop=new StoppableImplementation();
+  final ChoreService choreService=new ChoreService("TEST_SERVER_NAME");
+  CleanerChore.initChorePool(conf);
+  HFileCleaner cleaner=setupAndCreateCleaner(conf,fs,archiveDir,stop);
+  List<BaseHFileCleanerDelegate> cleaners=turnOnArchiving(STRING_TABLE_NAME,cleaner);
+  final LongTermArchivingHFileCleaner delegate=(LongTermArchivingHFileCleaner)cleaners.get(0);
+  ColumnFamilyDescriptor hcd=ColumnFamilyDescriptorBuilder.of(TEST_FAM);
+  HRegion region=UTIL.createTestRegion(STRING_TABLE_NAME,hcd);
+  List<HRegion> regions=new ArrayList<>();
+  regions.add(region);
+  Mockito.doReturn(regions).when(rss).getRegions();
+  final CompactedHFilesDischarger compactionCleaner=new CompactedHFilesDischarger(100,stop,rss,false);
+  loadFlushAndCompact(region,TEST_FAM);
+  compactionCleaner.chore();
+  hcd=ColumnFamilyDescriptorBuilder.of(TEST_FAM);
+  HRegion otherRegion=UTIL.createTestRegion(otherTable,hcd);
+  regions=new ArrayList<>();
+  regions.add(otherRegion);
+  Mockito.doReturn(regions).when(rss).getRegions();
+  final CompactedHFilesDischarger compactionCleaner1=new CompactedHFilesDischarger(100,stop,rss,false);
+  loadFlushAndCompact(otherRegion,TEST_FAM);
+  compactionCleaner1.chore();
+  List<Path> files=getAllFiles(fs,archiveDir);
+  if (files == null) {
+    FSUtils.logFileSystemState(fs,archiveDir,LOG);
+    throw new RuntimeException("Didn't load archive any files!");
+  }
+  int initialCountForPrimary=0;
+  int initialCountForOtherTable=0;
+  for (  Path file : files) {
+    String tableName=file.getParent().getParent().getParent().getName();
+    if (tableName.equals(otherTable))     initialCountForOtherTable++;
+ else     if (tableName.equals(STRING_TABLE_NAME))     initialCountForPrimary++;
+  }
+  assertTrue("Didn't archive files for:" + STRING_TABLE_NAME,initialCountForPrimary > 0);
+  assertTrue("Didn't archive files for:" + otherTable,initialCountForOtherTable > 0);
+  CountDownLatch finished=setupCleanerWatching(delegate,cleaners,files.size() + 3);
+  choreService.scheduleChore(cleaner);
+  finished.await();
+  stop.stop("");
+  List<Path> archivedFiles=getAllFiles(fs,archiveDir);
+  int archivedForPrimary=0;
+  for (  Path file : archivedFiles) {
+    String tableName=file.getParent().getParent().getParent().getName();
+    assertFalse("Have a file from the non-archived table: " + file,tableName.equals(otherTable));
+    if (tableName.equals(STRING_TABLE_NAME))     archivedForPrimary++;
+  }
+  assertEquals("Not all archived files for the primary table were retained.",initialCountForPrimary,archivedForPrimary);
+  assertTrue("Archive directory was deleted via archiver",fs.exists(archiveDir));
+}

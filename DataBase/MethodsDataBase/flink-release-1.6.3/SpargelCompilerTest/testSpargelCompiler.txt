@@ -1,0 +1,39 @@
+@SuppressWarnings("serial") @Test public void testSpargelCompiler(){
+  ExecutionEnvironment env=ExecutionEnvironment.getExecutionEnvironment();
+  env.setParallelism(DEFAULT_PARALLELISM);
+  DataSet<Vertex<Long,Long>> initialVertices=env.fromElements(new Tuple2<>(1L,1L),new Tuple2<>(2L,2L)).map(new Tuple2ToVertexMap<>());
+  DataSet<Edge<Long,NullValue>> edges=env.fromElements(new Tuple2<>(1L,2L)).map(new MapFunction<Tuple2<Long,Long>,Edge<Long,NullValue>>(){
+    public Edge<Long,NullValue> map(    Tuple2<Long,Long> edge){
+      return new Edge<>(edge.f0,edge.f1,NullValue.getInstance());
+    }
+  }
+);
+  Graph<Long,Long,NullValue> graph=Graph.fromDataSet(initialVertices,edges,env);
+  DataSet<Vertex<Long,Long>> result=graph.runScatterGatherIteration(new ConnectedComponents.CCMessenger<>(BasicTypeInfo.LONG_TYPE_INFO),new ConnectedComponents.CCUpdater<>(),100).getVertices();
+  result.output(new DiscardingOutputFormat<>());
+  Plan p=env.createProgramPlan("Spargel Connected Components");
+  OptimizedPlan op=compileNoStats(p);
+  SinkPlanNode sink=op.getDataSinks().iterator().next();
+  assertEquals(ShipStrategyType.FORWARD,sink.getInput().getShipStrategy());
+  assertEquals(DEFAULT_PARALLELISM,sink.getParallelism());
+  WorksetIterationPlanNode iteration=(WorksetIterationPlanNode)sink.getInput().getSource();
+  assertEquals(DEFAULT_PARALLELISM,iteration.getParallelism());
+  PlanNode ssDelta=iteration.getSolutionSetDeltaPlanNode();
+  assertTrue(ssDelta instanceof DualInputPlanNode);
+  DualInputPlanNode ssJoin=(DualInputPlanNode)ssDelta;
+  assertEquals(DEFAULT_PARALLELISM,ssJoin.getParallelism());
+  assertEquals(ShipStrategyType.PARTITION_HASH,ssJoin.getInput1().getShipStrategy());
+  assertEquals(new FieldList(0),ssJoin.getInput1().getShipStrategyKeys());
+  DualInputPlanNode edgeJoin=(DualInputPlanNode)ssJoin.getInput1().getSource();
+  assertEquals(DEFAULT_PARALLELISM,edgeJoin.getParallelism());
+  assertEquals(ShipStrategyType.PARTITION_HASH,edgeJoin.getInput1().getShipStrategy());
+  assertEquals(ShipStrategyType.FORWARD,edgeJoin.getInput2().getShipStrategy());
+  assertTrue(edgeJoin.getInput1().getTempMode().isCached());
+  assertEquals(new FieldList(0),edgeJoin.getInput1().getShipStrategyKeys());
+  assertEquals(ShipStrategyType.PARTITION_HASH,iteration.getInput1().getShipStrategy());
+  assertEquals(ShipStrategyType.PARTITION_HASH,iteration.getInput2().getShipStrategy());
+  assertEquals(new FieldList(0),iteration.getInput1().getShipStrategyKeys());
+  assertEquals(new FieldList(0),iteration.getInput2().getShipStrategyKeys());
+  assertEquals(LocalStrategy.SORT,iteration.getInput2().getLocalStrategy());
+  assertEquals(new FieldList(0),iteration.getInput2().getLocalStrategyKeys());
+}

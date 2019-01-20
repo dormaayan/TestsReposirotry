@@ -1,0 +1,67 @@
+/** 
+ * @author Rob Winch
+ * @since 5.0
+ */
+@RunWith(MockitoJUnitRunner.class) public class ServerHttpSecurityTests {
+  @Mock private ServerSecurityContextRepository contextRepository;
+  @Mock private ReactiveAuthenticationManager authenticationManager;
+  @Mock private ServerCsrfTokenRepository csrfTokenRepository;
+  private ServerHttpSecurity http;
+  @Before public void setup(){
+    this.http=ServerHttpSecurityConfigurationBuilder.http().authenticationManager(this.authenticationManager);
+  }
+  @Test public void defaults(){
+    TestPublisher<SecurityContext> securityContext=TestPublisher.create();
+    when(this.contextRepository.load(any())).thenReturn(securityContext.mono());
+    this.http.securityContextRepository(this.contextRepository);
+    WebTestClient client=buildClient();
+    FluxExchangeResult<String> result=client.get().uri("/").exchange().expectHeader().valueMatches(HttpHeaders.CACHE_CONTROL,".+").returnResult(String.class);
+    assertThat(result.getResponseCookies()).isEmpty();
+    securityContext.assertWasNotSubscribed();
+  }
+  @Test public void basic(){
+    given(this.authenticationManager.authenticate(any())).willReturn(Mono.just(new TestingAuthenticationToken("rob","rob","ROLE_USER","ROLE_ADMIN")));
+    this.http.securityContextRepository(new WebSessionServerSecurityContextRepository());
+    this.http.httpBasic();
+    this.http.authenticationManager(this.authenticationManager);
+    ServerHttpSecurity.AuthorizeExchangeSpec authorize=this.http.authorizeExchange();
+    authorize.anyExchange().authenticated();
+    WebTestClient client=buildClient();
+    EntityExchangeResult<String> result=client.get().uri("/").headers(headers -> headers.setBasicAuth("rob","rob")).exchange().expectStatus().isOk().expectHeader().valueMatches(HttpHeaders.CACHE_CONTROL,".+").expectBody(String.class).consumeWith(b -> assertThat(b.getResponseBody()).isEqualTo("ok")).returnResult();
+    assertThat(result.getResponseCookies().getFirst("SESSION")).isNull();
+  }
+  @Test public void basicWhenNoCredentialsThenUnauthorized(){
+    this.http.authorizeExchange().anyExchange().authenticated();
+    WebTestClient client=buildClient();
+    client.get().uri("/").exchange().expectStatus().isUnauthorized().expectHeader().valueMatches(HttpHeaders.CACHE_CONTROL,".+").expectBody().isEmpty();
+  }
+  @Test public void buildWhenServerWebExchangeFromContextThenFound(){
+    SecurityWebFilterChain filter=this.http.build();
+    WebTestClient client=WebTestClient.bindToController(new SubscriberContextController()).webFilter(new WebFilterChainProxy(filter)).build();
+    client.get().uri("/foo/bar").exchange().expectBody(String.class).isEqualTo("/foo/bar");
+  }
+  @Test public void csrfServerLogoutHandlerNotAppliedIfCsrfIsntEnabled(){
+    SecurityWebFilterChain securityWebFilterChain=this.http.csrf().disable().build();
+    assertThat(getWebFilter(securityWebFilterChain,CsrfWebFilter.class)).isNotPresent();
+    Optional<ServerLogoutHandler> logoutHandler=getWebFilter(securityWebFilterChain,LogoutWebFilter.class).map(logoutWebFilter -> (ServerLogoutHandler)ReflectionTestUtils.getField(logoutWebFilter,LogoutWebFilter.class,"logoutHandler"));
+    assertThat(logoutHandler).get().isExactlyInstanceOf(SecurityContextServerLogoutHandler.class);
+  }
+  @Test public void csrfServerLogoutHandlerAppliedIfCsrfIsEnabled(){
+    SecurityWebFilterChain securityWebFilterChain=this.http.csrf().csrfTokenRepository(this.csrfTokenRepository).and().build();
+    assertThat(getWebFilter(securityWebFilterChain,CsrfWebFilter.class)).get().extracting(csrfWebFilter -> ReflectionTestUtils.getField(csrfWebFilter,"csrfTokenRepository")).isEqualTo(this.csrfTokenRepository);
+    Optional<ServerLogoutHandler> logoutHandler=getWebFilter(securityWebFilterChain,LogoutWebFilter.class).map(logoutWebFilter -> (ServerLogoutHandler)ReflectionTestUtils.getField(logoutWebFilter,LogoutWebFilter.class,"logoutHandler"));
+    assertThat(logoutHandler).get().isExactlyInstanceOf(DelegatingServerLogoutHandler.class).extracting(delegatingLogoutHandler -> ((List<ServerLogoutHandler>)ReflectionTestUtils.getField(delegatingLogoutHandler,DelegatingServerLogoutHandler.class,"delegates")).stream().map(ServerLogoutHandler::getClass).collect(Collectors.toList())).isEqualTo(Arrays.asList(SecurityContextServerLogoutHandler.class,CsrfServerLogoutHandler.class));
+  }
+  private <T extends WebFilter>Optional<T> getWebFilter(  SecurityWebFilterChain filterChain,  Class<T> filterClass){
+    return (Optional<T>)filterChain.getWebFilters().filter(Objects::nonNull).filter(filter -> filter.getClass().isAssignableFrom(filterClass)).singleOrEmpty().blockOptional();
+  }
+  private WebTestClient buildClient(){
+    WebFilterChainProxy springSecurityFilterChain=new WebFilterChainProxy(this.http.build());
+    return WebTestClientBuilder.bindToWebFilters(springSecurityFilterChain).build();
+  }
+@RestController private static class SubscriberContextController {
+    @GetMapping("/**") Mono<String> pathWithinApplicationFromContext(){
+      return Mono.subscriberContext().filter(c -> c.hasKey(ServerWebExchange.class)).map(c -> c.get(ServerWebExchange.class)).map(e -> e.getRequest().getPath().pathWithinApplication().value());
+    }
+  }
+}

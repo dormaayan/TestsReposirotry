@@ -1,0 +1,92 @@
+@Category({MasterTests.class,MediumTests.class}) public class TestProcedureSkipPersistence {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestProcedureSkipPersistence.class);
+  private ProcedureExecutor<ProcEnv> procExecutor;
+  private ProcedureStore procStore;
+  private HBaseCommonTestingUtility htu;
+  private FileSystem fs;
+  private Path testDir;
+  private Path logDir;
+  private static volatile int STEP=0;
+public class ProcEnv {
+    public ProcedureExecutor<ProcEnv> getProcedureExecutor(){
+      return procExecutor;
+    }
+  }
+public static class TestProcedure extends Procedure<ProcEnv> {
+    @Override protected boolean holdLock(    ProcEnv env){
+      return true;
+    }
+    @Override protected Procedure<ProcEnv>[] execute(    ProcEnv env) throws ProcedureYieldException, ProcedureSuspendedException, InterruptedException {
+      if (STEP == 0) {
+        STEP=1;
+        setTimeout(60 * 60 * 1000);
+        setState(ProcedureProtos.ProcedureState.WAITING_TIMEOUT);
+        skipPersistence();
+        throw new ProcedureSuspendedException();
+      }
+ else       if (STEP == 1) {
+        STEP=2;
+        if (hasTimeout()) {
+          setFailure("Should not persist the timeout value",new IOException("Should not persist the timeout value"));
+          return null;
+        }
+        setTimeout(2 * 1000);
+        setState(ProcedureProtos.ProcedureState.WAITING_TIMEOUT);
+        throw new ProcedureSuspendedException();
+      }
+ else {
+        if (!hasTimeout()) {
+          setFailure("Should have persisted the timeout value",new IOException("Should have persisted the timeout value"));
+        }
+        return null;
+      }
+    }
+    @Override protected synchronized boolean setTimeoutFailure(    ProcEnv env){
+      setState(ProcedureProtos.ProcedureState.RUNNABLE);
+      env.getProcedureExecutor().getProcedureScheduler().addFront(this);
+      return false;
+    }
+    @Override protected void rollback(    ProcEnv env) throws IOException, InterruptedException {
+      throw new UnsupportedOperationException();
+    }
+    @Override protected boolean abort(    ProcEnv env){
+      return false;
+    }
+    @Override protected void serializeStateData(    ProcedureStateSerializer serializer) throws IOException {
+    }
+    @Override protected void deserializeStateData(    ProcedureStateSerializer serializer) throws IOException {
+    }
+  }
+  @Before public void setUp() throws IOException {
+    htu=new HBaseCommonTestingUtility();
+    testDir=htu.getDataTestDir();
+    fs=testDir.getFileSystem(htu.getConfiguration());
+    assertTrue(testDir.depth() > 1);
+    logDir=new Path(testDir,"proc-logs");
+    procStore=ProcedureTestingUtility.createWalStore(htu.getConfiguration(),logDir);
+    procExecutor=new ProcedureExecutor<>(htu.getConfiguration(),new ProcEnv(),procStore);
+    procStore.start(1);
+    ProcedureTestingUtility.initAndStartWorkers(procExecutor,1,true);
+  }
+  @After public void tearDown() throws IOException {
+    procExecutor.stop();
+    procStore.stop(false);
+    fs.delete(logDir,true);
+  }
+  @Test public void test() throws Exception {
+    TestProcedure proc=new TestProcedure();
+    long procId=procExecutor.submitProcedure(proc);
+    htu.waitFor(30000,() -> proc.isWaiting());
+    ProcedureTestingUtility.restart(procExecutor);
+    htu.waitFor(30000,() -> {
+      Procedure<?> p=procExecutor.getProcedure(procId);
+      return p.isWaiting() || p.isFinished();
+    }
+);
+    assertFalse(procExecutor.isFinished(procId));
+    ProcedureTestingUtility.restart(procExecutor);
+    htu.waitFor(30000,() -> procExecutor.isFinished(procId));
+    Procedure<ProcEnv> p=procExecutor.getResult(procId);
+    assertTrue(p.isSuccess());
+  }
+}

@@ -1,0 +1,43 @@
+@Test(timeout=120000) public void testLeaseRenewAndDFSOutputStreamDeadLock() throws Exception {
+  CountDownLatch testLatch=new CountDownLatch(1);
+  DFSClientFaultInjector.set(new DFSClientFaultInjector(){
+    public void delayWhenRenewLeaseTimeout(){
+      try {
+        testLatch.await();
+      }
+ catch (      InterruptedException e) {
+        e.printStackTrace();
+      }
+    }
+  }
+);
+  String file1="/testFile1";
+  conf.setInt(DFS_CLIENT_SOCKET_TIMEOUT_KEY,1000);
+  MiniDFSCluster cluster=new MiniDFSCluster.Builder(conf).build();
+  try {
+    cluster.waitActive();
+    final NamenodeProtocols spyNN=spy(cluster.getNameNodeRpc());
+    doAnswer(new SleepFixedTimeAnswer(1500,testLatch)).when(spyNN).complete(anyString(),anyString(),any(ExtendedBlock.class),anyLong());
+    DFSClient client=new DFSClient(null,spyNN,conf,null);
+    LeaseRenewer leaseRenewer=client.getLeaseRenewer();
+    leaseRenewer.setRenewalTime(100);
+    final OutputStream out1=client.create(file1,false);
+    out1.write(new byte[256]);
+    Thread closeThread=new Thread(new Runnable(){
+      @Override public void run(){
+        try {
+          Mockito.doThrow(new SocketTimeoutException()).when(spyNN).renewLease(Mockito.anyString());
+        }
+ catch (        IOException e) {
+          e.printStackTrace();
+        }
+      }
+    }
+);
+    closeThread.start();
+    out1.close();
+  }
+  finally {
+    cluster.shutdown();
+  }
+}

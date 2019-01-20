@@ -1,0 +1,45 @@
+@Category({MiscTests.class,LargeTests.class}) public class TestFullLogReconstruction {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestFullLogReconstruction.class);
+  private final static HBaseTestingUtility TEST_UTIL=new HBaseTestingUtility();
+  private final static TableName TABLE_NAME=TableName.valueOf("tabletest");
+  private final static byte[] FAMILY=Bytes.toBytes("family");
+  @BeforeClass public static void setUpBeforeClass() throws Exception {
+    Configuration c=TEST_UTIL.getConfiguration();
+    c.setInt("dfs.namenode.heartbeat.recheck-interval",5000);
+    c.setInt("dfs.heartbeat.interval",1);
+    c.setInt("dfs.client.socket-timeout",5000);
+    c.setInt("hbase.ipc.client.connect.max.retries",1);
+    c.setInt("dfs.client.block.recovery.retries",1);
+    c.setInt(HConstants.ZK_SESSION_TIMEOUT,1000);
+    TEST_UTIL.startMiniCluster(3);
+  }
+  @AfterClass public static void tearDownAfterClass() throws Exception {
+    TEST_UTIL.shutdownMiniCluster();
+  }
+  /** 
+ * Test the whole reconstruction loop. Build a table with regions aaa to zzz and load every one of them multiple times with the same date and do a flush at some point. Kill one of the region servers and scan the table. We should see all the rows.
+ */
+  @Test public void testReconstruction() throws Exception {
+    Table table=TEST_UTIL.createMultiRegionTable(TABLE_NAME,FAMILY);
+    int initialCount=TEST_UTIL.loadTable(table,FAMILY);
+    int count=TEST_UTIL.countRows(table);
+    assertEquals(initialCount,count);
+    for (int i=0; i < 4; i++) {
+      TEST_UTIL.loadTable(table,FAMILY);
+    }
+    RegionServerThread rsThread=TEST_UTIL.getHBaseCluster().getRegionServerThreads().get(0);
+    TEST_UTIL.expireRegionServerSession(0);
+    TEST_UTIL.waitFor(30000,new ExplainingPredicate<Exception>(){
+      @Override public boolean evaluate() throws Exception {
+        return !rsThread.isAlive();
+      }
+      @Override public String explainFailure() throws Exception {
+        return rsThread.getRegionServer() + " is still alive";
+      }
+    }
+);
+    int newCount=TEST_UTIL.countRows(table);
+    assertEquals(count,newCount);
+    table.close();
+  }
+}

@@ -1,0 +1,41 @@
+@Test public void testUnionClosedBranchingTest() throws Exception {
+  ExecutionEnvironment env=ExecutionEnvironment.getExecutionEnvironment();
+  env.getConfig().setExecutionMode(executionMode);
+  env.setParallelism(4);
+  DataSet<Tuple1<Integer>> src1=env.fromElements(new Tuple1<>(0),new Tuple1<>(1));
+  DataSet<Tuple1<Integer>> src2=env.fromElements(new Tuple1<>(0),new Tuple1<>(1));
+  DataSet<Tuple1<Integer>> union=src1.union(src2);
+  DataSet<Tuple2<Integer,Integer>> join=union.join(union).where(0).equalTo(0).projectFirst(0).projectSecond(0);
+  join.output(new DiscardingOutputFormat<Tuple2<Integer,Integer>>());
+  OptimizedPlan optimizedPlan=compileNoStats(env.createProgramPlan());
+  SinkPlanNode sinkNode=optimizedPlan.getDataSinks().iterator().next();
+  DualInputPlanNode joinNode=(DualInputPlanNode)sinkNode.getPredecessor();
+  for (  Channel channel : joinNode.getInputs()) {
+    assertEquals("Unexpected data exchange mode between union and join node.",unionToJoin,channel.getDataExchangeMode());
+    assertEquals("Unexpected ship strategy between union and join node.",unionToJoinStrategy,channel.getShipStrategy());
+  }
+  for (  SourcePlanNode src : optimizedPlan.getDataSources()) {
+    for (    Channel channel : src.getOutgoingChannels()) {
+      assertEquals("Unexpected data exchange mode between source and union node.",sourceToUnion,channel.getDataExchangeMode());
+      assertEquals("Unexpected ship strategy between source and union node.",sourceToUnionStrategy,channel.getShipStrategy());
+    }
+  }
+  JobGraphGenerator jgg=new JobGraphGenerator();
+  JobGraph jobGraph=jgg.compileJobGraph(optimizedPlan);
+  List<JobVertex> vertices=jobGraph.getVerticesSortedTopologicallyFromSources();
+  assertEquals("Unexpected number of vertices created.",4,vertices.size());
+  JobVertex[] sources=new JobVertex[]{vertices.get(0),vertices.get(1)};
+  for (  JobVertex src : sources) {
+    assertTrue("Unexpected vertex type. Test setup is broken.",src.isInputVertex());
+    assertEquals("Unexpected number of created results.",2,src.getNumberOfProducedIntermediateDataSets());
+    for (    IntermediateDataSet dataSet : src.getProducedDataSets()) {
+      ResultPartitionType dsType=dataSet.getResultType();
+      if (!executionMode.equals(ExecutionMode.PIPELINED_FORCED)) {
+        assertTrue("Expected batch exchange, but result type is " + dsType + ".",dsType.isBlocking());
+      }
+ else {
+        assertFalse("Expected non-batch exchange, but result type is " + dsType + ".",dsType.isBlocking());
+      }
+    }
+  }
+}

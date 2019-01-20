@@ -1,0 +1,82 @@
+@Category({ReplicationTests.class,LargeTests.class}) public class TestReplicationKillRS extends TestReplicationBase {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestReplicationKillRS.class);
+  private static final Logger LOG=LoggerFactory.getLogger(TestReplicationKillRS.class);
+  /** 
+ * Load up 1 tables over 2 region servers and kill a source during the upload. The failover happens internally. WARNING this test sometimes fails because of HBASE-3515
+ */
+  public void loadTableAndKillRS(  HBaseTestingUtility util) throws Exception {
+    int rsToKill1=util.getHBaseCluster().getServerWithMeta() == 0 ? 1 : 0;
+    Thread killer=killARegionServer(util,5000,rsToKill1);
+    Result[] res;
+    int initialCount;
+    try (Connection conn=ConnectionFactory.createConnection(conf1)){
+      try (Table table=conn.getTable(tableName)){
+        LOG.info("Start loading table");
+        initialCount=utility1.loadTable(table,famName);
+        LOG.info("Done loading table");
+        killer.join(5000);
+        LOG.info("Done waiting for threads");
+        while (true) {
+          try (ResultScanner scanner=table.getScanner(new Scan())){
+            res=scanner.next(initialCount);
+            break;
+          }
+ catch (          UnknownScannerException ex) {
+            LOG.info("Cluster wasn't ready yet, restarting scanner");
+          }
+        }
+      }
+     }
+     if (res.length != initialCount) {
+      LOG.warn("We lost some rows on the master cluster!");
+      initialCount=res.length;
+    }
+    int lastCount=0;
+    final long start=System.currentTimeMillis();
+    int i=0;
+    try (Connection conn=ConnectionFactory.createConnection(conf2)){
+      try (Table table=conn.getTable(tableName)){
+        while (true) {
+          if (i == NB_RETRIES - 1) {
+            fail("Waited too much time for queueFailover replication. " + "Waited " + (System.currentTimeMillis() - start) + "ms.");
+          }
+          Result[] res2;
+          try (ResultScanner scanner=table.getScanner(new Scan())){
+            res2=scanner.next(initialCount * 2);
+          }
+           if (res2.length < initialCount) {
+            if (lastCount < res2.length) {
+              i--;
+            }
+ else {
+              i++;
+            }
+            lastCount=res2.length;
+            LOG.info("Only got " + lastCount + " rows instead of "+ initialCount+ " current i="+ i);
+            Thread.sleep(SLEEP_TIME * 2);
+          }
+ else {
+            break;
+          }
+        }
+      }
+     }
+   }
+  private static Thread killARegionServer(  final HBaseTestingUtility utility,  final long timeout,  final int rs){
+    Thread killer=new Thread(){
+      @Override public void run(){
+        try {
+          Thread.sleep(timeout);
+          utility.getHBaseCluster().getRegionServer(rs).stop("Stopping as part of the test");
+        }
+ catch (        Exception e) {
+          LOG.error("Couldn't kill a region server",e);
+        }
+      }
+    }
+;
+    killer.setDaemon(true);
+    killer.start();
+    return killer;
+  }
+}

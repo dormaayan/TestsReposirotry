@@ -1,0 +1,140 @@
+public class StoreCopyCheckPointMutexTest {
+  private static final ThrowingAction<IOException> ASSERT_NOT_CALLED=() -> fail("Should not be called");
+  @Rule public final OtherThreadRule<Void> t2=new OtherThreadRule<>("T2");
+  @Rule public final OtherThreadRule<Void> t3=new OtherThreadRule<>("T3");
+  private final StoreCopyCheckPointMutex mutex=new StoreCopyCheckPointMutex();
+  @Test public void checkPointShouldBlockStoreCopy() throws Exception {
+    try (Resource lock=mutex.checkPoint()){
+      t2.execute(state -> mutex.storeCopy(noop()));
+      t2.get().waitUntilWaiting(details -> details.isAt(StoreCopyCheckPointMutex.class,"storeCopy"));
+    }
+   }
+  @Test public void checkPointShouldBlockAnotherCheckPoint() throws Exception {
+    try (Resource lock=mutex.checkPoint()){
+      t2.execute(state -> mutex.checkPoint());
+      t2.get().waitUntilWaiting(details -> details.isAt(StoreCopyCheckPointMutex.class,"checkPoint"));
+    }
+   }
+  @Test public void storeCopyShouldBlockCheckPoint() throws Exception {
+    try (Resource lock=mutex.storeCopy(noop())){
+      t2.execute(state -> mutex.checkPoint());
+      t2.get().waitUntilWaiting(details -> details.isAt(StoreCopyCheckPointMutex.class,"checkPoint"));
+    }
+   }
+  @Test public void storeCopyShouldHaveTryCheckPointBackOff() throws Exception {
+    try (Resource lock=mutex.storeCopy(noop())){
+      assertNull(mutex.tryCheckPoint());
+    }
+   }
+  @Test public void storeCopyShouldAllowAnotherStoreCopy() throws Exception {
+    try (Resource lock=mutex.storeCopy(noop())){
+      try (Resource otherLock=mutex.storeCopy(noop())){
+      }
+     }
+   }
+  @Test public void storeCopyShouldAllowAnotherStoreCopyButOnlyFirstShouldPerformBeforeAction() throws Exception {
+    @SuppressWarnings("unchecked") ThrowingAction<IOException> action=mock(ThrowingAction.class);
+    try (Resource lock=mutex.storeCopy(action)){
+      verify(action,times(1)).apply();
+      try (Resource otherLock=mutex.storeCopy(action)){
+        verify(action,times(1)).apply();
+      }
+     }
+   }
+  @Test public void shouldHandleMultipleConcurrentStoreCopyWhenBeforeActionPerformsCheckPoint() throws Throwable {
+    CheckPointingAction checkPointingAction=new CheckPointingAction(mutex);
+    for (int i=0; i < 2; i++) {
+      Resource firstLock=mutex.storeCopy(checkPointingAction);
+      assertNotNull(checkPointingAction.lock);
+      Resource secondLock=mutex.storeCopy(checkPointingAction);
+      firstLock.close();
+      Resource thirdLock=mutex.storeCopy(checkPointingAction);
+      thirdLock.close();
+      secondLock.close();
+      checkPointingAction.unlock();
+    }
+  }
+  @Test public void shouldHandleMultipleConcurrentStoreCopyRequests() throws Throwable {
+    Race race=new Race();
+    CountingAction action=new CountingAction();
+    int threads=Runtime.getRuntime().availableProcessors() * 10;
+    race.addContestants(threads,throwing(() -> {
+      parkARandomWhile();
+      try (Resource lock=mutex.storeCopy(action)){
+        parkARandomWhile();
+      }
+     }
+));
+    race.go();
+    assertThat(action.count(),lessThan(threads));
+  }
+  @Test public void shouldPropagateStoreCopyActionFailureToOtherStoreCopyRequests() throws Exception {
+    Barrier.Control barrier=new Barrier.Control();
+    IOException controlledFailure=new IOException("My own fault");
+    AtomicReference<Future<Object>> secondRequest=new AtomicReference<>();
+    ThrowingAction<IOException> controllableAndFailingAction=() -> {
+      secondRequest.set(t3.execute(state -> mutex.storeCopy(ASSERT_NOT_CALLED)));
+      barrier.awaitUninterruptibly();
+      try {
+        throw controlledFailure;
+      }
+  finally {
+        barrier.release();
+      }
+    }
+;
+    Future<Object> firstRequest=t2.execute(state -> mutex.storeCopy(controllableAndFailingAction));
+    while (secondRequest.get() == null) {
+      parkARandomWhile();
+    }
+    t3.get().waitUntilWaiting(details -> details.isAt(StoreCopyCheckPointMutex.class,"waitForFirstStoreCopyActionToComplete"));
+    barrier.reached();
+    try {
+      firstRequest.get();
+    }
+ catch (    ExecutionException e) {
+      assertSame(controlledFailure,e.getCause());
+    }
+    try {
+      secondRequest.get().get();
+    }
+ catch (    ExecutionException e) {
+      Throwable cooperativeActionFailure=e.getCause();
+      assertThat(cooperativeActionFailure.getMessage(),containsString("Co-operative"));
+      assertSame(controlledFailure,cooperativeActionFailure.getCause());
+    }
+    CountingAction action=new CountingAction();
+    try (Resource lock=mutex.storeCopy(action)){
+      assertEquals(1,action.count());
+    }
+   }
+  private static void parkARandomWhile(){
+    LockSupport.parkNanos(MILLISECONDS.toNanos(ThreadLocalRandom.current().nextInt(10)));
+  }
+private static class CheckPointingAction implements ThrowingAction<IOException> {
+    private final StoreCopyCheckPointMutex mutex;
+    private Resource lock;
+    CheckPointingAction(    StoreCopyCheckPointMutex mutex){
+      this.mutex=mutex;
+    }
+    @Override public void apply(){
+      assertNull(lock);
+      lock=mutex.checkPoint();
+    }
+    void unlock(){
+      assertNotNull(lock);
+      lock.close();
+      lock=null;
+    }
+  }
+private static class CountingAction implements ThrowingAction<IOException> {
+    private final AtomicInteger count=new AtomicInteger();
+    @Override public void apply(){
+      parkARandomWhile();
+      count.incrementAndGet();
+    }
+    int count(){
+      return count.get();
+    }
+  }
+}

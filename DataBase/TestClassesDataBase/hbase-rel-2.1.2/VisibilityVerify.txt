@@ -1,0 +1,61 @@
+static class VisibilityVerify extends Verify {
+  private static final Logger LOG=LoggerFactory.getLogger(VisibilityVerify.class);
+  private TableName tableName;
+  private int labelIndex;
+  public VisibilityVerify(  String tableName,  int index){
+    this.tableName=TableName.valueOf(tableName);
+    this.labelIndex=index;
+  }
+  @Override public int run(  final Path outputDir,  final int numReducers) throws Exception {
+    LOG.info("Running Verify with outputDir=" + outputDir + ", numReducers="+ numReducers);
+    PrivilegedExceptionAction<Integer> scanAction=new PrivilegedExceptionAction<Integer>(){
+      @Override public Integer run() throws Exception {
+        return doVerify(outputDir,numReducers);
+      }
+    }
+;
+    return USER.runAs(scanAction);
+  }
+  private int doVerify(  Path outputDir,  int numReducers) throws IOException, InterruptedException, ClassNotFoundException {
+    job=new Job(getConf());
+    job.setJobName("Link Verifier");
+    job.setNumReduceTasks(numReducers);
+    job.setJarByClass(getClass());
+    setJobScannerConf(job);
+    Scan scan=new Scan();
+    scan.addColumn(FAMILY_NAME,COLUMN_PREV);
+    scan.setCaching(10000);
+    scan.setCacheBlocks(false);
+    String[] split=labels.split(COMMA);
+    scan.setAuthorizations(new Authorizations(split[this.labelIndex * 2],split[(this.labelIndex * 2) + 1]));
+    TableMapReduceUtil.initTableMapperJob(tableName.getName(),scan,VerifyMapper.class,BytesWritable.class,BytesWritable.class,job);
+    TableMapReduceUtil.addDependencyJars(job.getConfiguration(),AbstractHBaseTool.class);
+    job.getConfiguration().setBoolean("mapreduce.map.speculative",false);
+    job.setReducerClass(VerifyReducer.class);
+    job.setOutputFormatClass(TextOutputFormat.class);
+    TextOutputFormat.setOutputPath(job,outputDir);
+    boolean success=job.waitForCompletion(true);
+    return success ? 0 : 1;
+  }
+  @Override protected void handleFailure(  Counters counters) throws IOException {
+    Configuration conf=job.getConfiguration();
+    ClusterConnection conn=(ClusterConnection)ConnectionFactory.createConnection(conf);
+    TableName tableName=TableName.valueOf(COMMON_TABLE_NAME);
+    CounterGroup g=counters.getGroup("undef");
+    Iterator<Counter> it=g.iterator();
+    while (it.hasNext()) {
+      String keyString=it.next().getName();
+      byte[] key=Bytes.toBytes(keyString);
+      HRegionLocation loc=conn.relocateRegion(tableName,key);
+      LOG.error("undefined row " + keyString + ", "+ loc);
+    }
+    g=counters.getGroup("unref");
+    it=g.iterator();
+    while (it.hasNext()) {
+      String keyString=it.next().getName();
+      byte[] key=Bytes.toBytes(keyString);
+      HRegionLocation loc=conn.relocateRegion(tableName,key);
+      LOG.error("unreferred row " + keyString + ", "+ loc);
+    }
+  }
+}

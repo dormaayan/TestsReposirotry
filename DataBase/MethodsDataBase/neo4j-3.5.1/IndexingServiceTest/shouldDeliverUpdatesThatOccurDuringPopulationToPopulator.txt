@@ -1,0 +1,46 @@
+@SuppressWarnings("unchecked") @Test public void shouldDeliverUpdatesThatOccurDuringPopulationToPopulator() throws Exception {
+  when(populator.newPopulatingUpdater(storeView)).thenReturn(updater);
+  CountDownLatch populationLatch=new CountDownLatch(1);
+  Barrier.Control populationStartBarrier=new Barrier.Control();
+  IndexingService.Monitor monitor=new IndexingService.MonitorAdapter(){
+    @Override public void indexPopulationScanStarting(){
+      populationStartBarrier.reached();
+    }
+    @Override public void indexPopulationScanComplete(){
+      try {
+        populationLatch.await();
+      }
+ catch (      InterruptedException e) {
+        Thread.currentThread().interrupt();
+        throw new RuntimeException("Index population monitor was interrupted",e);
+      }
+    }
+  }
+;
+  IndexingService indexingService=newIndexingServiceWithMockedDependencies(populator,accessor,withData(addNodeUpdate(1,"value1")),monitor);
+  life.start();
+  indexingService.createIndexes(index.withId(0));
+  IndexProxy proxy=indexingService.getIndexProxy(0);
+  assertEquals(InternalIndexState.POPULATING,proxy.getState());
+  populationStartBarrier.await();
+  populationStartBarrier.release();
+  IndexEntryUpdate<?> value2=add(2,"value2");
+  try (IndexUpdater updater=proxy.newUpdater(IndexUpdateMode.ONLINE)){
+    updater.process(value2);
+  }
+   populationLatch.countDown();
+  waitForIndexesToComeOnline(indexingService,0);
+  verify(populator).close(true);
+  assertEquals(InternalIndexState.ONLINE,proxy.getState());
+  InOrder order=inOrder(populator,accessor,updater);
+  order.verify(populator).create();
+  order.verify(populator).includeSample(add(1,"value1"));
+  order.verify(populator,times(3)).add(any(Collection.class));
+  order.verify(populator).newPopulatingUpdater(storeView);
+  order.verify(updater).close();
+  order.verify(populator).sampleResult();
+  order.verify(populator).close(true);
+  verifyNoMoreInteractions(updater);
+  verifyNoMoreInteractions(populator);
+  verifyZeroInteractions(accessor);
+}

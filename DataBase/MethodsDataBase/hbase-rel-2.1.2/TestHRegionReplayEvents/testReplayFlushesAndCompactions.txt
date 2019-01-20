@@ -1,0 +1,79 @@
+@Test public void testReplayFlushesAndCompactions() throws IOException {
+  putDataWithFlushes(primaryRegion,100,300,100);
+  LOG.info("-- Compacting primary, only 1 store");
+  primaryRegion.compactStore(Bytes.toBytes("cf1"),NoLimitThroughputController.INSTANCE);
+  reader=createWALReaderForPrimary();
+  LOG.info("-- Replaying edits and flush events in secondary");
+  int lastReplayed=0;
+  int expectedStoreFileCount=0;
+  while (true) {
+    WAL.Entry entry=reader.next();
+    if (entry == null) {
+      break;
+    }
+    FlushDescriptor flushDesc=WALEdit.getFlushDescriptor(entry.getEdit().getCells().get(0));
+    CompactionDescriptor compactionDesc=WALEdit.getCompaction(entry.getEdit().getCells().get(0));
+    if (flushDesc != null) {
+      verifyData(secondaryRegion,0,lastReplayed,cq,families);
+      HStore store=secondaryRegion.getStore(Bytes.toBytes("cf1"));
+      long storeMemstoreSize=store.getMemStoreSize().getHeapSize();
+      long regionMemstoreSize=secondaryRegion.getMemStoreDataSize();
+      MemStoreSize mss=store.getFlushableSize();
+      long storeSize=store.getSize();
+      long storeSizeUncompressed=store.getStoreSizeUncompressed();
+      if (flushDesc.getAction() == FlushAction.START_FLUSH) {
+        LOG.info("-- Replaying flush start in secondary");
+        PrepareFlushResult result=secondaryRegion.replayWALFlushStartMarker(flushDesc);
+        assertNull(result.result);
+        assertEquals(result.flushOpSeqId,flushDesc.getFlushSequenceNumber());
+        long newStoreMemstoreSize=store.getMemStoreSize().getHeapSize();
+        LOG.info("Memstore size reduced by:" + StringUtils.humanReadableInt(newStoreMemstoreSize - storeMemstoreSize));
+        assertTrue(storeMemstoreSize > newStoreMemstoreSize);
+      }
+ else       if (flushDesc.getAction() == FlushAction.COMMIT_FLUSH) {
+        LOG.info("-- Replaying flush commit in secondary");
+        secondaryRegion.replayWALFlushCommitMarker(flushDesc);
+        expectedStoreFileCount++;
+        for (        HStore s : secondaryRegion.getStores()) {
+          assertEquals(expectedStoreFileCount,s.getStorefilesCount());
+        }
+        MemStoreSize newMss=store.getFlushableSize();
+        assertTrue(mss.getHeapSize() > newMss.getHeapSize());
+        long newRegionMemstoreSize=secondaryRegion.getMemStoreDataSize();
+        assertTrue(regionMemstoreSize > newRegionMemstoreSize);
+        assertTrue(store.getSize() > storeSize);
+        assertTrue(store.getStoreSizeUncompressed() > storeSizeUncompressed);
+        assertEquals(store.getSize(),store.getStorefilesSize());
+      }
+      verifyData(secondaryRegion,0,lastReplayed + 1,cq,families);
+    }
+ else     if (compactionDesc != null) {
+      secondaryRegion.replayWALCompactionMarker(compactionDesc,true,false,Long.MAX_VALUE);
+      for (      HStore store : secondaryRegion.getStores()) {
+        if (store.getColumnFamilyName().equals("cf1")) {
+          assertEquals(1,store.getStorefilesCount());
+        }
+ else {
+          assertEquals(expectedStoreFileCount,store.getStorefilesCount());
+        }
+      }
+    }
+ else {
+      lastReplayed=replayEdit(secondaryRegion,entry);
+      ;
+    }
+  }
+  assertEquals(400 - 1,lastReplayed);
+  LOG.info("-- Verifying edits from secondary");
+  verifyData(secondaryRegion,0,400,cq,families);
+  LOG.info("-- Verifying edits from primary. Ensuring that files are not deleted");
+  verifyData(primaryRegion,0,lastReplayed,cq,families);
+  for (  HStore store : primaryRegion.getStores()) {
+    if (store.getColumnFamilyName().equals("cf1")) {
+      assertEquals(1,store.getStorefilesCount());
+    }
+ else {
+      assertEquals(expectedStoreFileCount,store.getStorefilesCount());
+    }
+  }
+}

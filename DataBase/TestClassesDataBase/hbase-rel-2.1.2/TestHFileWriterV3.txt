@@ -1,0 +1,151 @@
+/** 
+ * Testing writing a version 3  {@link HFile}.
+ */
+@RunWith(Parameterized.class) @Category({IOTests.class,SmallTests.class}) public class TestHFileWriterV3 {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestHFileWriterV3.class);
+  private static final Logger LOG=LoggerFactory.getLogger(TestHFileWriterV3.class);
+  private static final HBaseTestingUtility TEST_UTIL=new HBaseTestingUtility();
+  private Configuration conf;
+  private FileSystem fs;
+  private boolean useTags;
+  public TestHFileWriterV3(  boolean useTags){
+    this.useTags=useTags;
+  }
+  @Parameters public static Collection<Object[]> parameters(){
+    return HBaseCommonTestingUtility.BOOLEAN_PARAMETERIZED;
+  }
+  @Before public void setUp() throws IOException {
+    conf=TEST_UTIL.getConfiguration();
+    fs=FileSystem.get(conf);
+  }
+  @Test public void testHFileFormatV3() throws IOException {
+    testHFileFormatV3Internals(useTags);
+  }
+  private void testHFileFormatV3Internals(  boolean useTags) throws IOException {
+    Path hfilePath=new Path(TEST_UTIL.getDataTestDir(),"testHFileFormatV3");
+    final Compression.Algorithm compressAlgo=Compression.Algorithm.GZ;
+    final int entryCount=10000;
+    writeDataAndReadFromHFile(hfilePath,compressAlgo,entryCount,false,useTags);
+  }
+  @Test public void testMidKeyInHFile() throws IOException {
+    testMidKeyInHFileInternals(useTags);
+  }
+  private void testMidKeyInHFileInternals(  boolean useTags) throws IOException {
+    Path hfilePath=new Path(TEST_UTIL.getDataTestDir(),"testMidKeyInHFile");
+    Compression.Algorithm compressAlgo=Compression.Algorithm.NONE;
+    int entryCount=50000;
+    writeDataAndReadFromHFile(hfilePath,compressAlgo,entryCount,true,useTags);
+  }
+  private void writeDataAndReadFromHFile(  Path hfilePath,  Algorithm compressAlgo,  int entryCount,  boolean findMidKey,  boolean useTags) throws IOException {
+    HFileContext context=new HFileContextBuilder().withBlockSize(4096).withIncludesTags(useTags).withCompression(compressAlgo).build();
+    HFile.Writer writer=new HFile.WriterFactory(conf,new CacheConfig(conf)).withPath(fs,hfilePath).withFileContext(context).withComparator(CellComparatorImpl.COMPARATOR).create();
+    Random rand=new Random(9713312);
+    List<KeyValue> keyValues=new ArrayList<>(entryCount);
+    for (int i=0; i < entryCount; ++i) {
+      byte[] keyBytes=RandomKeyValueUtil.randomOrderedKey(rand,i);
+      byte[] valueBytes=RandomKeyValueUtil.randomValue(rand);
+      KeyValue keyValue=null;
+      if (useTags) {
+        ArrayList<Tag> tags=new ArrayList<>();
+        for (int j=0; j < 1 + rand.nextInt(4); j++) {
+          byte[] tagBytes=new byte[16];
+          rand.nextBytes(tagBytes);
+          tags.add(new ArrayBackedTag((byte)1,tagBytes));
+        }
+        keyValue=new KeyValue(keyBytes,null,null,HConstants.LATEST_TIMESTAMP,valueBytes,tags);
+      }
+ else {
+        keyValue=new KeyValue(keyBytes,null,null,HConstants.LATEST_TIMESTAMP,valueBytes);
+      }
+      writer.append(keyValue);
+      keyValues.add(keyValue);
+    }
+    writer.appendMetaBlock("CAPITAL_OF_USA",new Text("Washington, D.C."));
+    writer.appendMetaBlock("CAPITAL_OF_RUSSIA",new Text("Moscow"));
+    writer.appendMetaBlock("CAPITAL_OF_FRANCE",new Text("Paris"));
+    writer.close();
+    FSDataInputStream fsdis=fs.open(hfilePath);
+    long fileSize=fs.getFileStatus(hfilePath).getLen();
+    FixedFileTrailer trailer=FixedFileTrailer.readFromStream(fsdis,fileSize);
+    assertEquals(3,trailer.getMajorVersion());
+    assertEquals(entryCount,trailer.getEntryCount());
+    HFileContext meta=new HFileContextBuilder().withCompression(compressAlgo).withIncludesMvcc(false).withIncludesTags(useTags).withHBaseCheckSum(true).build();
+    HFileBlock.FSReader blockReader=new HFileBlock.FSReaderImpl(fsdis,fileSize,meta);
+    CellComparator comparator=trailer.createComparator();
+    HFileBlockIndex.BlockIndexReader dataBlockIndexReader=new HFileBlockIndex.CellBasedKeyBlockIndexReader(comparator,trailer.getNumDataIndexLevels());
+    HFileBlockIndex.BlockIndexReader metaBlockIndexReader=new HFileBlockIndex.ByteArrayKeyBlockIndexReader(1);
+    HFileBlock.BlockIterator blockIter=blockReader.blockRange(trailer.getLoadOnOpenDataOffset(),fileSize - trailer.getTrailerSize());
+    dataBlockIndexReader.readMultiLevelIndexRoot(blockIter.nextBlockWithBlockType(BlockType.ROOT_INDEX),trailer.getDataIndexCount());
+    if (findMidKey) {
+      Cell midkey=dataBlockIndexReader.midkey();
+      assertNotNull("Midkey should not be null",midkey);
+    }
+    metaBlockIndexReader.readRootIndex(blockIter.nextBlockWithBlockType(BlockType.ROOT_INDEX).getByteStream(),trailer.getMetaIndexCount());
+    FileInfo fileInfo=new FileInfo();
+    fileInfo.read(blockIter.nextBlockWithBlockType(BlockType.FILE_INFO).getByteStream());
+    byte[] keyValueFormatVersion=fileInfo.get(HFileWriterImpl.KEY_VALUE_VERSION);
+    boolean includeMemstoreTS=keyValueFormatVersion != null && Bytes.toInt(keyValueFormatVersion) > 0;
+    int entriesRead=0;
+    int blocksRead=0;
+    long memstoreTS=0;
+    fsdis.seek(0);
+    long curBlockPos=0;
+    while (curBlockPos <= trailer.getLastDataBlockOffset()) {
+      HFileBlock block=blockReader.readBlockData(curBlockPos,-1,false,false).unpack(context,blockReader);
+      assertEquals(BlockType.DATA,block.getBlockType());
+      ByteBuff buf=block.getBufferWithoutHeader();
+      int keyLen=-1;
+      while (buf.hasRemaining()) {
+        keyLen=buf.getInt();
+        int valueLen=buf.getInt();
+        byte[] key=new byte[keyLen];
+        buf.get(key);
+        byte[] value=new byte[valueLen];
+        buf.get(value);
+        byte[] tagValue=null;
+        if (useTags) {
+          int tagLen=((buf.get() & 0xff) << 8) ^ (buf.get() & 0xff);
+          tagValue=new byte[tagLen];
+          buf.get(tagValue);
+        }
+        if (includeMemstoreTS) {
+          ByteArrayInputStream byte_input=new ByteArrayInputStream(buf.array(),buf.arrayOffset() + buf.position(),buf.remaining());
+          DataInputStream data_input=new DataInputStream(byte_input);
+          memstoreTS=WritableUtils.readVLong(data_input);
+          buf.position(buf.position() + WritableUtils.getVIntSize(memstoreTS));
+        }
+        KeyValue kv=keyValues.get(entriesRead);
+        assertTrue(Bytes.compareTo(key,kv.getKey()) == 0);
+        assertTrue(Bytes.compareTo(value,0,value.length,kv.getValueArray(),kv.getValueOffset(),kv.getValueLength()) == 0);
+        if (useTags) {
+          assertNotNull(tagValue);
+          KeyValue tkv=kv;
+          assertEquals(tagValue.length,tkv.getTagsLength());
+          assertTrue(Bytes.compareTo(tagValue,0,tagValue.length,tkv.getTagsArray(),tkv.getTagsOffset(),tkv.getTagsLength()) == 0);
+        }
+        ++entriesRead;
+      }
+      ++blocksRead;
+      curBlockPos+=block.getOnDiskSizeWithHeader();
+    }
+    LOG.info("Finished reading: entries=" + entriesRead + ", blocksRead="+ blocksRead);
+    assertEquals(entryCount,entriesRead);
+    int metaCounter=0;
+    while (fsdis.getPos() < trailer.getLoadOnOpenDataOffset()) {
+      LOG.info("Current offset: " + fsdis.getPos() + ", scanning until "+ trailer.getLoadOnOpenDataOffset());
+      HFileBlock block=blockReader.readBlockData(curBlockPos,-1,false,false).unpack(context,blockReader);
+      assertEquals(BlockType.META,block.getBlockType());
+      Text t=new Text();
+      ByteBuff buf=block.getBufferWithoutHeader();
+      if (Writables.getWritable(buf.array(),buf.arrayOffset(),buf.limit(),t) == null) {
+        throw new IOException("Failed to deserialize block " + this + " into a "+ t.getClass().getSimpleName());
+      }
+      Text expectedText=(metaCounter == 0 ? new Text("Paris") : metaCounter == 1 ? new Text("Moscow") : new Text("Washington, D.C."));
+      assertEquals(expectedText,t);
+      LOG.info("Read meta block data: " + t);
+      ++metaCounter;
+      curBlockPos+=block.getOnDiskSizeWithHeader();
+    }
+    fsdis.close();
+  }
+}

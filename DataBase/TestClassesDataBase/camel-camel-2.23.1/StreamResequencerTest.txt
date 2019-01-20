@@ -1,0 +1,90 @@
+public class StreamResequencerTest extends ContextTestSupport {
+  protected void sendBodyAndHeader(  String endpointUri,  final Object body,  final String headerName,  final Object headerValue){
+    template.send(endpointUri,new Processor(){
+      public void process(      Exchange exchange){
+        Message in=exchange.getIn();
+        in.setBody(body);
+        in.setHeader(headerName,headerValue);
+        in.setHeader("testCase",getName());
+      }
+    }
+);
+  }
+  @Test public void testSendMessagesInWrongOrderButReceiveThemInCorrectOrder() throws Exception {
+    getMockEndpoint("mock:result").expectedBodiesReceived("msg1","msg2","msg3","msg4");
+    sendBodyAndHeader("direct:start","msg4","seqnum",4L);
+    sendBodyAndHeader("direct:start","msg1","seqnum",1L);
+    sendBodyAndHeader("direct:start","msg3","seqnum",3L);
+    sendBodyAndHeader("direct:start","msg2","seqnum",2L);
+    assertMockEndpointsSatisfied();
+  }
+  @Test public void testMultithreaded() throws Exception {
+    int numMessages=100;
+    Object[] bodies=new Object[numMessages];
+    for (int i=0; i < numMessages; i++) {
+      bodies[i]="msg" + i;
+    }
+    getMockEndpoint("mock:result").expectedBodiesReceived(bodies);
+    getMockEndpoint("mock:result").setResultWaitTime(20000);
+    ProducerTemplate producerTemplate=context.createProducerTemplate();
+    ProducerTemplate producerTemplate2=context.createProducerTemplate();
+    ExecutorService service=context.getExecutorServiceManager().newFixedThreadPool(this,getName(),2);
+    service.execute(new Sender(producerTemplate,0,numMessages,2));
+    service.execute(new Sender(producerTemplate2,1,numMessages,2));
+    assertMockEndpointsSatisfied();
+    ServiceHelper.stopServices(producerTemplate,producerTemplate2);
+  }
+  @Override protected boolean useJmx(){
+    boolean enable="testStreamResequencerTypeWithJmx".equals(getName());
+    log.info("Going to {} JMX for the test {}",enable ? "enable" : "disable",getName());
+    return enable;
+  }
+  protected RouteBuilder createRouteBuilder(){
+    return new RouteBuilder(){
+      public void configure(){
+        from("direct:start").resequence(header("seqnum")).stream().timeout(100).deliveryAttemptInterval(10).to("mock:result");
+      }
+    }
+;
+  }
+  @Test public void testStreamResequencerTypeWithJmx() throws Exception {
+    doTestStreamResequencerType();
+  }
+  @Test public void testStreamResequencerTypeWithoutJmx() throws Exception {
+    doTestStreamResequencerType();
+  }
+  protected void doTestStreamResequencerType() throws Exception {
+    List<Route> list=getRouteList(createRouteBuilder());
+    assertEquals("Number of routes created: " + list,1,list.size());
+    Route route=list.get(0);
+    EventDrivenConsumerRoute consumerRoute=assertIsInstanceOf(EventDrivenConsumerRoute.class,route);
+    Channel channel=unwrapChannel(consumerRoute.getProcessor());
+    assertIsInstanceOf(DefaultErrorHandler.class,channel.getErrorHandler());
+    assertIsInstanceOf(StreamResequencer.class,channel.getNextProcessor());
+  }
+private static class Sender implements Runnable {
+    private final ProducerTemplate template;
+    private final int start;
+    private final int end;
+    private final int increment;
+    private final Random random;
+    Sender(    ProducerTemplate template,    int start,    int end,    int increment){
+      this.template=template;
+      this.start=start;
+      this.end=end;
+      this.increment=increment;
+      random=new Random();
+    }
+    @Override public void run(){
+      for (long i=start; i < end; i+=increment) {
+        try {
+          Thread.sleep(random.nextInt(20));
+        }
+ catch (        InterruptedException e) {
+          Thread.currentThread().interrupt();
+        }
+        template.sendBodyAndHeader("direct:start","msg" + i,"seqnum",i);
+      }
+    }
+  }
+}

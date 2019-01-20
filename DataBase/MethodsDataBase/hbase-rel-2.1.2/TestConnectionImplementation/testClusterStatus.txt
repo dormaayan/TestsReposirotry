@@ -1,0 +1,39 @@
+@Ignore @Test(expected=RegionServerStoppedException.class) public void testClusterStatus() throws Exception {
+  final TableName tableName=TableName.valueOf(name.getMethodName());
+  byte[] cf="cf".getBytes();
+  byte[] rk="rk1".getBytes();
+  JVMClusterUtil.RegionServerThread rs=TEST_UTIL.getHBaseCluster().startRegionServer();
+  rs.waitForServerOnline();
+  final ServerName sn=rs.getRegionServer().getServerName();
+  Table t=TEST_UTIL.createTable(tableName,cf);
+  TEST_UTIL.waitTableAvailable(tableName);
+  TEST_UTIL.waitUntilNoRegionsInTransition();
+  final ConnectionImplementation hci=(ConnectionImplementation)TEST_UTIL.getConnection();
+  try (RegionLocator l=TEST_UTIL.getConnection().getRegionLocator(tableName)){
+    while (l.getRegionLocation(rk).getPort() != sn.getPort()) {
+      TEST_UTIL.getAdmin().move(l.getRegionLocation(rk).getRegionInfo().getEncodedNameAsBytes(),Bytes.toBytes(sn.toString()));
+      TEST_UTIL.waitUntilNoRegionsInTransition();
+      hci.clearRegionCache(tableName);
+    }
+    Assert.assertNotNull(hci.clusterStatusListener);
+    TEST_UTIL.assertRegionOnServer(l.getRegionLocation(rk).getRegionInfo(),sn,20000);
+  }
+   Put p1=new Put(rk);
+  p1.addColumn(cf,"qual".getBytes(),"val".getBytes());
+  t.put(p1);
+  rs.getRegionServer().abort("I'm dead");
+  TEST_UTIL.waitFor(40000,1000,true,new Waiter.Predicate<Exception>(){
+    @Override public boolean evaluate() throws Exception {
+      return TEST_UTIL.getHBaseCluster().getMaster().getServerManager().getDeadServers().isDeadServer(sn);
+    }
+  }
+);
+  TEST_UTIL.waitFor(40000,1000,true,new Waiter.Predicate<Exception>(){
+    @Override public boolean evaluate() throws Exception {
+      return hci.clusterStatusListener.isDeadServer(sn);
+    }
+  }
+);
+  t.close();
+  hci.getClient(sn);
+}

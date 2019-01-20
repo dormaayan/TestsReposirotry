@@ -1,0 +1,97 @@
+@Category({MasterTests.class,MediumTests.class}) public class TestStochasticLoadBalancerRegionReplica extends BalancerTestBase {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestStochasticLoadBalancerRegionReplica.class);
+  @Test public void testReplicaCost(){
+    Configuration conf=HBaseConfiguration.create();
+    StochasticLoadBalancer.CostFunction costFunction=new StochasticLoadBalancer.RegionReplicaHostCostFunction(conf);
+    for (    int[] mockCluster : clusterStateMocks) {
+      BaseLoadBalancer.Cluster cluster=mockCluster(mockCluster);
+      costFunction.init(cluster);
+      double cost=costFunction.cost();
+      assertTrue(cost >= 0);
+      assertTrue(cost <= 1.01);
+    }
+  }
+  @Test public void testReplicaCostForReplicas(){
+    Configuration conf=HBaseConfiguration.create();
+    StochasticLoadBalancer.CostFunction costFunction=new StochasticLoadBalancer.RegionReplicaHostCostFunction(conf);
+    int[] servers=new int[]{3,3,3,3,3};
+    TreeMap<ServerName,List<RegionInfo>> clusterState=mockClusterServers(servers);
+    BaseLoadBalancer.Cluster cluster;
+    cluster=new BaseLoadBalancer.Cluster(clusterState,null,null,null);
+    costFunction.init(cluster);
+    double costWithoutReplicas=costFunction.cost();
+    assertEquals(0,costWithoutReplicas,0);
+    RegionInfo replica1=RegionReplicaUtil.getRegionInfoForReplica(clusterState.firstEntry().getValue().get(0),1);
+    clusterState.lastEntry().getValue().add(replica1);
+    cluster=new BaseLoadBalancer.Cluster(clusterState,null,null,null);
+    costFunction.init(cluster);
+    double costWith1ReplicaDifferentServer=costFunction.cost();
+    assertEquals(0,costWith1ReplicaDifferentServer,0);
+    RegionInfo replica2=RegionReplicaUtil.getRegionInfoForReplica(replica1,2);
+    clusterState.lastEntry().getValue().add(replica2);
+    cluster=new BaseLoadBalancer.Cluster(clusterState,null,null,null);
+    costFunction.init(cluster);
+    double costWith1ReplicaSameServer=costFunction.cost();
+    assertTrue(costWith1ReplicaDifferentServer < costWith1ReplicaSameServer);
+    RegionInfo replica3;
+    Iterator<Entry<ServerName,List<RegionInfo>>> it;
+    Entry<ServerName,List<RegionInfo>> entry;
+    clusterState=mockClusterServers(servers);
+    it=clusterState.entrySet().iterator();
+    entry=it.next();
+    RegionInfo hri=entry.getValue().get(0);
+    replica1=RegionReplicaUtil.getRegionInfoForReplica(hri,1);
+    replica2=RegionReplicaUtil.getRegionInfoForReplica(hri,2);
+    replica3=RegionReplicaUtil.getRegionInfoForReplica(hri,3);
+    entry.getValue().add(replica1);
+    entry.getValue().add(replica2);
+    it.next().getValue().add(replica3);
+    cluster=new BaseLoadBalancer.Cluster(clusterState,null,null,null);
+    costFunction.init(cluster);
+    double costWith3ReplicasSameServer=costFunction.cost();
+    clusterState=mockClusterServers(servers);
+    hri=clusterState.firstEntry().getValue().get(0);
+    replica1=RegionReplicaUtil.getRegionInfoForReplica(hri,1);
+    replica2=RegionReplicaUtil.getRegionInfoForReplica(hri,2);
+    replica3=RegionReplicaUtil.getRegionInfoForReplica(hri,3);
+    clusterState.firstEntry().getValue().add(replica1);
+    clusterState.lastEntry().getValue().add(replica2);
+    clusterState.lastEntry().getValue().add(replica3);
+    cluster=new BaseLoadBalancer.Cluster(clusterState,null,null,null);
+    costFunction.init(cluster);
+    double costWith2ReplicasOnTwoServers=costFunction.cost();
+    assertTrue(costWith2ReplicasOnTwoServers < costWith3ReplicasSameServer);
+  }
+  @Test public void testNeedsBalanceForColocatedReplicas(){
+    List<RegionInfo> regions=randomRegions(1);
+    ServerName s1=ServerName.valueOf("host1",1000,11111);
+    ServerName s2=ServerName.valueOf("host11",1000,11111);
+    Map<ServerName,List<RegionInfo>> map=new HashMap<>();
+    map.put(s1,regions);
+    regions.add(RegionReplicaUtil.getRegionInfoForReplica(regions.get(0),1));
+    regions=randomRegions(1);
+    map.put(s2,regions);
+    assertTrue(loadBalancer.needsBalance(new Cluster(map,null,null,null)));
+    map.clear();
+    regions=randomRegions(1);
+    List<RegionInfo> regionsOnS2=new ArrayList<>(1);
+    regionsOnS2.add(RegionReplicaUtil.getRegionInfoForReplica(regions.get(0),1));
+    map.put(s1,regions);
+    map.put(s2,regionsOnS2);
+    map.put(ServerName.valueOf("host2",1000,11111),randomRegions(1));
+    assertTrue(loadBalancer.needsBalance(new Cluster(map,null,null,new ForTestRackManagerOne())));
+  }
+  @Test public void testRegionReplicasOnSmallCluster(){
+    int numNodes=10;
+    int numRegions=1000;
+    int replication=3;
+    int numRegionsPerServer=80;
+    int numTables=10;
+    testWithCluster(numNodes,numRegions,numRegionsPerServer,replication,numTables,true,true);
+  }
+private static class ForTestRackManagerOne extends RackManager {
+    @Override public String getRack(    ServerName server){
+      return server.getHostname().endsWith("1") ? "rack1" : "rack2";
+    }
+  }
+}

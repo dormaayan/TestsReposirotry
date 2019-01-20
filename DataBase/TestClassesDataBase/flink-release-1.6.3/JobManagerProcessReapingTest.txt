@@ -1,0 +1,131 @@
+/** 
+ * Tests that the JobManager process properly exits when the JobManager actor dies.
+ */
+public class JobManagerProcessReapingTest extends TestLogger {
+  @Test public void testReapProcessOnFailure(){
+    Process jmProcess=null;
+    ActorSystem localSystem=null;
+    final StringWriter processOutput=new StringWriter();
+    try {
+      String javaCommand=getJavaCommandPath();
+      if (javaCommand == null) {
+        System.out.println("---- Skipping JobManagerProcessReapingTest : Could not find java executable ----");
+        return;
+      }
+      File tempLogFile=File.createTempFile("testlogconfig","properties");
+      tempLogFile.deleteOnExit();
+      CommonTestUtils.printLog4jDebugConfig(tempLogFile);
+      String[] command=new String[]{javaCommand,"-Dlog.level=DEBUG","-Dlog4j.configuration=file:" + tempLogFile.getAbsolutePath(),"-Xms256m","-Xmx256m","-classpath",getCurrentClasspath(),JobManagerTestEntryPoint.class.getName()};
+      ProcessBuilder bld=new ProcessBuilder(command);
+      jmProcess=bld.start();
+      new PipeForwarder(jmProcess.getErrorStream(),processOutput);
+      Tuple2<String,Object> localAddress=new Tuple2<String,Object>("localhost",0);
+      localSystem=AkkaUtils.createActorSystem(new Configuration(),new Some<Tuple2<String,Object>>(localAddress));
+      ActorRef jobManagerRef=null;
+      Throwable lastError=null;
+      String pattern="Starting JobManager at [^:]*://flink@[^:]*:(\\d*)/";
+      Pattern r=Pattern.compile(pattern);
+      int jobManagerPort=-1;
+      for (int i=0; i < 40; i++) {
+        Matcher m=r.matcher(processOutput.toString());
+        if (m.find()) {
+          jobManagerPort=Integer.parseInt(m.group(1));
+          break;
+        }
+        Thread.sleep(500);
+      }
+      if (jobManagerPort != -1) {
+        try {
+          final String jobManagerAkkaUrl=AkkaRpcServiceUtils.getRpcUrl("localhost",jobManagerPort,JobMaster.JOB_MANAGER_NAME,HighAvailabilityServicesUtils.AddressResolution.NO_ADDRESS_RESOLUTION,AkkaRpcServiceUtils.AkkaProtocol.TCP);
+          jobManagerRef=AkkaUtils.getActorRef(jobManagerAkkaUrl,localSystem,new FiniteDuration(25L,TimeUnit.SECONDS));
+        }
+ catch (        Throwable t) {
+          lastError=t;
+        }
+      }
+ else {
+        fail("Could not determine port of started JobManager.");
+      }
+      assertTrue("JobManager process died",isProcessAlive(jmProcess));
+      if (jobManagerRef == null) {
+        if (lastError != null) {
+          lastError.printStackTrace();
+        }
+        fail("JobManager process did not launch the JobManager properly. Failed to look up JobManager actor at" + " localhost:" + jobManagerPort);
+      }
+      jobManagerRef.tell(PoisonPill.getInstance(),ActorRef.noSender());
+{
+        long now=System.currentTimeMillis();
+        long deadline=now + 5000;
+        while (now < deadline && isProcessAlive(jmProcess)) {
+          Thread.sleep(100);
+          now=System.currentTimeMillis();
+        }
+      }
+      assertFalse("JobManager process did not terminate upon actor death",isProcessAlive(jmProcess));
+      int returnCode=jmProcess.exitValue();
+      assertEquals("JobManager died, but not because of the process reaper",JobManager.RUNTIME_FAILURE_RETURN_CODE(),returnCode);
+    }
+ catch (    Exception e) {
+      e.printStackTrace();
+      printProcessLog(processOutput.toString());
+      fail(e.getMessage());
+    }
+catch (    Error e) {
+      e.printStackTrace();
+      printProcessLog(processOutput.toString());
+      throw e;
+    }
+ finally {
+      if (jmProcess != null) {
+        jmProcess.destroy();
+      }
+      if (localSystem != null) {
+        localSystem.shutdown();
+      }
+    }
+  }
+  private static void printProcessLog(  String log){
+    System.out.println("-----------------------------------------");
+    System.out.println("       BEGIN SPAWNED PROCESS LOG");
+    System.out.println("-----------------------------------------");
+    System.out.println(log);
+    System.out.println("-----------------------------------------");
+    System.out.println("        END SPAWNED PROCESS LOG");
+    System.out.println("-----------------------------------------");
+  }
+public static class JobManagerTestEntryPoint {
+    public static void main(    String[] args){
+      try {
+        Configuration config=new Configuration();
+        config.setInteger(WebOptions.PORT,-1);
+        JobManager.runJobManager(config,JobManagerMode.CLUSTER,"localhost",0);
+        System.exit(0);
+      }
+ catch (      Throwable t) {
+        System.exit(1);
+      }
+    }
+  }
+private static class PipeForwarder extends Thread {
+    private final StringWriter target;
+    private final InputStream source;
+    public PipeForwarder(    InputStream source,    StringWriter target){
+      super("Pipe Forwarder");
+      setDaemon(true);
+      this.source=source;
+      this.target=target;
+      start();
+    }
+    @Override public void run(){
+      try {
+        int next;
+        while ((next=source.read()) != -1) {
+          target.write(next);
+        }
+      }
+ catch (      IOException e) {
+      }
+    }
+  }
+}

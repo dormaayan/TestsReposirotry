@@ -1,0 +1,62 @@
+/** 
+ * Regression test for HDFS-4799, a case where, upon restart, if there were RWR replicas with out-of-date genstamps, the NN could accidentally delete good replicas instead of the bad replicas.
+ */
+@Test(timeout=120000) public void testRWRInvalidation() throws Exception {
+  Configuration conf=new HdfsConfiguration();
+  conf.setClass(DFSConfigKeys.DFS_BLOCK_REPLICATOR_CLASSNAME_KEY,RandomDeleterPolicy.class,BlockPlacementPolicy.class);
+  conf.setInt(DFSConfigKeys.DFS_HEARTBEAT_INTERVAL_KEY,1);
+  int numFiles=10;
+  List<Path> testPaths=Lists.newArrayList();
+  for (int i=0; i < numFiles; i++) {
+    testPaths.add(new Path("/test" + i));
+  }
+  MiniDFSCluster cluster=new MiniDFSCluster.Builder(conf).numDataNodes(2).build();
+  try {
+    List<FSDataOutputStream> streams=Lists.newArrayList();
+    try {
+      for (      Path path : testPaths) {
+        FSDataOutputStream out=cluster.getFileSystem().create(path,(short)2);
+        streams.add(out);
+        out.writeBytes("old gs data\n");
+        out.hflush();
+      }
+      for (      Path path : testPaths) {
+        DFSTestUtil.waitReplication(cluster.getFileSystem(),path,(short)2);
+      }
+      DataNodeProperties oldGenstampNode=cluster.stopDataNode(0);
+      for (int i=0; i < streams.size(); i++) {
+        Path path=testPaths.get(i);
+        FSDataOutputStream out=streams.get(i);
+        out.writeBytes("new gs data\n");
+        out.hflush();
+        cluster.getFileSystem().setReplication(path,(short)1);
+        out.close();
+      }
+      for (      Path path : testPaths) {
+        DFSTestUtil.waitReplication(cluster.getFileSystem(),path,(short)1);
+      }
+      LOG.info("=========================== restarting cluster");
+      DataNodeProperties otherNode=cluster.stopDataNode(0);
+      cluster.restartNameNode();
+      cluster.restartDataNode(oldGenstampNode);
+      cluster.waitActive();
+      cluster.restartDataNode(otherNode);
+      cluster.waitActive();
+      cluster.getNameNode().getNamesystem().getBlockManager().computeInvalidateWork(2);
+      cluster.triggerHeartbeats();
+      HATestUtil.waitForDNDeletions(cluster);
+      cluster.triggerDeletionReports();
+      waitForNumTotalBlocks(cluster,numFiles);
+      for (      Path path : testPaths) {
+        String ret=DFSTestUtil.readFile(cluster.getFileSystem(),path);
+        assertEquals("old gs data\n" + "new gs data\n",ret);
+      }
+    }
+  finally {
+      IOUtils.cleanup(LOG,streams.toArray(new Closeable[0]));
+    }
+  }
+  finally {
+    cluster.shutdown();
+  }
+}

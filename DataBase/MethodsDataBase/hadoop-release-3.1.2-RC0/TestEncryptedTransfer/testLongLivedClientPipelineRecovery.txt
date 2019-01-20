@@ -1,0 +1,39 @@
+@Test public void testLongLivedClientPipelineRecovery() throws IOException, InterruptedException, TimeoutException {
+  if (resolverClazz != null) {
+    return;
+  }
+  int numDataNodes=4;
+  conf.setBoolean(DFSConfigKeys.DFS_NAMENODE_REDUNDANCY_CONSIDERLOAD_KEY,false);
+  setEncryptionConfigKeys();
+  cluster=new MiniDFSCluster.Builder(conf).numDataNodes(numDataNodes).build();
+  fs=getFileSystem(conf);
+  DFSClient client=DFSClientAdapter.getDFSClient((DistributedFileSystem)fs);
+  DFSClient spyClient=Mockito.spy(client);
+  DFSClientAdapter.setDFSClient((DistributedFileSystem)fs,spyClient);
+  writeTestDataToFile(fs);
+  BlockTokenSecretManager btsm=cluster.getNamesystem().getBlockManager().getBlockTokenSecretManager();
+  btsm.setKeyUpdateIntervalForTesting(2 * 1000);
+  btsm.setTokenLifetime(2 * 1000);
+  btsm.clearAllKeysForTesting();
+  LOG.info("Wait until encryption keys become invalid...");
+  DataEncryptionKey encryptionKey=spyClient.getEncryptionKey();
+  List<DataNode> dataNodes=cluster.getDataNodes();
+  for (  DataNode dn : dataNodes) {
+    GenericTestUtils.waitFor(new Supplier<Boolean>(){
+      @Override public Boolean get(){
+        return !dn.getBlockPoolTokenSecretManager().get(encryptionKey.blockPoolId).hasKey(encryptionKey.keyId);
+      }
+    }
+,100,30 * 1000);
+  }
+  LOG.info("The encryption key is invalid on all nodes now.");
+  try (FSDataOutputStream out=fs.append(TEST_PATH)){
+    DFSOutputStream dfstream=(DFSOutputStream)out.getWrappedStream();
+    DatanodeInfo[] targets=dfstream.getPipeline();
+    cluster.stopDataNode(targets[0].getXferAddr());
+    out.write(PLAIN_TEXT.getBytes());
+    out.hflush();
+    assertFalse("The first datanode in the pipeline was not replaced.",Arrays.asList(dfstream.getPipeline()).contains(targets[0]));
+  }
+   Mockito.verify(spyClient,times(1)).clearDataEncryptionKey();
+}

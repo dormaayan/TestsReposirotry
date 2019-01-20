@@ -1,0 +1,44 @@
+/** 
+ * Tests that the stream operator can snapshot and restore the operator state of chained operators.
+ */
+@Test public void testSnapshottingAndRestoring() throws Exception {
+  final Deadline deadline=new FiniteDuration(2,TimeUnit.MINUTES).fromNow();
+  final OneInputStreamTaskTestHarness<String,String> testHarness=new OneInputStreamTaskTestHarness<>(OneInputStreamTask::new,BasicTypeInfo.STRING_TYPE_INFO,BasicTypeInfo.STRING_TYPE_INFO);
+  testHarness.setupOutputForSingletonOperatorChain();
+  IdentityKeySelector<String> keySelector=new IdentityKeySelector<>();
+  testHarness.configureForKeyedStream(keySelector,BasicTypeInfo.STRING_TYPE_INFO);
+  long checkpointId=1L;
+  long checkpointTimestamp=1L;
+  int numberChainedTasks=11;
+  StreamConfig streamConfig=testHarness.getStreamConfig();
+  configureChainedTestingStreamOperator(streamConfig,numberChainedTasks);
+  TestTaskStateManager taskStateManager=testHarness.taskStateManager;
+  OneShotLatch waitForAcknowledgeLatch=new OneShotLatch();
+  taskStateManager.setWaitForReportLatch(waitForAcknowledgeLatch);
+  TestingStreamOperator.numberRestoreCalls=0;
+  testHarness.invoke();
+  testHarness.waitForTaskRunning(deadline.timeLeft().toMillis());
+  final OneInputStreamTask<String,String> streamTask=testHarness.getTask();
+  CheckpointMetaData checkpointMetaData=new CheckpointMetaData(checkpointId,checkpointTimestamp);
+  while (!streamTask.triggerCheckpoint(checkpointMetaData,CheckpointOptions.forCheckpointWithDefaultLocation())) {
+  }
+  assertEquals(0,TestingStreamOperator.numberRestoreCalls);
+  waitForAcknowledgeLatch.await();
+  assertEquals(checkpointId,taskStateManager.getReportedCheckpointId());
+  testHarness.endInput();
+  testHarness.waitForTaskCompletion(deadline.timeLeft().toMillis());
+  final OneInputStreamTaskTestHarness<String,String> restoredTaskHarness=new OneInputStreamTaskTestHarness<>(OneInputStreamTask::new,BasicTypeInfo.STRING_TYPE_INFO,BasicTypeInfo.STRING_TYPE_INFO);
+  restoredTaskHarness.configureForKeyedStream(keySelector,BasicTypeInfo.STRING_TYPE_INFO);
+  restoredTaskHarness.setTaskStateSnapshot(checkpointId,taskStateManager.getLastJobManagerTaskStateSnapshot());
+  StreamConfig restoredTaskStreamConfig=restoredTaskHarness.getStreamConfig();
+  configureChainedTestingStreamOperator(restoredTaskStreamConfig,numberChainedTasks);
+  TaskStateSnapshot stateHandles=taskStateManager.getLastJobManagerTaskStateSnapshot();
+  Assert.assertEquals(numberChainedTasks,stateHandles.getSubtaskStateMappings().size());
+  TestingStreamOperator.numberRestoreCalls=0;
+  restoredTaskHarness.taskStateManager.restoreLatestCheckpointState(taskStateManager.getJobManagerTaskStateSnapshotsByCheckpointId());
+  restoredTaskHarness.invoke();
+  restoredTaskHarness.endInput();
+  restoredTaskHarness.waitForTaskCompletion(deadline.timeLeft().toMillis());
+  assertEquals(numberChainedTasks,TestingStreamOperator.numberRestoreCalls);
+  TestingStreamOperator.numberRestoreCalls=0;
+}

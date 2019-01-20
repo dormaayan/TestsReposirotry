@@ -1,0 +1,46 @@
+@Test public void parallel() throws Exception {
+  int parallelFactor=10;
+  RawStore rdbms;
+  rdbms=new ObjectStore();
+  rdbms.setConf(conf);
+  String[] dbNames=new String[]{"paralleldb1"};
+  int now=(int)System.currentTimeMillis() / 1000;
+  for (int i=0; i < dbNames.length; i++) {
+    rdbms.createDatabase(new Database(dbNames[i],"no description","file:/tmp",emptyParameters));
+    List<FieldSchema> cols=new ArrayList<>();
+    cols.add(new FieldSchema("col1","int","nocomment"));
+    SerDeInfo serde=new SerDeInfo("serde","seriallib",null);
+    StorageDescriptor sd=new StorageDescriptor(cols,"file:/tmp","input","output",false,0,serde,null,null,emptyParameters);
+    List<FieldSchema> partCols=new ArrayList<>();
+    partCols.add(new FieldSchema("region","string",""));
+    for (int j=0; j < parallelFactor; j++) {
+      rdbms.createTable(new Table("t" + j,dbNames[i],"me",now,now,0,sd,partCols,emptyParameters,null,null,null));
+      for (int k=0; k < parallelFactor; k++) {
+        StorageDescriptor psd=new StorageDescriptor(sd);
+        psd.setLocation("file:/tmp/region=" + k);
+        Partition part=new Partition(Arrays.asList("p" + k),dbNames[i],"t" + j,now,now,psd,emptyParameters);
+        rdbms.addPartition(part);
+      }
+    }
+  }
+  HBaseImport importer=new HBaseImport("-p","2","-b","2","-d",dbNames[0]);
+  importer.setConnections(rdbms,store);
+  importer.run();
+  for (int i=0; i < dbNames.length; i++) {
+    Database db=store.getDatabase(dbNames[i]);
+    Assert.assertNotNull(db);
+    for (int j=0; j < parallelFactor; j++) {
+      Table table=store.getTable(db.getName(),"t" + j);
+      Assert.assertNotNull(table);
+      Assert.assertEquals(now,table.getLastAccessTime());
+      Assert.assertEquals("input",table.getSd().getInputFormat());
+      for (int k=0; k < parallelFactor; k++) {
+        Partition part=store.getPartition(dbNames[i],"t" + j,Arrays.asList("p" + k));
+        Assert.assertNotNull(part);
+        Assert.assertEquals("file:/tmp/region=" + k,part.getSd().getLocation());
+      }
+      Assert.assertEquals(parallelFactor,store.getPartitions(dbNames[i],"t" + j,-1).size());
+    }
+    Assert.assertEquals(parallelFactor,store.getAllTables(dbNames[i]).size());
+  }
+}

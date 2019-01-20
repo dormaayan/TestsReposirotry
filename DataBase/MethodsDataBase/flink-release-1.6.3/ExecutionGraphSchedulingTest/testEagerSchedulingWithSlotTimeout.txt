@@ -1,0 +1,36 @@
+/** 
+ * This tests makes sure that with eager scheduling no task is deployed if a single slot allocation fails. Moreover we check that allocated slots will be returned.
+ */
+@Test public void testEagerSchedulingWithSlotTimeout() throws Exception {
+  final int parallelism=3;
+  final JobVertex vertex=new JobVertex("task");
+  vertex.setParallelism(parallelism);
+  vertex.setInvokableClass(NoOpInvokable.class);
+  final JobID jobId=new JobID();
+  final JobGraph jobGraph=new JobGraph(jobId,"test",vertex);
+  final BlockingQueue<AllocationID> returnedSlots=new ArrayBlockingQueue<>(2);
+  final TestingSlotOwner slotOwner=new TestingSlotOwner();
+  slotOwner.setReturnAllocatedSlotConsumer((  LogicalSlot logicalSlot) -> returnedSlots.offer(logicalSlot.getAllocationId()));
+  final TaskManagerGateway taskManager=mock(TaskManagerGateway.class);
+  final SimpleSlot[] slots=new SimpleSlot[parallelism];
+  @SuppressWarnings({"unchecked","rawtypes"}) final CompletableFuture<LogicalSlot>[] slotFutures=new CompletableFuture[parallelism];
+  for (int i=0; i < parallelism; i++) {
+    slots[i]=createSlot(taskManager,jobId,slotOwner);
+    slotFutures[i]=new CompletableFuture<>();
+  }
+  ProgrammedSlotProvider slotProvider=new ProgrammedSlotProvider(parallelism);
+  slotProvider.addSlots(vertex.getID(),slotFutures);
+  final ExecutionGraph eg=createExecutionGraph(jobGraph,slotProvider);
+  slotFutures[1].complete(slots[1]);
+  eg.setScheduleMode(ScheduleMode.EAGER);
+  eg.setQueuedSchedulingAllowed(true);
+  eg.scheduleForExecution();
+  slotFutures[2].complete(slots[2]);
+  assertThat(eg.getTerminationFuture().isDone(),is(false));
+  slotFutures[0].completeExceptionally(new TimeoutException("Test time out"));
+  assertThat(eg.getTerminationFuture().get(),is(JobStatus.FAILED));
+  for (int i=0; i < parallelism - 1; i++) {
+    returnedSlots.poll(2000,TimeUnit.MILLISECONDS);
+  }
+  verify(taskManager,times(0)).submitTask(any(TaskDeploymentDescriptor.class),any(Time.class));
+}

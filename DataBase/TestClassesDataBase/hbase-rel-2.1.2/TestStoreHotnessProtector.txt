@@ -1,0 +1,56 @@
+@Category(SmallTests.class) public class TestStoreHotnessProtector {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestStoreHotnessProtector.class);
+  @Test(timeout=60000) public void testPreparePutCounter() throws Exception {
+    ExecutorService executorService=Executors.newFixedThreadPool(10);
+    Configuration conf=new Configuration();
+    conf.setInt(PARALLEL_PUT_STORE_THREADS_LIMIT_MIN_COLUMN_COUNT,0);
+    conf.setInt(PARALLEL_PUT_STORE_THREADS_LIMIT,10);
+    conf.setInt(PARALLEL_PREPARE_PUT_STORE_MULTIPLIER,3);
+    Region mockRegion=mock(Region.class);
+    StoreHotnessProtector storeHotnessProtector=new StoreHotnessProtector(mockRegion,conf);
+    Store mockStore1=mock(Store.class);
+    RegionInfo mockRegionInfo=mock(RegionInfo.class);
+    byte[] family="testF1".getBytes();
+    when(mockRegion.getStore(family)).thenReturn(mockStore1);
+    when(mockRegion.getRegionInfo()).thenReturn(mockRegionInfo);
+    when(mockRegionInfo.getRegionNameAsString()).thenReturn("test_region_1");
+    when(mockStore1.getCurrentParallelPutCount()).thenReturn(1);
+    when(mockStore1.getColumnFamilyName()).thenReturn("test_Family_1");
+    final Map<byte[],List<Cell>> familyMaps=new HashMap<>();
+    familyMaps.put(family,Lists.newArrayList(mock(Cell.class),mock(Cell.class)));
+    final AtomicReference<Exception> exception=new AtomicReference<>();
+    int threadCount=conf.getInt(PARALLEL_PUT_STORE_THREADS_LIMIT,10) * conf.getInt(PARALLEL_PREPARE_PUT_STORE_MULTIPLIER,3);
+    CountDownLatch countDownLatch=new CountDownLatch(threadCount);
+    for (int i=0; i < threadCount; i++) {
+      executorService.execute(() -> {
+        try {
+          storeHotnessProtector.start(familyMaps);
+        }
+ catch (        RegionTooBusyException e) {
+          e.printStackTrace();
+          exception.set(e);
+        }
+ finally {
+          countDownLatch.countDown();
+        }
+      }
+);
+    }
+    countDownLatch.await(60,TimeUnit.SECONDS);
+    Assert.assertEquals(exception.get(),null);
+    Assert.assertEquals(storeHotnessProtector.getPreparePutToStoreMap().size(),1);
+    Assert.assertEquals(storeHotnessProtector.getPreparePutToStoreMap().get(family).get(),threadCount);
+    try {
+      storeHotnessProtector.start(familyMaps);
+    }
+ catch (    RegionTooBusyException e) {
+      e.printStackTrace();
+      exception.set(e);
+    }
+    Assert.assertEquals(exception.get().getClass(),RegionTooBusyException.class);
+    Assert.assertEquals(storeHotnessProtector.getPreparePutToStoreMap().size(),1);
+    Assert.assertEquals(storeHotnessProtector.getPreparePutToStoreMap().get(family).get(),threadCount + 1);
+    storeHotnessProtector.finish(familyMaps);
+    Assert.assertEquals(storeHotnessProtector.getPreparePutToStoreMap().get(family).get(),threadCount);
+  }
+}

@@ -1,0 +1,207 @@
+public class NodeProxyTest extends PropertyContainerProxyTest {
+  private final String PROPERTY_KEY="PROPERTY_KEY";
+  @Override protected long createPropertyContainer(){
+    return db.createNode().getId();
+  }
+  @Override protected PropertyContainer lookupPropertyContainer(  long id){
+    return db.getNodeById(id);
+  }
+  @Test public void shouldThrowHumaneExceptionsWhenPropertyDoesNotExistOnNode(){
+    createNodeWith(PROPERTY_KEY);
+    try (Transaction ignored=db.beginTx()){
+      Node node=db.createNode();
+      node.getProperty(PROPERTY_KEY);
+      fail("Expected exception to have been thrown");
+    }
+ catch (    NotFoundException exception) {
+      assertThat(exception.getMessage(),containsString(PROPERTY_KEY));
+    }
+  }
+  @Test public void createDropNodeLongStringProperty(){
+    Label markerLabel=Label.label("marker");
+    String testPropertyKey="testProperty";
+    String propertyValue=RandomStringUtils.randomAscii(255);
+    try (Transaction tx=db.beginTx()){
+      Node node=db.createNode(markerLabel);
+      node.setProperty(testPropertyKey,propertyValue);
+      tx.success();
+    }
+     try (Transaction tx=db.beginTx()){
+      Node node=Iterators.single(db.findNodes(markerLabel));
+      assertEquals(propertyValue,node.getProperty(testPropertyKey));
+      tx.success();
+    }
+     try (Transaction tx=db.beginTx()){
+      Node node=Iterators.single(db.findNodes(markerLabel));
+      node.removeProperty(testPropertyKey);
+      tx.success();
+    }
+     try (Transaction tx=db.beginTx()){
+      Node node=Iterators.single(db.findNodes(markerLabel));
+      assertFalse(node.hasProperty(testPropertyKey));
+      tx.success();
+    }
+   }
+  @Test public void createDropNodeLongArrayProperty(){
+    Label markerLabel=Label.label("marker");
+    String testPropertyKey="testProperty";
+    byte[] propertyValue=RandomUtils.nextBytes(1024);
+    try (Transaction tx=db.beginTx()){
+      Node node=db.createNode(markerLabel);
+      node.setProperty(testPropertyKey,propertyValue);
+      tx.success();
+    }
+     try (Transaction tx=db.beginTx()){
+      Node node=Iterators.single(db.findNodes(markerLabel));
+      assertArrayEquals(propertyValue,(byte[])node.getProperty(testPropertyKey));
+      tx.success();
+    }
+     try (Transaction tx=db.beginTx()){
+      Node node=Iterators.single(db.findNodes(markerLabel));
+      node.removeProperty(testPropertyKey);
+      tx.success();
+    }
+     try (Transaction tx=db.beginTx()){
+      Node node=Iterators.single(db.findNodes(markerLabel));
+      assertFalse(node.hasProperty(testPropertyKey));
+      tx.success();
+    }
+   }
+  @Test public void shouldThrowHumaneExceptionsWhenPropertyDoesNotExist(){
+    try (Transaction ignored=db.beginTx()){
+      Node node=db.createNode();
+      node.getProperty(PROPERTY_KEY);
+    }
+ catch (    NotFoundException exception) {
+      assertThat(exception.getMessage(),containsString(PROPERTY_KEY));
+    }
+  }
+  @Test(expected=NotFoundException.class) public void deletionOfSameNodeTwiceInOneTransactionShouldNotRollbackIt(){
+    Node node;
+    try (Transaction tx=db.beginTx()){
+      node=db.createNode();
+      tx.success();
+    }
+     Exception exceptionThrownBySecondDelete=null;
+    try (Transaction tx=db.beginTx()){
+      node.delete();
+      try {
+        node.delete();
+      }
+ catch (      Exception e) {
+        exceptionThrownBySecondDelete=e;
+      }
+      tx.success();
+    }
+     assertThat(exceptionThrownBySecondDelete,instanceOf(NotFoundException.class));
+    try (Transaction tx=db.beginTx()){
+      db.getNodeById(node.getId());
+      tx.success();
+    }
+   }
+  @Test(expected=NotFoundException.class) public void deletionOfAlreadyDeletedNodeShouldThrow(){
+    Node node;
+    try (Transaction tx=db.beginTx()){
+      node=db.createNode();
+      tx.success();
+    }
+     try (Transaction tx=db.beginTx()){
+      node.delete();
+      tx.success();
+    }
+     try (Transaction tx=db.beginTx()){
+      node.delete();
+      tx.success();
+    }
+   }
+  @Test public void getAllPropertiesShouldWorkFineWithConcurrentPropertyModifications() throws Exception {
+    ExecutorService executor=cleanup.add(Executors.newFixedThreadPool(2,named("Test-executor-thread")));
+    final int propertiesCount=100;
+    final long nodeId;
+    try (Transaction tx=db.beginTx()){
+      Node node=db.createNode();
+      nodeId=node.getId();
+      for (int i=0; i < propertiesCount; i++) {
+        node.setProperty("property-" + i,i);
+      }
+      tx.success();
+    }
+     final CountDownLatch start=new CountDownLatch(1);
+    final AtomicBoolean writerDone=new AtomicBoolean();
+    Runnable writer=() -> {
+      try {
+        awaitLatch(start);
+        int propertyKey=0;
+        while (propertyKey < propertiesCount) {
+          try (Transaction tx=db.beginTx()){
+            Node node=db.getNodeById(nodeId);
+            for (int i=0; i < 10 && propertyKey < propertiesCount; i++, propertyKey++) {
+              node.setProperty("property-" + propertyKey,UUID.randomUUID().toString());
+            }
+            tx.success();
+          }
+         }
+      }
+  finally {
+        writerDone.set(true);
+      }
+    }
+;
+    Runnable reader=() -> {
+      try (Transaction tx=db.beginTx()){
+        Node node=db.getNodeById(nodeId);
+        awaitLatch(start);
+        while (!writerDone.get()) {
+          int size=node.getAllProperties().size();
+          assertThat(size,greaterThan(0));
+        }
+        tx.success();
+      }
+     }
+;
+    Future<?> readerFuture=executor.submit(reader);
+    Future<?> writerFuture=executor.submit(writer);
+    start.countDown();
+    writerFuture.get();
+    readerFuture.get();
+    try (Transaction tx=db.beginTx()){
+      assertEquals(propertiesCount,db.getNodeById(nodeId).getAllProperties().size());
+      tx.success();
+    }
+   }
+  @Test public void shouldBeAbleToForceTypeChangeOfProperty(){
+    Node node;
+    try (Transaction tx=db.beginTx()){
+      node=db.createNode();
+      node.setProperty("prop",1337);
+      tx.success();
+    }
+     try (Transaction tx=db.beginTx()){
+      node.setProperty("prop",1337.0);
+      tx.success();
+    }
+     try (Transaction ignore=db.beginTx()){
+      assertThat(node.getProperty("prop"),instanceOf(Double.class));
+    }
+   }
+  @Test public void shouldOnlyReturnTypeOnce(){
+    Node node;
+    try (Transaction tx=db.beginTx()){
+      node=db.createNode();
+      node.createRelationshipTo(db.createNode(),RelationshipType.withName("R"));
+      node.createRelationshipTo(db.createNode(),RelationshipType.withName("R"));
+      node.createRelationshipTo(db.createNode(),RelationshipType.withName("R"));
+      tx.success();
+    }
+     try (Transaction tx=db.beginTx()){
+      assertThat(Iterables.asList(node.getRelationshipTypes()),equalTo(singletonList(RelationshipType.withName("R"))));
+    }
+   }
+  private void createNodeWith(  String key){
+    try (Transaction tx=db.beginTx()){
+      Node node=db.createNode();
+      node.setProperty(key,1);
+      tx.success();
+    }
+   }
+}

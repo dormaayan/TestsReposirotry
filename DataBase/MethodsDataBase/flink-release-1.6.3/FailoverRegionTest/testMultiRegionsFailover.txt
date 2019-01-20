@@ -1,0 +1,62 @@
+/** 
+ * Tests that a job has server failover regions and one region failover does not influence others <pre> (a1) ---> (b1) -+-> (c1) ---+-> (d1)  X          / (a2) ---> (b2) -+-> (c2) -+ ^         ^         ^ |         |         | (pipelined) (blocking) (pipelined) </pre>
+ */
+@Test public void testMultiRegionsFailover() throws Exception {
+  final JobID jobId=new JobID();
+  final String jobName="Test Job Sample Name";
+  final SlotProvider slotProvider=new SimpleSlotProvider(jobId,20);
+  JobVertex v1=new JobVertex("vertex1");
+  JobVertex v2=new JobVertex("vertex2");
+  JobVertex v3=new JobVertex("vertex3");
+  JobVertex v4=new JobVertex("vertex4");
+  v1.setParallelism(2);
+  v2.setParallelism(2);
+  v3.setParallelism(2);
+  v4.setParallelism(1);
+  v1.setInvokableClass(AbstractInvokable.class);
+  v2.setInvokableClass(AbstractInvokable.class);
+  v3.setInvokableClass(AbstractInvokable.class);
+  v4.setInvokableClass(AbstractInvokable.class);
+  v2.connectNewDataSetAsInput(v1,DistributionPattern.POINTWISE,ResultPartitionType.PIPELINED);
+  v3.connectNewDataSetAsInput(v2,DistributionPattern.ALL_TO_ALL,ResultPartitionType.BLOCKING);
+  v4.connectNewDataSetAsInput(v3,DistributionPattern.ALL_TO_ALL,ResultPartitionType.PIPELINED);
+  List<JobVertex> ordered=Arrays.asList(v1,v2,v3,v4);
+  ExecutionGraph eg=new ExecutionGraph(new DummyJobInformation(jobId,jobName),TestingUtils.defaultExecutor(),TestingUtils.defaultExecutor(),AkkaUtils.getDefaultTimeout(),new InfiniteDelayRestartStrategy(10),new FailoverPipelinedRegionWithDirectExecutor(),slotProvider);
+  eg.attachJobGraph(ordered);
+  RestartPipelinedRegionStrategy strategy=(RestartPipelinedRegionStrategy)eg.getFailoverStrategy();
+  ExecutionVertex ev11=eg.getJobVertex(v1.getID()).getTaskVertices()[0];
+  ExecutionVertex ev21=eg.getJobVertex(v2.getID()).getTaskVertices()[0];
+  ExecutionVertex ev12=eg.getJobVertex(v1.getID()).getTaskVertices()[1];
+  ExecutionVertex ev22=eg.getJobVertex(v2.getID()).getTaskVertices()[1];
+  ExecutionVertex ev31=eg.getJobVertex(v3.getID()).getTaskVertices()[0];
+  ExecutionVertex ev32=eg.getJobVertex(v3.getID()).getTaskVertices()[1];
+  ExecutionVertex ev4=eg.getJobVertex(v3.getID()).getTaskVertices()[0];
+  eg.scheduleForExecution();
+  assertEquals(JobStatus.RUNNING,strategy.getFailoverRegion(ev11).getState());
+  ev21.scheduleForExecution(slotProvider,true,LocationPreferenceConstraint.ALL,Collections.emptySet());
+  ev21.getCurrentExecutionAttempt().fail(new Exception("New fail"));
+  assertEquals(JobStatus.CANCELLING,strategy.getFailoverRegion(ev11).getState());
+  assertEquals(JobStatus.RUNNING,strategy.getFailoverRegion(ev22).getState());
+  assertEquals(JobStatus.RUNNING,strategy.getFailoverRegion(ev31).getState());
+  ev11.getCurrentExecutionAttempt().cancelingComplete();
+  assertEquals(JobStatus.RUNNING,strategy.getFailoverRegion(ev11).getState());
+  assertEquals(JobStatus.RUNNING,strategy.getFailoverRegion(ev22).getState());
+  assertEquals(JobStatus.RUNNING,strategy.getFailoverRegion(ev31).getState());
+  ev11.getCurrentExecutionAttempt().markFinished();
+  ev21.getCurrentExecutionAttempt().markFinished();
+  ev22.scheduleForExecution(slotProvider,true,LocationPreferenceConstraint.ALL,Collections.emptySet());
+  ev22.getCurrentExecutionAttempt().markFinished();
+  assertEquals(JobStatus.RUNNING,strategy.getFailoverRegion(ev11).getState());
+  assertEquals(JobStatus.RUNNING,strategy.getFailoverRegion(ev22).getState());
+  assertEquals(JobStatus.RUNNING,strategy.getFailoverRegion(ev31).getState());
+  waitUntilExecutionState(ev31.getCurrentExecutionAttempt(),ExecutionState.DEPLOYING,2000);
+  waitUntilExecutionState(ev32.getCurrentExecutionAttempt(),ExecutionState.DEPLOYING,2000);
+  ev31.getCurrentExecutionAttempt().fail(new Exception("New fail"));
+  assertEquals(JobStatus.RUNNING,strategy.getFailoverRegion(ev11).getState());
+  assertEquals(JobStatus.RUNNING,strategy.getFailoverRegion(ev22).getState());
+  assertEquals(JobStatus.CANCELLING,strategy.getFailoverRegion(ev31).getState());
+  ev32.getCurrentExecutionAttempt().cancelingComplete();
+  assertEquals(JobStatus.RUNNING,strategy.getFailoverRegion(ev11).getState());
+  assertEquals(JobStatus.RUNNING,strategy.getFailoverRegion(ev22).getState());
+  assertEquals(JobStatus.RUNNING,strategy.getFailoverRegion(ev31).getState());
+}

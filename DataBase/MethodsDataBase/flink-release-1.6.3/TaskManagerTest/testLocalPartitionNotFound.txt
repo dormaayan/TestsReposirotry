@@ -1,0 +1,54 @@
+/** 
+ * Tests that repeated local  {@link PartitionNotFoundException}s ultimately fail the receiver.
+ */
+@Test public void testLocalPartitionNotFound() throws Exception {
+  new JavaTestKit(system){
+{
+      ActorGateway jobManager=null;
+      ActorGateway taskManager=null;
+      final ActorGateway testActorGateway=new AkkaActorGateway(getTestActor(),LEADER_SESSION_ID);
+      try {
+        final IntermediateDataSetID resultId=new IntermediateDataSetID();
+        ActorRef jm=system.actorOf(Props.create(new SimplePartitionStateLookupJobManagerCreator(LEADER_SESSION_ID,getTestActor())));
+        jobManager=new AkkaActorGateway(jm,LEADER_SESSION_ID);
+        highAvailabilityServices.setJobMasterLeaderRetriever(HighAvailabilityServices.DEFAULT_JOB_ID,new StandaloneLeaderRetrievalService(jobManager.path(),jobManager.leaderSessionID()));
+        final Configuration config=new Configuration();
+        config.setInteger(TaskManagerOptions.NETWORK_REQUEST_BACKOFF_INITIAL,100);
+        config.setInteger(TaskManagerOptions.NETWORK_REQUEST_BACKOFF_MAX,200);
+        taskManager=TestingUtils.createTaskManager(system,highAvailabilityServices,config,true,true);
+        final ActorGateway tm=taskManager;
+        final JobID jid=new JobID();
+        final JobVertexID vid=new JobVertexID();
+        final ExecutionAttemptID eid=new ExecutionAttemptID();
+        final ResultPartitionID partitionId=new ResultPartitionID();
+        final ResultPartitionLocation loc=ResultPartitionLocation.createLocal();
+        final InputChannelDeploymentDescriptor[] icdd=new InputChannelDeploymentDescriptor[]{new InputChannelDeploymentDescriptor(partitionId,loc)};
+        final InputGateDeploymentDescriptor igdd=new InputGateDeploymentDescriptor(resultId,ResultPartitionType.PIPELINED,0,icdd);
+        final TaskDeploymentDescriptor tdd=createTaskDeploymentDescriptor(jid,"TestJob",vid,eid,new SerializedValue<>(new ExecutionConfig()),"Receiver",1,0,1,0,new Configuration(),new Configuration(),Tasks.AgnosticReceiver.class.getName(),Collections.<ResultPartitionDeploymentDescriptor>emptyList(),Collections.singletonList(igdd),Collections.emptyList(),Collections.emptyList(),0);
+        new Within(new FiniteDuration(120,TimeUnit.SECONDS)){
+          @Override protected void run(){
+            tm.tell(new SubmitTask(tdd),testActorGateway);
+            expectMsgClass(Acknowledge.get().getClass());
+            TaskExecutionState msg=expectMsgClass(TaskExecutionState.class);
+            assertEquals(msg.getExecutionState(),ExecutionState.FAILED);
+            Throwable error=msg.getError(getClass().getClassLoader());
+            if (error.getClass() != PartitionNotFoundException.class) {
+              error.printStackTrace();
+              fail("Wrong exception: " + error.getMessage());
+            }
+          }
+        }
+;
+      }
+ catch (      Exception e) {
+        e.printStackTrace();
+        fail(e.getMessage());
+      }
+ finally {
+        TestingUtils.stopActor(taskManager);
+        TestingUtils.stopActor(jobManager);
+      }
+    }
+  }
+;
+}

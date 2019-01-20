@@ -1,0 +1,82 @@
+/** 
+ * A simple request/reply using custom reply to header.
+ */
+public class JmsSimpleRequestCustomReplyToTest extends CamelTestSupport {
+  private static final Logger LOG=LoggerFactory.getLogger(JmsSimpleRequestCustomReplyToTest.class);
+  private static String myReplyTo;
+  protected String componentName="activemq";
+  private CountDownLatch latch=new CountDownLatch(1);
+  @Test public void testRequetCustomReplyTo() throws Exception {
+    Thread sender=new Thread(new SendLateReply());
+    sender.start();
+    MockEndpoint result=getMockEndpoint("mock:result");
+    result.expectedMessageCount(1);
+    Exchange out=template.request("activemq:queue:hello",new Processor(){
+      public void process(      Exchange exchange) throws Exception {
+        exchange.setPattern(ExchangePattern.InOnly);
+        exchange.getIn().setHeader("MyReplyQeueue","foo");
+        exchange.getIn().setBody("Hello World");
+      }
+    }
+);
+    result.assertIsSatisfied();
+    assertNotNull(out);
+    assertFalse(out.hasOut());
+    Endpoint end=context.getEndpoint(componentName + ":" + myReplyTo);
+    final Consumer consumer=end.createConsumer(new Processor(){
+      public void process(      Exchange exchange) throws Exception {
+        assertEquals("Late reply",exchange.getIn().getBody());
+        latch.countDown();
+      }
+    }
+);
+    latch=new CountDownLatch(1);
+    consumer.start();
+    latch.await();
+    consumer.stop();
+  }
+private class SendLateReply implements Runnable {
+    public void run(){
+      try {
+        LOG.debug("Waiting for latch");
+        latch.await();
+        Thread.sleep(1000);
+      }
+ catch (      Exception e) {
+      }
+      LOG.debug("Sending late reply");
+      template.send(componentName + ":" + myReplyTo,new Processor(){
+        public void process(        Exchange exchange) throws Exception {
+          exchange.setPattern(ExchangePattern.InOnly);
+          exchange.getIn().setBody("Late reply");
+        }
+      }
+);
+    }
+  }
+  protected CamelContext createCamelContext() throws Exception {
+    CamelContext camelContext=super.createCamelContext();
+    ConnectionFactory connectionFactory=CamelJmsTestHelper.createConnectionFactory();
+    camelContext.addComponent("activemq",jmsComponentAutoAcknowledge(connectionFactory));
+    JmsComponent jms=camelContext.getComponent("activemq",JmsComponent.class);
+    jms.getConfiguration().setRequestTimeout(10000);
+    return camelContext;
+  }
+  protected RouteBuilder createRouteBuilder() throws Exception {
+    return new RouteBuilder(){
+      public void configure() throws Exception {
+        from(componentName + ":queue:hello").process(new Processor(){
+          public void process(          Exchange exchange) throws Exception {
+            assertEquals("Hello World",exchange.getIn().getBody());
+            myReplyTo=exchange.getIn().getHeader("MyReplyQeueue",String.class);
+            LOG.debug("ReplyTo: " + myReplyTo);
+            LOG.debug("Ahh I cannot send a reply. Someone else must do it.");
+            latch.countDown();
+          }
+        }
+).to("mock:result");
+      }
+    }
+;
+  }
+}

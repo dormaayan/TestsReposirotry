@@ -1,0 +1,112 @@
+public class IndexCRUDIT {
+  @Test public void addingANodeWithPropertyShouldGetIndexed() throws Exception {
+    String indexProperty="indexProperty";
+    GatheringIndexWriter writer=newWriter();
+    createIndex(db,myLabel,indexProperty);
+    int value1=12;
+    String otherProperty="otherProperty";
+    int otherValue=17;
+    Node node=createNode(map(indexProperty,value1,otherProperty,otherValue),myLabel);
+    try (Transaction tx=db.beginTx()){
+      KernelTransaction ktx=ctxSupplier.getKernelTransactionBoundToThisThread(true);
+      TokenRead tokenRead=ktx.tokenRead();
+      int propertyKey1=tokenRead.propertyKey(indexProperty);
+      int label=tokenRead.nodeLabel(myLabel.name());
+      LabelSchemaDescriptor descriptor=SchemaDescriptorFactory.forLabel(label,propertyKey1);
+      assertThat(writer.updatesCommitted,equalTo(asSet(IndexEntryUpdate.add(node.getId(),descriptor,Values.of(value1)))));
+      tx.success();
+    }
+   }
+  @Test public void addingALabelToPreExistingNodeShouldGetIndexed() throws Exception {
+    String indexProperty="indexProperty";
+    GatheringIndexWriter writer=newWriter();
+    createIndex(db,myLabel,indexProperty);
+    String otherProperty="otherProperty";
+    int value=12;
+    int otherValue=17;
+    Node node=createNode(map(indexProperty,value,otherProperty,otherValue));
+    assertThat(writer.updatesCommitted.size(),equalTo(0));
+    try (Transaction tx=db.beginTx()){
+      node.addLabel(myLabel);
+      tx.success();
+    }
+     try (Transaction tx=db.beginTx()){
+      KernelTransaction ktx=ctxSupplier.getKernelTransactionBoundToThisThread(true);
+      TokenRead tokenRead=ktx.tokenRead();
+      int propertyKey1=tokenRead.propertyKey(indexProperty);
+      int label=tokenRead.nodeLabel(myLabel.name());
+      LabelSchemaDescriptor descriptor=SchemaDescriptorFactory.forLabel(label,propertyKey1);
+      assertThat(writer.updatesCommitted,equalTo(asSet(IndexEntryUpdate.add(node.getId(),descriptor,Values.of(value)))));
+      tx.success();
+    }
+   }
+  private GraphDatabaseAPI db;
+  @Rule public EphemeralFileSystemRule fs=new EphemeralFileSystemRule();
+  private final IndexProvider mockedIndexProvider=mock(IndexProvider.class);
+  private final KernelExtensionFactory<?> mockedIndexProviderFactory=singleInstanceIndexProviderFactory("none",mockedIndexProvider);
+  private ThreadToStatementContextBridge ctxSupplier;
+  private final Label myLabel=Label.label("MYLABEL");
+  private Node createNode(  Map<String,Object> properties,  Label... labels){
+    try (Transaction tx=db.beginTx()){
+      Node node=db.createNode(labels);
+      for (      Map.Entry<String,Object> prop : properties.entrySet()) {
+        node.setProperty(prop.getKey(),prop.getValue());
+      }
+      tx.success();
+      return node;
+    }
+   }
+  @Before public void before(){
+    when(mockedIndexProvider.getProviderDescriptor()).thenReturn(PROVIDER_DESCRIPTOR);
+    when(mockedIndexProvider.storeMigrationParticipant(any(FileSystemAbstraction.class),any(PageCache.class))).thenReturn(StoreMigrationParticipant.NOT_PARTICIPATING);
+    TestGraphDatabaseFactory factory=new TestGraphDatabaseFactory();
+    factory.setFileSystem(fs.get());
+    factory.setKernelExtensions(Collections.singletonList(mockedIndexProviderFactory));
+    db=(GraphDatabaseAPI)factory.newImpermanentDatabaseBuilder().setConfig(default_schema_provider,PROVIDER_DESCRIPTOR.name()).newGraphDatabase();
+    ctxSupplier=db.getDependencyResolver().resolveDependency(ThreadToStatementContextBridge.class);
+  }
+  private GatheringIndexWriter newWriter() throws IOException {
+    GatheringIndexWriter writer=new GatheringIndexWriter();
+    when(mockedIndexProvider.getPopulator(any(StoreIndexDescriptor.class),any(IndexSamplingConfig.class))).thenReturn(writer);
+    when(mockedIndexProvider.getOnlineAccessor(any(StoreIndexDescriptor.class),any(IndexSamplingConfig.class))).thenReturn(writer);
+    return writer;
+  }
+  @After public void after(){
+    db.shutdown();
+  }
+private static class GatheringIndexWriter extends IndexAccessor.Adapter implements IndexPopulator {
+    private final Set<IndexEntryUpdate<?>> updatesCommitted=new HashSet<>();
+    private final Map<Object,Set<Long>> indexSamples=new HashMap<>();
+    @Override public void create(){
+    }
+    @Override public void add(    Collection<? extends IndexEntryUpdate<?>> updates){
+      updatesCommitted.addAll(updates);
+    }
+    @Override public void verifyDeferredConstraints(    NodePropertyAccessor nodePropertyAccessor){
+    }
+    @Override public IndexUpdater newPopulatingUpdater(    NodePropertyAccessor nodePropertyAccessor){
+      return newUpdater(IndexUpdateMode.ONLINE);
+    }
+    @Override public IndexUpdater newUpdater(    final IndexUpdateMode mode){
+      return new CollectingIndexUpdater(updatesCommitted::addAll);
+    }
+    @Override public void close(    boolean populationCompletedSuccessfully){
+    }
+    @Override public void markAsFailed(    String failure){
+    }
+    @Override public void includeSample(    IndexEntryUpdate<?> update){
+      addValueToSample(update.getEntityId(),update.values()[0]);
+    }
+    @Override public IndexSample sampleResult(){
+      long indexSize=0;
+      for (      Set<Long> nodeIds : indexSamples.values()) {
+        indexSize+=nodeIds.size();
+      }
+      return new IndexSample(indexSize,indexSamples.size(),indexSize);
+    }
+    private void addValueToSample(    long nodeId,    Object propertyValue){
+      Set<Long> nodeIds=indexSamples.computeIfAbsent(propertyValue,k -> new HashSet<>());
+      nodeIds.add(nodeId);
+    }
+  }
+}

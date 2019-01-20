@@ -1,0 +1,47 @@
+/** 
+ * Tests an issue where the  {@link MultipleIndexPopulator} had a condition when applying external concurrent updates that any givenupdate would only be applied if the entity id was lower than the highest entity id the scan had seen (i.e. where the scan was currently at). This would be a problem because of how the  {@link LabelScanReader} works internally, which is that it reads one bit-set of node idsat the time, effectively caching a small range of ids. If a concurrent creation would happen right in front of where the scan was after it had read and cached that bit-set it would not apply the update and miss that entity in the scan and would end up with an index that was inconsistent with the store.
+ */
+@Test(timeout=60_000) public void shouldNoticeConcurrentUpdatesWithinCurrentLabelIndexEntryRange() throws Exception {
+  List<Node> nodes=new ArrayList<>();
+  int nextId=0;
+  try (Transaction tx=db.beginTx()){
+    Node node;
+    do {
+      node=db.createNode(LABEL_ONE);
+      node.setProperty(NAME_PROPERTY,"Node " + nextId++);
+      nodes.add(node);
+    }
+ while (node.getId() < INITIAL_CREATION_NODE_ID_THRESHOLD);
+    tx.success();
+  }
+   assertThat("At least one node below the scan barrier threshold must have been created, otherwise test assumptions are invalid or outdated",count(filter(n -> n.getId() <= SCAN_BARRIER_NODE_ID_THRESHOLD,nodes)),greaterThan(0L));
+  assertThat("At least two nodes above the scan barrier threshold and below initial creation threshold must have been created, " + "otherwise test assumptions are invalid or outdated",count(filter(n -> n.getId() > SCAN_BARRIER_NODE_ID_THRESHOLD,nodes)),greaterThan(1L));
+  db.getDependencyResolver().resolveDependency(IdController.class).maintenance();
+  try (Transaction tx=db.beginTx()){
+    db.schema().indexFor(LABEL_ONE).on(NAME_PROPERTY).create();
+    tx.success();
+  }
+   index.barrier.await();
+  try (Transaction tx=db.beginTx()){
+    Node node;
+    do {
+      node=db.createNode(LABEL_ONE);
+      node.setProperty(NAME_PROPERTY,nextId++);
+      nodes.add(node);
+    }
+ while (node.getId() < index.populationAtId);
+    tx.success();
+  }
+   index.barrier.release();
+  try (Transaction tx=db.beginTx()){
+    db.schema().awaitIndexesOnline(1,MINUTES);
+    tx.success();
+  }
+   assertEquals(nodes.size(),index.entitiesByScan.size() + index.entitiesByUpdater.size());
+  try (Transaction tx=db.beginTx()){
+    for (    Node node : db.getAllNodes()) {
+      assertTrue(index.entitiesByScan.contains(node.getId()) || index.entitiesByUpdater.contains(node.getId()));
+    }
+    tx.success();
+  }
+ }

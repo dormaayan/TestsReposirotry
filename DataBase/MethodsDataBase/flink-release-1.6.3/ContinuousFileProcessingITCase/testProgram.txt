@@ -1,0 +1,61 @@
+@Test public void testProgram() throws Exception {
+  TextInputFormat format=new TextInputFormat(new Path(hdfsURI));
+  format.setFilePath(hdfsURI);
+  format.setFilesFilter(FilePathFilter.createDefaultFilter());
+  final StreamExecutionEnvironment env=StreamExecutionEnvironment.getExecutionEnvironment();
+  env.setParallelism(PARALLELISM);
+  ContinuousFileMonitoringFunction<String> monitoringFunction=new ContinuousFileMonitoringFunction<>(format,FileProcessingMode.PROCESS_CONTINUOUSLY,env.getParallelism(),INTERVAL);
+  DataStream<TimestampedFileInputSplit> splits=env.addSource(monitoringFunction);
+  Assert.assertEquals(1,splits.getParallelism());
+  ContinuousFileReaderOperator<String> reader=new ContinuousFileReaderOperator<>(format);
+  TypeInformation<String> typeInfo=TypeExtractor.getInputFormatTypes(format);
+  DataStream<String> content=splits.transform("FileSplitReader",typeInfo,reader);
+  Assert.assertEquals(PARALLELISM,content.getParallelism());
+  TestingSinkFunction sink=new TestingSinkFunction();
+  content.addSink(sink).setParallelism(1);
+  Thread job=new Thread(){
+    @Override public void run(){
+      try {
+        env.execute("ContinuousFileProcessingITCase Job.");
+      }
+ catch (      Exception e) {
+        Throwable th=e;
+        for (int depth=0; depth < 20; depth++) {
+          if (th instanceof SuccessException) {
+            return;
+          }
+ else           if (th.getCause() != null) {
+            th=th.getCause();
+          }
+ else {
+            break;
+          }
+        }
+        e.printStackTrace();
+        Assert.fail(e.getMessage());
+      }
+    }
+  }
+;
+  job.start();
+  long lastCreatedModTime=Long.MIN_VALUE;
+  for (int i=0; i < NO_OF_FILES; i++) {
+    Tuple2<org.apache.hadoop.fs.Path,String> tmpFile;
+    long modTime;
+    do {
+      Thread.sleep(50);
+      tmpFile=fillWithData(hdfsURI,"file",i,"This is test line.");
+      modTime=hdfs.getFileStatus(tmpFile.f0).getModificationTime();
+      if (modTime <= lastCreatedModTime) {
+        hdfs.delete(tmpFile.f0,false);
+      }
+    }
+ while (modTime <= lastCreatedModTime);
+    lastCreatedModTime=modTime;
+    expectedContents.put(i,tmpFile.f1);
+    org.apache.hadoop.fs.Path file=new org.apache.hadoop.fs.Path(hdfsURI + "/file" + i);
+    hdfs.rename(tmpFile.f0,file);
+    Assert.assertTrue(hdfs.exists(file));
+  }
+  job.join();
+}

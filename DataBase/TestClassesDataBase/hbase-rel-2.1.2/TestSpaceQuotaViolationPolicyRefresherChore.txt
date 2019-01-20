@@ -1,0 +1,121 @@
+/** 
+ * Test class for  {@link SpaceQuotaRefresherChore}.
+ */
+@Category(SmallTests.class) public class TestSpaceQuotaViolationPolicyRefresherChore {
+  @ClassRule public static final HBaseClassTestRule CLASS_RULE=HBaseClassTestRule.forClass(TestSpaceQuotaViolationPolicyRefresherChore.class);
+  private RegionServerSpaceQuotaManager manager;
+  private RegionServerServices rss;
+  private SpaceQuotaRefresherChore chore;
+  private Configuration conf;
+  private Connection conn;
+  @SuppressWarnings("unchecked") @Before public void setup() throws IOException {
+    conf=HBaseConfiguration.create();
+    rss=mock(RegionServerServices.class);
+    manager=mock(RegionServerSpaceQuotaManager.class);
+    conn=mock(Connection.class);
+    when(manager.getRegionServerServices()).thenReturn(rss);
+    when(rss.getConfiguration()).thenReturn(conf);
+    chore=mock(SpaceQuotaRefresherChore.class);
+    when(chore.getConnection()).thenReturn(conn);
+    when(chore.getManager()).thenReturn(manager);
+    doCallRealMethod().when(chore).chore();
+    when(chore.isInViolation(any())).thenCallRealMethod();
+    doCallRealMethod().when(chore).extractQuotaSnapshot(any(),any());
+  }
+  @Test public void testPoliciesAreEnforced() throws IOException {
+    final Map<TableName,SpaceQuotaSnapshot> policiesToEnforce=new HashMap<>();
+    policiesToEnforce.put(TableName.valueOf("table1"),new SpaceQuotaSnapshot(new SpaceQuotaStatus(SpaceViolationPolicy.DISABLE),1024L,512L));
+    policiesToEnforce.put(TableName.valueOf("table2"),new SpaceQuotaSnapshot(new SpaceQuotaStatus(SpaceViolationPolicy.NO_INSERTS),2048L,512L));
+    policiesToEnforce.put(TableName.valueOf("table3"),new SpaceQuotaSnapshot(new SpaceQuotaStatus(SpaceViolationPolicy.NO_WRITES),4096L,512L));
+    policiesToEnforce.put(TableName.valueOf("table4"),new SpaceQuotaSnapshot(new SpaceQuotaStatus(SpaceViolationPolicy.NO_WRITES_COMPACTIONS),8192L,512L));
+    when(manager.copyQuotaSnapshots()).thenReturn(Collections.emptyMap());
+    when(chore.fetchSnapshotsFromQuotaTable()).thenReturn(policiesToEnforce);
+    chore.chore();
+    for (    Entry<TableName,SpaceQuotaSnapshot> entry : policiesToEnforce.entrySet()) {
+      verify(manager).enforceViolationPolicy(entry.getKey(),entry.getValue());
+      verify(manager,never()).disableViolationPolicyEnforcement(entry.getKey());
+    }
+  }
+  @Test public void testOldPoliciesAreRemoved() throws IOException {
+    final Map<TableName,SpaceQuotaSnapshot> previousPolicies=new HashMap<>();
+    previousPolicies.put(TableName.valueOf("table3"),new SpaceQuotaSnapshot(new SpaceQuotaStatus(SpaceViolationPolicy.NO_WRITES),4096L,512L));
+    previousPolicies.put(TableName.valueOf("table4"),new SpaceQuotaSnapshot(new SpaceQuotaStatus(SpaceViolationPolicy.NO_WRITES),8192L,512L));
+    final Map<TableName,SpaceQuotaSnapshot> policiesToEnforce=new HashMap<>();
+    policiesToEnforce.put(TableName.valueOf("table1"),new SpaceQuotaSnapshot(new SpaceQuotaStatus(SpaceViolationPolicy.DISABLE),1024L,512L));
+    policiesToEnforce.put(TableName.valueOf("table2"),new SpaceQuotaSnapshot(new SpaceQuotaStatus(SpaceViolationPolicy.NO_INSERTS),2048L,512L));
+    policiesToEnforce.put(TableName.valueOf("table3"),new SpaceQuotaSnapshot(SpaceQuotaStatus.notInViolation(),256L,512L));
+    policiesToEnforce.put(TableName.valueOf("table4"),new SpaceQuotaSnapshot(SpaceQuotaStatus.notInViolation(),128L,512L));
+    when(manager.copyQuotaSnapshots()).thenReturn(previousPolicies);
+    when(chore.fetchSnapshotsFromQuotaTable()).thenReturn(policiesToEnforce);
+    chore.chore();
+    verify(manager).enforceViolationPolicy(TableName.valueOf("table1"),policiesToEnforce.get(TableName.valueOf("table1")));
+    verify(manager).enforceViolationPolicy(TableName.valueOf("table2"),policiesToEnforce.get(TableName.valueOf("table2")));
+    verify(manager).disableViolationPolicyEnforcement(TableName.valueOf("table3"));
+    verify(manager).disableViolationPolicyEnforcement(TableName.valueOf("table4"));
+  }
+  @Test public void testNewPolicyOverridesOld() throws IOException {
+    final Map<TableName,SpaceQuotaSnapshot> policiesToEnforce=new HashMap<>();
+    policiesToEnforce.put(TableName.valueOf("table1"),new SpaceQuotaSnapshot(new SpaceQuotaStatus(SpaceViolationPolicy.DISABLE),1024L,512L));
+    policiesToEnforce.put(TableName.valueOf("table2"),new SpaceQuotaSnapshot(new SpaceQuotaStatus(SpaceViolationPolicy.NO_WRITES),2048L,512L));
+    policiesToEnforce.put(TableName.valueOf("table3"),new SpaceQuotaSnapshot(new SpaceQuotaStatus(SpaceViolationPolicy.NO_INSERTS),4096L,512L));
+    final Map<TableName,SpaceQuotaSnapshot> previousPolicies=new HashMap<>();
+    previousPolicies.put(TableName.valueOf("table1"),new SpaceQuotaSnapshot(new SpaceQuotaStatus(SpaceViolationPolicy.NO_WRITES),8192L,512L));
+    when(manager.getActivePoliciesAsMap()).thenReturn(previousPolicies);
+    when(chore.fetchSnapshotsFromQuotaTable()).thenReturn(policiesToEnforce);
+    chore.chore();
+    for (    Entry<TableName,SpaceQuotaSnapshot> entry : policiesToEnforce.entrySet()) {
+      verify(manager).enforceViolationPolicy(entry.getKey(),entry.getValue());
+    }
+    verify(manager,never()).disableViolationPolicyEnforcement(TableName.valueOf("table1"));
+  }
+  @Test public void testMissingAllColumns() throws IOException {
+    when(chore.fetchSnapshotsFromQuotaTable()).thenCallRealMethod();
+    ResultScanner scanner=mock(ResultScanner.class);
+    Table quotaTable=mock(Table.class);
+    when(conn.getTable(QuotaUtil.QUOTA_TABLE_NAME)).thenReturn(quotaTable);
+    when(quotaTable.getScanner(any(Scan.class))).thenReturn(scanner);
+    List<Result> results=new ArrayList<>();
+    results.add(Result.create(Collections.emptyList()));
+    when(scanner.iterator()).thenReturn(results.iterator());
+    try {
+      chore.fetchSnapshotsFromQuotaTable();
+      fail("Expected an IOException, but did not receive one.");
+    }
+ catch (    IOException e) {
+    }
+  }
+  @Test public void testMissingDesiredColumn() throws IOException {
+    when(chore.fetchSnapshotsFromQuotaTable()).thenCallRealMethod();
+    ResultScanner scanner=mock(ResultScanner.class);
+    Table quotaTable=mock(Table.class);
+    when(conn.getTable(QuotaUtil.QUOTA_TABLE_NAME)).thenReturn(quotaTable);
+    when(quotaTable.getScanner(any(Scan.class))).thenReturn(scanner);
+    List<Result> results=new ArrayList<>();
+    Cell c=new KeyValue(toBytes("t:inviolation"),toBytes("q"),toBytes("s"),new byte[0]);
+    results.add(Result.create(Collections.singletonList(c)));
+    when(scanner.iterator()).thenReturn(results.iterator());
+    try {
+      chore.fetchSnapshotsFromQuotaTable();
+      fail("Expected an IOException, but did not receive one.");
+    }
+ catch (    IOException e) {
+    }
+  }
+  @Test public void testParsingError() throws IOException {
+    when(chore.fetchSnapshotsFromQuotaTable()).thenCallRealMethod();
+    ResultScanner scanner=mock(ResultScanner.class);
+    Table quotaTable=mock(Table.class);
+    when(conn.getTable(QuotaUtil.QUOTA_TABLE_NAME)).thenReturn(quotaTable);
+    when(quotaTable.getScanner(any(Scan.class))).thenReturn(scanner);
+    List<Result> results=new ArrayList<>();
+    Cell c=new KeyValue(toBytes("t:inviolation"),toBytes("u"),toBytes("v"),new byte[0]);
+    results.add(Result.create(Collections.singletonList(c)));
+    when(scanner.iterator()).thenReturn(results.iterator());
+    try {
+      chore.fetchSnapshotsFromQuotaTable();
+      fail("Expected an IOException, but did not receive one.");
+    }
+ catch (    IOException e) {
+    }
+  }
+}

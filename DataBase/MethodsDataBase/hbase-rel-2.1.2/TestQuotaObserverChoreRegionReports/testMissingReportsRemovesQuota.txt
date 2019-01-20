@@ -1,0 +1,52 @@
+@Test public void testMissingReportsRemovesQuota() throws Exception {
+  Configuration conf=TEST_UTIL.getConfiguration();
+  conf.setInt(QuotaObserverChore.REGION_REPORT_RETENTION_DURATION_KEY,5000);
+  TEST_UTIL.startMiniCluster(1);
+  final String FAM1="f1";
+  final TableName tn=TableName.valueOf("quotaAcceptanceWithoutReports");
+  HTableDescriptor tableDesc=new HTableDescriptor(tn);
+  tableDesc.addFamily(new HColumnDescriptor(FAM1));
+  TEST_UTIL.getAdmin().createTable(tableDesc);
+  final long sizeLimit=1L * SpaceQuotaHelperForTests.ONE_KILOBYTE;
+  final SpaceViolationPolicy violationPolicy=SpaceViolationPolicy.NO_INSERTS;
+  QuotaSettings settings=QuotaSettingsFactory.limitTableSpace(tn,sizeLimit,violationPolicy);
+  final Admin admin=TEST_UTIL.getAdmin();
+  admin.setQuota(settings);
+  final Connection conn=TEST_UTIL.getConnection();
+  Put p=new Put(Bytes.toBytes("row1"));
+  byte[] bytes=new byte[10];
+  Arrays.fill(bytes,(byte)2);
+  for (int i=0; i < 200; i++) {
+    p.addColumn(Bytes.toBytes(FAM1),Bytes.toBytes("qual" + i),bytes);
+  }
+  conn.getTable(tn).put(p);
+  admin.flush(tn);
+  Waiter.waitFor(TEST_UTIL.getConfiguration(),30000,1000,new Waiter.Predicate<Exception>(){
+    @Override public boolean evaluate() throws Exception {
+      SpaceQuotaSnapshot snapshot=getSnapshotForTable(conn,tn);
+      if (snapshot == null) {
+        return false;
+      }
+      return snapshot.getQuotaStatus().isInViolation();
+    }
+  }
+);
+  List<RegionInfo> regions=admin.getRegions(tn);
+  assertEquals(1,regions.size());
+  RegionInfo hri=regions.get(0);
+  admin.unassign(hri.getRegionName(),true);
+  Waiter.waitFor(TEST_UTIL.getConfiguration(),30000,1000,new Waiter.Predicate<Exception>(){
+    @Override public boolean evaluate() throws Exception {
+      SpaceQuotaSnapshot snapshot=getSnapshotForTable(conn,tn);
+      if (snapshot == null) {
+        return false;
+      }
+      return !snapshot.getQuotaStatus().isInViolation();
+    }
+  }
+);
+  final HMaster master=TEST_UTIL.getMiniHBaseCluster().getMaster();
+  QuotaSnapshotStore<TableName> tableStore=master.getQuotaObserverChore().getTableSnapshotStore();
+  SpaceQuotaSnapshot snapshot=tableStore.getCurrentState(tn);
+  assertFalse("Quota should not be in violation",snapshot.getQuotaStatus().isInViolation());
+}

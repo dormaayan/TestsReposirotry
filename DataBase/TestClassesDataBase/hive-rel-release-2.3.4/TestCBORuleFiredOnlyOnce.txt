@@ -1,0 +1,67 @@
+public class TestCBORuleFiredOnlyOnce {
+  @Test public void testRuleFiredOnlyOnce(){
+    HiveConf conf=new HiveConf();
+    HepProgramBuilder programBuilder=new HepProgramBuilder();
+    programBuilder.addMatchOrder(HepMatchOrder.TOP_DOWN);
+    programBuilder=programBuilder.addRuleCollection(ImmutableList.<RelOptRule>of(DummyRule.INSTANCE));
+    HiveRulesRegistry registry=new HiveRulesRegistry();
+    HivePlannerContext context=new HivePlannerContext(null,registry,null);
+    HepPlanner planner=new HepPlanner(programBuilder.build(),context);
+    RexBuilder rexBuilder=new RexBuilder(new JavaTypeFactoryImpl());
+    RelOptCluster cluster=RelOptCluster.create(planner,rexBuilder);
+    HiveDefaultRelMetadataProvider mdProvider=new HiveDefaultRelMetadataProvider(conf);
+    List<RelMetadataProvider> list=Lists.newArrayList();
+    list.add(mdProvider.getMetadataProvider());
+    planner.registerMetadataProviders(list);
+    RelMetadataProvider chainedProvider=ChainedRelMetadataProvider.of(list);
+    final RelNode node=new DummyNode(cluster,cluster.traitSet());
+    node.getCluster().setMetadataProvider(new CachingRelMetadataProvider(chainedProvider,planner));
+    planner.setRoot(node);
+    planner.findBestExp();
+    assertEquals(3,DummyRule.INSTANCE.numberMatches);
+    assertEquals(1,DummyRule.INSTANCE.numberOnMatch);
+  }
+public static class DummyRule extends RelOptRule {
+    public static final DummyRule INSTANCE=new DummyRule();
+    public int numberMatches;
+    public int numberOnMatch;
+    private DummyRule(){
+      super(operand(RelNode.class,any()));
+      numberMatches=0;
+      numberOnMatch=0;
+    }
+    @Override public boolean matches(    RelOptRuleCall call){
+      final RelNode node=call.rel(0);
+      numberMatches++;
+      HiveRulesRegistry registry=call.getPlanner().getContext().unwrap(HiveRulesRegistry.class);
+      if (registry != null && registry.getVisited(this).contains(node)) {
+        return false;
+      }
+      return true;
+    }
+    @Override public void onMatch(    RelOptRuleCall call){
+      final RelNode node=call.rel(0);
+      numberOnMatch++;
+      if (numberOnMatch > 1) {
+        return;
+      }
+      HiveRulesRegistry registry=call.getPlanner().getContext().unwrap(HiveRulesRegistry.class);
+      if (registry != null) {
+        registry.registerVisited(this,node);
+      }
+      final RelNode newNode=new DummyNode(node.getCluster(),node.getTraitSet());
+      if (registry != null) {
+        registry.registerVisited(this,newNode);
+      }
+      call.transformTo(newNode);
+    }
+  }
+public static class DummyNode extends AbstractRelNode {
+    protected DummyNode(    RelOptCluster cluster,    RelTraitSet traits){
+      super(cluster,cluster.traitSet());
+    }
+    @Override protected RelDataType deriveRowType(){
+      return new RelRecordType(Lists.<RelDataTypeField>newArrayList());
+    }
+  }
+}

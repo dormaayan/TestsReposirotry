@@ -1,0 +1,39 @@
+@Test public void testWithKerberizedCluster() throws Exception {
+  conf=new HdfsConfiguration(baseConf);
+  conf.setInt(HADOOP_KERBEROS_MIN_SECONDS_BEFORE_RELOGIN,3);
+  conf.setInt(IPC_CLIENT_CONNECTION_IDLESCANINTERVAL_KEY,100);
+  conf.setInt(IPC_CLIENT_CONNECTION_MAXIDLETIME_KEY,2000);
+  Client.setConnectTimeout(conf,2000);
+  cluster=new MiniQJMHACluster.Builder(conf).setForceRemoteEditsOnly(true).build();
+  cluster.getDfsCluster().waitActive();
+  cluster.getDfsCluster().transitionToActive(0);
+  final UserGroupInformation ugi=UserGroupInformation.loginUserFromKeytabAndReturnUGI("hdfs",generalHDFSKeytabFile.getAbsolutePath());
+  UserGroupInformation.setShouldRenewImmediatelyForTests(true);
+  ugi.doAs(new PrivilegedExceptionAction<Void>(){
+    @Override public Void run() throws Exception {
+      LOG.info("Current user is: " + UserGroupInformation.getCurrentUser() + " login user is:"+ UserGroupInformation.getLoginUser());
+      Configuration clientConf=new Configuration(cluster.getDfsCluster().getConfiguration(0));
+      try (DistributedFileSystem clientFs=(DistributedFileSystem)FileSystem.get(clientConf)){
+        clientFs.mkdirs(new Path("/test"));
+        LOG.info("mkdir /test success");
+        final DFSInotifyEventInputStream eis=clientFs.getInotifyEventStream();
+        EventBatch batch;
+        while ((batch=eis.poll()) != null) {
+          LOG.info("txid: " + batch.getTxid());
+        }
+        assertNull("poll should not return anything",eis.poll());
+        Thread.sleep(6000);
+        LOG.info("Slept 6 seconds to make sure the TGT has expired.");
+        UserGroupInformation.getCurrentUser().checkTGTAndReloginFromKeytab();
+        clientFs.mkdirs(new Path("/test1"));
+        LOG.info("mkdir /test1 success");
+        batch=eis.poll();
+        assertNotNull("poll should return something",batch);
+        assertEquals(1,batch.getEvents().length);
+        assertNull("poll should not return anything",eis.poll());
+        return null;
+      }
+     }
+  }
+);
+}

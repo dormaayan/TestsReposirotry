@@ -1,0 +1,51 @@
+public class ReaderLogVersionBridgeTest {
+  @Rule public final TestDirectory testDirectory=TestDirectory.testDirectory();
+  private final FileSystemAbstraction fs=mock(FileSystemAbstraction.class);
+  private final LogVersionedStoreChannel channel=mock(LogVersionedStoreChannel.class);
+  private final long version=10L;
+  private LogFiles logFiles;
+  @Before public void setUp() throws Exception {
+    logFiles=prepareLogFiles();
+  }
+  @Test public void shouldOpenTheNextChannelWhenItExists() throws IOException {
+    final StoreChannel newStoreChannel=mock(StoreChannel.class);
+    final ReaderLogVersionBridge bridge=new ReaderLogVersionBridge(logFiles);
+    when(channel.getVersion()).thenReturn(version);
+    when(channel.getLogFormatVersion()).thenReturn(CURRENT_LOG_VERSION);
+    when(fs.fileExists(any(File.class))).thenReturn(true);
+    when(fs.open(any(File.class),eq(OpenMode.READ))).thenReturn(newStoreChannel);
+    when(newStoreChannel.read(ArgumentMatchers.<ByteBuffer>any())).then(invocationOnMock -> {
+      ByteBuffer buffer=invocationOnMock.getArgument(0);
+      buffer.putLong(encodeLogVersion(version + 1));
+      buffer.putLong(42);
+      return LOG_HEADER_SIZE;
+    }
+);
+    final LogVersionedStoreChannel result=bridge.next(channel);
+    PhysicalLogVersionedStoreChannel expected=new PhysicalLogVersionedStoreChannel(newStoreChannel,version + 1,CURRENT_LOG_VERSION);
+    assertEquals(expected,result);
+    verify(channel,times(1)).close();
+  }
+  @Test public void shouldReturnOldChannelWhenThereIsNoNextChannel() throws IOException {
+    final ReaderLogVersionBridge bridge=new ReaderLogVersionBridge(logFiles);
+    when(channel.getVersion()).thenReturn(version);
+    when(fs.open(any(File.class),eq(OpenMode.READ))).thenThrow(new FileNotFoundException());
+    final LogVersionedStoreChannel result=bridge.next(channel);
+    assertEquals(channel,result);
+    verify(channel,never()).close();
+  }
+  @Test public void shouldReturnOldChannelWhenNextChannelHasntGottenCompleteHeaderYet() throws Exception {
+    final ReaderLogVersionBridge bridge=new ReaderLogVersionBridge(logFiles);
+    final StoreChannel nextVersionWithIncompleteHeader=mock(StoreChannel.class);
+    when(nextVersionWithIncompleteHeader.read(any(ByteBuffer.class))).thenReturn(LOG_HEADER_SIZE / 2);
+    when(channel.getVersion()).thenReturn(version);
+    when(fs.fileExists(any(File.class))).thenReturn(true);
+    when(fs.open(any(File.class),eq(OpenMode.READ))).thenReturn(nextVersionWithIncompleteHeader);
+    final LogVersionedStoreChannel result=bridge.next(channel);
+    assertEquals(channel,result);
+    verify(channel,never()).close();
+  }
+  private LogFiles prepareLogFiles() throws IOException {
+    return LogFilesBuilder.logFilesBasedOnlyBuilder(testDirectory.directory(),fs).build();
+  }
+}

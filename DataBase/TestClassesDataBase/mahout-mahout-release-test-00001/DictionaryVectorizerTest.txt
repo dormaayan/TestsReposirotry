@@ -1,0 +1,94 @@
+/** 
+ * Test the dictionary Vector
+ */
+@ThreadLeakScope(ThreadLeakScope.Scope.NONE) public final class DictionaryVectorizerTest extends MahoutTestCase {
+  private static final int NUM_DOCS=100;
+  private static final String SECOND_TEXT_BLOCK_IDENTIFIER="2NDBLOCK";
+  private Path inputPath;
+  @Override @Before public void setUp() throws Exception {
+    super.setUp();
+    Configuration conf=getConfiguration();
+    inputPath=getTestTempFilePath("documents/docs.file");
+    FileSystem fs=FileSystem.get(inputPath.toUri(),conf);
+    SequenceFile.Writer writer=new SequenceFile.Writer(fs,conf,inputPath,Text.class,Text.class);
+    try {
+      RandomDocumentGenerator gen=new RandomDocumentGenerator();
+      for (int i=0; i < NUM_DOCS; i++) {
+        writer.append(new Text("Document::ID::" + i),new Text(gen.getRandomDocument()));
+        writer.append(new Text("Document::ID::" + i),new Text(SECOND_TEXT_BLOCK_IDENTIFIER));
+      }
+    }
+  finally {
+      Closeables.close(writer,false);
+    }
+  }
+  @Test public void testCreateTermFrequencyVectors() throws Exception {
+    runTest(false,false);
+  }
+  @Test public void testCreateTermFrequencyVectorsNam() throws Exception {
+    runTest(false,true);
+  }
+  @Test public void testCreateTermFrequencyVectorsSeq() throws Exception {
+    runTest(true,false);
+  }
+  @Test public void testCreateTermFrequencyVectorsSeqNam() throws Exception {
+    runTest(true,true);
+  }
+  private void runTest(  boolean sequential,  boolean named) throws IOException, ClassNotFoundException, InterruptedException {
+    Class<? extends Analyzer> analyzer=StandardAnalyzer.class;
+    Path tokenizedDocuments=getTestTempDirPath("output/tokenized-documents");
+    Path wordCount=getTestTempDirPath("output/wordcount");
+    Path tfVectors=new Path(wordCount,"tf-vectors");
+    Path tfidf=getTestTempDirPath("output/tfidf");
+    Path tfidfVectors=new Path(tfidf,"tfidf-vectors");
+    Configuration conf=getConfiguration();
+    DocumentProcessor.tokenizeDocuments(inputPath,analyzer,tokenizedDocuments,conf);
+    DictionaryVectorizer.createTermFrequencyVectors(tokenizedDocuments,wordCount,DictionaryVectorizer.DOCUMENT_VECTOR_OUTPUT_FOLDER,conf,2,1,0.0f,-1.0f,true,1,100,sequential,named);
+    validateVectors(conf,NUM_DOCS,tfVectors,sequential,named);
+    Pair<Long[],List<Path>> docFrequenciesFeatures=TFIDFConverter.calculateDF(tfVectors,tfidf,conf,100);
+    TFIDFConverter.processTfIdf(tfVectors,tfidf,conf,docFrequenciesFeatures,1,-1,2.0f,false,sequential,named,1);
+    validateVectors(conf,NUM_DOCS,tfidfVectors,sequential,named);
+    Integer secondTextBlockIdentifierDimensionId=validateDictionary(wordCount,conf);
+    validateVectorContainingSecondTextBlock(conf,tfVectors,secondTextBlockIdentifierDimensionId);
+  }
+  public static void validateVectors(  Configuration conf,  int numDocs,  Path vectorPath,  boolean sequential,  boolean named){
+    int count=0;
+    for (    VectorWritable value : new SequenceFileDirValueIterable<VectorWritable>(vectorPath,PathType.LIST,PathFilters.partFilter(),null,true,conf)) {
+      count++;
+      Vector v=value.get();
+      if (named) {
+        assertTrue("Expected NamedVector",v instanceof NamedVector);
+        v=((NamedVector)v).getDelegate();
+      }
+      if (sequential) {
+        assertTrue("Expected SequentialAccessSparseVector",v instanceof SequentialAccessSparseVector);
+      }
+ else {
+        assertTrue("Expected RandomAccessSparseVector",v instanceof RandomAccessSparseVector);
+      }
+    }
+    assertEquals("Expected " + numDocs + " documents",numDocs,count);
+  }
+  private Integer validateDictionary(  Path dictionaryDirectoryPath,  Configuration conf){
+    PathFilter dictionaryChunkPathFilter=new PathFilter(){
+      @Override public boolean accept(      Path path){
+        String name=path.getName();
+        return name.startsWith("dictionary.file");
+      }
+    }
+;
+    Map<String,Integer> dictionary=new HashMap<>();
+    for (    Pair<Text,IntWritable> value : new SequenceFileDirIterable<Text,IntWritable>(dictionaryDirectoryPath,PathType.LIST,dictionaryChunkPathFilter,null,true,conf)) {
+      dictionary.put(value.getFirst().toString(),value.getSecond().get());
+    }
+    Integer secondTextBlockIdentifierDimensionId=dictionary.get(SECOND_TEXT_BLOCK_IDENTIFIER.toLowerCase());
+    assertNotNull("Token '" + SECOND_TEXT_BLOCK_IDENTIFIER + "' must be in dictionary ",secondTextBlockIdentifierDimensionId);
+    assertTrue("Dictionary must contain more than just 1 element!",dictionary.size() > 1);
+    return secondTextBlockIdentifierDimensionId;
+  }
+  public static void validateVectorContainingSecondTextBlock(  Configuration conf,  Path vectorPath,  int dimensionId){
+    for (    VectorWritable value : new SequenceFileDirValueIterable<VectorWritable>(vectorPath,PathType.LIST,PathFilters.partFilter(),null,true,conf)) {
+      assertTrue("The vector must contain the second text block",value.get().get(dimensionId) > 0);
+    }
+  }
+}
