@@ -1,0 +1,54 @@
+/** 
+ * @author <a href="mailto:nmaurer@redhat.com">Norman Maurer</a>
+ */
+@RunWith(DefaultServer.class) @HttpOneOnly public class ProgramaticLazyEndpointTest {
+  private static ServerWebSocketContainer deployment;
+  @BeforeClass public static void setup() throws Exception {
+    final ServletContainer container=ServletContainer.Factory.newInstance();
+    DeploymentInfo builder=new DeploymentInfo().setClassLoader(ProgramaticLazyEndpointTest.class.getClassLoader()).setContextPath("/").setClassIntrospecter(TestClassIntrospector.INSTANCE).addServlet(Servlets.servlet("add",AddEndpointServlet.class).setLoadOnStartup(100)).addServletContextAttribute(WebSocketDeploymentInfo.ATTRIBUTE_NAME,new WebSocketDeploymentInfo().setBuffers(DefaultServer.getBufferPool()).setWorker(DefaultServer.getWorker()).addListener(new WebSocketDeploymentInfo.ContainerReadyListener(){
+      @Override public void ready(      ServerWebSocketContainer container){
+        deployment=container;
+      }
+    }
+)).setDeploymentName("servletContext.war");
+    DeploymentManager manager=container.addDeployment(builder);
+    manager.deploy();
+    DefaultServer.setRootHandler(manager.start());
+    DefaultServer.startSSLServer();
+  }
+  @AfterClass public static void after() throws IOException {
+    deployment=null;
+    DefaultServer.stopSSLServer();
+  }
+  @org.junit.Test public void testStringOnMessage() throws Exception {
+    SSLContext context=DefaultServer.getClientSSLContext();
+    ProgramaticClientEndpoint endpoint=new ProgramaticClientEndpoint();
+    ClientEndpointConfig clientEndpointConfig=ClientEndpointConfig.Builder.create().build();
+    clientEndpointConfig.getUserProperties().put(DefaultWebSocketClientSslProvider.SSL_CONTEXT,context);
+    ContainerProvider.getWebSocketContainer().connectToServer(endpoint,clientEndpointConfig,new URI("wss://" + DefaultServer.getHostAddress("default") + ":"+ DefaultServer.getHostSSLPort("default")+ "/foo"));
+    Assert.assertEquals("Hello Stuart",endpoint.getResponses().poll(15,TimeUnit.SECONDS));
+    endpoint.session.close();
+    endpoint.closeLatch.await(10,TimeUnit.SECONDS);
+  }
+public static class ProgramaticClientEndpoint extends Endpoint {
+    private final LinkedBlockingDeque<String> responses=new LinkedBlockingDeque<>();
+    final CountDownLatch closeLatch=new CountDownLatch(1);
+    volatile Session session;
+    @Override public void onOpen(    Session session,    EndpointConfig config){
+      this.session=session;
+      session.getAsyncRemote().sendText("Stuart");
+      session.addMessageHandler(new MessageHandler.Whole<String>(){
+        @Override public void onMessage(        String message){
+          responses.add(message);
+        }
+      }
+);
+    }
+    @Override public void onClose(    Session session,    CloseReason closeReason){
+      closeLatch.countDown();
+    }
+    public LinkedBlockingDeque<String> getResponses(){
+      return responses;
+    }
+  }
+}

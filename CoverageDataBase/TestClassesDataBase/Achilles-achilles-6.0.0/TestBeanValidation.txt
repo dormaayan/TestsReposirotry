@@ -1,0 +1,69 @@
+public class TestBeanValidation {
+  private static Interceptor<EntityWithBeanValidation> PRE_INSERT_INTERCEPTOR=new Interceptor<EntityWithBeanValidation>(){
+    @Override public boolean acceptEntity(    Class<?> entityClass){
+      return entityClass.equals(EntityWithBeanValidation.class);
+    }
+    @Override public void onEvent(    EntityWithBeanValidation entity,    Event event){
+      if (MapUtils.isEmpty(entity.getUdt().getMap())) {
+        entity.getUdt().setMap(ImmutableMap.of(0,"default"));
+      }
+    }
+    @Override public List<Event> interceptOnEvents(){
+      return asList(PRE_INSERT);
+    }
+  }
+;
+  @Rule public ExpectedException exception=ExpectedException.none();
+  @Rule public AchillesTestResource<ManagerFactory> resource=AchillesTestResourceBuilder.forJunit().entityClassesToTruncate(EntityWithBeanValidation.class).truncateBeforeAndAfterTest().build((cluster,statementsCache) -> ManagerFactoryBuilder.builder(cluster).withManagedEntityClasses(EntityWithBeanValidation.class).doForceSchemaCreation(true).withBeanValidation(true).withPostLoadBeanValidation(true).withEventInterceptors(asList(PRE_INSERT_INTERCEPTOR)).withDefaultKeyspaceName(DEFAULT_CASSANDRA_EMBEDDED_KEYSPACE_NAME).withStatementsCache(statementsCache).build());
+  private Session session=resource.getNativeSession();
+  private EntityWithBeanValidation_Manager manager=resource.getManagerFactory().forEntityWithBeanValidation();
+  private ScriptExecutor scriptExecutor=resource.getScriptExecutor();
+  @Test public void should_fail_on_pre_insert_because_empty_text() throws Exception {
+    final Long id=RandomUtils.nextLong(0L,Long.MAX_VALUE);
+    final TestUDT udt=new TestUDT("test@test.com",asList("list"),ImmutableMap.of(1,"one"));
+    final EntityWithBeanValidation entity=new EntityWithBeanValidation(id,"",asList("1","2"),udt);
+    exception.expect(AchillesBeanValidationException.class);
+    exception.expectMessage("Bean validation error on event 'PRE_INSERT' : \n" + "\tproperty 'value' of class 'info.archinnov.achilles.internals.entities.EntityWithBeanValidation' may not be empty");
+    manager.crud().insert(entity).execute();
+  }
+  @Test public void should_fail_on_pre_insert_because_empty_list() throws Exception {
+    final Long id=RandomUtils.nextLong(0L,Long.MAX_VALUE);
+    final TestUDT udt=new TestUDT("test@test.com",asList("list"),ImmutableMap.of(1,"one"));
+    final EntityWithBeanValidation entity=new EntityWithBeanValidation(id,"value",new ArrayList<>(),udt);
+    exception.expect(AchillesBeanValidationException.class);
+    exception.expectMessage("Bean validation error on event 'PRE_INSERT' : \n" + "\tproperty 'list' of class 'info.archinnov.achilles.internals.entities.EntityWithBeanValidation' may not be empty");
+    manager.crud().insert(entity).execute();
+  }
+  @Test public void should_fail_on_pre_insert_because_invalid_email_in_udt() throws Exception {
+    final Long id=RandomUtils.nextLong(0L,Long.MAX_VALUE);
+    final TestUDT udt=new TestUDT("test",asList("list"),ImmutableMap.of(1,"one"));
+    final EntityWithBeanValidation entity=new EntityWithBeanValidation(id,"value",asList(""),udt);
+    exception.expect(AchillesBeanValidationException.class);
+    exception.expectMessage("Bean validation error on event 'PRE_INSERT' : \n" + "\tproperty 'udt.name' of class 'info.archinnov.achilles.internals.entities.TestUDT' not a well-formed email address");
+    manager.crud().insert(entity).execute();
+  }
+  @Test public void should_fail_on_pre_insert_because_failed_constraint_in_udt() throws Exception {
+    final Long id=RandomUtils.nextLong(0L,Long.MAX_VALUE);
+    final TestUDT udt=new TestUDT("test@test.com",null,ImmutableMap.of(1,"one"));
+    final EntityWithBeanValidation entity=new EntityWithBeanValidation(id,"value",asList(""),udt);
+    exception.expect(AchillesBeanValidationException.class);
+    exception.expectMessage("Bean validation error on event 'PRE_INSERT' : \n" + "\tproperty 'udt.list' of class 'info.archinnov.achilles.internals.entities.TestUDT' UDT list should not be empty");
+    manager.crud().insert(entity).execute();
+  }
+  @Test public void should_verify_bean_validator_called_last_on_pre_insert() throws Exception {
+    final Long id=RandomUtils.nextLong(0L,Long.MAX_VALUE);
+    final TestUDT udt=new TestUDT("test@test.com",asList("1"),null);
+    final EntityWithBeanValidation entity=new EntityWithBeanValidation(id,"value",asList(""),udt);
+    manager.crud().insert(entity).execute();
+    Row actual=session.execute("SELECT * FROM bean_validation WHERE id = " + id).one();
+    assertThat(actual).isNotNull();
+    assertThat(actual.getUDTValue("udt").getMap("map",String.class,String.class)).containsEntry("0","default");
+  }
+  @Test public void should_fail_on_post_load() throws Exception {
+    final Long id=RandomUtils.nextLong(0L,Long.MAX_VALUE);
+    scriptExecutor.executeScriptTemplate("EntityWithBeanValidation/insert_single_row.cql",ImmutableMap.of("id",id));
+    exception.expect(AchillesException.class);
+    exception.expectMessage("Bean validation error on event 'POST_LOAD' : \n" + "\tproperty 'list' of class 'info.archinnov.achilles.internals.entities.EntityWithBeanValidation' may not be empty");
+    manager.crud().findById(id).get();
+  }
+}

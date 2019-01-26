@@ -1,0 +1,147 @@
+/** 
+ * Tests for  {@link JimfsAsynchronousFileChannel}.
+ * @author Colin Decker
+ */
+@RunWith(JUnit4.class) public class JimfsAsynchronousFileChannelTest {
+  private static JimfsAsynchronousFileChannel channel(  RegularFile file,  ExecutorService executor,  OpenOption... options) throws IOException {
+    JimfsFileChannel channel=new JimfsFileChannel(file,Options.getOptionsForChannel(ImmutableSet.copyOf(options)),new FileSystemState(Runnables.doNothing()));
+    return new JimfsAsynchronousFileChannel(channel,executor);
+  }
+  /** 
+ * Just tests the main read/write methods... the methods all delegate to the non-async channel anyway.
+ */
+  @Test public void testAsyncChannel() throws Throwable {
+    RegularFile file=regularFile(15);
+    ExecutorService executor=Executors.newSingleThreadExecutor();
+    JimfsAsynchronousFileChannel channel=channel(file,executor,READ,WRITE);
+    try {
+      assertEquals(15,channel.size());
+      assertSame(channel,channel.truncate(5));
+      assertEquals(5,channel.size());
+      file.write(5,new byte[5],0,5);
+      checkAsyncRead(channel);
+      checkAsyncWrite(channel);
+      checkAsyncLock(channel);
+      channel.close();
+      assertFalse(channel.isOpen());
+    }
+  finally {
+      executor.shutdown();
+    }
+  }
+  @Test public void testClosedChannel() throws Throwable {
+    RegularFile file=regularFile(15);
+    ExecutorService executor=Executors.newSingleThreadExecutor();
+    try {
+      JimfsAsynchronousFileChannel channel=channel(file,executor,READ,WRITE);
+      channel.close();
+      assertClosed(channel.read(ByteBuffer.allocate(10),0));
+      assertClosed(channel.write(ByteBuffer.allocate(10),15));
+      assertClosed(channel.lock());
+      assertClosed(channel.lock(0,10,true));
+    }
+  finally {
+      executor.shutdown();
+    }
+  }
+  @Test public void testAsyncClose_write() throws Throwable {
+    RegularFile file=regularFile(15);
+    ExecutorService executor=Executors.newFixedThreadPool(4);
+    try {
+      JimfsAsynchronousFileChannel channel=channel(file,executor,READ,WRITE);
+      file.writeLock().lock();
+      Future<Integer> future=channel.write(ByteBuffer.allocate(10),0);
+      SettableFuture<Integer> completionHandlerFuture=SettableFuture.create();
+      channel.write(ByteBuffer.allocate(10),0,null,setFuture(completionHandlerFuture));
+      Uninterruptibles.sleepUninterruptibly(10,MILLISECONDS);
+      channel.close();
+      assertAsynchronousClose(future);
+      assertAsynchronousClose(completionHandlerFuture);
+    }
+  finally {
+      executor.shutdown();
+    }
+  }
+  @Test public void testAsyncClose_read() throws Throwable {
+    RegularFile file=regularFile(15);
+    ExecutorService executor=Executors.newFixedThreadPool(2);
+    try {
+      JimfsAsynchronousFileChannel channel=channel(file,executor,READ,WRITE);
+      file.writeLock().lock();
+      Future<Integer> future=channel.read(ByteBuffer.allocate(10),0);
+      SettableFuture<Integer> completionHandlerFuture=SettableFuture.create();
+      channel.read(ByteBuffer.allocate(10),0,null,setFuture(completionHandlerFuture));
+      Uninterruptibles.sleepUninterruptibly(10,MILLISECONDS);
+      channel.close();
+      assertAsynchronousClose(future);
+      assertAsynchronousClose(completionHandlerFuture);
+    }
+  finally {
+      executor.shutdown();
+    }
+  }
+  private static void checkAsyncRead(  AsynchronousFileChannel channel) throws Throwable {
+    ByteBuffer buf=buffer("1234567890");
+    assertEquals(10,(int)channel.read(buf,0).get());
+    buf.flip();
+    SettableFuture<Integer> future=SettableFuture.create();
+    channel.read(buf,0,null,setFuture(future));
+    assertThat(future.get(10,SECONDS)).isEqualTo(10);
+  }
+  private static void checkAsyncWrite(  AsynchronousFileChannel asyncChannel) throws Throwable {
+    ByteBuffer buf=buffer("1234567890");
+    assertEquals(10,(int)asyncChannel.write(buf,0).get());
+    buf.flip();
+    SettableFuture<Integer> future=SettableFuture.create();
+    asyncChannel.write(buf,0,null,setFuture(future));
+    assertThat(future.get(10,SECONDS)).isEqualTo(10);
+  }
+  private static void checkAsyncLock(  AsynchronousFileChannel channel) throws Throwable {
+    assertNotNull(channel.lock().get());
+    assertNotNull(channel.lock(0,10,true).get());
+    SettableFuture<FileLock> future=SettableFuture.create();
+    channel.lock(0,10,true,null,setFuture(future));
+    assertNotNull(future.get(10,SECONDS));
+  }
+  /** 
+ * Returns a  {@code CompletionHandler} that sets the appropriate result or exception on the given{@code future} on completion.
+ */
+  private static <T>CompletionHandler<T,Object> setFuture(  final SettableFuture<T> future){
+    return new CompletionHandler<T,Object>(){
+      @Override public void completed(      T result,      Object attachment){
+        future.set(result);
+      }
+      @Override public void failed(      Throwable exc,      Object attachment){
+        future.setException(exc);
+      }
+    }
+;
+  }
+  /** 
+ * Assert that the future fails, with the failure caused by  {@code ClosedChannelException}.
+ */
+  private static void assertClosed(  Future<?> future) throws Throwable {
+    try {
+      future.get(10,SECONDS);
+      fail("ChannelClosedException was not thrown");
+    }
+ catch (    ExecutionException expected) {
+      assertThat(expected.getCause()).isInstanceOf(ClosedChannelException.class);
+    }
+  }
+  /** 
+ * Assert that the future fails, with the failure caused by either {@code AsynchronousCloseException} or (rarely) {@code ClosedChannelException}.
+ */
+  private static void assertAsynchronousClose(  Future<?> future) throws Throwable {
+    try {
+      future.get(10,SECONDS);
+      fail("no exception was thrown");
+    }
+ catch (    ExecutionException expected) {
+      Throwable t=expected.getCause();
+      if (!(t instanceof AsynchronousCloseException || t instanceof ClosedChannelException)) {
+        fail("expected AsynchronousCloseException (or in rare cases ClosedChannelException): " + "got " + t);
+      }
+    }
+  }
+}

@@ -1,0 +1,106 @@
+public final class CertificatePinnerChainValidationTest {
+  @Rule public final MockWebServer server=new MockWebServer();
+  /** 
+ * The pinner should pull the root certificate from the trust manager. 
+ */
+  @Test public void pinRootNotPresentInChain() throws Exception {
+    HeldCertificate rootCa=new HeldCertificate.Builder().serialNumber(1L).certificateAuthority(1).commonName("root").build();
+    HeldCertificate intermediateCa=new HeldCertificate.Builder().signedBy(rootCa).certificateAuthority(0).serialNumber(2L).commonName("intermediate_ca").build();
+    HeldCertificate certificate=new HeldCertificate.Builder().signedBy(intermediateCa).serialNumber(3L).commonName(server.getHostName()).build();
+    CertificatePinner certificatePinner=new CertificatePinner.Builder().add(server.getHostName(),CertificatePinner.pin(rootCa.certificate())).build();
+    HandshakeCertificates handshakeCertificates=new HandshakeCertificates.Builder().addTrustedCertificate(rootCa.certificate()).build();
+    OkHttpClient client=defaultClient().newBuilder().sslSocketFactory(handshakeCertificates.sslSocketFactory(),handshakeCertificates.trustManager()).hostnameVerifier(new RecordingHostnameVerifier()).certificatePinner(certificatePinner).build();
+    HandshakeCertificates serverHandshakeCertificates=new HandshakeCertificates.Builder().heldCertificate(certificate,intermediateCa.certificate()).build();
+    server.useHttps(serverHandshakeCertificates.sslSocketFactory(),false);
+    server.enqueue(new MockResponse().setBody("abc").setSocketPolicy(SocketPolicy.DISCONNECT_AT_END));
+    Call call1=client.newCall(new Request.Builder().url(server.url("/")).build());
+    Response response1=call1.execute();
+    assertEquals("abc",response1.body().string());
+    server.enqueue(new MockResponse().setBody("def").setSocketPolicy(SocketPolicy.DISCONNECT_AT_END));
+    Call call2=client.newCall(new Request.Builder().url(server.url("/")).build());
+    Response response2=call2.execute();
+    assertEquals("def",response2.body().string());
+  }
+  /** 
+ * The pinner should accept an intermediate from the server's chain. 
+ */
+  @Test public void pinIntermediatePresentInChain() throws Exception {
+    HeldCertificate rootCa=new HeldCertificate.Builder().serialNumber(1L).certificateAuthority(1).commonName("root").build();
+    HeldCertificate intermediateCa=new HeldCertificate.Builder().signedBy(rootCa).certificateAuthority(0).serialNumber(2L).commonName("intermediate_ca").build();
+    HeldCertificate certificate=new HeldCertificate.Builder().signedBy(intermediateCa).serialNumber(3L).commonName(server.getHostName()).build();
+    CertificatePinner certificatePinner=new CertificatePinner.Builder().add(server.getHostName(),CertificatePinner.pin(intermediateCa.certificate())).build();
+    HandshakeCertificates handshakeCertificates=new HandshakeCertificates.Builder().addTrustedCertificate(rootCa.certificate()).build();
+    OkHttpClient client=defaultClient().newBuilder().sslSocketFactory(handshakeCertificates.sslSocketFactory(),handshakeCertificates.trustManager()).hostnameVerifier(new RecordingHostnameVerifier()).certificatePinner(certificatePinner).build();
+    HandshakeCertificates serverHandshakeCertificates=new HandshakeCertificates.Builder().heldCertificate(certificate,intermediateCa.certificate()).build();
+    server.useHttps(serverHandshakeCertificates.sslSocketFactory(),false);
+    server.enqueue(new MockResponse().setBody("abc").setSocketPolicy(SocketPolicy.DISCONNECT_AT_END));
+    Call call1=client.newCall(new Request.Builder().url(server.url("/")).build());
+    Response response1=call1.execute();
+    assertEquals("abc",response1.body().string());
+    response1.close();
+    client.connectionPool().evictAll();
+    server.enqueue(new MockResponse().setBody("def").setSocketPolicy(SocketPolicy.DISCONNECT_AT_END));
+    Call call2=client.newCall(new Request.Builder().url(server.url("/")).build());
+    Response response2=call2.execute();
+    assertEquals("def",response2.body().string());
+    response2.close();
+  }
+  @Test public void unrelatedPinnedLeafCertificateInChain() throws Exception {
+    HeldCertificate rootCa=new HeldCertificate.Builder().serialNumber(1L).certificateAuthority(1).commonName("root").build();
+    HeldCertificate goodIntermediateCa=new HeldCertificate.Builder().signedBy(rootCa).certificateAuthority(0).serialNumber(2L).commonName("good_intermediate_ca").build();
+    HeldCertificate goodCertificate=new HeldCertificate.Builder().signedBy(goodIntermediateCa).serialNumber(3L).commonName(server.getHostName()).build();
+    CertificatePinner certificatePinner=new CertificatePinner.Builder().add(server.getHostName(),CertificatePinner.pin(goodCertificate.certificate())).build();
+    HandshakeCertificates handshakeCertificates=new HandshakeCertificates.Builder().addTrustedCertificate(rootCa.certificate()).build();
+    OkHttpClient client=defaultClient().newBuilder().sslSocketFactory(handshakeCertificates.sslSocketFactory(),handshakeCertificates.trustManager()).hostnameVerifier(new RecordingHostnameVerifier()).certificatePinner(certificatePinner).build();
+    HeldCertificate compromisedIntermediateCa=new HeldCertificate.Builder().signedBy(rootCa).certificateAuthority(0).serialNumber(4L).commonName("bad_intermediate_ca").build();
+    HeldCertificate rogueCertificate=new HeldCertificate.Builder().serialNumber(5L).signedBy(compromisedIntermediateCa).commonName(server.getHostName()).build();
+    SSLSocketFactory socketFactory=newServerSocketFactory(rogueCertificate,compromisedIntermediateCa.certificate(),goodCertificate.certificate());
+    server.useHttps(socketFactory,false);
+    server.enqueue(new MockResponse().setBody("abc").addHeader("Content-Type: text/plain"));
+    Request request=new Request.Builder().url(server.url("/")).build();
+    Call call=client.newCall(request);
+    try {
+      call.execute();
+      fail();
+    }
+ catch (    SSLPeerUnverifiedException expected) {
+      String message=expected.getMessage();
+      assertTrue(message,message.startsWith("Certificate pinning failure!"));
+    }
+  }
+  @Test public void unrelatedPinnedIntermediateCertificateInChain() throws Exception {
+    HeldCertificate rootCa=new HeldCertificate.Builder().serialNumber(1L).certificateAuthority(1).commonName("root").build();
+    HeldCertificate compromisedRootCa=new HeldCertificate.Builder().serialNumber(2L).certificateAuthority(1).commonName("compromised_root").build();
+    HeldCertificate goodIntermediateCa=new HeldCertificate.Builder().signedBy(rootCa).certificateAuthority(0).serialNumber(3L).commonName("intermediate_ca").build();
+    CertificatePinner certificatePinner=new CertificatePinner.Builder().add(server.getHostName(),CertificatePinner.pin(goodIntermediateCa.certificate())).build();
+    HandshakeCertificates handshakeCertificates=new HandshakeCertificates.Builder().addTrustedCertificate(rootCa.certificate()).addTrustedCertificate(compromisedRootCa.certificate()).build();
+    OkHttpClient client=defaultClient().newBuilder().sslSocketFactory(handshakeCertificates.sslSocketFactory(),handshakeCertificates.trustManager()).hostnameVerifier(new RecordingHostnameVerifier()).certificatePinner(certificatePinner).build();
+    HeldCertificate compromisedIntermediateCa=new HeldCertificate.Builder().signedBy(compromisedRootCa).certificateAuthority(0).serialNumber(4L).commonName("intermediate_ca").build();
+    HeldCertificate rogueCertificate=new HeldCertificate.Builder().serialNumber(5L).signedBy(compromisedIntermediateCa).commonName(server.getHostName()).build();
+    SSLSocketFactory socketFactory=newServerSocketFactory(rogueCertificate,goodIntermediateCa.certificate(),compromisedIntermediateCa.certificate());
+    server.useHttps(socketFactory,false);
+    server.enqueue(new MockResponse().setBody("abc").addHeader("Content-Type: text/plain"));
+    Request request=new Request.Builder().url(server.url("/")).build();
+    Call call=client.newCall(request);
+    try {
+      call.execute();
+      fail();
+    }
+ catch (    SSLHandshakeException expected) {
+      String message=expected.getMessage();
+      assertTrue(message,message.contains("Could not validate certificate"));
+    }
+catch (    SSLPeerUnverifiedException expected) {
+      String message=expected.getMessage();
+      assertTrue(message,message.startsWith("Certificate pinning failure!"));
+    }
+  }
+  private SSLSocketFactory newServerSocketFactory(  HeldCertificate heldCertificate,  X509Certificate... intermediates) throws GeneralSecurityException {
+    String keystoreType=getPlatform().equals("jdk9") ? "JKS" : null;
+    X509KeyManager x509KeyManager=newKeyManager(keystoreType,heldCertificate,intermediates);
+    X509TrustManager trustManager=newTrustManager(keystoreType,Collections.<X509Certificate>emptyList());
+    SSLContext sslContext=Platform.get().getSSLContext();
+    sslContext.init(new KeyManager[]{x509KeyManager},new TrustManager[]{trustManager},new SecureRandom());
+    return sslContext.getSocketFactory();
+  }
+}

@@ -1,0 +1,83 @@
+/** 
+ * @author Stuart Douglas
+ */
+@RunWith(DefaultServer.class) public class ServletClientCertAuthTestCase {
+  private static final String REALM_NAME="Servlet_Realm";
+  protected static final IdentityManager identityManager;
+  private static SSLContext clientSSLContext;
+static {
+    final Set<String> certUsers=new HashSet<>();
+    certUsers.add("CN=Test Client,OU=OU,O=Org,L=City,ST=State,C=GB");
+    identityManager=new IdentityManager(){
+      @Override public Account verify(      Account account){
+        return account;
+      }
+      @Override public Account verify(      String id,      Credential credential){
+        return null;
+      }
+      @Override public Account verify(      Credential credential){
+        if (credential instanceof X509CertificateCredential) {
+          final Principal p=((X509CertificateCredential)credential).getCertificate().getSubjectX500Principal();
+          if (certUsers.contains(p.getName())) {
+            return new Account(){
+              @Override public Principal getPrincipal(){
+                return p;
+              }
+              @Override public Set<String> getRoles(){
+                return Collections.singleton("role1");
+              }
+            }
+;
+          }
+        }
+        return null;
+      }
+    }
+;
+  }
+  @BeforeClass public static void startSSL() throws Exception {
+  }
+  @AfterClass public static void stopSSL() throws Exception {
+    clientSSLContext=null;
+    DefaultServer.stopSSLServer();
+  }
+  @BeforeClass public static void setup() throws ServletException, IOException {
+    DefaultServer.startSSLServer();
+    clientSSLContext=DefaultServer.getClientSSLContext();
+    final PathHandler path=new PathHandler();
+    final ServletContainer container=ServletContainer.Factory.newInstance();
+    ServletInfo usernameServlet=new ServletInfo("Username Servlet",SendUsernameServlet.class).addMapping("/secured/username");
+    ServletInfo authTypeServlet=new ServletInfo("Auth Type Servlet",SendAuthTypeServlet.class).addMapping("/secured/authType");
+    LoginConfig loginConfig=new LoginConfig(REALM_NAME);
+    loginConfig.addFirstAuthMethod(new AuthMethodConfig("CLIENT_CERT"));
+    DeploymentInfo builder=new DeploymentInfo().setClassLoader(SimpleServletTestCase.class.getClassLoader()).setContextPath("/servletContext").setClassIntrospecter(TestClassIntrospector.INSTANCE).setDeploymentName("servletContext.war").setIdentityManager(identityManager).setLoginConfig(loginConfig).addServlets(usernameServlet,authTypeServlet);
+    builder.addSecurityConstraint(new SecurityConstraint().addWebResourceCollection(new WebResourceCollection().addUrlPattern("/secured/*")).addRoleAllowed("role1").setEmptyRoleSemantic(SecurityInfo.EmptyRoleSemantic.DENY));
+    DeploymentManager manager=container.addDeployment(builder);
+    manager.deploy();
+    path.addPrefixPath(builder.getContextPath(),manager.start());
+    DefaultServer.setRootHandler(path);
+  }
+  @Test public void testUserName() throws Exception {
+    testCall("username","CN=Test Client,OU=OU,O=Org,L=City,ST=State,C=GB",200);
+  }
+  @Test public void testAuthType() throws Exception {
+    testCall("authType","CLIENT_CERT",200);
+  }
+  public void testCall(  final String path,  final String expectedResponse,  int expect) throws Exception {
+    TestHttpClient client=new TestHttpClient();
+    client.setSSLContext(clientSSLContext);
+    try {
+      String url=DefaultServer.getDefaultServerSSLAddress() + "/servletContext/secured/" + path;
+      HttpGet get=new HttpGet(url);
+      HttpResponse result=client.execute(get);
+      assertEquals(expect,result.getStatusLine().getStatusCode());
+      final String response=HttpClientUtils.readResponse(result);
+      if (expect == 200) {
+        assertEquals(expectedResponse,response);
+      }
+    }
+  finally {
+      client.getConnectionManager().shutdown();
+    }
+  }
+}

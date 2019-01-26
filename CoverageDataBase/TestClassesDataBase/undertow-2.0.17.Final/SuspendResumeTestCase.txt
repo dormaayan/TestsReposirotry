@@ -1,0 +1,103 @@
+/** 
+ * @author Stuart Douglas
+ */
+@RunWith(DefaultServer.class) @HttpOneOnly public class SuspendResumeTestCase {
+  private static volatile ServerWebSocketContainer serverContainer;
+  @BeforeClass public static void setup() throws ServletException {
+    final ServletContainer container=ServletContainer.Factory.newInstance();
+    DeploymentInfo builder=new DeploymentInfo().setClassLoader(TestMessagesReceivedInOrder.class.getClassLoader()).setContextPath("/").setResourceManager(new TestResourceLoader(TestMessagesReceivedInOrder.class)).setClassIntrospecter(TestClassIntrospector.INSTANCE).addServletContextAttribute(WebSocketDeploymentInfo.ATTRIBUTE_NAME,new WebSocketDeploymentInfo().setBuffers(DefaultServer.getBufferPool()).setWorker(DefaultServer.getWorker()).addListener(new WebSocketDeploymentInfo.ContainerReadyListener(){
+      @Override public void ready(      ServerWebSocketContainer c){
+        serverContainer=c;
+      }
+    }
+).addEndpoint(SuspendResumeEndpoint.class)).setDeploymentName("servletContext.war");
+    DeploymentManager manager=container.addDeployment(builder);
+    manager.deploy();
+    DefaultServer.setRootHandler(Handlers.path().addPrefixPath("/",manager.start()));
+  }
+  @Test public void testConnectionWaitsForMessageEnd() throws Exception {
+    final CountDownLatch done=new CountDownLatch(1);
+    final AtomicReference<String> message=new AtomicReference<>();
+    WebSocketChannel channel=WebSocketClient.connectionBuilder(DefaultServer.getWorker(),DefaultServer.getBufferPool(),new URI(DefaultServer.getDefaultServerURL() + "/")).connect().get();
+    channel.getReceiveSetter().set(new AbstractReceiveListener(){
+      @Override protected void onFullTextMessage(      WebSocketChannel channel,      BufferedTextMessage msg) throws IOException {
+        message.set(msg.getData());
+        done.countDown();
+      }
+      @Override protected void onError(      WebSocketChannel channel,      Throwable error){
+        error.printStackTrace();
+        message.set("error");
+        done.countDown();
+      }
+      @Override protected void onFullCloseMessage(      WebSocketChannel channel,      BufferedBinaryMessage message) throws IOException {
+        message.getData().free();
+        done.countDown();
+      }
+    }
+);
+    channel.resumeReceives();
+    Assert.assertTrue(channel.isOpen());
+    WebSockets.sendText("Hello World",channel,null);
+    Thread.sleep(500);
+    serverContainer.pause(null);
+    try {
+      Assert.assertTrue(done.await(10,TimeUnit.SECONDS));
+      Assert.assertEquals("Hello World",message.get());
+    }
+  finally {
+      serverContainer.resume();
+    }
+  }
+  @Test public void testConnectionClosedOnPause() throws Exception {
+    final CountDownLatch done=new CountDownLatch(1);
+    final AtomicReference<String> message=new AtomicReference<>();
+    WebSocketChannel channel=WebSocketClient.connectionBuilder(DefaultServer.getWorker(),DefaultServer.getBufferPool(),new URI(DefaultServer.getDefaultServerURL() + "/")).connect().get();
+    channel.getReceiveSetter().set(new ChannelListener<WebSocketChannel>(){
+      @Override public void handleEvent(      WebSocketChannel channel){
+        try {
+          StreamSourceFrameChannel res=channel.receive();
+          if (res == null) {
+            return;
+          }
+          if (res.getType() == WebSocketFrameType.CLOSE) {
+            message.set("closed");
+            done.countDown();
+          }
+          Channels.drain(res,Long.MAX_VALUE);
+        }
+ catch (        IOException e) {
+          if (message.get() == null) {
+            e.printStackTrace();
+            message.set("error");
+            done.countDown();
+          }
+        }
+      }
+    }
+);
+    channel.resumeReceives();
+    Assert.assertTrue(channel.isOpen());
+    Thread.sleep(500);
+    serverContainer.pause(null);
+    try {
+      Assert.assertTrue(done.await(10,TimeUnit.SECONDS));
+      Assert.assertEquals("closed",message.get());
+    }
+  finally {
+      serverContainer.resume();
+    }
+  }
+  @Test public void testRejectWhenSuspended() throws Exception {
+    try {
+      serverContainer.pause(null);
+      WebSocketChannel channel=WebSocketClient.connectionBuilder(DefaultServer.getWorker(),DefaultServer.getBufferPool(),new URI(DefaultServer.getDefaultServerURL() + "/")).connect().get();
+      IoUtils.safeClose(channel);
+      Assert.fail();
+    }
+ catch (    UpgradeFailedException e) {
+    }
+ finally {
+      serverContainer.resume();
+    }
+  }
+}

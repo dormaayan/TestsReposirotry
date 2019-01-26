@@ -1,0 +1,60 @@
+/** 
+ * @author Andrej Golovnin
+ * @author <a href="mailto:nmaurer@redhat.com">Norman Maurer</a>
+ */
+@RunWith(DefaultServer.class) @HttpOneOnly public class BinaryEndpointTest {
+  private static ServerWebSocketContainer deployment;
+  private static byte[] bytes;
+  @BeforeClass public static void setup() throws Exception {
+    bytes=new byte[256 * 1024];
+    new Random().nextBytes(bytes);
+    final ServletContainer container=ServletContainer.Factory.newInstance();
+    DeploymentInfo builder=new DeploymentInfo().setClassLoader(BinaryEndpointTest.class.getClassLoader()).setContextPath("/").setClassIntrospecter(TestClassIntrospector.INSTANCE).addServlet(Servlets.servlet("bin",BinaryEndpointServlet.class).setLoadOnStartup(100)).addServletContextAttribute(WebSocketDeploymentInfo.ATTRIBUTE_NAME,new WebSocketDeploymentInfo().setBuffers(DefaultServer.getBufferPool()).setWorker(DefaultServer.getWorkerSupplier()).addListener(new WebSocketDeploymentInfo.ContainerReadyListener(){
+      @Override public void ready(      ServerWebSocketContainer container){
+        deployment=container;
+      }
+    }
+)).setDeploymentName("servletContext.war");
+    DeploymentManager manager=container.addDeployment(builder);
+    manager.deploy();
+    DefaultServer.setRootHandler(new RequestDumpingHandler(manager.start()));
+    DefaultServer.startSSLServer();
+  }
+  @AfterClass public static void after() throws IOException {
+    deployment=null;
+    DefaultServer.stopSSLServer();
+  }
+  @org.junit.Test public void testBytesOnMessage() throws Exception {
+    SSLContext context=DefaultServer.getClientSSLContext();
+    ProgramaticClientEndpoint endpoint=new ProgramaticClientEndpoint();
+    ClientEndpointConfig clientEndpointConfig=ClientEndpointConfig.Builder.create().build();
+    clientEndpointConfig.getUserProperties().put(DefaultWebSocketClientSslProvider.SSL_CONTEXT,context);
+    ContainerProvider.getWebSocketContainer().connectToServer(endpoint,clientEndpointConfig,new URI("wss://" + DefaultServer.getHostAddress("default") + ":"+ DefaultServer.getHostSSLPort("default")+ "/partial"));
+    Assert.assertArrayEquals(bytes,endpoint.getResponses().poll(15,TimeUnit.SECONDS));
+    endpoint.session.close();
+    endpoint.closeLatch.await(10,TimeUnit.SECONDS);
+  }
+public static class ProgramaticClientEndpoint extends Endpoint {
+    private final LinkedBlockingDeque<byte[]> responses=new LinkedBlockingDeque<>();
+    final CountDownLatch closeLatch=new CountDownLatch(1);
+    volatile Session session;
+    @Override public void onOpen(    Session session,    EndpointConfig config){
+      this.session=session;
+      byte[] mutableBytes=new byte[bytes.length];
+      System.arraycopy(bytes,0,mutableBytes,0,bytes.length);
+      session.getAsyncRemote().sendBinary(ByteBuffer.wrap(mutableBytes));
+      session.addMessageHandler(new MessageHandler.Whole<byte[]>(){
+        @Override public void onMessage(        byte[] message){
+          responses.add(message);
+        }
+      }
+);
+    }
+    @Override public void onClose(    Session session,    CloseReason closeReason){
+      closeLatch.countDown();
+    }
+    public LinkedBlockingDeque<byte[]> getResponses(){
+      return responses;
+    }
+  }
+}

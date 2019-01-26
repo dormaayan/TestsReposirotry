@@ -1,0 +1,117 @@
+public final class ConnectionPoolTest {
+  private final Address addressA=newAddress("a");
+  private final Route routeA1=newRoute(addressA);
+  private final Address addressB=newAddress("b");
+  private final Route routeB1=newRoute(addressB);
+  private final Address addressC=newAddress("c");
+  private final Route routeC1=newRoute(addressC);
+static {
+    Internal.initializeInstanceForTests();
+  }
+  @Test public void connectionsEvictedWhenIdleLongEnough() throws Exception {
+    ConnectionPool pool=new ConnectionPool(Integer.MAX_VALUE,100L,TimeUnit.NANOSECONDS);
+    pool.cleanupRunning=true;
+    RealConnection c1=newConnection(pool,routeA1,50L);
+    assertEquals(100L,pool.cleanup(50L));
+    assertEquals(1,pool.connectionCount());
+    assertFalse(c1.socket().isClosed());
+    assertEquals(90L,pool.cleanup(60L));
+    assertEquals(1,pool.connectionCount());
+    assertFalse(c1.socket().isClosed());
+    assertEquals(1L,pool.cleanup(149L));
+    assertEquals(1,pool.connectionCount());
+    assertFalse(c1.socket().isClosed());
+    assertEquals(0,pool.cleanup(150L));
+    assertEquals(0,pool.connectionCount());
+    assertTrue(c1.socket().isClosed());
+    assertEquals(-1,pool.cleanup(150L));
+    assertEquals(0,pool.connectionCount());
+    assertTrue(c1.socket().isClosed());
+  }
+  @Test public void inUseConnectionsNotEvicted() throws Exception {
+    ConnectionPool pool=new ConnectionPool(Integer.MAX_VALUE,100L,TimeUnit.NANOSECONDS);
+    pool.cleanupRunning=true;
+    RealConnection c1=newConnection(pool,routeA1,50L);
+synchronized (pool) {
+      StreamAllocation streamAllocation=new StreamAllocation(pool,addressA,null,EventListener.NONE,null);
+      streamAllocation.acquire(c1,true);
+    }
+    assertEquals(100L,pool.cleanup(50L));
+    assertEquals(1,pool.connectionCount());
+    assertFalse(c1.socket().isClosed());
+    assertEquals(100L,pool.cleanup(60L));
+    assertEquals(1,pool.connectionCount());
+    assertFalse(c1.socket().isClosed());
+    assertEquals(100L,pool.cleanup(160L));
+    assertEquals(1,pool.connectionCount());
+    assertFalse(c1.socket().isClosed());
+  }
+  @Test public void cleanupPrioritizesEarliestEviction() throws Exception {
+    ConnectionPool pool=new ConnectionPool(Integer.MAX_VALUE,100L,TimeUnit.NANOSECONDS);
+    pool.cleanupRunning=true;
+    RealConnection c1=newConnection(pool,routeA1,75L);
+    RealConnection c2=newConnection(pool,routeB1,50L);
+    assertEquals(75L,pool.cleanup(75L));
+    assertEquals(2,pool.connectionCount());
+    assertEquals(1L,pool.cleanup(149L));
+    assertEquals(2,pool.connectionCount());
+    assertEquals(0L,pool.cleanup(150L));
+    assertEquals(1,pool.connectionCount());
+    assertFalse(c1.socket().isClosed());
+    assertTrue(c2.socket().isClosed());
+    assertEquals(25L,pool.cleanup(150L));
+    assertEquals(1,pool.connectionCount());
+    assertEquals(0L,pool.cleanup(175L));
+    assertEquals(0,pool.connectionCount());
+    assertTrue(c1.socket().isClosed());
+    assertTrue(c2.socket().isClosed());
+  }
+  @Test public void oldestConnectionsEvictedIfIdleLimitExceeded() throws Exception {
+    ConnectionPool pool=new ConnectionPool(2,100L,TimeUnit.NANOSECONDS);
+    pool.cleanupRunning=true;
+    RealConnection c1=newConnection(pool,routeA1,50L);
+    RealConnection c2=newConnection(pool,routeB1,75L);
+    assertEquals(50L,pool.cleanup(100L));
+    assertEquals(2,pool.connectionCount());
+    assertFalse(c1.socket().isClosed());
+    assertFalse(c2.socket().isClosed());
+    RealConnection c3=newConnection(pool,routeC1,75L);
+    assertEquals(0L,pool.cleanup(100L));
+    assertEquals(2,pool.connectionCount());
+    assertTrue(c1.socket().isClosed());
+    assertFalse(c2.socket().isClosed());
+    assertFalse(c3.socket().isClosed());
+  }
+  @Test public void leakedAllocation() throws Exception {
+    ConnectionPool pool=new ConnectionPool(2,100L,TimeUnit.NANOSECONDS);
+    pool.cleanupRunning=true;
+    RealConnection c1=newConnection(pool,routeA1,0L);
+    allocateAndLeakAllocation(pool,c1);
+    awaitGarbageCollection();
+    assertEquals(0L,pool.cleanup(100L));
+    assertEquals(Collections.emptyList(),c1.allocations);
+    assertTrue(c1.noNewStreams);
+  }
+  /** 
+ * Use a helper method so there's no hidden reference remaining on the stack. 
+ */
+  private void allocateAndLeakAllocation(  ConnectionPool pool,  RealConnection connection){
+synchronized (pool) {
+      StreamAllocation leak=new StreamAllocation(pool,connection.route().address(),null,EventListener.NONE,null);
+      leak.acquire(connection,true);
+    }
+  }
+  private RealConnection newConnection(  ConnectionPool pool,  Route route,  long idleAtNanos){
+    RealConnection result=RealConnection.testConnection(pool,route,new Socket(),idleAtNanos);
+synchronized (pool) {
+      pool.put(result);
+    }
+    return result;
+  }
+  private Address newAddress(  String name){
+    return new Address(name,1,Dns.SYSTEM,SocketFactory.getDefault(),null,null,null,new RecordingOkAuthenticator("password",null),null,Collections.<Protocol>emptyList(),Collections.<ConnectionSpec>emptyList(),ProxySelector.getDefault());
+  }
+  private Route newRoute(  Address address){
+    return new Route(address,Proxy.NO_PROXY,InetSocketAddress.createUnresolved(address.url().host(),address.url().port()));
+  }
+}

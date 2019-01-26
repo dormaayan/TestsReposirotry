@@ -1,0 +1,50 @@
+/** 
+ * Tests the load balancing proxy
+ * @author Stuart Douglas
+ */
+@RunWith(DefaultServer.class) public class LoadBalancingProxyHTTP2ViaUpgradeTestCase extends AbstractLoadBalancingProxyTestCase {
+  @BeforeClass public static void setup() throws URISyntaxException {
+    int port=DefaultServer.getHostPort("default");
+    final HttpHandler handler1=getRootHandler("s1","server1");
+    server1=Undertow.builder().addHttpListener(port + 1,DefaultServer.getHostAddress("default")).setServerOption(UndertowOptions.ENABLE_HTTP2,true).setServerOption(UndertowOptions.NO_REQUEST_TIMEOUT,IDLE_TIMEOUT).setSocketOption(Options.REUSE_ADDRESSES,true).setHandler(new Http2UpgradeHandler(new HttpHandler(){
+      @Override public void handleRequest(      HttpServerExchange exchange) throws Exception {
+        if (!(exchange.getConnection() instanceof Http2ServerConnection)) {
+          throw new RuntimeException("Not HTTP2");
+        }
+        exchange.getResponseHeaders().add(new HttpString("X-Custom-Header"),"foo");
+        System.out.println("server1 " + exchange.getRequestHeaders());
+        handler1.handleRequest(exchange);
+      }
+    }
+)).build();
+    final HttpHandler handler2=getRootHandler("s2","server2");
+    server2=Undertow.builder().addHttpListener(port + 2,DefaultServer.getHostAddress("default")).setServerOption(UndertowOptions.ENABLE_HTTP2,true).setServerOption(UndertowOptions.NO_REQUEST_TIMEOUT,IDLE_TIMEOUT).setSocketOption(Options.REUSE_ADDRESSES,true).setHandler(new Http2UpgradeHandler(new HttpHandler(){
+      @Override public void handleRequest(      HttpServerExchange exchange) throws Exception {
+        if (!(exchange.getConnection() instanceof Http2ServerConnection)) {
+          throw new RuntimeException("Not HTTP2");
+        }
+        exchange.getResponseHeaders().add(new HttpString("X-Custom-Header"),"foo");
+        System.out.println("server2 " + exchange.getRequestHeaders());
+        handler2.handleRequest(exchange);
+      }
+    }
+)).build();
+    server1.start();
+    server2.start();
+    DefaultServer.setRootHandler(ProxyHandler.builder().setProxyClient(new LoadBalancingProxyClient().setConnectionsPerThread(4).addHost(new URI("h2c",null,DefaultServer.getHostAddress("default"),port + 1,null,null,null),"s1").addHost(new URI("h2c",null,DefaultServer.getHostAddress("default"),port + 2,null,null,null),"s2")).setMaxRequestTime(10000).setMaxConnectionRetries(2).build());
+  }
+  @Test public void testHeadersAreLowercase() throws IOException {
+    TestHttpClient client=new TestHttpClient();
+    try {
+      HttpGet get=new HttpGet(DefaultServer.getDefaultServerURL() + "/name");
+      HttpResponse result=client.execute(get);
+      Assert.assertEquals(StatusCodes.OK,result.getStatusLine().getStatusCode());
+      HttpClientUtils.readResponse(result);
+      Header header=result.getFirstHeader("x-custom-header");
+      Assert.assertEquals("x-custom-header",header.getName());
+    }
+  finally {
+      client.getConnectionManager().shutdown();
+    }
+  }
+}

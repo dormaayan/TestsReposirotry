@@ -1,0 +1,178 @@
+public class HLockManagerImplTest extends BaseEmbededServerSetupTest {
+  private static final Logger logger=LoggerFactory.getLogger(HLockManagerImplTest.class);
+  Cluster cluster;
+  HLockManager lm;
+  HLockManagerConfigurator hlc;
+  @Before public void setupTest(){
+    cluster=getOrCreateCluster("MyCluster",getCHCForTest());
+    hlc=new HLockManagerConfigurator();
+    hlc.setReplicationFactor(1);
+    lm=new HLockManagerImpl(cluster,hlc);
+    lm.init();
+  }
+  @Test public void testInitWithDefaults(){
+    KeyspaceDefinition keyspaceDef=cluster.describeKeyspace(lm.getKeyspace().getKeyspaceName());
+    assertNotNull(keyspaceDef);
+    assertTrue(verifyCFCreation(keyspaceDef.getCfDefs()));
+  }
+  @Test public void testHeartbeatNoExpiration() throws InterruptedException {
+    HLock lock=lm.createLock("/testHeartbeatNoExpiration");
+    lm.acquire(lock);
+    assertTrue(lock.isAcquired());
+    Thread.sleep(hlc.getLocksTTLInMillis() + 2000);
+    HLock newLock=lm.createLock("/testHeartbeatNoExpiration");
+    boolean lockTimedOut=false;
+    try {
+      lm.acquire(newLock,0);
+    }
+ catch (    HLockTimeoutException te) {
+      lockTimedOut=true;
+    }
+    assertTrue(lock.isAcquired());
+    assertFalse(newLock.isAcquired());
+    assertTrue(lockTimedOut);
+    lm.release(lock);
+  }
+  @Test public void testHeartbeatFailure() throws InterruptedException {
+    HLockManagerImpl failedLockManager=new HLockManagerImpl(cluster,hlc);
+    failedLockManager.init();
+    HLock lock=failedLockManager.createLock("/testHeartbeatFailure");
+    failedLockManager.acquire(lock);
+    assertTrue(lock.isAcquired());
+    failedLockManager.shutdownScheduler();
+    Thread.sleep(hlc.getLocksTTLInMillis() + 2000);
+    HLock newLock=lm.createLock("/testHeartbeatFailure");
+    boolean lockTimedOut=false;
+    try {
+      lm.acquire(newLock,0);
+    }
+ catch (    HLockTimeoutException te) {
+      lockTimedOut=true;
+    }
+    assertFalse(lockTimedOut);
+    assertTrue(newLock.isAcquired());
+    lm.release(newLock);
+  }
+  @Test public void testNonConcurrentLockUnlock(){
+    HLock lock=lm.createLock("/testNonConcurrentLockUnlock");
+    lm.acquire(lock);
+    assertTrue(lock.isAcquired());
+    try {
+      HLock lock2=lm.createLock("/testNonConcurrentLockUnlock");
+      lm.acquire(lock2,1000);
+      fail();
+    }
+ catch (    HLockTimeoutException e) {
+    }
+    lm.release(lock);
+    assertFalse(lock.isAcquired());
+    HLock nextLock=lm.createLock("/testNonConcurrentLockUnlock");
+    lm.acquire(nextLock,0);
+    assertTrue(nextLock.isAcquired());
+    lm.release(nextLock);
+  }
+  @Test public void testNoConflict() throws InterruptedException {
+    Semaphore failSemaphore=new Semaphore(1);
+    int lockManagers=5;
+    int lockClients=30;
+    LockWorkerPool[] pools=new LockWorkerPool[lockManagers];
+    for (int i=0; i < lockManagers; i++) {
+      HLockManager lm=new HLockManagerImpl(cluster,hlc);
+      lm.init();
+      pools[i]=new LockWorkerPool(lockClients,"/testNoConflict",lm,failSemaphore);
+      pools[i].go();
+    }
+    for (int i=0; i < lockManagers; i++) {
+      pools[i].waitToFinish();
+      assertFalse(pools[i].isFailed());
+    }
+  }
+  private boolean verifyCFCreation(  List<ColumnFamilyDefinition> cfDefs){
+    for (    ColumnFamilyDefinition cfDef : cfDefs) {
+      if (cfDef.getName().equals(HLockManagerConfigurator.DEFAUT_LOCK_MANAGER_CF))       return true;
+    }
+    return false;
+  }
+private static class LockWorkerPool {
+    private final int numberLocks;
+    private final String path;
+    private final HLockManager lm;
+    private final ExecutorService executor;
+    private final CountDownLatch startLatch;
+    private final CountDownLatch finishLatch;
+    private final Semaphore failSemaphore;
+    private boolean failed;
+    private LockWorkerPool(    int numberLocks,    String path,    HLockManager lm,    Semaphore failSemaphore){
+      this.numberLocks=numberLocks;
+      this.path=path;
+      this.lm=lm;
+      this.executor=Executors.newFixedThreadPool(8);
+      this.failSemaphore=failSemaphore;
+      startLatch=new CountDownLatch(1);
+      finishLatch=new CountDownLatch(numberLocks);
+      failed=false;
+    }
+    private void go() throws InterruptedException {
+      for (int i=0; i < numberLocks; i++) {
+        executor.execute(new LockWorker(this));
+      }
+      startLatch.countDown();
+    }
+    private void waitToFinish() throws InterruptedException {
+      finishLatch.await();
+    }
+    private void setFailed(){
+      logger.error("Failed flag set");
+      failed=true;
+      List<Runnable> waiting=executor.shutdownNow();
+      for (int i=0; i < waiting.size() + 1; i++) {
+        finishLatch.countDown();
+      }
+    }
+    private boolean isFailed(){
+      return failed;
+    }
+  }
+private static class LockWorker implements Runnable {
+    private LockWorkerPool pool;
+    /** 
+ * @param path
+ * @param lm
+ */
+    public LockWorker(    LockWorkerPool pool){
+      this.pool=pool;
+    }
+    @Override public void run(){
+      HLock lock=pool.lm.createLock(pool.path);
+      try {
+        try {
+          pool.startLatch.await();
+        }
+ catch (        InterruptedException e) {
+        }
+        logger.info("{} trying",lock);
+        pool.lm.acquire(lock);
+        logger.info("{} acquired",lock);
+        if (!pool.failSemaphore.tryAcquire()) {
+          logger.error("Acquired semaphore when we shouldn't.  Failing test");
+          pool.setFailed();
+        }
+        try {
+          Thread.sleep(100);
+        }
+ catch (        InterruptedException e) {
+        }
+        pool.failSemaphore.release();
+        logger.info("{} released",lock);
+      }
+ catch (      Throwable t) {
+        logger.error("Error when trying to acquire lock",t);
+        pool.setFailed();
+      }
+ finally {
+        pool.lm.release(lock);
+        pool.finishLatch.countDown();
+      }
+    }
+  }
+}

@@ -1,0 +1,140 @@
+/** 
+ * Processes HTTP requests layered over HTTP/2. 
+ */
+private class Http2SocketHandler extends Http2Connection.Listener {
+  private final Socket socket;
+  private final Protocol protocol;
+  private final AtomicInteger sequenceNumber=new AtomicInteger();
+  private Http2SocketHandler(  Socket socket,  Protocol protocol){
+    this.socket=socket;
+    this.protocol=protocol;
+  }
+  @Override public void onStream(  Http2Stream stream) throws IOException {
+    MockResponse peekedResponse=dispatcher.peek();
+    if (peekedResponse.getSocketPolicy() == RESET_STREAM_AT_START) {
+      try {
+        dispatchBookkeepingRequest(sequenceNumber.getAndIncrement(),socket);
+        stream.close(ErrorCode.fromHttp2(peekedResponse.getHttp2ErrorCode()));
+        return;
+      }
+ catch (      InterruptedException e) {
+        throw new AssertionError(e);
+      }
+    }
+    RecordedRequest request=readRequest(stream);
+    requestCount.incrementAndGet();
+    requestQueue.add(request);
+    MockResponse response;
+    try {
+      response=dispatcher.dispatch(request);
+    }
+ catch (    InterruptedException e) {
+      throw new AssertionError(e);
+    }
+    if (response.getSocketPolicy() == DISCONNECT_AFTER_REQUEST) {
+      socket.close();
+      return;
+    }
+    writeResponse(stream,response);
+    if (logger.isLoggable(Level.INFO)) {
+      logger.info(MockWebServer.this + " received request: " + request+ " and responded: "+ response+ " protocol is "+ protocol.toString());
+    }
+    if (response.getSocketPolicy() == DISCONNECT_AT_END) {
+      Http2Connection connection=stream.getConnection();
+      connection.shutdown(ErrorCode.NO_ERROR);
+    }
+  }
+  private RecordedRequest readRequest(  Http2Stream stream) throws IOException {
+    Headers streamHeaders=stream.takeHeaders();
+    Headers.Builder httpHeaders=new Headers.Builder();
+    String method="<:method omitted>";
+    String path="<:path omitted>";
+    boolean readBody=true;
+    for (int i=0, size=streamHeaders.size(); i < size; i++) {
+      String name=streamHeaders.name(i);
+      String value=streamHeaders.value(i);
+      if (name.equals(Header.TARGET_METHOD_UTF8)) {
+        method=value;
+      }
+ else       if (name.equals(Header.TARGET_PATH_UTF8)) {
+        path=value;
+      }
+ else       if (protocol == Protocol.HTTP_2 || protocol == Protocol.H2_PRIOR_KNOWLEDGE) {
+        httpHeaders.add(name,value);
+      }
+ else {
+        throw new IllegalStateException();
+      }
+      if (name.equals("expect") && value.equalsIgnoreCase("100-continue")) {
+        readBody=false;
+      }
+    }
+    Headers headers=httpHeaders.build();
+    MockResponse peek=dispatcher.peek();
+    if (!readBody && peek.getSocketPolicy() == EXPECT_CONTINUE) {
+      stream.writeHeaders(Collections.singletonList(new Header(Header.RESPONSE_STATUS,ByteString.encodeUtf8("100 Continue"))),true);
+      stream.getConnection().flush();
+      readBody=true;
+    }
+    Buffer body=new Buffer();
+    if (readBody) {
+      String contentLengthString=headers.get("content-length");
+      long byteCount=contentLengthString != null ? Long.parseLong(contentLengthString) : Long.MAX_VALUE;
+      throttledTransfer(peek,socket,Okio.buffer(stream.getSource()),body,byteCount,true);
+    }
+    String requestLine=method + ' ' + path+ " HTTP/1.1";
+    List<Integer> chunkSizes=Collections.emptyList();
+    return new RecordedRequest(requestLine,headers,chunkSizes,body.size(),body,sequenceNumber.getAndIncrement(),socket);
+  }
+  private void writeResponse(  Http2Stream stream,  MockResponse response) throws IOException {
+    Settings settings=response.getSettings();
+    if (settings != null) {
+      stream.getConnection().setSettings(settings);
+    }
+    if (response.getSocketPolicy() == NO_RESPONSE) {
+      return;
+    }
+    List<Header> http2Headers=new ArrayList<>();
+    String[] statusParts=response.getStatus().split(" ",3);
+    if (statusParts.length < 2) {
+      throw new AssertionError("Unexpected status: " + response.getStatus());
+    }
+    http2Headers.add(new Header(Header.RESPONSE_STATUS,statusParts[1]));
+    Headers headers=response.getHeaders();
+    for (int i=0, size=headers.size(); i < size; i++) {
+      http2Headers.add(new Header(headers.name(i),headers.value(i)));
+    }
+    sleepIfDelayed(response.getHeadersDelay(TimeUnit.MILLISECONDS));
+    Buffer body=response.getBody();
+    boolean closeStreamAfterHeaders=body != null || !response.getPushPromises().isEmpty();
+    stream.writeHeaders(http2Headers,closeStreamAfterHeaders);
+    pushPromises(stream,response.getPushPromises());
+    if (body != null) {
+      BufferedSink sink=Okio.buffer(stream.getSink());
+      sleepIfDelayed(response.getBodyDelay(TimeUnit.MILLISECONDS));
+      throttledTransfer(response,socket,body,sink,body.size(),false);
+      sink.close();
+    }
+ else     if (closeStreamAfterHeaders) {
+      stream.close(ErrorCode.NO_ERROR);
+    }
+  }
+  private void pushPromises(  Http2Stream stream,  List<PushPromise> promises) throws IOException {
+    for (    PushPromise pushPromise : promises) {
+      List<Header> pushedHeaders=new ArrayList<>();
+      pushedHeaders.add(new Header(Header.TARGET_AUTHORITY,url(pushPromise.path()).host()));
+      pushedHeaders.add(new Header(Header.TARGET_METHOD,pushPromise.method()));
+      pushedHeaders.add(new Header(Header.TARGET_PATH,pushPromise.path()));
+      Headers pushPromiseHeaders=pushPromise.headers();
+      for (int i=0, size=pushPromiseHeaders.size(); i < size; i++) {
+        pushedHeaders.add(new Header(pushPromiseHeaders.name(i),pushPromiseHeaders.value(i)));
+      }
+      String requestLine=pushPromise.method() + ' ' + pushPromise.path()+ " HTTP/1.1";
+      List<Integer> chunkSizes=Collections.emptyList();
+      requestQueue.add(new RecordedRequest(requestLine,pushPromise.headers(),chunkSizes,0,new Buffer(),sequenceNumber.getAndIncrement(),socket));
+      boolean hasBody=pushPromise.response().getBody() != null;
+      Http2Stream pushedStream=stream.getConnection().pushStream(stream.getId(),pushedHeaders,hasBody);
+      writeResponse(pushedStream,pushPromise.response());
+    }
+  }
+}

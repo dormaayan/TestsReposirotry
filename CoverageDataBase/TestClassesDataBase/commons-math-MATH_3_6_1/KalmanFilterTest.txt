@@ -1,0 +1,189 @@
+/** 
+ * Tests for  {@link KalmanFilter}.
+ */
+public class KalmanFilterTest {
+  @Test(expected=MatrixDimensionMismatchException.class) public void testTransitionMeasurementMatrixMismatch(){
+    RealMatrix A=new Array2DRowRealMatrix(new double[]{1d});
+    RealMatrix B=null;
+    RealMatrix H=new Array2DRowRealMatrix(new double[]{1d,1d});
+    RealMatrix Q=new Array2DRowRealMatrix(new double[]{0});
+    RealMatrix R=new Array2DRowRealMatrix(new double[]{0});
+    ProcessModel pm=new DefaultProcessModel(A,B,Q,new ArrayRealVector(new double[]{0}),null);
+    MeasurementModel mm=new DefaultMeasurementModel(H,R);
+    new KalmanFilter(pm,mm);
+    Assert.fail("transition and measurement matrix should not be compatible");
+  }
+  @Test(expected=MatrixDimensionMismatchException.class) public void testTransitionControlMatrixMismatch(){
+    RealMatrix A=new Array2DRowRealMatrix(new double[]{1d});
+    RealMatrix B=new Array2DRowRealMatrix(new double[]{1d,1d});
+    RealMatrix H=new Array2DRowRealMatrix(new double[]{1d});
+    RealMatrix Q=new Array2DRowRealMatrix(new double[]{0});
+    RealMatrix R=new Array2DRowRealMatrix(new double[]{0});
+    ProcessModel pm=new DefaultProcessModel(A,B,Q,new ArrayRealVector(new double[]{0}),null);
+    MeasurementModel mm=new DefaultMeasurementModel(H,R);
+    new KalmanFilter(pm,mm);
+    Assert.fail("transition and control matrix should not be compatible");
+  }
+  @Test public void testConstant(){
+    double constantValue=10d;
+    double measurementNoise=0.1d;
+    double processNoise=1e-5d;
+    RealMatrix A=new Array2DRowRealMatrix(new double[]{1d});
+    RealMatrix B=null;
+    RealMatrix H=new Array2DRowRealMatrix(new double[]{1d});
+    RealVector x=new ArrayRealVector(new double[]{constantValue});
+    RealMatrix Q=new Array2DRowRealMatrix(new double[]{processNoise});
+    RealMatrix R=new Array2DRowRealMatrix(new double[]{measurementNoise});
+    ProcessModel pm=new DefaultProcessModel(A,B,Q,new ArrayRealVector(new double[]{constantValue}),null);
+    MeasurementModel mm=new DefaultMeasurementModel(H,R);
+    KalmanFilter filter=new KalmanFilter(pm,mm);
+    Assert.assertEquals(1,filter.getMeasurementDimension());
+    Assert.assertEquals(1,filter.getStateDimension());
+    assertMatrixEquals(Q.getData(),filter.getErrorCovariance());
+    double[] expectedInitialState=new double[]{constantValue};
+    assertVectorEquals(expectedInitialState,filter.getStateEstimation());
+    RealVector pNoise=new ArrayRealVector(1);
+    RealVector mNoise=new ArrayRealVector(1);
+    RandomGenerator rand=new JDKRandomGenerator();
+    for (int i=0; i < 60; i++) {
+      filter.predict();
+      pNoise.setEntry(0,processNoise * rand.nextGaussian());
+      x=A.operate(x).add(pNoise);
+      mNoise.setEntry(0,measurementNoise * rand.nextGaussian());
+      RealVector z=H.operate(x).add(mNoise);
+      filter.correct(z);
+      double diff=FastMath.abs(constantValue - filter.getStateEstimation()[0]);
+      Assert.assertTrue(Precision.compareTo(diff,measurementNoise,1e-6) < 0);
+    }
+    Assert.assertTrue(Precision.compareTo(filter.getErrorCovariance()[0][0],0.02d,1e-6) < 0);
+  }
+  @Test public void testConstantAcceleration(){
+    double dt=0.1d;
+    double measurementNoise=10d;
+    double accelNoise=0.2d;
+    RealMatrix A=new Array2DRowRealMatrix(new double[][]{{1,dt},{0,1}});
+    RealMatrix B=new Array2DRowRealMatrix(new double[][]{{FastMath.pow(dt,2d) / 2d},{dt}});
+    RealMatrix H=new Array2DRowRealMatrix(new double[][]{{1d,0d}});
+    RealVector x=new ArrayRealVector(new double[]{0,0});
+    RealMatrix tmp=new Array2DRowRealMatrix(new double[][]{{FastMath.pow(dt,4d) / 4d,FastMath.pow(dt,3d) / 2d},{FastMath.pow(dt,3d) / 2d,FastMath.pow(dt,2d)}});
+    RealMatrix Q=tmp.scalarMultiply(FastMath.pow(accelNoise,2));
+    RealMatrix P0=new Array2DRowRealMatrix(new double[][]{{1,1},{1,1}});
+    RealMatrix R=new Array2DRowRealMatrix(new double[]{FastMath.pow(measurementNoise,2)});
+    RealVector u=new ArrayRealVector(new double[]{0.1d});
+    ProcessModel pm=new DefaultProcessModel(A,B,Q,x,P0);
+    MeasurementModel mm=new DefaultMeasurementModel(H,R);
+    KalmanFilter filter=new KalmanFilter(pm,mm);
+    Assert.assertEquals(1,filter.getMeasurementDimension());
+    Assert.assertEquals(2,filter.getStateDimension());
+    assertMatrixEquals(P0.getData(),filter.getErrorCovariance());
+    double[] expectedInitialState=new double[]{0.0,0.0};
+    assertVectorEquals(expectedInitialState,filter.getStateEstimation());
+    RandomGenerator rand=new JDKRandomGenerator();
+    RealVector tmpPNoise=new ArrayRealVector(new double[]{FastMath.pow(dt,2d) / 2d,dt});
+    for (int i=0; i < 60; i++) {
+      filter.predict(u);
+      RealVector pNoise=tmpPNoise.mapMultiply(accelNoise * rand.nextGaussian());
+      x=A.operate(x).add(B.operate(u)).add(pNoise);
+      double mNoise=measurementNoise * rand.nextGaussian();
+      RealVector z=H.operate(x).mapAdd(mNoise);
+      filter.correct(z);
+      double diff=FastMath.abs(x.getEntry(0) - filter.getStateEstimation()[0]);
+      Assert.assertTrue(Precision.compareTo(diff,measurementNoise,1e-6) < 0);
+    }
+    Assert.assertTrue(Precision.compareTo(filter.getErrorCovariance()[1][1],0.1d,1e-6) < 0);
+  }
+  /** 
+ * Represents an idealized Cannonball only taking into account gravity.
+ */
+public static class Cannonball {
+    private final double[] gravity={0,-9.81};
+    private final double[] velocity;
+    private final double[] location;
+    private double timeslice;
+    public Cannonball(    double timeslice,    double angle,    double initialVelocity){
+      this.timeslice=timeslice;
+      final double angleInRadians=FastMath.toRadians(angle);
+      this.velocity=new double[]{initialVelocity * FastMath.cos(angleInRadians),initialVelocity * FastMath.sin(angleInRadians)};
+      this.location=new double[]{0,0};
+    }
+    public double getX(){
+      return location[0];
+    }
+    public double getY(){
+      return location[1];
+    }
+    public double getXVelocity(){
+      return velocity[0];
+    }
+    public double getYVelocity(){
+      return velocity[1];
+    }
+    public void step(){
+      double[] slicedGravity=gravity.clone();
+      for (int i=0; i < slicedGravity.length; i++) {
+        slicedGravity[i]*=timeslice;
+      }
+      double[] slicedVelocity=velocity.clone();
+      for (int i=0; i < velocity.length; i++) {
+        velocity[i]+=slicedGravity[i];
+        slicedVelocity[i]=velocity[i] * timeslice;
+        location[i]+=slicedVelocity[i];
+      }
+      if (location[1] < 0) {
+        location[1]=0;
+      }
+    }
+  }
+  @Test public void testCannonball(){
+    final int iterations=144;
+    final double dt=0.1d;
+    final double measurementNoise=30d;
+    final double initialVelocity=100;
+    final double angle=45;
+    final Cannonball cannonball=new Cannonball(dt,angle,initialVelocity);
+    final double speedX=cannonball.getXVelocity();
+    final double speedY=cannonball.getYVelocity();
+    final RealMatrix A=MatrixUtils.createRealMatrix(new double[][]{{1,dt,0,0},{0,1,0,0},{0,0,1,dt},{0,0,0,1}});
+    final RealVector controlVector=MatrixUtils.createRealVector(new double[]{0,0,0.5 * -9.81 * dt* dt,-9.81 * dt});
+    final RealMatrix B=MatrixUtils.createRealMatrix(new double[][]{{0,0,0,0},{0,0,0,0},{0,0,1,0},{0,0,0,1}});
+    final RealMatrix H=MatrixUtils.createRealMatrix(new double[][]{{1,0,0,0},{0,0,0,0},{0,0,1,0},{0,0,0,0}});
+    final RealVector initialState=MatrixUtils.createRealVector(new double[]{0,speedX,0,speedY});
+    final double var=measurementNoise * measurementNoise;
+    final RealMatrix initialErrorCovariance=MatrixUtils.createRealMatrix(new double[][]{{var,0,0,0},{0,1e-3,0,0},{0,0,var,0},{0,0,0,1e-3}});
+    final RealMatrix Q=MatrixUtils.createRealMatrix(4,4);
+    final RealMatrix R=MatrixUtils.createRealMatrix(new double[][]{{var,0,0,0},{0,1e-3,0,0},{0,0,var,0},{0,0,0,1e-3}});
+    final ProcessModel pm=new DefaultProcessModel(A,B,Q,initialState,initialErrorCovariance);
+    final MeasurementModel mm=new DefaultMeasurementModel(H,R);
+    final KalmanFilter filter=new KalmanFilter(pm,mm);
+    final RandomGenerator rng=new Well19937c(1000);
+    final NormalDistribution dist=new NormalDistribution(rng,0,measurementNoise);
+    for (int i=0; i < iterations; i++) {
+      double x=cannonball.getX();
+      double y=cannonball.getY();
+      double nx=x + dist.sample();
+      double ny=y + dist.sample();
+      cannonball.step();
+      filter.predict(controlVector);
+      filter.correct(new double[]{nx,0,ny,0});
+      double diff=FastMath.abs(cannonball.getY() - filter.getStateEstimation()[2]);
+      Assert.assertTrue(Precision.compareTo(diff,measurementNoise,1e-6) < 0);
+    }
+    Assert.assertTrue(Precision.compareTo(filter.getErrorCovariance()[0][0],9,1e-6) < 0);
+    Assert.assertTrue(Precision.compareTo(filter.getErrorCovariance()[2][2],9,1e-6) < 0);
+  }
+  private void assertVectorEquals(  double[] expected,  double[] result){
+    Assert.assertEquals("Wrong number of rows.",expected.length,result.length);
+    for (int i=0; i < expected.length; i++) {
+      Assert.assertEquals("Wrong value at position [" + i + "]",expected[i],result[i],1.0e-6);
+    }
+  }
+  private void assertMatrixEquals(  double[][] expected,  double[][] result){
+    Assert.assertEquals("Wrong number of rows.",expected.length,result.length);
+    for (int i=0; i < expected.length; i++) {
+      Assert.assertEquals("Wrong number of columns.",expected[i].length,result[i].length);
+      for (int j=0; j < expected[i].length; j++) {
+        Assert.assertEquals("Wrong value at position [" + i + ","+ j+ "]",expected[i][j],result[i][j],1.0e-6);
+      }
+    }
+  }
+}
