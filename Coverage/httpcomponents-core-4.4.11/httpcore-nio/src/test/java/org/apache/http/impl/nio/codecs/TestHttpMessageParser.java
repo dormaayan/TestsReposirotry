@@ -43,6 +43,7 @@ import org.apache.http.impl.nio.reactor.SessionInputBufferImpl;
 import org.apache.http.nio.NHttpMessageParser;
 import org.apache.http.nio.reactor.SessionInputBuffer;
 import org.junit.Assert;
+import org.junit.Ignore;
 import org.junit.Test;
 
 /**
