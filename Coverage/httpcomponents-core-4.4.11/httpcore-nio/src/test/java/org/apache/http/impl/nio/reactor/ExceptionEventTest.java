@@ -30,6 +30,7 @@ package org.apache.http.impl.nio.reactor;
 import java.util.Date;
 
 import org.junit.Assert;
+import org.junit.Ignore;
 import org.junit.Test;
 
 public class ExceptionEventTest {
@@ -52,7 +53,7 @@ public class ExceptionEventTest {
         Assert.assertEquals(new Date(1234567890L), ee.getTimestamp());
     }
 
-    @Test
+    @Ignore @Test
     public void testToString() {
         Assert.assertNotNull(new ExceptionEvent(new NullPointerException()));
     }

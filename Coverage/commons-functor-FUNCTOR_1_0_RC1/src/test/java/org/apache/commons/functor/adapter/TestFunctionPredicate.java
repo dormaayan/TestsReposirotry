@@ -24,6 +24,7 @@ import static org.junit.Assert.assertTrue;
 import org.apache.commons.functor.BaseFunctorTest;
 import org.apache.commons.functor.Predicate;
 import org.apache.commons.functor.core.Constant;
+import org.junit.Ignore;
 import org.junit.Test;
 
 /**

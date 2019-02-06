@@ -21,6 +21,7 @@ import org.apache.commons.math3.stat.correlation.PearsonsCorrelation;
 import org.apache.commons.math3.TestUtils;
 import org.apache.commons.math3.util.FastMath;
 import org.junit.Assert;
+import org.junit.Ignore;
 import org.junit.Test;
 
 /**
@@ -45,7 +46,7 @@ public class MillerUpdatingRegressionTest {
     /**
      * Test of hasIntercept method, of class MillerUpdatingRegression.
      */
-    @Test
+    @Ignore @Test
     public void testHasIntercept() {
         MillerUpdatingRegression instance = new MillerUpdatingRegression(10, false);
         if (instance.hasIntercept()) {

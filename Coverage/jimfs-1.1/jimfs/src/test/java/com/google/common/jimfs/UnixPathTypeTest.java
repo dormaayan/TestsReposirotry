@@ -25,6 +25,7 @@ import static org.junit.Assert.fail;
 
 import com.google.common.collect.ImmutableList;
 
+import org.junit.Ignore;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.JUnit4;
@@ -40,7 +41,7 @@ import java.nio.file.InvalidPathException;
 @RunWith(JUnit4.class)
 public class UnixPathTypeTest {
 
-  @Test
+  @Ignore @Test
   public void testUnix() {
     PathType unix = PathType.unix();
     assertThat(unix.getSeparator()).isEqualTo("/");

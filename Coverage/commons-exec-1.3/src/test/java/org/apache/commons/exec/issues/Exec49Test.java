@@ -27,6 +27,7 @@ import org.apache.commons.exec.DefaultExecutor;
 import org.apache.commons.exec.Executor;
 import org.apache.commons.exec.OS;
 import org.apache.commons.exec.PumpStreamHandler;
+import org.junit.Ignore;
 import org.junit.Test;
 
 /**
@@ -46,7 +47,7 @@ public class Exec49Test {
      *
      * @throws Exception the test failed
      */
-    @Test
+    @Ignore @Test
     public void testExec49_1() throws Exception {
 
         if (OS.isFamilyUnix()) {

@@ -22,6 +22,7 @@ import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
 import org.apache.commons.validator.routines.checkdigit.IBANCheckDigit;
+import org.junit.Ignore;
 import org.junit.Test;
 
 /**
@@ -143,7 +144,7 @@ public class IBANValidatorTest {
         }
     }
 
-    @Test
+   @Test
     public void testInValid() {
         for(String f : invalidIBANFormat) {
             assertFalse(f, VALIDATOR.isValid(f));
